@@ -200,6 +200,17 @@ python -m pip install -r requirements.txt
 sudo systemctl restart simple-hyper.service
 ```
 
+### 服务器 C 自动同步
+
+服务器 C 使用 `simple-hyper-sync.timer` 定时从 GitHub `main` 同步代码并重启 `simple-hyper.service`。同步脚本保留服务器本机的 `.venv/`、`logs/` 和 `coin_aliases.csv`，避免覆盖运行环境、历史日志和本机别名表。
+
+检查同步状态：
+
+```bash
+systemctl status simple-hyper-sync.timer
+journalctl -u simple-hyper-sync.service -n 80 --no-pager
+```
+
 ### 网页使用
 
 页面流程：
@@ -358,7 +369,7 @@ markets --dex xyz --limit 10
 
 ## 前台输出
 
-前台只显示账户指标、订单核心字段和日志路径。数字统一使用千分位并保留 2 位小数。
+前台只显示账户指标和订单核心字段。完整运行日志仍写入 `logs/`，但网页输出不显示日志路径。数字统一使用千分位并保留 2 位小数。
 
 ```text
 +- Account ----------------+
@@ -375,7 +386,6 @@ markets --dex xyz --limit 10
 | limitPx: 29,889.00         |
 | origSz: 0.00               |
 +----------------------------+
-log: /.../logs/order-20260525-181905-173543.log
 ```
 
 字段说明：

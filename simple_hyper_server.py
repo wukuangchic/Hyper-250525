@@ -24,6 +24,10 @@ ICON_FILES = {
     "/apple-touch-icon.png": PROJECT_DIR / "simple-hyper-icon-180.png",
     "/apple-touch-icon-180.png": PROJECT_DIR / "simple-hyper-icon-180.png",
     "/apple-touch-icon-precomposed.png": PROJECT_DIR / "simple-hyper-icon-180.png",
+    "/apple-touch-icon-120x120.png": PROJECT_DIR / "simple-hyper-icon-180.png",
+    "/apple-touch-icon-152x152.png": PROJECT_DIR / "simple-hyper-icon-180.png",
+    "/apple-touch-icon-167x167.png": PROJECT_DIR / "simple-hyper-icon-180.png",
+    "/apple-touch-icon-180x180.png": PROJECT_DIR / "simple-hyper-icon-180.png",
     "/icon.png": PROJECT_DIR / "simple-hyper-icon-192.png",
     "/icon-192.png": PROJECT_DIR / "simple-hyper-icon-192.png",
     "/icon-512.png": PROJECT_DIR / "simple-hyper-icon-512.png",
@@ -45,9 +49,13 @@ INDEX_HTML = r"""<!doctype html>
   <meta name="theme-color" content="#f6f2ea">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-title" content="Simple-Hyper">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="application-name" content="Simple-Hyper">
   <title>Simple-Hyper</title>
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/icon-192.png" sizes="192x192" type="image/png">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
   <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon-180.png">
   <style>
     :root {
@@ -540,24 +548,33 @@ README_HTML = r"""<!doctype html>
 
 
 MANIFEST = {
+    "id": "/",
     "name": "Simple-Hyper",
     "short_name": "Simple-Hyper",
     "start_url": "/",
+    "scope": "/",
     "display": "standalone",
+    "orientation": "portrait",
     "background_color": "#f6f2ea",
     "theme_color": "#f6f2ea",
     "icons": [
         {
+            "src": "/apple-touch-icon-180.png",
+            "sizes": "180x180",
+            "type": "image/png",
+            "purpose": "any",
+        },
+        {
             "src": "/icon-192.png",
             "sizes": "192x192",
             "type": "image/png",
-            "purpose": "any",
+            "purpose": "any maskable",
         },
         {
             "src": "/icon-512.png",
             "sizes": "512x512",
             "type": "image/png",
-            "purpose": "any",
+            "purpose": "any maskable",
         }
     ],
 }
@@ -616,6 +633,11 @@ def parse_command(raw: Any) -> list[str]:
     return args
 
 
+def clean_web_output(output: str) -> str:
+    lines = [line for line in output.splitlines() if not line.startswith("log: ")]
+    return "\n".join(lines).rstrip()
+
+
 def run_hl_order(args: list[str], account_address: str, secret_key: str) -> dict[str, Any]:
     started = time.monotonic()
     command = [sys.executable, str(PROJECT_DIR / "hl_order.py"), *args]
@@ -637,7 +659,7 @@ def run_hl_order(args: list[str], account_address: str, secret_key: str) -> dict
         "ok": True,
         "command_ok": completed.returncode == 0,
         "command": f"hl_order.py {shlex.join(args)}",
-        "output": completed.stdout,
+        "output": clean_web_output(completed.stdout),
         "elapsed_ms": elapsed_ms,
         "returncode": completed.returncode,
     }
