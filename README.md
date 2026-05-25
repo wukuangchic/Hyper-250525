@@ -34,6 +34,7 @@ order-terminal.command
 query
 BTC buy --dry-run
 BTC buy
+BTC buy 10 --market
 GOLD buy
 SAMSUNG buy
 QQQ buy --dry-run
@@ -46,6 +47,7 @@ BTC --cancel
 . ./aliases
 query
 order BTC buy --dry-run
+order BTC buy 10 --market
 order BTC --cancel
 ```
 
@@ -70,7 +72,7 @@ order-terminal-windows.cmd
 ```bat
 query
 order BTC buy --dry-run
-order BTC buy
+order BTC buy 10 --market
 markets BTC
 ```
 
@@ -92,6 +94,7 @@ markets.cmd QQQ
 - 不填价格时，按同向订单簿第 `10` 档挂单：
   - 买入 / 看多：第 10 档 bid。
   - 卖出 / 看空：第 10 档 ask。
+- 加 `--market` 时，按当前 mid 计算数量，并用带滑点保护的 IOC 单成交，不会留下挂单。
 - 真实下单前，自动把当前合约杠杆设置为 `maxLeverage`。
 - 如果数量 round 后名义价值低于 `10` 美元，会向上补一个数量步进。
 - 前台默认精简输出，完整日志写入 `logs/`。
@@ -114,6 +117,13 @@ BTC buy 25
 # 指定价格
 BTC buy 10 --price 75000
 
+# 市价买入 / 卖出
+BTC buy 10 --market
+BTC sell 10 --market
+
+# 调整市价单滑点保护，默认 5%
+BTC buy 10 --market --slippage 1%
+
 # 指定同向订单簿档位
 BTC sell 10 --book-level 5
 
@@ -133,6 +143,7 @@ BTC --cancel 441260592983
 order query
 order --query
 order BTC buy
+order BTC buy 10 --market
 order BTC --cancel
 ```
 
@@ -230,6 +241,16 @@ log: /.../logs/order-20260525-181905-173543.log
 - `price`：本地计算或手动输入的价格；如果别名有 `rate`，括号里显示换算价。
 - `limitPx`：交易所返回的挂单价格。
 - `origSz`：交易所返回的原始订单数量。
+
+市价单：
+
+```bash
+BTC buy 10 --market
+BTC sell 10 --market
+BTC buy 10 --market --slippage 1%
+```
+
+`--market` 会使用 IOC 订单；默认滑点保护是 `0.05`，也就是 `5%`。如果要更保守，可以用 `--slippage 1%` 或 `--slippage 0.01`。
 
 查询指令会返回当前所有 DEX 的持仓和未成订单：
 

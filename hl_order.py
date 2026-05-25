@@ -4,6 +4,7 @@
 Examples:
   ./hl_order.py query
   ./hl_order.py BTC buy
+  ./hl_order.py BTC buy 10 --market
   ./hl_order.py BTC buy --price 75000
   ./hl_order.py BTC sell 25 --price 80000
   ./hl_order.py BTC --cancel
@@ -130,6 +131,13 @@ def format_price(value: Decimal | str, rate: Decimal | None = None) -> str:
     if rate is None:
         return text
     return f"{text}({decimal_to_display(price / rate)})"
+
+
+def format_optional_price(value: Any, rate: Decimal | None = None) -> str:
+    decimal = decimal_or_none(value)
+    if decimal is None:
+        return "n/a"
+    return format_price(decimal, rate)
 
 
 def format_percent(value: Optional[Decimal]) -> str:
@@ -309,6 +317,47 @@ def calc_size(amount_usd: Decimal, price: Decimal, sz_decimals: int) -> tuple[De
     return size, notional, target_notional
 
 
+def calc_market_size(
+    amount_usd: Decimal,
+    reference_price: Decimal,
+    worst_price: Decimal,
+    sz_decimals: int,
+) -> tuple[Decimal, Decimal, Decimal, Decimal]:
+    if reference_price <= 0 or worst_price <= 0:
+        raise ValueError("Market reference price must be positive")
+
+    target_notional = max(amount_usd, MIN_NOTIONAL)
+    step = Decimal(1).scaleb(-sz_decimals)
+    raw_size = target_notional / reference_price
+    size = round_to_step(raw_size, step, ROUND_DOWN)
+    if size <= 0 or size * reference_price < target_notional:
+        size = round_to_step(raw_size, step, ROUND_UP)
+
+    if size * worst_price < MIN_NOTIONAL:
+        size = round_to_step(MIN_NOTIONAL / worst_price, step, ROUND_UP)
+
+    reference_notional = size * reference_price
+    worst_notional = size * worst_price
+    if worst_notional < MIN_NOTIONAL:
+        raise ValueError(
+            f"Calculated market notional is still below {MIN_NOTIONAL}: "
+            f"size={decimal_to_plain(size)}, worst_price={decimal_to_plain(worst_price)}, "
+            f"notional={decimal_to_plain(worst_notional)}"
+        )
+    return size, reference_notional, target_notional, worst_notional
+
+
+def parse_slippage(value: str) -> Decimal:
+    text = value.strip()
+    if text.endswith("%"):
+        slippage = Decimal(text[:-1]) / Decimal("100")
+    else:
+        slippage = Decimal(text)
+    if slippage < 0 or slippage >= 1:
+        raise ValueError("--slippage must be >= 0 and < 1, e.g. 0.05 or 5%")
+    return slippage
+
+
 def same_side_book_price(info: Info, coin: str, is_buy: bool, level: int) -> Decimal:
     if level < 1:
         raise ValueError("--book-level must be >= 1")
@@ -457,6 +506,51 @@ def print_order_row(
             ("price", format_price(price, price_rate)),
             ("limitPx", decimal_to_display(limit_px)),
             ("origSz", decimal_to_display(orig_sz)),
+        ],
+    )
+
+
+def print_market_order_row(
+    coin: str,
+    side: str,
+    reference_price: Decimal | str,
+    limit_px: Decimal | str,
+    orig_sz: Decimal | str,
+    slippage: Decimal,
+    reference_notional: Decimal | str,
+    worst_notional: Decimal | str,
+    price_rate: Decimal | None = None,
+) -> None:
+    print_box(
+        "Market Order",
+        [
+            ("coin", coin),
+            ("side", side),
+            ("referencePx", format_price(reference_price, price_rate)),
+            ("iocLimitPx", format_price(limit_px, price_rate)),
+            ("slippage", format_percent(slippage)),
+            ("sz", format_optional_quantity(orig_sz)),
+            ("referenceNtl", decimal_to_display(reference_notional)),
+            ("worstNtl", decimal_to_display(worst_notional)),
+        ],
+    )
+
+
+def print_filled_row(
+    coin: str,
+    side: str,
+    filled: dict[str, Any],
+    fallback_size: Decimal | str,
+    price_rate: Decimal | None = None,
+) -> None:
+    print_box(
+        "Filled",
+        [
+            ("coin", coin),
+            ("side", side),
+            ("oid", str(filled.get("oid", "n/a"))),
+            ("avgPx", format_optional_price(filled.get("avgPx"), price_rate)),
+            ("totalSz", format_optional_quantity(filled.get("totalSz", fallback_size))),
         ],
     )
 
@@ -648,19 +742,38 @@ def place_order(args: argparse.Namespace) -> None:
     amount = Decimal(args.amount)
     if amount <= 0:
         raise ValueError("amount must be positive")
+    slippage = parse_slippage(args.slippage)
 
     mids = info.all_mids(dex)
     log_event("all_mids_sample", {"dex": dex or "default", "coin": coin, "mid": mids.get(coin)})
     max_leverage = int(asset["maxLeverage"])
-    if args.price:
+    if args.market:
+        mid = mids.get(coin)
+        if mid is None:
+            raise ValueError(f"No mid price found for {coin}, cannot place market order")
+        reference_price = Decimal(str(mid))
+        price = Decimal(str(exchange._slippage_price(coin, is_buy, float(slippage), float(reference_price))))
+        price_source = f"mid with {format_percent(slippage)} slippage protection"
+    elif args.price:
         price = Decimal(args.price)
         price_source = "user"
     else:
         price = same_side_book_price(info, coin, is_buy, args.book_level)
         price_source = f"same-side book level {args.book_level}"
 
-    size, notional, target_notional = calc_size(amount, price, int(asset["szDecimals"]))
-    order_type = {"limit": {"tif": args.tif}}
+    if args.market:
+        size, notional, target_notional, worst_notional = calc_market_size(
+            amount,
+            reference_price,
+            price,
+            int(asset["szDecimals"]),
+        )
+        order_type = {"limit": {"tif": "Ioc"}}
+    else:
+        size, notional, target_notional = calc_size(amount, price, int(asset["szDecimals"]))
+        worst_notional = notional
+        reference_price = price
+        order_type = {"limit": {"tif": args.tif}}
 
     side_code = "B" if is_buy else "A"
     if args.verbose:
@@ -668,17 +781,33 @@ def place_order(args: argparse.Namespace) -> None:
         print("price_source:", price_source)
         print("current_mid:", mids.get(coin))
         print("max_leverage:", max_leverage)
+        print("market:", int(args.market))
+        print("slippage:", decimal_to_plain(slippage))
         print("requested_usd:", decimal_to_plain(amount))
         print("target_usd:", decimal_to_plain(target_notional))
         print("sz_decimals:", asset["szDecimals"])
         print("order_notional:", decimal_to_plain(notional))
-        print("tif:", args.tif)
+        print("worst_notional:", decimal_to_plain(worst_notional))
+        print("tif:", order_type["limit"]["tif"])
         print("reduce_only:", args.reduce_only)
 
     if args.dry_run:
         print_account_metrics(info, account)
         print_box("Run", [("dry_run", "1")])
-        print_order_row(coin, side_code, price, price, size, price_rate)
+        if args.market:
+            print_market_order_row(
+                coin,
+                side_code,
+                reference_price,
+                price,
+                size,
+                slippage,
+                notional,
+                worst_notional,
+                price_rate,
+            )
+        else:
+            print_order_row(coin, side_code, price, price, size, price_rate)
         return
 
     leverage_result = exchange.update_leverage(max_leverage, coin, is_cross=True)
@@ -721,7 +850,7 @@ def place_order(args: argparse.Namespace) -> None:
                 print_order_row(coin, side_code, price, price, size, price_rate)
             continue
         if "filled" in status:
-            print_order_row(coin, side_code, price, price, size, price_rate)
+            print_filled_row(coin, side_code, status["filled"], size, price_rate)
 
 
 def parse_args() -> argparse.Namespace:
@@ -730,6 +859,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("side", nargs="?", help="buy/long/看多 or sell/short/看空. Not needed with --cancel.")
     parser.add_argument("amount", nargs="?", default="10", help="USD notional. Default: 10.")
     parser.add_argument("--price", help="Limit price. Defaults to same-side book level 10.")
+    parser.add_argument("--market", action="store_true", help="Submit as a market order using IOC with slippage protection.")
+    parser.add_argument("--slippage", default=str(Exchange.DEFAULT_SLIPPAGE), help="Market slippage protection. Default: 0.05. Also accepts 5%%.")
     parser.add_argument("--book-level", type=int, default=10, help="Same-side book level when --price is omitted.")
     parser.add_argument("--tif", default="Gtc", choices=["Gtc", "Ioc", "Alo"], help="Time in force. Default: Gtc.")
     parser.add_argument("--reduce-only", action="store_true", help="Place a reduce-only order.")
@@ -752,6 +883,10 @@ def parse_args() -> argparse.Namespace:
         args.coin = ""
     if not args.query and not args.coin:
         parser.error("coin is required unless query/status or --query is used")
+    if args.market and args.price:
+        parser.error("--market cannot be used with --price")
+    if args.market and args.cancel is not None:
+        parser.error("--market cannot be used with --cancel")
     return args
 
 
