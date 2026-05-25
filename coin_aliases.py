@@ -20,7 +20,7 @@ def load_coin_aliases(path: Path = ALIAS_FILE) -> dict[str, str]:
         return {}
 
     aliases: dict[str, str] = {}
-    with path.open(newline="") as handle:
+    with path.open(newline="", encoding="utf-8", errors="replace") as handle:
         for row in csv.DictReader(handle):
             alias = (row.get("alias") or "").strip()
             target = (row.get("target") or "").strip()
@@ -35,7 +35,7 @@ def load_coin_alias_rates(path: Path = ALIAS_FILE) -> dict[str, Decimal]:
         return {}
 
     rates: dict[str, Decimal] = {}
-    with path.open(newline="") as handle:
+    with path.open(newline="", encoding="utf-8", errors="replace") as handle:
         for row in csv.DictReader(handle):
             alias = (row.get("alias") or "").strip()
             target = (row.get("target") or "").strip()
