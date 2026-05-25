@@ -1,0 +1,9 @@
+#!/bin/sh
+# Source this file to use local commands without ./, e.g.:
+#   . ./activate
+#   order BTC buy
+case ":$PATH:" in
+  *":$(pwd):"*) ;;
+  *) export PATH="$(pwd):$PATH" ;;
+esac
+echo "Hyper local commands enabled: order, hl_order.py, hl_markets.py"

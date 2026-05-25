@@ -1,0 +1,2 @@
+eth-account==0.13.7
+hyperliquid-python-sdk @ git+https://github.com/hyperliquid-dex/hyperliquid-python-sdk.git@7ee976d123b1e04295e4a1e37a424ca6a13bef88

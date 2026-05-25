@@ -1,0 +1,6 @@
+# Source this file to enable short local aliases:
+#   . ./aliases
+#   order BTC buy
+
+alias order='./order'
+alias markets='./hl_markets.py'
