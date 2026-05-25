@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
+ICON_PATH = PROJECT_DIR / "simple-hyper-icon.png"
 TLS_CERT = os.environ.get("SIMPLE_HYPER_TLS_CERT", "")
 TLS_KEY = os.environ.get("SIMPLE_HYPER_TLS_KEY", "")
 COMMAND_TIMEOUT = float(os.environ.get("SIMPLE_HYPER_COMMAND_TIMEOUT", "60"))
@@ -38,7 +39,8 @@ INDEX_HTML = r"""<!doctype html>
   <meta name="apple-mobile-web-app-title" content="Simple-Hyper">
   <title>Simple-Hyper</title>
   <link rel="manifest" href="/manifest.webmanifest">
-  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="icon" href="/icon.png" type="image/png">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
   <style>
     :root {
       color-scheme: light;
@@ -536,15 +538,15 @@ MANIFEST = {
     "display": "standalone",
     "background_color": "#f6f2ea",
     "theme_color": "#f6f2ea",
+    "icons": [
+        {
+            "src": "/icon.png",
+            "sizes": "447x447",
+            "type": "image/png",
+            "purpose": "any maskable",
+        }
+    ],
 }
-
-
-ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
-<rect width="128" height="128" rx="24" fill="#f6f2ea"/>
-<path d="M24 80 50 32l18 64 36-48" fill="none" stroke="#245f73" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
-<circle cx="50" cy="32" r="7" fill="#137547"/>
-<circle cx="68" cy="96" r="7" fill="#b3261e"/>
-</svg>"""
 
 
 def json_bytes(payload: dict[str, Any], status: int = HTTPStatus.OK) -> tuple[int, bytes, str]:
@@ -661,8 +663,8 @@ class SimpleHyperHandler(BaseHTTPRequestHandler):
                 "application/manifest+json; charset=utf-8",
             )
             return
-        if path == "/icon.svg":
-            self.send_payload(HTTPStatus.OK, ICON_SVG.encode("utf-8"), "image/svg+xml; charset=utf-8")
+        if path in {"/icon.png", "/apple-touch-icon.png"}:
+            self.send_payload(HTTPStatus.OK, ICON_PATH.read_bytes(), "image/png")
             return
         if path == "/api/health":
             self.send_json({"ok": True, "service": "simple-hyper"})
