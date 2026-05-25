@@ -6,6 +6,7 @@
 !.env.example
 服务器C/
 *.pem
+simple-hyper-token.txt
 
 # Python runtime artifacts
 .venv/
