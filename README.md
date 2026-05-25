@@ -88,11 +88,10 @@ markets.cmd QQQ
 
 `simple_hyper_server.py` 是给 iPhone/Safari 用的极简网页控制台。它不会重写交易逻辑，只是在服务器上调用当前目录的 `hl_order.py`。
 
-本地或服务器启动前需要设置访问口令：
+启动：
 
 ```bash
 cp simple-hyper.env.example simple-hyper.env
-编辑 simple-hyper.env，把 SIMPLE_HYPER_TOKEN 改成长随机口令
 set -a
 . ./simple-hyper.env
 set +a
@@ -113,11 +112,12 @@ https://服务器地址:8787
 
 安全默认值：
 
-- API 必须带 `SIMPLE_HYPER_TOKEN`。
-- 下单界面默认先 `--dry-run`。
-- 真实下单需要前端确认，并且后端要求 `confirm=SUBMIT`。
-- 真实撤单需要前端确认，并且后端要求 `confirm=CANCEL`。
-- 单笔金额默认上限由 `SIMPLE_HYPER_MAX_AMOUNT_USD` 控制。
+- 服务器不需要保存交易 `.env`。
+- 网页验证通过后会隐藏地址和密钥，凭证只留在当前页面内存里。
+- 每次执行请求都会带 `account_address` 和 `secret_key`，后端只放进子进程环境变量。
+- 后端用 `shlex.split()` 解析输入框命令，不走 shell。
+- 命令不含 `--dry-run` 且不是 `query` 时，前端会弹出真实提交确认。
+- 服务日志不记录请求 body，`hl_order.py` 日志也不会写入密钥。
 
 ## 默认行为
 

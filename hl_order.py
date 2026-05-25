@@ -93,19 +93,25 @@ def log_event(label: str, value: Any) -> None:
 
 def load_dotenv(path: str = ".env") -> dict[str, str]:
     env_path = Path(path)
-    if not env_path.exists():
-        raise FileNotFoundError(f"Missing env file: {env_path}")
-
     values: dict[str, str] = {}
-    for raw in env_path.read_text().splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        values[key.strip()] = value.strip().strip('"').strip("'")
+    if env_path.exists():
+        for raw in env_path.read_text().splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip().strip('"').strip("'")
 
     # Also accept uppercase env-style names if the file ever changes.
     normalized = {key.lower(): value for key, value in values.items()}
+    for key in ("account_address", "secret_key"):
+        for env_key in (key, key.upper()):
+            env_value = os.environ.get(env_key)
+            if env_value:
+                normalized[key] = env_value
+                break
+    if not normalized.get("account_address") or not normalized.get("secret_key"):
+        raise FileNotFoundError(f"Missing credentials: set {env_path} or account_address/secret_key environment variables")
     return normalized
 
 
