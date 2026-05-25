@@ -51,6 +51,37 @@ order BTC --cancel
 
 注意 alias 要分两步执行，不要写成 `. ./aliases && order BTC buy`。
 
+## Windows 用法
+
+首次安装时在项目目录里双击：
+
+```text
+setup-windows.cmd
+```
+
+安装完成后双击：
+
+```text
+order-terminal-windows.cmd
+```
+
+打开的 CMD 窗口里可以直接运行：
+
+```bat
+query
+order BTC buy --dry-run
+order BTC buy
+markets BTC
+```
+
+也可以在普通 CMD / PowerShell 里进入项目目录后运行：
+
+```bat
+order.cmd BTC buy --dry-run
+query.cmd
+markets.cmd QQQ
+```
+
 ## 默认行为
 
 - 读取根目录 `.env` 的 `account_address` 和 `secret_key`。

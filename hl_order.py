@@ -30,8 +30,12 @@ from typing import Any, Optional
 def ensure_local_venv() -> None:
     project_dir = Path(__file__).resolve().parent
     venv_dir = project_dir / ".venv"
-    venv_python = project_dir / ".venv" / "bin" / "python"
-    if not venv_python.exists():
+    candidates = [
+        venv_dir / "bin" / "python",
+        venv_dir / "Scripts" / "python.exe",
+    ]
+    venv_python = next((path for path in candidates if path.exists()), None)
+    if venv_python is None:
         return
     if Path(sys.prefix).resolve() == venv_dir.resolve():
         return
