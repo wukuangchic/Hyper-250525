@@ -6,4 +6,4 @@ case ":$PATH:" in
   *":$(pwd):"*) ;;
   *) export PATH="$(pwd):$PATH" ;;
 esac
-echo "Hyper local commands enabled: order, hl_order.py, hl_markets.py"
+echo "Hyper local commands enabled: order, query, hl_order.py, hl_markets.py"

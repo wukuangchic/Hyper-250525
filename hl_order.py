@@ -2,6 +2,7 @@
 """Small Hyperliquid perp order helper.
 
 Examples:
+  ./hl_order.py query
   ./hl_order.py BTC buy
   ./hl_order.py BTC buy --price 75000
   ./hl_order.py BTC sell 25 --price 80000
@@ -139,6 +140,39 @@ def format_leverage(value: Optional[Decimal]) -> str:
     return f"{decimal_to_display(value)}x"
 
 
+def decimal_or_none(value: Any) -> Decimal | None:
+    if value is None or value == "":
+        return None
+    return Decimal(str(value))
+
+
+def format_optional_decimal(value: Any) -> str:
+    decimal = decimal_or_none(value)
+    if decimal is None:
+        return "n/a"
+    return decimal_to_display(decimal)
+
+
+def format_optional_quantity(value: Any) -> str:
+    decimal = decimal_or_none(value)
+    if decimal is None:
+        return "n/a"
+    return decimal_to_plain(decimal)
+
+
+def format_optional_percent(value: Any) -> str:
+    decimal = decimal_or_none(value)
+    if decimal is None:
+        return "n/a"
+    return format_percent(decimal)
+
+
+def format_timestamp_ms(value: Any) -> str:
+    if value in (None, ""):
+        return "n/a"
+    return datetime.fromtimestamp(int(value) / 1000).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def visible_width(text: str) -> int:
     width = 0
     for char in text:
@@ -158,6 +192,28 @@ def print_box(title: str, rows: list[tuple[str, str]]) -> None:
         text = f"{key}: {value}"
         print(f"| {pad_visible(text, width)} |")
     print("+" + "-" * (width + 2) + "+")
+
+
+def print_table(title: str, rows: list[dict[str, str]], columns: list[tuple[str, str]]) -> None:
+    print_box(title, [("count", str(len(rows)))])
+    if not rows:
+        return
+
+    widths = []
+    for key, label in columns:
+        width = visible_width(label)
+        for row in rows:
+            width = max(width, visible_width(row.get(key, "")))
+        widths.append(width)
+
+    separator = "+" + "+".join("-" * (width + 2) for width in widths) + "+"
+    header = "|" + "|".join(f" {pad_visible(label, width)} " for (_, label), width in zip(columns, widths)) + "|"
+    print(separator)
+    print(header)
+    print(separator)
+    for row in rows:
+        print("|" + "|".join(f" {pad_visible(row.get(key, ''), width)} " for (key, _), width in zip(columns, widths)) + "|")
+    print(separator)
 
 
 def parse_side(side: str) -> bool:
@@ -401,6 +457,121 @@ def print_order_row(
     )
 
 
+def format_position_side(size: Decimal) -> str:
+    if size > 0:
+        return "long"
+    if size < 0:
+        return "short"
+    return "flat"
+
+
+def format_position_leverage(position: dict[str, Any]) -> str:
+    leverage = position.get("leverage") or {}
+    value = leverage.get("value")
+    if value is None:
+        return "n/a"
+    leverage_type = leverage.get("type")
+    suffix = f" {leverage_type}" if leverage_type else ""
+    return f"{value}x{suffix}"
+
+
+def collect_account_positions_and_orders(info: Info, account: str) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    positions: list[dict[str, str]] = []
+    orders: list[dict[str, str]] = []
+    seen_order_keys: set[tuple[str, int]] = set()
+    dex_names = all_dex_names(info)
+    log_event("query_dex_names", dex_names)
+
+    for dex in dex_names:
+        dex_name = dex or "default"
+        state = info.user_state(account, dex=dex)
+        log_event(f"query_user_state:{dex_name}", state)
+        for item in state.get("assetPositions", []):
+            position = item.get("position", {})
+            size = Decimal(str(position.get("szi", "0")))
+            if size == 0:
+                continue
+            positions.append(
+                {
+                    "dex": dex_name,
+                    "coin": str(position.get("coin", "")),
+                    "side": format_position_side(size),
+                    "szi": decimal_to_plain(size),
+                    "entryPx": format_optional_decimal(position.get("entryPx")),
+                    "value": format_optional_decimal(position.get("positionValue")),
+                    "uPnl": format_optional_decimal(position.get("unrealizedPnl")),
+                    "roe": format_optional_percent(position.get("returnOnEquity")),
+                    "liqPx": format_optional_decimal(position.get("liquidationPx")),
+                    "lev": format_position_leverage(position),
+                }
+            )
+
+        open_orders = info.open_orders(account, dex=dex)
+        log_event(f"query_open_orders:{dex_name}", open_orders)
+        for order in open_orders:
+            oid = int(order["oid"])
+            order_key = (str(order.get("coin", "")), oid)
+            if order_key in seen_order_keys:
+                continue
+            seen_order_keys.add(order_key)
+            orders.append(
+                {
+                    "dex": dex_name,
+                    "coin": str(order.get("coin", "")),
+                    "side": str(order.get("side", "")),
+                    "limitPx": format_optional_decimal(order.get("limitPx")),
+                    "sz": format_optional_quantity(order.get("sz", order.get("origSz"))),
+                    "oid": str(oid),
+                    "time": format_timestamp_ms(order.get("timestamp")),
+                }
+            )
+
+    positions.sort(key=lambda row: (row["dex"], row["coin"], row["side"]))
+    orders.sort(key=lambda row: (row["dex"], row["coin"], row["oid"]))
+    return positions, orders
+
+
+def query_account(args: argparse.Namespace) -> None:
+    info, _exchange, account, signer, role = build_clients(args.network, args.timeout, "")
+    if args.verbose:
+        print("network:", args.network)
+        print("account:", mask(account))
+        print("signer:", mask(signer))
+        print("account_role_source:", role)
+
+    print_account_metrics(info, account)
+    positions, orders = collect_account_positions_and_orders(info, account)
+    print_table(
+        "Positions",
+        positions,
+        [
+            ("dex", "dex"),
+            ("coin", "coin"),
+            ("side", "side"),
+            ("szi", "szi"),
+            ("entryPx", "entryPx"),
+            ("value", "value"),
+            ("uPnl", "uPnl"),
+            ("roe", "ROE"),
+            ("liqPx", "liqPx"),
+            ("lev", "lev"),
+        ],
+    )
+    print_table(
+        "Open Orders",
+        orders,
+        [
+            ("dex", "dex"),
+            ("coin", "coin"),
+            ("side", "side"),
+            ("limitPx", "limitPx"),
+            ("sz", "sz"),
+            ("oid", "oid"),
+            ("time", "time"),
+        ],
+    )
+
+
 def cancel_order(
     exchange: Exchange,
     info: Info,
@@ -448,6 +619,10 @@ def cancel_order(
 
 
 def place_order(args: argparse.Namespace) -> None:
+    if args.query:
+        query_account(args)
+        return
+
     info, exchange, account, signer, role = build_clients(args.network, args.timeout, args.coin)
     coin, asset = resolve_perp_asset(info, args.coin)
     dex = coin_dex(coin)
@@ -547,7 +722,7 @@ def place_order(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Place or cancel a small Hyperliquid perp order.")
-    parser.add_argument("coin", help="Perp name, e.g. BTC, ETH, SOL, or BTCUSDC.")
+    parser.add_argument("coin", nargs="?", help="Perp name, e.g. BTC, ETH, SOL, or BTCUSDC. Use query/status to list account state.")
     parser.add_argument("side", nargs="?", help="buy/long/看多 or sell/short/看空. Not needed with --cancel.")
     parser.add_argument("amount", nargs="?", default="10", help="USD notional. Default: 10.")
     parser.add_argument("--price", help="Limit price. Defaults to same-side book level 10.")
@@ -563,9 +738,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--network", choices=["mainnet", "testnet"], default="mainnet", help="Default: mainnet.")
     parser.add_argument("--timeout", type=float, default=20, help="HTTP timeout in seconds. Default: 20.")
     parser.add_argument("--dry-run", action="store_true", help="Preview only; do not send cancel/order requests.")
+    parser.add_argument("--query", "--status", action="store_true", help="Query all current positions and open orders.")
     parser.add_argument("--verbose", action="store_true", help="Print diagnostic details.")
     parser.add_argument("--submit", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    query_words = {"query", "status", "positions", "orders", "持仓", "订单", "查询"}
+    if args.coin and args.side is None and args.coin.strip().lower() in query_words:
+        args.query = True
+        args.coin = ""
+    if not args.query and not args.coin:
+        parser.error("coin is required unless query/status or --query is used")
     return args
 
 

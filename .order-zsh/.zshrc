@@ -17,6 +17,7 @@ command_not_found_handler() {
 
 echo "Hyper order terminal ready."
 echo "Examples:"
+echo "  query"
 echo "  BTC buy --dry-run"
 echo "  GOLD buy"
 echo "  GOLD --cancel"

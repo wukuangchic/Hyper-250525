@@ -3,4 +3,5 @@
 #   order BTC buy
 
 alias order='./order'
+alias query='./query'
 alias markets='./hl_markets.py'

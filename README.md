@@ -31,6 +31,7 @@ order-terminal.command
 打开的新 Terminal 会进入下单专用模式，可以省略 `order`：
 
 ```bash
+query
 BTC buy --dry-run
 BTC buy
 GOLD buy
@@ -43,6 +44,7 @@ BTC --cancel
 
 ```bash
 . ./aliases
+query
 order BTC buy --dry-run
 order BTC --cancel
 ```
@@ -69,6 +71,9 @@ order BTC --cancel
 # 预演，不下单
 BTC buy --dry-run
 
+# 查询全部持仓和未成订单
+query
+
 # 默认 10 美元看多
 BTC buy
 
@@ -94,6 +99,8 @@ BTC --cancel 441260592983
 普通终端里加 `order` 前缀：
 
 ```bash
+order query
+order --query
 order BTC buy
 order BTC --cancel
 ```
@@ -192,6 +199,16 @@ log: /.../logs/order-20260525-181905-173543.log
 - `price`：本地计算或手动输入的价格；如果别名有 `rate`，括号里显示换算价。
 - `limitPx`：交易所返回的挂单价格。
 - `origSz`：交易所返回的原始订单数量。
+
+查询指令会返回当前所有 DEX 的持仓和未成订单：
+
+```bash
+query
+order query
+order --query
+```
+
+其中 `Positions` 显示当前持仓，`Open Orders` 显示当前未成订单。`side=B` 是买入 / 看多挂单，`side=A` 是卖出 / 看空挂单。
 
 ## 日志和排错
 
