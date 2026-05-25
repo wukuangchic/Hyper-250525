@@ -22,6 +22,7 @@ from urllib.parse import urlparse
 PROJECT_DIR = Path(__file__).resolve().parent
 ICON_FILES = {
     "/apple-touch-icon.png": PROJECT_DIR / "simple-hyper-icon-180.png",
+    "/apple-touch-icon-180.png": PROJECT_DIR / "simple-hyper-icon-180.png",
     "/apple-touch-icon-precomposed.png": PROJECT_DIR / "simple-hyper-icon-180.png",
     "/icon.png": PROJECT_DIR / "simple-hyper-icon-192.png",
     "/icon-192.png": PROJECT_DIR / "simple-hyper-icon-192.png",
@@ -47,7 +48,7 @@ INDEX_HTML = r"""<!doctype html>
   <title>Simple-Hyper</title>
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/icon-192.png" sizes="192x192" type="image/png">
-  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon-180.png">
   <style>
     :root {
       color-scheme: light;
