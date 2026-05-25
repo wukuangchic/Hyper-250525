@@ -20,7 +20,14 @@ from urllib.parse import urlparse
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
-ICON_PATH = PROJECT_DIR / "simple-hyper-icon.png"
+ICON_FILES = {
+    "/apple-touch-icon.png": PROJECT_DIR / "simple-hyper-icon-180.png",
+    "/apple-touch-icon-precomposed.png": PROJECT_DIR / "simple-hyper-icon-180.png",
+    "/icon.png": PROJECT_DIR / "simple-hyper-icon-192.png",
+    "/icon-192.png": PROJECT_DIR / "simple-hyper-icon-192.png",
+    "/icon-512.png": PROJECT_DIR / "simple-hyper-icon-512.png",
+    "/favicon.ico": PROJECT_DIR / "simple-hyper-icon-192.png",
+}
 TLS_CERT = os.environ.get("SIMPLE_HYPER_TLS_CERT", "")
 TLS_KEY = os.environ.get("SIMPLE_HYPER_TLS_KEY", "")
 COMMAND_TIMEOUT = float(os.environ.get("SIMPLE_HYPER_COMMAND_TIMEOUT", "60"))
@@ -39,8 +46,8 @@ INDEX_HTML = r"""<!doctype html>
   <meta name="apple-mobile-web-app-title" content="Simple-Hyper">
   <title>Simple-Hyper</title>
   <link rel="manifest" href="/manifest.webmanifest">
-  <link rel="icon" href="/icon.png" type="image/png">
-  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <link rel="icon" href="/icon-192.png" sizes="192x192" type="image/png">
+  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
   <style>
     :root {
       color-scheme: light;
@@ -540,10 +547,16 @@ MANIFEST = {
     "theme_color": "#f6f2ea",
     "icons": [
         {
-            "src": "/icon.png",
-            "sizes": "447x447",
+            "src": "/icon-192.png",
+            "sizes": "192x192",
             "type": "image/png",
-            "purpose": "any maskable",
+            "purpose": "any",
+        },
+        {
+            "src": "/icon-512.png",
+            "sizes": "512x512",
+            "type": "image/png",
+            "purpose": "any",
         }
     ],
 }
@@ -635,13 +648,28 @@ class SimpleHyperHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write("%s - - [%s] %s\n" % (self.client_address[0], self.log_date_time_string(), fmt % args))
 
-    def send_payload(self, status: int, body: bytes, content_type: str) -> None:
+    def send_headers(
+        self,
+        status: int,
+        content_length: int,
+        content_type: str,
+        cache_control: str = "no-store",
+    ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(content_length))
+        self.send_header("Cache-Control", cache_control)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
+
+    def send_payload(
+        self,
+        status: int,
+        body: bytes,
+        content_type: str,
+        cache_control: str = "no-store",
+    ) -> None:
+        self.send_headers(status, len(body), content_type, cache_control)
         self.wfile.write(body)
 
     def send_json(self, payload: dict[str, Any], status: int = HTTPStatus.OK) -> None:
@@ -661,15 +689,43 @@ class SimpleHyperHandler(BaseHTTPRequestHandler):
                 HTTPStatus.OK,
                 json.dumps(MANIFEST, ensure_ascii=False).encode("utf-8"),
                 "application/manifest+json; charset=utf-8",
+                "public, max-age=3600",
             )
             return
-        if path in {"/icon.png", "/apple-touch-icon.png"}:
-            self.send_payload(HTTPStatus.OK, ICON_PATH.read_bytes(), "image/png")
+        if path in ICON_FILES:
+            self.send_payload(HTTPStatus.OK, ICON_FILES[path].read_bytes(), "image/png", "public, max-age=86400")
             return
         if path == "/api/health":
             self.send_json({"ok": True, "service": "simple-hyper"})
             return
         self.send_json({"ok": False, "error": "not found"}, HTTPStatus.NOT_FOUND)
+
+    def do_HEAD(self) -> None:
+        path = urlparse(self.path).path
+        if path == "/":
+            self.send_headers(HTTPStatus.OK, len(INDEX_HTML.encode("utf-8")), "text/html; charset=utf-8")
+            return
+        if path == "/readme":
+            self.send_headers(HTTPStatus.OK, len(README_HTML.encode("utf-8")), "text/html; charset=utf-8")
+            return
+        if path == "/manifest.webmanifest":
+            body = json.dumps(MANIFEST, ensure_ascii=False).encode("utf-8")
+            self.send_headers(
+                HTTPStatus.OK,
+                len(body),
+                "application/manifest+json; charset=utf-8",
+                "public, max-age=3600",
+            )
+            return
+        if path in ICON_FILES:
+            self.send_headers(
+                HTTPStatus.OK,
+                ICON_FILES[path].stat().st_size,
+                "image/png",
+                "public, max-age=86400",
+            )
+            return
+        self.send_headers(HTTPStatus.NOT_FOUND, 0, "application/json; charset=utf-8")
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
