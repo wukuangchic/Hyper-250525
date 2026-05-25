@@ -88,14 +88,44 @@ markets.cmd QQQ
 
 `simple_hyper_server.py` 是给 iPhone/Safari 用的极简网页控制台。它不会重写交易逻辑，只是在服务器上调用当前目录的 `hl_order.py`。
 
-启动：
+### 新服务器部署
+
+在任意 Ubuntu 服务器上拉代码、安装依赖：
 
 ```bash
+git clone git@github.com:wukuangchic/Hyper-250525.git
+cd Hyper-250525
+
+sudo apt-get update
+sudo apt-get install -y python3-venv git
+
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
+
 cp simple-hyper.env.example simple-hyper.env
 set -a
 . ./simple-hyper.env
 set +a
 python3 simple_hyper_server.py --host 0.0.0.0 --port 8787
+```
+
+如果服务器没有配置 GitHub SSH key，可以改用 HTTPS clone：
+
+```bash
+git clone https://github.com/wukuangchic/Hyper-250525.git
+```
+
+如果 `python3 -m venv .venv` 提示缺少 `ensurepip`，在 Ubuntu 24.04 上安装：
+
+```bash
+sudo apt-get install -y python3.12-venv
+```
+
+云服务器安全组 / 防火墙需要放行：
+
+```text
+TCP 8787
 ```
 
 手机访问：
@@ -110,6 +140,81 @@ http://服务器地址:8787
 https://服务器地址:8787
 ```
 
+公网使用时建议启用 HTTPS，否则钱包密钥会以明文 HTTP 请求经过网络。
+
+### systemd 常驻
+
+如果要像服务器 C 一样后台常驻并开机自启，可以创建：
+
+```bash
+sudo cp simple-hyper.env.example /etc/simple-hyper.env
+sudo nano /etc/simple-hyper.env
+```
+
+示例 `/etc/simple-hyper.env`：
+
+```text
+SIMPLE_HYPER_HOST=0.0.0.0
+SIMPLE_HYPER_PORT=8787
+SIMPLE_HYPER_COMMAND_TIMEOUT=60
+SIMPLE_HYPER_MAX_COMMAND_LENGTH=240
+```
+
+创建服务：
+
+```bash
+sudo tee /etc/systemd/system/simple-hyper.service >/dev/null <<'UNIT'
+[Unit]
+Description=Simple-Hyper mobile web server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/Hyper-250525
+EnvironmentFile=/etc/simple-hyper.env
+ExecStart=/home/ubuntu/Hyper-250525/.venv/bin/python /home/ubuntu/Hyper-250525/simple_hyper_server.py
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now simple-hyper.service
+sudo systemctl status simple-hyper.service
+```
+
+如果仓库目录不是 `/home/ubuntu/Hyper-250525`，把 `WorkingDirectory` 和 `ExecStart` 改成实际路径。
+
+更新代码后重启：
+
+```bash
+git pull
+. .venv/bin/activate
+python -m pip install -r requirements.txt
+sudo systemctl restart simple-hyper.service
+```
+
+### 网页使用
+
+页面流程：
+
+```text
+1. 输入 Wallet Address 和 Private Key or Agent Key
+2. 点击 Verify
+3. 验证成功后地址和密钥输入框会隐藏
+4. 用 Query Account 查询账户
+5. 在 Command 输入框输入命令
+6. 点击 Run 执行
+```
+
+页面底部有 `README` 链接，里面有英文命令示例。
+
 安全默认值：
 
 - 服务器不需要保存交易 `.env`。
@@ -121,7 +226,7 @@ https://服务器地址:8787
 
 ## 默认行为
 
-- 读取根目录 `.env` 的 `account_address` 和 `secret_key`。
+- 读取根目录 `.env` 的 `account_address` 和 `secret_key`，也支持同名环境变量覆盖。
 - 如果签名地址是 agent，会自动解析到绑定的主账户。
 - 默认网络是主网。
 - 默认金额是 `10` 美元。
