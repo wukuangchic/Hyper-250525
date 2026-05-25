@@ -362,6 +362,12 @@ INDEX_HTML = r"""<!doctype html>
       setOutput(`${shownCommand}${data.output || ""}${elapsed}`);
     }
 
+    function isReadOnlyCommand(command) {
+      if (command === "query") return true;
+      if (!command.includes(" ") && command.length > 0) return true;
+      return command.includes("--dry-run");
+    }
+
     async function run(command) {
       if (!state.verified) {
         setOutput("Verify your wallet first.");
@@ -412,7 +418,7 @@ INDEX_HTML = r"""<!doctype html>
     $("reverify").addEventListener("click", reverify);
     $("submit").addEventListener("click", () => {
       const command = $("command").value.trim();
-      if (command && !command.includes("--dry-run") && command !== "query") {
+      if (command && !isReadOnlyCommand(command)) {
         if (!confirm("This command may submit a real action. Continue?")) return;
       }
       run(command);
@@ -496,6 +502,7 @@ README_HTML = r"""<!doctype html>
     <section>
       <h2>Examples</h2>
       <ul>
+        <li><code>BTC</code></li>
         <li><code>query</code></li>
         <li><code>BTC buy 10 --dry-run</code></li>
         <li><code>BTC buy 10 --market --dry-run</code></li>
@@ -508,8 +515,9 @@ README_HTML = r"""<!doctype html>
     <section>
       <h2>Notes</h2>
       <ul>
+        <li>A coin-only command such as <code>BTC</code> returns the 24h trend, high, low, turnover, and current position if any.</li>
         <li>Use <code>--dry-run</code> to preview without submitting.</li>
-        <li>Commands without <code>--dry-run</code> can place or cancel real orders.</li>
+        <li>Commands without <code>--dry-run</code> can place or cancel real orders, except read-only commands like <code>query</code> or <code>BTC</code>.</li>
         <li>Market orders use <code>--market</code> and Hyperliquid IOC behavior.</li>
         <li>The command box is parsed as <code>hl_order.py</code> arguments, not as a shell command.</li>
       </ul>

@@ -3,6 +3,7 @@
 
 Examples:
   ./hl_order.py query
+  ./hl_order.py BTC
   ./hl_order.py BTC buy
   ./hl_order.py BTC buy 10 --market
   ./hl_order.py BTC buy --price 75000
@@ -20,6 +21,7 @@ import io
 import json
 import os
 import sys
+import time
 import traceback
 import unicodedata
 from datetime import datetime
@@ -150,6 +152,16 @@ def format_percent(value: Optional[Decimal]) -> str:
     if value is None:
         return "n/a"
     return f"{decimal_to_display(value * Decimal('100'))}%"
+
+
+def format_signed_percent(value: Decimal) -> str:
+    sign = "+" if value >= 0 else ""
+    return f"{sign}{decimal_to_display(value * Decimal('100'))}%"
+
+
+def format_signed_decimal(value: Decimal) -> str:
+    sign = "+" if value >= 0 else ""
+    return f"{sign}{decimal_to_display(value)}"
 
 
 def format_leverage(value: Optional[Decimal]) -> str:
@@ -579,6 +591,78 @@ def format_position_leverage(position: dict[str, Any]) -> str:
     return f"{value}x{suffix}"
 
 
+def position_matches_coin(position_coin: str, coin: str) -> bool:
+    return coin_alias_key(position_coin) == coin_alias_key(coin)
+
+
+def find_current_position(info: Info, account: str, coin: str, dex: str) -> dict[str, Any] | None:
+    state = info.user_state(account, dex=dex)
+    log_event(f"market_user_state:{dex or 'default'}", state)
+    for item in state.get("assetPositions", []):
+        position = item.get("position", {})
+        if not position_matches_coin(str(position.get("coin", "")), coin):
+            continue
+        size = Decimal(str(position.get("szi", "0")))
+        if size != 0:
+            return position
+    return None
+
+
+def print_market_overview(info: Info, account: str, raw_coin: str, coin: str, dex: str, price_rate: Decimal | None) -> None:
+    end_ms = int(time.time() * 1000)
+    start_ms = end_ms - 24 * 60 * 60 * 1000
+    candles = info.candles_snapshot(coin, "1h", start_ms, end_ms)
+    log_event("candles_24h", {"coin": coin, "dex": dex or "default", "count": len(candles), "candles": candles})
+    if not candles:
+        raise ValueError(f"No 24h candle data found for {raw_coin}")
+
+    open_price = Decimal(str(candles[0]["o"]))
+    latest_price = Decimal(str(candles[-1]["c"]))
+    mids = info.all_mids(dex)
+    mid = mids.get(coin)
+    if mid is not None:
+        latest_price = Decimal(str(mid))
+    high_price = max([Decimal(str(candle["h"])) for candle in candles] + [latest_price])
+    low_price = min([Decimal(str(candle["l"])) for candle in candles] + [latest_price])
+    notional_volume = sum(
+        (Decimal(str(candle.get("v", "0"))) * Decimal(str(candle.get("c", "0"))) for candle in candles),
+        Decimal("0"),
+    )
+    change = latest_price - open_price
+    change_percent = change / open_price if open_price else Decimal("0")
+    if change > 0:
+        trend = "up"
+    elif change < 0:
+        trend = "down"
+    else:
+        trend = "flat"
+
+    print_box(
+        "Market 24h",
+        [
+            ("coin", coin),
+            ("trend", f"{trend} {format_signed_decimal(change)} ({format_signed_percent(change_percent)})"),
+            ("latest", format_price(latest_price, price_rate)),
+            ("high", format_price(high_price, price_rate)),
+            ("low", format_price(low_price, price_rate)),
+            ("turnover", decimal_to_display(notional_volume)),
+        ],
+    )
+
+    position = find_current_position(info, account, coin, dex)
+    if position is None:
+        return
+    print_box(
+        "Position",
+        [
+            ("side", format_position_side(Decimal(str(position.get("szi", "0"))))),
+            ("szi", format_optional_quantity(position.get("szi"))),
+            ("value", format_optional_decimal(position.get("positionValue"))),
+            ("leverage", format_position_leverage(position)),
+        ],
+    )
+
+
 def collect_account_positions_and_orders(info: Info, account: str) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     positions: list[dict[str, str]] = []
     orders: list[dict[str, str]] = []
@@ -737,12 +821,23 @@ def place_order(args: argparse.Namespace) -> None:
         print("signer:", mask(signer))
         print("account_role_source:", role)
 
+    if not args.side and args.cancel is None:
+        order_flags_without_side = (
+            args.price
+            or args.market
+            or args.reduce_only
+            or args.book_level != 10
+            or args.tif != "Gtc"
+            or args.slippage != str(Exchange.DEFAULT_SLIPPAGE)
+        )
+        if order_flags_without_side:
+            raise ValueError("side is required when order options are used")
+        print_market_overview(info, account, args.coin, coin, dex, price_rate)
+        return
+
     if args.cancel is not None:
         cancel_order(exchange, info, account, coin, dex, args.cancel, args.dry_run, price_rate)
         return
-
-    if not args.side:
-        raise ValueError("side is required unless --cancel is used")
 
     is_buy = parse_side(args.side)
     amount = Decimal(args.amount)
