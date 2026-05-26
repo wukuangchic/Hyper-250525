@@ -651,6 +651,24 @@ def rounded_perp_price(price: Decimal, sz_decimals: int) -> Decimal:
     return rounded
 
 
+def scale_order_size(base_size: Decimal, size_ratio: Decimal, sz_decimals: int, min_value_price: Decimal, label: str) -> Decimal:
+    if size_ratio <= 0 or size_ratio > 1:
+        raise ValueError(f"{label} size ratio must be greater than 0 and at most 1")
+    if size_ratio == 1:
+        return base_size
+
+    step = Decimal(1).scaleb(-sz_decimals)
+    size = round_to_step(base_size * size_ratio, step, ROUND_DOWN)
+    if size <= 0:
+        raise ValueError(f"{label} size is too small after applying the >{format_percent(size_ratio)} suffix")
+    if size * min_value_price < MIN_NOTIONAL:
+        raise ValueError(
+            f"{label} size after applying the >{format_percent(size_ratio)} suffix must still be at least "
+            f"{MIN_NOTIONAL} USD notional"
+        )
+    return size
+
+
 def scale_prices(start: Decimal, end: Decimal, count: int, sz_decimals: int) -> list[Decimal]:
     if count < 2:
         raise ValueError("--scale must be >= 2")
@@ -720,7 +738,8 @@ def parse_entry_trigger_with_limit(value: str, explicit_limit: str | None, label
 
 TPSL_SPEC_RE = re.compile(
     r"^\s*(?P<trigger_sign>[+-]?)(?P<trigger>\d+(?:\.\d+)?)(?P<trigger_pct>%?)"
-    r"(?:(?P<limit_sign>[+-])(?P<limit>\d+(?:\.\d+)?%?))?\s*$"
+    r"(?:(?P<limit_sign>[+-])(?P<limit>\d+(?:\.\d+)?%?))?"
+    r"(?:(?P<ratio_sep>[>@])(?P<ratio>\d+(?:\.\d+)?%?))?\s*$"
 )
 
 
@@ -738,13 +757,24 @@ def apply_signed_offset(base_px: Decimal, sign: str, value_text: str, label: str
     return result
 
 
-def parse_tpsl_spec(value: str, base_px: Decimal | None, label: str) -> tuple[Decimal, Decimal | None]:
+def parse_size_ratio(value: str, label: str) -> Decimal:
+    text = value.strip()
+    if text.endswith("%"):
+        ratio = Decimal(text[:-1]) / Decimal("100")
+    else:
+        ratio = Decimal(text)
+    if ratio <= 0 or ratio > 1:
+        raise ValueError(f"{label} must be greater than 0 and at most 1")
+    return ratio
+
+
+def parse_tpsl_spec(value: str, base_px: Decimal | None, label: str) -> tuple[Decimal, Decimal | None, Decimal]:
     text = value.strip().replace(" ", "")
     match = TPSL_SPEC_RE.fullmatch(text)
     if not match:
         raise ValueError(
             f"Invalid {label} value: {value}. Use PRICE, PRICE+OFFSET, PRICE-OFFSET, PRICE+PERCENT, PRICE-PERCENT, "
-            "or REL%[+/-OFFSET] when a reference price is available."
+            "or REL%[+/-OFFSET] when a reference price is available. Append @RATIO to close only part of the order."
         )
 
     trigger_sign = match.group("trigger_sign") or "+"
@@ -768,7 +798,11 @@ def parse_tpsl_spec(value: str, base_px: Decimal | None, label: str) -> tuple[De
     limit_text = match.group("limit")
     if limit_text is not None:
         inline_limit_px = apply_signed_offset(trigger_px, match.group("limit_sign") or "+", limit_text, f"{label} limit price")
-    return trigger_px, inline_limit_px
+    size_ratio = Decimal("1")
+    ratio_text = match.group("ratio")
+    if ratio_text is not None:
+        size_ratio = parse_size_ratio(ratio_text, f"{label} size ratio")
+    return trigger_px, inline_limit_px, size_ratio
 
 
 def resolve_tpsl_spec(
@@ -776,16 +810,16 @@ def resolve_tpsl_spec(
     explicit_limit: str | None,
     base_px: Decimal | None,
     label: str,
-) -> tuple[Decimal, Decimal | None]:
-    trigger_px, inline_limit_px = parse_tpsl_spec(value, base_px, label)
+) -> tuple[Decimal, Decimal | None, Decimal]:
+    trigger_px, inline_limit_px, size_ratio = parse_tpsl_spec(value, base_px, label)
     if explicit_limit is not None and inline_limit_px is not None:
         raise ValueError(f"--{label}-limit cannot be combined with inline +/- syntax in --{label}")
     if explicit_limit is not None:
         limit_px = Decimal(explicit_limit)
         if limit_px <= 0:
             raise ValueError(f"--{label}-limit must be positive")
-        return trigger_px, limit_px
-    return trigger_px, inline_limit_px
+        return trigger_px, limit_px, size_ratio
+    return trigger_px, inline_limit_px, size_ratio
 
 
 def validate_tpsl_direction(
@@ -1680,6 +1714,7 @@ def build_trigger_order_plan(
     reduce_only: bool,
     tpsl: str | None = None,
     size: Decimal | None = None,
+    size_ratio: Decimal = Decimal("1"),
 ) -> dict[str, Any]:
     if trigger_px <= 0:
         raise ValueError(f"{label} trigger price must be positive")
@@ -1691,6 +1726,7 @@ def build_trigger_order_plan(
     if is_market_trigger:
         limit_px = Decimal(str(exchange._slippage_price(coin, is_buy, float(slippage), float(trigger_px))))
         limit_px = rounded_perp_price(limit_px, sz_decimals)
+        min_value_price = limit_px
         mode = f"{label}-market"
         if size is None:
             size, notional, target_notional, worst_notional = calc_market_size(
@@ -1708,8 +1744,8 @@ def build_trigger_order_plan(
         mode = f"{label}-limit"
         if limit_px <= 0:
             raise ValueError(f"{label} limit price must be positive")
+        min_value_price = min(trigger_px, limit_px)
         if size is None:
-            min_value_price = min(trigger_px, limit_px)
             size, notional, target_notional, _minimum_value_notional = calc_size(
                 amount,
                 limit_px,
@@ -1721,6 +1757,16 @@ def build_trigger_order_plan(
             target_notional = notional
         worst_notional = notional
 
+    size = scale_order_size(size, size_ratio, sz_decimals, min_value_price, label)
+    if is_market_trigger:
+        notional = size * trigger_px
+        target_notional = notional
+        worst_notional = size * limit_px
+    else:
+        notional = size * limit_px
+        target_notional = notional
+        worst_notional = notional
+
     return {
         "label": label,
         "coin": coin,
@@ -1728,6 +1774,7 @@ def build_trigger_order_plan(
         "size": size,
         "limit_px": limit_px,
         "trigger_px": trigger_px,
+        "reference_price": trigger_px,
         "order_type": {
             "trigger": {
                 "triggerPx": float(trigger_px),
@@ -1842,7 +1889,7 @@ def build_tpsl_child_plans(
     parent_is_long = parent_is_buy
     plans: list[dict[str, Any]] = []
     if args.take_profit:
-        take_trigger_px, take_limit_px = resolve_tpsl_spec(
+        take_trigger_px, take_limit_px, take_ratio = resolve_tpsl_spec(
             args.take_profit,
             args.take_profit_limit,
             base_px,
@@ -1865,10 +1912,11 @@ def build_tpsl_child_plans(
                 take_limit_px,
                 True,
                 size=size,
+                size_ratio=take_ratio,
             )
         )
     if args.stop_loss:
-        stop_trigger_px, stop_limit_px = resolve_tpsl_spec(
+        stop_trigger_px, stop_limit_px, stop_ratio = resolve_tpsl_spec(
             args.stop_loss,
             args.stop_loss_limit,
             base_px,
@@ -1891,6 +1939,7 @@ def build_tpsl_child_plans(
                 stop_limit_px,
                 True,
                 size=size,
+                size_ratio=stop_ratio,
             )
         )
     return plans
@@ -1957,7 +2006,7 @@ def place_protective_tpsl_orders(
     position_is_long = not is_buy
     plans: list[dict[str, Any]] = []
     if args.take_profit:
-        take_trigger_px, take_limit_px = resolve_tpsl_spec(
+        take_trigger_px, take_limit_px, take_ratio = resolve_tpsl_spec(
             args.take_profit,
             args.take_profit_limit,
             position_base_px,
@@ -1979,10 +2028,11 @@ def place_protective_tpsl_orders(
                 take_trigger_px,
                 take_limit_px,
                 True,
+                size_ratio=take_ratio,
             )
         )
     if args.stop_loss:
-        stop_trigger_px, stop_limit_px = resolve_tpsl_spec(
+        stop_trigger_px, stop_limit_px, stop_ratio = resolve_tpsl_spec(
             args.stop_loss,
             args.stop_loss_limit,
             position_base_px,
@@ -2004,6 +2054,7 @@ def place_protective_tpsl_orders(
                 stop_trigger_px,
                 stop_limit_px,
                 True,
+                size_ratio=stop_ratio,
             )
         )
     if not plans:
@@ -2164,6 +2215,40 @@ def place_order(args: argparse.Namespace) -> None:
             stop_limit_px,
             current_mid,
         )
+        if args.take_profit or args.stop_loss:
+            child_plans = build_tpsl_child_plans(
+                args,
+                exchange,
+                coin,
+                asset,
+                is_buy,
+                entry_trigger_plan["size"],
+                amount,
+                slippage,
+                Decimal(str(entry_trigger_plan["reference_price"])),
+            )
+            plans = [entry_trigger_plan, *child_plans]
+            if args.verbose:
+                print("dex:", dex or "default")
+                print("current_mid:", mids.get(coin))
+                print("max_leverage:", max_leverage)
+                print("stop_entry:", decimal_to_plain(stop_trigger_px))
+                if stop_limit_px is not None:
+                    print("stop_entry_limit:", decimal_to_plain(stop_limit_px))
+                print("bracket_orders:", len(plans))
+            submit_order_plans(
+                exchange,
+                info,
+                account,
+                coin,
+                max_leverage,
+                plans,
+                "normalTpsl",
+                args,
+                price_rate,
+                "Stop Entry Bracket",
+            )
+            return
         if args.verbose:
             print("dex:", dex or "default")
             print("current_mid:", mids.get(coin))
@@ -2198,6 +2283,40 @@ def place_order(args: argparse.Namespace) -> None:
             take_limit_px,
             current_mid,
         )
+        if args.take_profit or args.stop_loss:
+            child_plans = build_tpsl_child_plans(
+                args,
+                exchange,
+                coin,
+                asset,
+                is_buy,
+                entry_trigger_plan["size"],
+                amount,
+                slippage,
+                Decimal(str(entry_trigger_plan["reference_price"])),
+            )
+            plans = [entry_trigger_plan, *child_plans]
+            if args.verbose:
+                print("dex:", dex or "default")
+                print("current_mid:", mids.get(coin))
+                print("max_leverage:", max_leverage)
+                print("take_entry:", decimal_to_plain(take_trigger_px))
+                if take_limit_px is not None:
+                    print("take_entry_limit:", decimal_to_plain(take_limit_px))
+                print("bracket_orders:", len(plans))
+            submit_order_plans(
+                exchange,
+                info,
+                account,
+                coin,
+                max_leverage,
+                plans,
+                "normalTpsl",
+                args,
+                price_rate,
+                "Take Entry Bracket",
+            )
+            return
         if args.verbose:
             print("dex:", dex or "default")
             print("current_mid:", mids.get(coin))
@@ -2397,7 +2516,7 @@ def parse_args() -> argparse.Namespace:
         "--stop-entry",
         "--stop",
         dest="stop_entry",
-        help="Stop entry trigger price. Use PRICE, PRICE+OFFSET, PRICE-OFFSET, PRICE+PERCENT, or PRICE-PERCENT.",
+        help="Stop entry trigger price. Use PRICE, PRICE+OFFSET, PRICE-OFFSET, PRICE+PERCENT, or PRICE-PERCENT. Can also be combined with --tp/--sl.",
     )
     parser.add_argument(
         "--stop-limit",
@@ -2408,7 +2527,7 @@ def parse_args() -> argparse.Namespace:
         "--take-entry",
         "--take",
         dest="take_entry",
-        help="Take entry trigger price. Use PRICE, PRICE+OFFSET, PRICE-OFFSET, PRICE+PERCENT, or PRICE-PERCENT.",
+        help="Take entry trigger price. Use PRICE, PRICE+OFFSET, PRICE-OFFSET, PRICE+PERCENT, or PRICE-PERCENT. Can also be combined with --tp/--sl.",
     )
     parser.add_argument(
         "--take-limit",
@@ -2419,13 +2538,13 @@ def parse_args() -> argparse.Namespace:
         "--tp",
         "--take-profit",
         dest="take_profit",
-        help="Take-profit trigger price. Use ABS, ABS+OFFSET, or REL%%[+/-OFFSET] from the entry/position price.",
+        help="Take-profit trigger price. Use ABS, ABS+OFFSET, or REL%%[+/-OFFSET] from the entry/position price. Append >RATIO to close only part of the order.",
     )
     parser.add_argument(
         "--sl",
         "--stop-loss",
         dest="stop_loss",
-        help="Stop-loss trigger price. Use ABS, ABS+OFFSET, or REL%%[+/-OFFSET] from the entry/position price.",
+        help="Stop-loss trigger price. Use ABS, ABS+OFFSET, or REL%%[+/-OFFSET] from the entry/position price. Append >RATIO to close only part of the order.",
     )
     parser.add_argument(
         "--tp-limit",
@@ -2493,10 +2612,6 @@ def parse_args() -> argparse.Namespace:
     has_tpsl = bool(args.take_profit or args.stop_loss)
     if args.stop_entry and args.take_entry:
         parser.error("--stop-entry and --take-entry are mutually exclusive")
-    if args.stop_entry and has_tpsl:
-        parser.error("--stop-entry cannot be combined with --tp/--sl")
-    if args.take_entry and has_tpsl:
-        parser.error("--take-entry cannot be combined with --tp/--sl")
     if args.scale is not None:
         if args.scale < 2:
             parser.error("--scale must be >= 2")
