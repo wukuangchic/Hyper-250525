@@ -24,7 +24,7 @@ import sys
 import time
 import traceback
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 from pathlib import Path
 from typing import Any, Optional
@@ -59,7 +59,29 @@ from coin_aliases import coin_alias_key, load_coin_aliases, load_coin_alias_rate
 MIN_NOTIONAL = Decimal("10")
 ISOLATED_FALLBACK_LEVERAGE = 5
 KLINE_CHART_HEIGHT = 8
-KLINE_CHART_CANDLES = 24
+KLINE_MODES = {
+    "hour": {
+        "interval": "1h",
+        "candles": 24,
+        "lookback_days": 2,
+        "market_title": "Market 24h",
+        "title": "Kline 24h",
+    },
+    "day": {
+        "interval": "1d",
+        "candles": 30,
+        "lookback_days": 45,
+        "market_title": "Market 30d",
+        "title": "Kline 30d",
+    },
+    "week": {
+        "interval": "1w",
+        "candles": 52,
+        "lookback_days": 400,
+        "market_title": "Market 52w",
+        "title": "Kline 52w",
+    },
+}
 COIN_ALIASES = load_coin_aliases()
 COIN_ALIAS_RATES = load_coin_alias_rates()
 
@@ -270,8 +292,38 @@ def price_to_chart_row(price: Decimal, high: Decimal, low: Decimal, height: int)
     return max(0, min(height - 1, row))
 
 
-def render_kline_chart(candles: list[dict[str, Any]], latest_price: Decimal | None = None) -> list[str]:
-    chart_candles = [dict(candle) for candle in candles[-KLINE_CHART_CANDLES:]]
+def candle_start_utc(candle: dict[str, Any]) -> datetime:
+    return datetime.fromtimestamp(int(candle["t"]) / 1000, tz=timezone.utc)
+
+
+def candle_end_utc(candle: dict[str, Any]) -> datetime:
+    return datetime.fromtimestamp(int(candle["T"]) / 1000, tz=timezone.utc)
+
+
+def kline_marker_for_candle(candle: dict[str, Any], mode: str) -> str:
+    start = candle_start_utc(candle)
+    if mode == "hour":
+        if start.hour == 0:
+            return "0"
+        if start.hour == 12:
+            return "+"
+        return " "
+    if mode == "day":
+        return "1" if start.day == 1 else " "
+    if mode == "week":
+        month_start = datetime(start.year, start.month, 1, tzinfo=timezone.utc)
+        if month_start < start:
+            if start.month == 12:
+                month_start = datetime(start.year + 1, 1, 1, tzinfo=timezone.utc)
+            else:
+                month_start = datetime(start.year, start.month + 1, 1, tzinfo=timezone.utc)
+        return str(month_start.month % 10) if month_start <= candle_end_utc(candle) else " "
+    return " "
+
+
+def render_kline_chart(candles: list[dict[str, Any]], latest_price: Decimal | None = None, mode: str = "hour") -> list[str]:
+    mode_config = KLINE_MODES.get(mode, KLINE_MODES["hour"])
+    chart_candles = [dict(candle) for candle in candles[-mode_config["candles"] :]]
     if not chart_candles:
         return ["no candle data"]
 
@@ -315,6 +367,8 @@ def render_kline_chart(candles: list[dict[str, Any]], latest_price: Decimal | No
             marks.append(mark)
         rows.append(f"{pad_visible(labels[row], label_width)} │ {''.join(marks)}")
 
+    axis_markers = "".join(kline_marker_for_candle(candle, mode) for candle in chart_candles)
+    rows.append(f"{' ' * label_width} │ {axis_markers}")
     return rows
 
 
@@ -694,24 +748,41 @@ def find_current_position(info: Info, account: str, coin: str, dex: str) -> dict
     return None
 
 
-def print_market_overview(info: Info, account: str, raw_coin: str, coin: str, dex: str, price_rate: Decimal | None) -> None:
+def print_market_overview(
+    info: Info,
+    account: str,
+    raw_coin: str,
+    coin: str,
+    dex: str,
+    price_rate: Decimal | None,
+    kline_mode: str = "hour",
+) -> None:
+    mode_config = KLINE_MODES.get(kline_mode, KLINE_MODES["hour"])
     end_ms = int(time.time() * 1000)
-    start_ms = end_ms - 24 * 60 * 60 * 1000
-    candles = info.candles_snapshot(coin, "1h", start_ms, end_ms)
-    log_event("candles_24h", {"coin": coin, "dex": dex or "default", "count": len(candles), "candles": candles})
+    start_ms = end_ms - mode_config["lookback_days"] * 24 * 60 * 60 * 1000
+    candles = info.candles_snapshot(coin, mode_config["interval"], start_ms, end_ms)
+    log_event(
+        f"candles_{kline_mode}",
+        {
+            "coin": coin,
+            "dex": dex or "default",
+            "interval": mode_config["interval"],
+            "count": len(candles),
+            "candles": candles,
+        },
+    )
     if not candles:
-        raise ValueError(f"No 24h candle data found for {raw_coin}")
+        raise ValueError(f"No candle data found for {raw_coin}")
 
-    open_price = Decimal(str(candles[0]["o"]))
-    latest_price = Decimal(str(candles[-1]["c"]))
+    chart_candles = candles[-mode_config["candles"] :]
+    open_price = Decimal(str(chart_candles[0]["o"]))
+    latest_price = Decimal(str(chart_candles[-1]["c"]))
     mids = info.all_mids(dex)
     mid = mids.get(coin)
     if mid is not None:
         latest_price = Decimal(str(mid))
-    high_price = max([Decimal(str(candle["h"])) for candle in candles] + [latest_price])
-    low_price = min([Decimal(str(candle["l"])) for candle in candles] + [latest_price])
     notional_volume = sum(
-        (Decimal(str(candle.get("v", "0"))) * Decimal(str(candle.get("c", "0"))) for candle in candles),
+        (Decimal(str(candle.get("v", "0"))) * Decimal(str(candle.get("c", "0"))) for candle in chart_candles),
         Decimal("0"),
     )
     change = latest_price - open_price
@@ -724,7 +795,7 @@ def print_market_overview(info: Info, account: str, raw_coin: str, coin: str, de
         trend = "flat"
 
     print_box(
-        "Market 24h",
+        mode_config["market_title"],
         [
             ("coin", coin),
             ("trend", f"{trend} {format_signed_decimal(change)} ({format_signed_percent(change_percent)})"),
@@ -732,7 +803,7 @@ def print_market_overview(info: Info, account: str, raw_coin: str, coin: str, de
             ("turnover", decimal_to_display(notional_volume)),
         ],
     )
-    print_text_box("Kline 24h", render_kline_chart(candles, latest_price))
+    print_text_box(mode_config["title"], render_kline_chart(chart_candles, latest_price, kline_mode))
 
     position = find_current_position(info, account, coin, dex)
     if position is None:
@@ -937,6 +1008,7 @@ def place_order(args: argparse.Namespace) -> None:
         print("account_role_source:", role)
 
     if not args.side and args.cancel is None:
+        kline_mode = "week" if args.week else "day" if args.day else "hour"
         order_flags_without_side = (
             args.price
             or args.market
@@ -947,7 +1019,7 @@ def place_order(args: argparse.Namespace) -> None:
         )
         if order_flags_without_side:
             raise ValueError("side is required when order options are used")
-        print_market_overview(info, account, args.coin, coin, dex, price_rate)
+        print_market_overview(info, account, args.coin, coin, dex, price_rate, kline_mode)
         return
 
     if args.cancel is not None:
@@ -1096,6 +1168,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--book-level", type=int, default=10, help="Same-side book level when --price is omitted.")
     parser.add_argument("--tif", default="Gtc", choices=["Gtc", "Ioc", "Alo"], help="Time in force. Default: Gtc.")
     parser.add_argument("--reduce-only", action="store_true", help="Place a reduce-only order.")
+    kline_group = parser.add_mutually_exclusive_group()
+    kline_group.add_argument("--day", action="store_true", help="Show the last 30 daily candles in market overview mode.")
+    kline_group.add_argument("--week", action="store_true", help="Show the last 52 weekly candles in market overview mode.")
     parser.add_argument(
         "--cancel",
         nargs="?",
