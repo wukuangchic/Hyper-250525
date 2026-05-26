@@ -228,6 +228,7 @@ INDEX_HTML = r"""<!doctype html>
       min-height: 260px;
       max-height: 54vh;
       overflow: auto;
+      -webkit-overflow-scrolling: touch;
       margin: 0;
       border: 1px solid #27231f;
       border-radius: 8px;
@@ -237,8 +238,9 @@ INDEX_HTML = r"""<!doctype html>
       font-family: "SF Mono", Menlo, Consolas, monospace;
       font-size: 12px;
       line-height: 1.55;
-      white-space: pre-wrap;
-      word-break: break-word;
+      white-space: pre;
+      overflow-wrap: normal;
+      word-break: normal;
     }
 
     .footer {
@@ -264,6 +266,18 @@ INDEX_HTML = r"""<!doctype html>
 
       .verified-row {
         grid-template-columns: 1fr auto;
+      }
+
+      .output-panel {
+        padding: 8px;
+      }
+
+      .output {
+        min-height: 340px;
+        max-height: 58vh;
+        padding: 10px;
+        font-size: 10px;
+        line-height: 1.5;
       }
     }
   </style>
@@ -309,7 +323,7 @@ INDEX_HTML = r"""<!doctype html>
       </div>
     </section>
 
-    <section class="panel">
+    <section class="panel output-panel">
       <pre id="output" class="output">Ready.</pre>
     </section>
 
