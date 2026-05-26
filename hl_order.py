@@ -330,8 +330,21 @@ def print_box(title: str, rows: list[tuple[str, str]]) -> None:
     print("+" + "-" * (width + 2) + "+")
 
 
-def print_table(title: str, rows: list[dict[str, str]], columns: list[tuple[str, str]]) -> None:
-    print_box(title, [("count", str(len(rows)))])
+def print_section_title(title: str) -> None:
+    width = max(visible_width(title) + 2, 26)
+    print(f"+- {title} " + "-" * max(width - visible_width(title) - 3, 0) + "+")
+
+
+def print_table(
+    title: str,
+    rows: list[dict[str, str]],
+    columns: list[tuple[str, str]],
+    show_count: bool = True,
+) -> None:
+    if show_count:
+        print_box(title, [("count", str(len(rows)))])
+    else:
+        print_section_title(title)
     if not rows:
         return
 
@@ -930,7 +943,7 @@ def print_market_overview(
                 ("value", format_optional_decimal(position.get("positionValue"))),
                 ("leverage", format_position_leverage(position)),
             ],
-        )
+    )
     open_orders = collect_open_orders_for_coin(info, account, coin, dex)
     if open_orders:
         print_table(
@@ -944,6 +957,7 @@ def print_market_overview(
                 ("oid", "oid"),
                 ("time", "time"),
             ],
+            show_count=False,
         )
     print_recent_history(info, account, coin=coin)
 
@@ -1103,6 +1117,7 @@ def print_recent_history(
             ("value", "value"),
             ("closedPnl", "closedPnl"),
         ],
+        show_count=False,
     )
 
 
@@ -1144,6 +1159,7 @@ def query_account(args: argparse.Namespace) -> None:
             ("oid", "oid"),
             ("time", "time"),
         ],
+        show_count=False,
     )
     print_recent_history(info, account, show_empty=True)
 
