@@ -190,6 +190,10 @@ def format_optional_quantity(value: Any) -> str:
     return decimal_to_plain(decimal)
 
 
+def order_amount(limit_px: Any, size: Any) -> Decimal:
+    return Decimal(str(limit_px)) * Decimal(str(size))
+
+
 def format_optional_percent(value: Any) -> str:
     decimal = decimal_or_none(value)
     if decimal is None:
@@ -513,7 +517,7 @@ def print_order_row(
     side: str,
     mid_px: Decimal | str | None,
     limit_px: Decimal | str,
-    orig_sz: Decimal | str,
+    amount: Decimal | str,
     price_rate: Decimal | None = None,
 ) -> None:
     rows = [
@@ -525,7 +529,7 @@ def print_order_row(
     rows.extend(
         [
             ("limitPx", decimal_to_display(limit_px)),
-            ("origSz", format_optional_quantity(orig_sz)),
+            ("amount", decimal_to_display(amount)),
         ]
     )
     print_box(
@@ -795,7 +799,14 @@ def cancel_order(
         print_account_metrics(info, account)
         print_box("Run", [("dry_run", "1")])
         for order in matching_orders:
-            print_order_row(order["coin"], order["side"], None, order["limitPx"], order["origSz"], price_rate)
+            print_order_row(
+                order["coin"],
+                order["side"],
+                None,
+                order["limitPx"],
+                order_amount(order["limitPx"], order.get("origSz", order.get("sz", "0"))),
+                price_rate,
+            )
         return
 
     result = exchange.bulk_cancel(cancel_requests)
@@ -809,7 +820,14 @@ def cancel_order(
     print_account_metrics(info, account)
     print_box("Cancel", [("coin", coin), ("cancelled", str(len(matching_orders)))])
     for order in matching_orders:
-        print_order_row(order["coin"], order["side"], None, order["limitPx"], order["origSz"], price_rate)
+        print_order_row(
+            order["coin"],
+            order["side"],
+            None,
+            order["limitPx"],
+            order_amount(order["limitPx"], order.get("origSz", order.get("sz", "0"))),
+            price_rate,
+        )
 
 
 def place_order(args: argparse.Namespace) -> None:
@@ -914,7 +932,7 @@ def place_order(args: argparse.Namespace) -> None:
                 price_rate,
             )
         else:
-            print_order_row(coin, side_code, current_mid, price, size, price_rate)
+            print_order_row(coin, side_code, current_mid, price, notional, price_rate)
         return
 
     leverage_result = exchange.update_leverage(max_leverage, coin, is_cross=True)
@@ -952,9 +970,16 @@ def place_order(args: argparse.Namespace) -> None:
             log_event("open_orders_after", open_orders)
             order = next((item for item in open_orders if item.get("oid") == oid), None)
             if order:
-                print_order_row(order["coin"], order["side"], current_mid, order["limitPx"], order["origSz"], price_rate)
+                print_order_row(
+                    order["coin"],
+                    order["side"],
+                    current_mid,
+                    order["limitPx"],
+                    order_amount(order["limitPx"], order.get("origSz", order.get("sz", "0"))),
+                    price_rate,
+                )
             else:
-                print_order_row(coin, side_code, current_mid, price, size, price_rate)
+                print_order_row(coin, side_code, current_mid, price, notional, price_rate)
             continue
         if "filled" in status:
             print_filled_row(coin, side_code, status["filled"], size, price_rate)
