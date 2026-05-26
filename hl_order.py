@@ -319,25 +319,33 @@ def round_to_step(value: Decimal, step: Decimal, rounding: str) -> Decimal:
     return units * step
 
 
-def calc_size(amount_usd: Decimal, price: Decimal, sz_decimals: int) -> tuple[Decimal, Decimal, Decimal]:
+def calc_size(
+    amount_usd: Decimal,
+    price: Decimal,
+    sz_decimals: int,
+    min_value_price: Decimal | None = None,
+) -> tuple[Decimal, Decimal, Decimal, Decimal]:
     target_notional = max(amount_usd, MIN_NOTIONAL)
     step = Decimal(1).scaleb(-sz_decimals)
+    sizing_price = min(price, min_value_price) if min_value_price is not None else price
 
-    raw_size = target_notional / price
+    raw_size = target_notional / sizing_price
     size = round_to_step(raw_size, step, ROUND_DOWN)
 
     # Rounding down can make a 10 USD order become 9.75 USD. In that case,
     # move one size step in the opposite direction: round up until it is enough.
-    if size <= 0 or size * price < target_notional:
+    if size <= 0 or size * sizing_price < target_notional:
         size = round_to_step(raw_size, step, ROUND_UP)
 
     notional = size * price
-    if notional < MIN_NOTIONAL:
+    minimum_value_notional = size * sizing_price
+    if minimum_value_notional < MIN_NOTIONAL:
         raise ValueError(
             f"Calculated notional is still below {MIN_NOTIONAL}: "
-            f"size={decimal_to_plain(size)}, price={decimal_to_plain(price)}, notional={decimal_to_plain(notional)}"
+            f"size={decimal_to_plain(size)}, price={decimal_to_plain(sizing_price)}, "
+            f"notional={decimal_to_plain(minimum_value_notional)}"
         )
-    return size, notional, target_notional
+    return size, notional, target_notional, minimum_value_notional
 
 
 def calc_market_size(
@@ -912,7 +920,13 @@ def place_order(args: argparse.Namespace) -> None:
         )
         order_type = {"limit": {"tif": "Ioc"}}
     else:
-        size, notional, target_notional = calc_size(amount, price, int(asset["szDecimals"]))
+        min_value_price = min(price, current_mid) if current_mid is not None else price
+        size, notional, target_notional, minimum_value_notional = calc_size(
+            amount,
+            price,
+            int(asset["szDecimals"]),
+            min_value_price,
+        )
         worst_notional = notional
         reference_price = price
         order_type = {"limit": {"tif": args.tif}}
@@ -929,6 +943,9 @@ def place_order(args: argparse.Namespace) -> None:
         print("target_usd:", decimal_to_plain(target_notional))
         print("sz_decimals:", asset["szDecimals"])
         print("order_notional:", decimal_to_plain(notional))
+        if not args.market:
+            print("min_value_price:", decimal_to_plain(min_value_price))
+            print("min_value_notional:", decimal_to_plain(minimum_value_notional))
         print("worst_notional:", decimal_to_plain(worst_notional))
         print("tif:", order_type["limit"]["tif"])
         print("reduce_only:", args.reduce_only)
