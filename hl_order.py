@@ -658,8 +658,8 @@ def build_clients(network: str, timeout: float, raw_coin: str) -> tuple[Info, Ex
     dex = coin_dex(raw_coin)
     perp_dexs = ["", dex] if dex else None
     raw_info = Info(base_url, skip_ws=True, timeout=timeout, perp_dexs=perp_dexs)
-    main_account, role = resolve_account(raw_info, account_address, wallet.address)
     info: CachedInfo = CachedInfo(raw_info)
+    main_account, role = resolve_account(info, account_address, wallet.address)
     exchange = Exchange(wallet, base_url, account_address=main_account, timeout=timeout, perp_dexs=perp_dexs)
     log_event(
         "context",
@@ -1074,6 +1074,8 @@ def collect_recent_history(info: Info, account: str, coin: str | None = None, li
                     },
                 )
             )
+            if len(entries) >= limit:
+                break
 
         entries.sort(key=lambda item: item[0], reverse=True)
 
