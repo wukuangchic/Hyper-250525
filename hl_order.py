@@ -139,7 +139,7 @@ def format_price(value: Decimal | str, rate: Decimal | None = None) -> str:
     text = decimal_to_display(price)
     if rate is None:
         return text
-    return f"{text}({decimal_to_display(price / rate)})"
+    return f"{text} ({decimal_to_display(price / rate)})"
 
 
 def format_optional_price(value: Any, rate: Decimal | None = None) -> str:
