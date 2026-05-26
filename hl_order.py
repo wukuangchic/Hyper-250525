@@ -229,13 +229,13 @@ def format_optional_percent(value: Any) -> str:
 def format_timestamp_ms(value: Any) -> str:
     if value in (None, ""):
         return "n/a"
-    return datetime.fromtimestamp(int(value) / 1000).strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.fromtimestamp(int(value) / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def format_short_timestamp_ms(value: Any) -> str:
     if value in (None, ""):
         return "n/a"
-    return datetime.fromtimestamp(int(value) / 1000).strftime("%m-%d %H:%M")
+    return datetime.fromtimestamp(int(value) / 1000, tz=timezone.utc).strftime("%m-%d %H:%M")
 
 
 def visible_width(text: str) -> int:
