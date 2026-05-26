@@ -859,6 +859,20 @@ def print_market_overview(
                 ("leverage", format_position_leverage(position)),
             ],
         )
+    open_orders = collect_open_orders_for_coin(info, account, coin, dex)
+    if open_orders:
+        print_table(
+            "Open Orders",
+            open_orders,
+            [
+                ("coin", "coin"),
+                ("side", "side"),
+                ("limitPx", "limitPx"),
+                ("sz", "sz"),
+                ("oid", "oid"),
+                ("time", "time"),
+            ],
+        )
     print_recent_history(info, account, coin=coin)
 
 
@@ -916,6 +930,29 @@ def collect_account_positions_and_orders(info: Info, account: str) -> tuple[list
     positions.sort(key=lambda row: (row["dex"], row["coin"], row["side"]))
     orders.sort(key=lambda row: (row["dex"], row["coin"], row["oid"]))
     return positions, orders
+
+
+def collect_open_orders_for_coin(info: Info, account: str, coin: str, dex: str) -> list[dict[str, str]]:
+    open_orders = info.open_orders(account, dex=dex)
+    log_event(f"market_open_orders:{dex or 'default'}", open_orders)
+    rows: list[dict[str, str]] = []
+
+    for order in open_orders:
+        if not position_matches_coin(str(order.get("coin", "")), coin):
+            continue
+        rows.append(
+            {
+                "coin": str(order.get("coin", "")),
+                "side": str(order.get("side", "")),
+                "limitPx": format_optional_decimal(order.get("limitPx")),
+                "sz": format_optional_quantity(order.get("sz", order.get("origSz"))),
+                "oid": str(order.get("oid", "")),
+                "time": format_timestamp_ms(order.get("timestamp")),
+            }
+        )
+
+    rows.sort(key=lambda row: row["oid"])
+    return rows
 
 
 def collect_recent_history(info: Info, account: str, coin: str | None = None, limit: int = 10) -> list[dict[str, str]]:
