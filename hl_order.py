@@ -58,6 +58,8 @@ from coin_aliases import coin_alias_key, load_coin_aliases, load_coin_alias_rate
 
 MIN_NOTIONAL = Decimal("10")
 ISOLATED_FALLBACK_LEVERAGE = 5
+KLINE_CHART_HEIGHT = 8
+KLINE_CHART_CANDLES = 24
 COIN_ALIASES = load_coin_aliases()
 COIN_ALIAS_RATES = load_coin_alias_rates()
 
@@ -249,6 +251,72 @@ def print_table(title: str, rows: list[dict[str, str]], columns: list[tuple[str,
     for row in rows:
         print("|" + "|".join(f" {pad_visible(row.get(key, ''), width)} " for (key, _), width in zip(columns, widths)) + "|")
     print(separator)
+
+
+def print_text_box(title: str, lines: list[str]) -> None:
+    width = max([visible_width(title), *(visible_width(line) for line in lines)], default=0)
+    width = max(width, 26)
+    print(f"+- {title} " + "-" * max(width - visible_width(title) - 3, 0) + "+")
+    for line in lines:
+        print(f"| {pad_visible(line, width)} |")
+    print("+" + "-" * (width + 2) + "+")
+
+
+def price_to_chart_row(price: Decimal, high: Decimal, low: Decimal, height: int) -> int:
+    if high == low:
+        return height // 2
+    relative = (high - price) / (high - low)
+    row = int((relative * Decimal(height - 1)).to_integral_value(rounding=ROUND_HALF_UP))
+    return max(0, min(height - 1, row))
+
+
+def render_kline_chart(candles: list[dict[str, Any]], latest_price: Decimal | None = None) -> list[str]:
+    chart_candles = [dict(candle) for candle in candles[-KLINE_CHART_CANDLES:]]
+    if not chart_candles:
+        return ["no candle data"]
+
+    if latest_price is not None:
+        last = chart_candles[-1]
+        last["c"] = str(latest_price)
+        last["h"] = str(max(Decimal(str(last["h"])), latest_price))
+        last["l"] = str(min(Decimal(str(last["l"])), latest_price))
+
+    highs = [Decimal(str(candle["h"])) for candle in chart_candles]
+    lows = [Decimal(str(candle["l"])) for candle in chart_candles]
+    high = max(highs)
+    low = min(lows)
+    labels = [""] * KLINE_CHART_HEIGHT
+    labels[0] = decimal_to_display(high)
+    labels[-1] = decimal_to_display(low)
+    label_width = max(visible_width(label) for label in labels)
+
+    rows = []
+    for row in range(KLINE_CHART_HEIGHT):
+        marks = []
+        for candle in chart_candles:
+            open_price = Decimal(str(candle["o"]))
+            close_price = Decimal(str(candle["c"]))
+            high_price = Decimal(str(candle["h"]))
+            low_price = Decimal(str(candle["l"]))
+            high_row = price_to_chart_row(high_price, high, low, KLINE_CHART_HEIGHT)
+            low_row = price_to_chart_row(low_price, high, low, KLINE_CHART_HEIGHT)
+            open_row = price_to_chart_row(open_price, high, low, KLINE_CHART_HEIGHT)
+            close_row = price_to_chart_row(close_price, high, low, KLINE_CHART_HEIGHT)
+            body_top = min(open_row, close_row)
+            body_bottom = max(open_row, close_row)
+            wick_top = min(high_row, low_row)
+            wick_bottom = max(high_row, low_row)
+            if body_top <= row <= body_bottom:
+                mark = "□" if close_price > open_price else "■" if close_price < open_price else "─"
+            elif wick_top <= row <= wick_bottom:
+                mark = "│"
+            else:
+                mark = " "
+            marks.append(mark)
+        rows.append(f"{pad_visible(labels[row], label_width)} │ {''.join(marks)}")
+
+    rows.append("□ up  ■ down  │ wick")
+    return rows
 
 
 def parse_side(side: str) -> bool:
@@ -667,6 +735,7 @@ def print_market_overview(info: Info, account: str, raw_coin: str, coin: str, de
             ("turnover", decimal_to_display(notional_volume)),
         ],
     )
+    print_text_box("Kline 24h", render_kline_chart(candles, latest_price))
 
     position = find_current_position(info, account, coin, dex)
     if position is None:
