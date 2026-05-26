@@ -174,7 +174,7 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     .buttons {
-      display: grid;
+      display: flex;
       gap: 10px;
       margin-top: 6px;
     }
@@ -208,6 +208,14 @@ INDEX_HTML = r"""<!doctype html>
       min-height: 36px;
       padding: 7px 10px;
       font-size: 12px;
+    }
+
+    button.flex {
+      flex: 1 1 auto;
+    }
+
+    button.narrow {
+      flex: 0 0 86px;
     }
 
     button.secondary {
@@ -319,7 +327,8 @@ INDEX_HTML = r"""<!doctype html>
         <input id="command" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="BTC buy 10 --dry-run">
       </div>
       <div class="buttons">
-        <button id="submit">Run</button>
+        <button id="clear" class="secondary small narrow">Clear</button>
+        <button id="submit" class="flex">Run</button>
       </div>
     </section>
 
@@ -446,8 +455,16 @@ INDEX_HTML = r"""<!doctype html>
       setOutput("Ready.");
     }
 
+    function clearCommand() {
+      const input = $("command");
+      input.value = "";
+      input.focus();
+      input.setSelectionRange(0, 0);
+    }
+
     $("verify").addEventListener("click", verify);
     $("reverify").addEventListener("click", reverify);
+    $("clear").addEventListener("click", clearCommand);
     $("submit").addEventListener("click", () => {
       const command = $("command").value.trim();
       if (command && !isReadOnlyCommand(command)) {
