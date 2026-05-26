@@ -939,11 +939,12 @@ def print_market_overview(
             "Position",
             [
                 ("side", format_position_side(Decimal(str(position.get("szi", "0"))))),
-                ("szi", format_optional_quantity(position.get("szi"))),
+                ("entryPx", format_optional_decimal(position.get("entryPx"))),
+                ("nPnl", format_optional_decimal(position.get("unrealizedPnl"))),
                 ("value", format_optional_decimal(position.get("positionValue"))),
                 ("leverage", format_position_leverage(position)),
             ],
-    )
+        )
     open_orders = collect_open_orders_for_coin(info, account, coin, dex)
     if open_orders:
         print_table(
@@ -986,7 +987,7 @@ def collect_account_positions_and_orders(info: Info, account: str) -> tuple[list
                     "szi": decimal_to_plain(size),
                     "entryPx": format_optional_decimal(position.get("entryPx")),
                     "value": format_optional_decimal(position.get("positionValue")),
-                    "uPnl": format_optional_decimal(position.get("unrealizedPnl")),
+                    "nPnl": format_optional_decimal(position.get("unrealizedPnl")),
                     "roe": format_optional_percent(position.get("returnOnEquity")),
                     "liqPx": format_optional_decimal(position.get("liquidationPx")),
                     "lev": format_position_leverage(position),
@@ -1141,7 +1142,7 @@ def query_account(args: argparse.Namespace) -> None:
             ("szi", "szi"),
             ("entryPx", "entryPx"),
             ("value", "value"),
-            ("uPnl", "uPnl"),
+            ("nPnl", "nPnl"),
             ("roe", "ROE"),
             ("liqPx", "liqPx"),
             ("lev", "lev"),
