@@ -315,7 +315,6 @@ def render_kline_chart(candles: list[dict[str, Any]], latest_price: Decimal | No
             marks.append(mark)
         rows.append(f"{pad_visible(labels[row], label_width)} │ {''.join(marks)}")
 
-    rows.append("□ up  ■ down  │ wick")
     return rows
 
 
@@ -730,8 +729,6 @@ def print_market_overview(info: Info, account: str, raw_coin: str, coin: str, de
             ("coin", coin),
             ("trend", f"{trend} {format_signed_decimal(change)} ({format_signed_percent(change_percent)})"),
             ("latest", format_price(latest_price, price_rate)),
-            ("high", format_price(high_price, price_rate)),
-            ("low", format_price(low_price, price_rate)),
             ("turnover", decimal_to_display(notional_volume)),
         ],
     )
