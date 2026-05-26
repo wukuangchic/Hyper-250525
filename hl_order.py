@@ -1004,11 +1004,9 @@ def main() -> None:
         output = buffer.getvalue()
         log_event("stdout", output)
         print(output, end="")
-        print(f"log: {LOGGER.path}")
     except Exception as exc:
         log_event("exception", {"type": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()})
         print("error:", exc)
-        print(f"log: {LOGGER.path}")
         raise SystemExit(1)
 
 
