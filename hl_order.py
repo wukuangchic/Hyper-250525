@@ -232,6 +232,12 @@ def format_timestamp_ms(value: Any) -> str:
     return datetime.fromtimestamp(int(value) / 1000).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def format_short_timestamp_ms(value: Any) -> str:
+    if value in (None, ""):
+        return "n/a"
+    return datetime.fromtimestamp(int(value) / 1000).strftime("%m-%d %H:%M")
+
+
 def visible_width(text: str) -> int:
     width = 0
     for char in text:
@@ -754,6 +760,10 @@ def position_matches_coin(position_coin: str, coin: str) -> bool:
     return coin_alias_key(position_coin) == coin_alias_key(coin)
 
 
+def fill_matches_coin(fill_coin: str, coin: str) -> bool:
+    return canonical_coin_input(fill_coin).upper() == canonical_coin_input(coin).upper()
+
+
 def find_current_position(info: Info, account: str, coin: str, dex: str) -> dict[str, Any] | None:
     state = info.user_state(account, dex=dex)
     log_event(f"market_user_state:{dex or 'default'}", state)
@@ -826,17 +836,17 @@ def print_market_overview(
     print_text_box(mode_config["title"], chart_lines, chart_overlay)
 
     position = find_current_position(info, account, coin, dex)
-    if position is None:
-        return
-    print_box(
-        "Position",
-        [
-            ("side", format_position_side(Decimal(str(position.get("szi", "0"))))),
-            ("szi", format_optional_quantity(position.get("szi"))),
-            ("value", format_optional_decimal(position.get("positionValue"))),
-            ("leverage", format_position_leverage(position)),
-        ],
-    )
+    if position is not None:
+        print_box(
+            "Position",
+            [
+                ("side", format_position_side(Decimal(str(position.get("szi", "0"))))),
+                ("szi", format_optional_quantity(position.get("szi"))),
+                ("value", format_optional_decimal(position.get("positionValue"))),
+                ("leverage", format_position_leverage(position)),
+            ],
+        )
+    print_recent_history(info, account, coin=coin)
 
 
 def collect_account_positions_and_orders(info: Info, account: str) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
@@ -895,6 +905,55 @@ def collect_account_positions_and_orders(info: Info, account: str) -> tuple[list
     return positions, orders
 
 
+def collect_recent_history(info: Info, account: str, coin: str | None = None, limit: int = 10) -> list[dict[str, str]]:
+    fills = info.user_fills(account)
+    log_event("user_fills", {"count": len(fills), "coin_filter": coin or "all"})
+    rows: list[dict[str, str]] = []
+
+    for fill in sorted(fills, key=lambda item: int(item.get("time", 0)), reverse=True):
+        fill_coin = str(fill.get("coin", ""))
+        if coin is not None and not fill_matches_coin(fill_coin, coin):
+            continue
+        rows.append(
+            {
+                "time": format_short_timestamp_ms(fill.get("time")),
+                "coin": fill_coin,
+                "dir": str(fill.get("dir", "n/a")) or "n/a",
+                "px": format_optional_decimal(fill.get("px")),
+                "sz": format_optional_quantity(fill.get("sz")),
+                "closedPnl": format_optional_decimal(fill.get("closedPnl")),
+            }
+        )
+        if len(rows) >= limit:
+            break
+
+    return rows
+
+
+def print_recent_history(
+    info: Info,
+    account: str,
+    coin: str | None = None,
+    limit: int = 10,
+    show_empty: bool = False,
+) -> None:
+    rows = collect_recent_history(info, account, coin=coin, limit=limit)
+    if not rows and not show_empty:
+        return
+    print_table(
+        "History",
+        rows,
+        [
+            ("time", "time"),
+            ("coin", "coin"),
+            ("dir", "dir"),
+            ("px", "px"),
+            ("sz", "sz"),
+            ("closedPnl", "closedPnl"),
+        ],
+    )
+
+
 def query_account(args: argparse.Namespace) -> None:
     info, _exchange, account, signer, role = build_clients(args.network, args.timeout, "")
     if args.verbose:
@@ -934,6 +993,7 @@ def query_account(args: argparse.Namespace) -> None:
             ("time", "time"),
         ],
     )
+    print_recent_history(info, account, show_empty=True)
 
 
 def cancel_order(
