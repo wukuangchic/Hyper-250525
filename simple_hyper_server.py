@@ -566,6 +566,7 @@ README_HTML = r"""<!doctype html>
       <ul>
         <li>A coin-only command such as <code>BTC</code> returns the 24h trend, high, low, turnover, and current position if any.</li>
         <li>Use <code>--dry-run</code> to preview without submitting.</li>
+        <li>Limit orders default to <code>ALO</code> unless you pass <code>--tif</code>.</li>
         <li>Commands without <code>--dry-run</code> can place or cancel real orders, except read-only commands like <code>query</code> or <code>BTC</code>.</li>
         <li>Market orders use <code>--market</code> and Hyperliquid IOC behavior.</li>
         <li>The command box is parsed as <code>hl_order.py</code> arguments, not as a shell command.</li>

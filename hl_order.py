@@ -1264,7 +1264,7 @@ def place_order(args: argparse.Namespace) -> None:
             or args.market
             or args.reduce_only
             or args.book_level != 10
-            or args.tif != "Gtc"
+            or args.tif is not None
             or args.slippage != str(Exchange.DEFAULT_SLIPPAGE)
         )
         if order_flags_without_side:
@@ -1317,7 +1317,7 @@ def place_order(args: argparse.Namespace) -> None:
         )
         worst_notional = notional
         reference_price = price
-        order_type = {"limit": {"tif": args.tif}}
+        order_type = {"limit": {"tif": args.tif or "Alo"}}
 
     side_code = "B" if is_buy else "A"
     if args.verbose:
@@ -1417,7 +1417,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--market", action="store_true", help="Submit as a market order using IOC with slippage protection.")
     parser.add_argument("--slippage", default=str(Exchange.DEFAULT_SLIPPAGE), help="Market slippage protection. Default: 0.05. Also accepts 5%%.")
     parser.add_argument("--book-level", type=int, default=10, help="Same-side book level when --price is omitted.")
-    parser.add_argument("--tif", default="Gtc", choices=["Gtc", "Ioc", "Alo"], help="Time in force. Default: Gtc.")
+    parser.add_argument("--tif", choices=["Gtc", "Ioc", "Alo"], help="Time in force. Limit orders default to Alo.")
     parser.add_argument("--reduce-only", action="store_true", help="Place a reduce-only order.")
     kline_group = parser.add_mutually_exclusive_group()
     kline_group.add_argument("--day", action="store_true", help="Show the last 30 daily candles in market overview mode.")
