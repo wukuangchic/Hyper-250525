@@ -247,7 +247,7 @@ journalctl -u simple-hyper-sync.service -n 80 --no-pager
   - 买入 / 看多：第 10 档 bid。
   - 卖出 / 看空：第 10 档 ask。
 - 加 `--market` 时，按当前 mid 计算数量，并用带滑点保护的 IOC 单成交，不会留下挂单。
-- 真实下单前，自动把当前合约杠杆设置为 `maxLeverage`。
+- 真实下单前，默认把当前合约 cross 杠杆设置为 `maxLeverage`；如果标的不支持 cross，会自动切到 isolated，默认使用 `5x`。
 - 如果数量 round 后名义价值低于 `10` 美元，会向上补一个数量步进。
 - 前台默认精简输出，完整日志写入 `logs/`。
 
@@ -450,7 +450,7 @@ BTC buy --dry-run --verbose
 
 ```text
 1. 解析标的 / 方向 / 金额 / 价格
-2. 设置该合约最大杠杆
+2. 设置该合约杠杆；cross 用最大杠杆，不支持 cross 时 isolated 用 5x
 3. 提交下单
 4. 下单接口返回
 5. 扫所有 DEX 计算统一账户比率和统一账户杠杆

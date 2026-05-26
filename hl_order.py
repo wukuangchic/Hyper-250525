@@ -57,6 +57,7 @@ from coin_aliases import coin_alias_key, load_coin_aliases, load_coin_alias_rate
 
 
 MIN_NOTIONAL = Decimal("10")
+ISOLATED_FALLBACK_LEVERAGE = 5
 COIN_ALIASES = load_coin_aliases()
 COIN_ALIAS_RATES = load_coin_alias_rates()
 
@@ -832,7 +833,7 @@ def cancel_order(
 
 def update_order_leverage(exchange: Exchange, max_leverage: int, coin: str) -> tuple[str, dict[str, Any]]:
     result = exchange.update_leverage(max_leverage, coin, is_cross=True)
-    log_event("update_leverage_result", {"mode": "cross", "result": result})
+    log_event("update_leverage_result", {"mode": "cross", "leverage": max_leverage, "result": result})
     if result.get("status") == "ok":
         return "cross", result
 
@@ -840,8 +841,9 @@ def update_order_leverage(exchange: Exchange, max_leverage: int, coin: str) -> t
     if "Cross margin is not allowed" not in response:
         return "cross", result
 
-    result = exchange.update_leverage(max_leverage, coin, is_cross=False)
-    log_event("update_leverage_result", {"mode": "isolated", "result": result})
+    isolated_leverage = min(ISOLATED_FALLBACK_LEVERAGE, max_leverage)
+    result = exchange.update_leverage(isolated_leverage, coin, is_cross=False)
+    log_event("update_leverage_result", {"mode": "isolated", "leverage": isolated_leverage, "result": result})
     return "isolated", result
 
 
