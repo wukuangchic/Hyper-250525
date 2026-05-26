@@ -24,6 +24,7 @@ import sys
 import time
 import traceback
 import unicodedata
+from threading import Lock
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 from pathlib import Path
@@ -116,6 +117,76 @@ LOGGER: RunLogger | None = None
 def log_event(label: str, value: Any) -> None:
     if LOGGER is not None:
         LOGGER.write(label, value)
+
+
+class CachedInfo:
+    def __init__(self, info: Info) -> None:
+        self._info = info
+        self._cache: dict[tuple[Any, ...], Any] = {}
+        self._lock = Lock()
+
+    def clear_cache(self) -> None:
+        with self._lock:
+            self._cache.clear()
+
+    def _cached(self, key: tuple[Any, ...], loader: Any) -> Any:
+        with self._lock:
+            if key in self._cache:
+                return self._cache[key]
+        value = loader()
+        with self._lock:
+            self._cache[key] = value
+        return value
+
+    def user_role(self, address: str) -> Any:
+        return self._cached(("user_role", address), lambda: self._info.user_role(address))
+
+    def perp_dexs(self) -> Any:
+        return self._cached(("perp_dexs",), lambda: self._info.perp_dexs())
+
+    def spot_user_state(self, account: str) -> Any:
+        return self._cached(("spot_user_state", account), lambda: self._info.spot_user_state(account))
+
+    def user_state(self, account: str, dex: str = "") -> Any:
+        return self._cached(("user_state", account, dex), lambda: self._info.user_state(account, dex=dex))
+
+    def meta(self, dex: str = "") -> Any:
+        return self._cached(("meta", dex), lambda: self._info.meta(dex=dex))
+
+    def all_mids(self, dex: str = "") -> Any:
+        return self._cached(("all_mids", dex), lambda: self._info.all_mids(dex))
+
+    def l2_snapshot(self, name: str) -> Any:
+        return self._cached(("l2_snapshot", name), lambda: self._info.l2_snapshot(name))
+
+    def candles_snapshot(self, name: str, interval: str, startTime: int, endTime: int) -> Any:
+        return self._cached(
+            ("candles_snapshot", name, interval, startTime, endTime),
+            lambda: self._info.candles_snapshot(name, interval, startTime, endTime),
+        )
+
+    def open_orders(self, account: str, dex: str = "") -> Any:
+        return self._cached(("open_orders", account, dex), lambda: self._info.open_orders(account, dex=dex))
+
+    def user_fills(self, account: str) -> Any:
+        return self._cached(("user_fills", account), lambda: self._info.user_fills(account))
+
+    def user_fills_by_time(
+        self, account: str, start_time: int, end_time: Optional[int] = None, aggregate_by_time: Optional[bool] = False
+    ) -> Any:
+        return self._cached(
+            ("user_fills_by_time", account, start_time, end_time, aggregate_by_time),
+            lambda: self._info.user_fills_by_time(account, start_time, end_time, aggregate_by_time),
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._info, name)
+
+
+def clear_info_cache(info: Any) -> None:
+    clear = getattr(info, "clear_cache", None)
+    if callable(clear):
+        clear()
 
 
 def load_dotenv(path: str = ".env") -> dict[str, str]:
@@ -586,8 +657,9 @@ def build_clients(network: str, timeout: float, raw_coin: str) -> tuple[Info, Ex
     base_url = constants.TESTNET_API_URL if network == "testnet" else constants.MAINNET_API_URL
     dex = coin_dex(raw_coin)
     perp_dexs = ["", dex] if dex else None
-    info = Info(base_url, skip_ws=True, timeout=timeout, perp_dexs=perp_dexs)
-    main_account, role = resolve_account(info, account_address, wallet.address)
+    raw_info = Info(base_url, skip_ws=True, timeout=timeout, perp_dexs=perp_dexs)
+    main_account, role = resolve_account(raw_info, account_address, wallet.address)
+    info: CachedInfo = CachedInfo(raw_info)
     exchange = Exchange(wallet, base_url, account_address=main_account, timeout=timeout, perp_dexs=perp_dexs)
     log_event(
         "context",
@@ -1121,6 +1193,7 @@ def cancel_order(
         print("error:", result)
         return
 
+    clear_info_cache(info)
     print_account_metrics(info, account)
     print_box("Cancel", [("coin", coin), ("cancelled", str(len(matching_orders)))])
     for order in matching_orders:
@@ -1284,6 +1357,7 @@ def place_order(args: argparse.Namespace) -> None:
         print("order_result:", result)
     log_event("order_result", result)
 
+    clear_info_cache(info)
     print_account_metrics(info, account)
     if result.get("status") != "ok":
         print("error:", result)
