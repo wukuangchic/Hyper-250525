@@ -59,7 +59,7 @@ from coin_aliases import coin_alias_key, load_coin_aliases, load_coin_alias_rate
 
 MIN_NOTIONAL = Decimal("10")
 ISOLATED_FALLBACK_LEVERAGE = 5
-KLINE_CHART_HEIGHT = 8
+KLINE_CHART_HEIGHT = 13
 KLINE_MODES = {
     "hour": {
         "interval": "1h",
