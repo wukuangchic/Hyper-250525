@@ -281,6 +281,19 @@ def print_table(title: str, rows: list[dict[str, str]], columns: list[tuple[str,
     print(separator)
 
 
+def fetch_user_fills_window(info: Info, account: str, start_ms: int, end_ms: int) -> list[dict[str, Any]]:
+    fills = info.user_fills_by_time(account, start_ms, end_ms)
+    log_event(
+        "user_fills_by_time",
+        {
+            "startTime": start_ms,
+            "endTime": end_ms,
+            "count": len(fills),
+        },
+    )
+    return fills
+
+
 def print_text_box(title: str, lines: list[str], bottom_border_overlay: str | None = None) -> None:
     width = max([visible_width(title), *(visible_width(line) for line in lines)], default=0)
     width = max(width, 26)
@@ -906,28 +919,56 @@ def collect_account_positions_and_orders(info: Info, account: str) -> tuple[list
 
 
 def collect_recent_history(info: Info, account: str, coin: str | None = None, limit: int = 10) -> list[dict[str, str]]:
-    fills = info.user_fills(account)
-    log_event("user_fills", {"count": len(fills), "coin_filter": coin or "all"})
-    rows: list[dict[str, str]] = []
+    now_ms = int(time.time() * 1000)
+    windows_days = [7, 30, 90, 365, 3650]
+    seen: set[tuple[str, int, int, str, str, str, str]] = set()
+    entries: list[tuple[int, dict[str, str]]] = []
 
-    for fill in sorted(fills, key=lambda item: int(item.get("time", 0)), reverse=True):
-        fill_coin = str(fill.get("coin", ""))
-        if coin is not None and not fill_matches_coin(fill_coin, coin):
-            continue
-        rows.append(
-            {
-                "time": format_short_timestamp_ms(fill.get("time")),
-                "coin": fill_coin,
-                "dir": str(fill.get("dir", "n/a")) or "n/a",
-                "px": format_optional_decimal(fill.get("px")),
-                "sz": format_optional_quantity(fill.get("sz")),
-                "closedPnl": format_optional_decimal(fill.get("closedPnl")),
-            }
-        )
-        if len(rows) >= limit:
+    for days in windows_days:
+        if len(entries) >= limit:
             break
 
-    return rows
+        start_ms = now_ms - days * 24 * 60 * 60 * 1000
+        fills = fetch_user_fills_window(info, account, start_ms, now_ms)
+        for fill in sorted(fills, key=lambda item: int(item.get("time", 0)), reverse=True):
+            fill_coin = str(fill.get("coin", ""))
+            if coin is not None and not fill_matches_coin(fill_coin, coin):
+                continue
+
+            fill_time = int(fill.get("time", 0))
+            fill_key = (
+                str(fill.get("hash", "")),
+                int(fill.get("oid", -1)),
+                fill_time,
+                fill_coin,
+                str(fill.get("side", "")),
+                str(fill.get("px", "")),
+                str(fill.get("sz", "")),
+            )
+            if fill_key in seen:
+                continue
+            seen.add(fill_key)
+
+            px = decimal_or_none(fill.get("px"))
+            sz = decimal_or_none(fill.get("sz"))
+            value = px * sz if px is not None and sz is not None else None
+            entries.append(
+                (
+                    fill_time,
+                    {
+                        "time": format_short_timestamp_ms(fill.get("time")),
+                        "coin": fill_coin,
+                        "dir": str(fill.get("dir", "n/a")) or "n/a",
+                        "px": format_optional_decimal(fill.get("px")),
+                        "value": decimal_to_display(value) if value is not None else "n/a",
+                        "closedPnl": format_optional_decimal(fill.get("closedPnl")),
+                    },
+                )
+            )
+
+        entries.sort(key=lambda item: item[0], reverse=True)
+
+    return [row for _, row in entries[:limit]]
 
 
 def print_recent_history(
@@ -948,7 +989,7 @@ def print_recent_history(
             ("coin", "coin"),
             ("dir", "dir"),
             ("px", "px"),
-            ("sz", "sz"),
+            ("value", "value"),
             ("closedPnl", "closedPnl"),
         ],
     )
