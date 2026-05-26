@@ -275,13 +275,18 @@ def print_table(title: str, rows: list[dict[str, str]], columns: list[tuple[str,
     print(separator)
 
 
-def print_text_box(title: str, lines: list[str]) -> None:
+def print_text_box(title: str, lines: list[str], bottom_border_overlay: str | None = None) -> None:
     width = max([visible_width(title), *(visible_width(line) for line in lines)], default=0)
     width = max(width, 26)
     print(f"+- {title} " + "-" * max(width - visible_width(title) - 3, 0) + "+")
     for line in lines:
         print(f"| {pad_visible(line, width)} |")
-    print("+" + "-" * (width + 2) + "+")
+    bottom_border = ["+"] + ["-"] * (width + 2) + ["+"]
+    if bottom_border_overlay:
+        for index, char in enumerate(bottom_border_overlay[: width + 2]):
+            if char != " ":
+                bottom_border[1 + index] = char
+    print("".join(bottom_border))
 
 
 def price_to_chart_row(price: Decimal, high: Decimal, low: Decimal, height: int) -> int:
@@ -321,11 +326,15 @@ def kline_marker_for_candle(candle: dict[str, Any], mode: str) -> str:
     return " "
 
 
-def render_kline_chart(candles: list[dict[str, Any]], latest_price: Decimal | None = None, mode: str = "hour") -> list[str]:
+def render_kline_chart(
+    candles: list[dict[str, Any]],
+    latest_price: Decimal | None = None,
+    mode: str = "hour",
+) -> tuple[list[str], str | None]:
     mode_config = KLINE_MODES.get(mode, KLINE_MODES["hour"])
     chart_candles = [dict(candle) for candle in candles[-mode_config["candles"] :]]
     if not chart_candles:
-        return ["no candle data"]
+        return ["no candle data"], None
 
     if latest_price is not None:
         last = chart_candles[-1]
@@ -367,9 +376,13 @@ def render_kline_chart(candles: list[dict[str, Any]], latest_price: Decimal | No
             marks.append(mark)
         rows.append(f"{pad_visible(labels[row], label_width)} │ {''.join(marks)}")
 
-    axis_markers = "".join(kline_marker_for_candle(candle, mode) for candle in chart_candles)
-    rows.append(f"{' ' * label_width} │ {axis_markers}")
-    return rows
+    content_width = max(visible_width(line) for line in rows)
+    bottom_border_overlay = [" "] * (content_width + 2)
+    for index, candle in enumerate(chart_candles):
+        marker = kline_marker_for_candle(candle, mode)
+        if marker != " ":
+            bottom_border_overlay[label_width + 4 + index] = marker
+    return rows, "".join(bottom_border_overlay)
 
 
 def parse_side(side: str) -> bool:
@@ -803,7 +816,8 @@ def print_market_overview(
             ("turnover", decimal_to_display(notional_volume)),
         ],
     )
-    print_text_box(mode_config["title"], render_kline_chart(chart_candles, latest_price, kline_mode))
+    chart_lines, chart_overlay = render_kline_chart(chart_candles, latest_price, kline_mode)
+    print_text_box(mode_config["title"], chart_lines, chart_overlay)
 
     position = find_current_position(info, account, coin, dex)
     if position is None:
