@@ -739,7 +739,7 @@ def parse_entry_trigger_with_limit(value: str, explicit_limit: str | None, label
 TPSL_SPEC_RE = re.compile(
     r"^\s*(?P<trigger_sign>[+-]?)(?P<trigger>\d+(?:\.\d+)?)(?P<trigger_pct>%?)"
     r"(?:(?P<limit_sign>[+-])(?P<limit>\d+(?:\.\d+)?%?))?"
-    r"(?:(?P<ratio_sep>[>@])(?P<ratio>\d+(?:\.\d+)?%?))?\s*$"
+    r"(?:(?P<ratio_sep>d)(?P<ratio>\d+(?:\.\d+)?%?))?\s*$"
 )
 
 
@@ -774,7 +774,7 @@ def parse_tpsl_spec(value: str, base_px: Decimal | None, label: str) -> tuple[De
     if not match:
         raise ValueError(
             f"Invalid {label} value: {value}. Use PRICE, PRICE+OFFSET, PRICE-OFFSET, PRICE+PERCENT, PRICE-PERCENT, "
-            "or REL%[+/-OFFSET] when a reference price is available. Append @RATIO to close only part of the order."
+            "or REL%[+/-OFFSET] when a reference price is available. Append dRATIO to close only part of the order."
         )
 
     trigger_sign = match.group("trigger_sign") or "+"
@@ -2538,13 +2538,13 @@ def parse_args() -> argparse.Namespace:
         "--tp",
         "--take-profit",
         dest="take_profit",
-        help="Take-profit trigger price. Use ABS, ABS+OFFSET, or REL%%[+/-OFFSET] from the entry/position price. Append >RATIO to close only part of the order.",
+        help="Take-profit trigger price. Use ABS, ABS+OFFSET, or REL%%[+/-OFFSET] from the entry/position price. Append dRATIO to close only part of the order.",
     )
     parser.add_argument(
         "--sl",
         "--stop-loss",
         dest="stop_loss",
-        help="Stop-loss trigger price. Use ABS, ABS+OFFSET, or REL%%[+/-OFFSET] from the entry/position price. Append >RATIO to close only part of the order.",
+        help="Stop-loss trigger price. Use ABS, ABS+OFFSET, or REL%%[+/-OFFSET] from the entry/position price. Append dRATIO to close only part of the order.",
     )
     parser.add_argument(
         "--tp-limit",

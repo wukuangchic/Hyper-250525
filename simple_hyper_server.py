@@ -554,7 +554,7 @@ README_HTML = r"""<!doctype html>
         <li><code>tp/sl</code>: <code>--tp</code>, <code>--sl</code></li>
         <li><code>--reduce-only</code></li>
       </ul>
-      <p><code>--stop</code> / <code>--take</code> are entry triggers. <code>--stop</code> is breakout style and <code>--take</code> is if-touched style. You can append <code>+50</code>, <code>-50</code>, <code>+0.2%</code>, or <code>-0.2%</code> to set the post-trigger limit price; without a suffix the order is a market trigger. <code>--stop-limit</code> / <code>--take-limit</code> still work as explicit equivalents. Percent is literal: <code>70000+2%</code> means <code>71400</code>, while <code>70140</code> is <code>70000+0.2%</code>. These trigger-limit styles are not <code>ALO</code>; only plain limit orders use <code>--tif</code>. <code>--tp</code> / <code>--sl</code> also accept absolute prices, absolute prices plus offsets, or relative percentages from the entry / position price such as <code>2%+0.1%</code> and <code>-2%-0.1%</code>. You can append <code>@0.6</code> or <code>@60%</code> to close only part of the order; the old <code>&gt;0.6</code> style is still accepted if you quote it, but <code>@</code> does not need quotes. Entry triggers can also be combined with <code>--tp</code> / <code>--sl</code> into a bracket order. Without <code>--reduce-only</code> they form a bracket order, and with it they protect an existing position. <code>--level</code> is the main name for the same-side book depth; <code>--book-level</code> still works as an alias.</p>
+      <p><code>--stop</code> / <code>--take</code> are entry triggers. <code>--stop</code> is breakout style and <code>--take</code> is if-touched style. You can append <code>+50</code>, <code>-50</code>, <code>+0.2%</code>, or <code>-0.2%</code> to set the post-trigger limit price; without a suffix the order is a market trigger. <code>--stop-limit</code> / <code>--take-limit</code> still work as explicit equivalents. Percent is literal: <code>70000+2%</code> means <code>71400</code>, while <code>70140</code> is <code>70000+0.2%</code>. These trigger-limit styles are not <code>ALO</code>; only plain limit orders use <code>--tif</code>. <code>--tp</code> / <code>--sl</code> also accept absolute prices, absolute prices plus offsets, or relative percentages from the entry / position price such as <code>2%+0.1%</code> and <code>-2%-0.1%</code>. You can append <code>d0.6</code> or <code>d60%</code> to close only part of the order. Entry triggers can also be combined with <code>--tp</code> / <code>--sl</code> into a bracket order. Without <code>--reduce-only</code> they form a bracket order, and with it they protect an existing position. <code>--level</code> is the main name for the same-side book depth; <code>--book-level</code> still works as an alias.</p>
     </section>
     <section>
       <h2>Flow</h2>
@@ -582,7 +582,7 @@ README_HTML = r"""<!doctype html>
         <li><code>BTC buy --tp 2%+0.1% --sl -2%-0.1% --dry-run</code></li>
         <li><code>BTC sell --tp -2%-0.1% --sl 2%+0.1% --dry-run</code></li>
         <li><code>BTC buy 100 --price 68000 --tp 72000 --sl 65000 --dry-run</code></li>
-        <li><code>BTC buy 30 --stop 80000-10 --tp 0.6%+0@0.6 --dry-run</code></li>
+        <li><code>BTC buy 30 --stop 80000-10 --tp 0.6%+0d0.6 --dry-run</code></li>
         <li><code>BTC buy 100 --scale 5 --from 67000 --to 63000 --dry-run</code></li>
         <li><code>BTC --cancel --dry-run</code></li>
         <li><code>BTC --cancel 441260592983 --dry-run</code></li>
