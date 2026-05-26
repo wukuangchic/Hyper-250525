@@ -314,7 +314,13 @@ def kline_marker_for_candle(candle: dict[str, Any], mode: str) -> str:
             return "+"
         return " "
     if mode == "day":
-        return "1" if start.day == 1 else " "
+        if start.day in {1, 10}:
+            return "1"
+        if start.day == 20:
+            return "2"
+        if start.day == 30:
+            return "3"
+        return " "
     if mode == "week":
         month_start = datetime(start.year, start.month, 1, tzinfo=timezone.utc)
         if month_start < start:
