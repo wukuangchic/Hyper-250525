@@ -2,6 +2,28 @@
 
 这是一个基于官方 `hyperliquid-python-sdk` 的本地轻量下单工具。日常建议双击 `order-terminal.command` 进入专用 Terminal，也可以在普通终端里使用 `order` alias。
 
+## 命令速记
+
+下单命令从前到后可以记成 6 段：
+
+1. `coin`，例如 `BTC`
+2. `buy/sell`，或 `query`
+3. `amount`，默认 `10`
+4. `entry/exec` 选项，常用的是 `--market`、`--price`、`--stop`、`--stop-limit`、`--take`、`--take-limit`、`--level`、`--tif`、`--slippage`
+5. `tp/sl`，就是 `--tp`、`--sl`
+6. `--reduce-only`
+
+其中：
+
+- `--stop` / `--take` 是入场触发价。`--stop` 偏突破，`--take` 偏触价。
+- 你可以直接写成 `70000+50`、`70000-50`、`70000+0.2%` 这种 `触发价+偏移` 形式；不写偏移时默认是触发市价单。`--stop-limit` / `--take-limit` 也仍然可用，作为显式写法。
+- 百分比是按触发价计算的，所以 `70000+2% = 71400`，如果你想要 `70140`，写 `70000+0.2%`。
+- `--tp` / `--sl` 也支持 `ABS+OFFSET` 或 `REL%+OFFSET` 这种写法；相对百分比是按入场价或持仓均价计算的。买多通常用正百分比止盈、负百分比止损，卖空则相反。
+- 这类百分比算出来的触发价和限价，会先对齐到交易所可接受的价格精度，再提交下单。
+- 这种带触发的偏移限价不是 `ALO`；它们是 trigger-limit。只有普通限价单才会走 `--tif`。
+- `--tp` / `--sl` 是止盈止损；不加 `--reduce-only` 时是 bracket，加了 `--reduce-only` 时是保护已有仓位。
+- 不写价格时，限价单默认按同向订单簿第 `10` 档挂单，且默认 `ALO`。`--level` 是主写法，`--book-level` 仍然保留作兼容别名。
+
 当前 SDK 信息：
 
 - SDK：`0.23.0`
@@ -247,6 +269,12 @@ journalctl -u simple-hyper-sync.service -n 80 --no-pager
   - 买入 / 看多：第 10 档 bid。
   - 卖出 / 看空：第 10 档 ask。
 - 加 `--market` 时，按当前 mid 计算数量，并用带滑点保护的 IOC 单成交，不会留下挂单。
+- 加 `--stop-entry`（或更短的 `--stop`）时，会提交 stop-entry；不写偏移时是触发市价单，写成 `70000+50` / `70000+0.2%` 这种形式时会变成触发限价单。
+- 加 `--take-entry`（或更短的 `--take`）时，会提交 take-entry；不写偏移时是触发市价单，写成 `70000+50` / `70000+0.2%` 这种形式时会变成触发限价单。
+- 加 `--tp` / `--sl` 时，可以写成绝对价、绝对价加偏移，或者相对入场价 / 持仓均价的百分比，再跟一个偏移，比如 `2%+0.1%` 或 `-2%-0.1%`。
+- 加 `--tp` / `--sl` 且不加 `--reduce-only` 时，会用 `normalTpsl` 一次提交开仓单和子止盈 / 止损单。
+- 加 `--tp` / `--sl` 且同时加 `--reduce-only` 时，会按 `positionTpsl` 提交保护已有仓位的触发单。
+- 加 `--scale` 时，会把总金额平均拆成多张限价单；每张子单金额必须至少 `10` 美元。
 - 真实下单前，默认把当前合约 cross 杠杆设置为 `maxLeverage`；如果标的不支持 cross，会自动切到 isolated，默认使用 `5x`。
 - 如果数量 round 后名义价值低于 `10` 美元，会向上补一个数量步进。
 - 前台默认精简输出，完整日志写入 `logs/`。
@@ -276,14 +304,46 @@ BTC buy 10 --price 75000
 BTC buy 10 --market
 BTC sell 10 --market
 
+# 突破后开仓
+BTC sell 25 --stop 70000
+BTC buy 25 --stop 80000
+
+# 突破后开仓，并指定触发限价
+BTC sell 25 --stop 70000+50
+BTC buy 25 --stop 80000+100
+
+# 触价后开仓
+BTC buy 25 --take 70000
+BTC sell 25 --take 80000
+
+# 触价后开仓，并指定触发限价
+BTC buy 25 --take 70000+50
+BTC sell 25 --take 80000+100
+
 # 调整市价单滑点保护，默认 5%
 BTC buy 10 --market --slippage 1%
 
 # 指定同向订单簿档位
-BTC sell 10 --book-level 5
+BTC sell 10 --level 5
 
 # 只减仓 / 平仓，不允许反手
 BTC sell --reduce-only
+
+# 保护已有仓位的止盈 / 止损触发单
+BTC sell 25 --tp 72000 --reduce-only
+BTC sell 25 --sl 65000 --reduce-only
+BTC sell --tp 2%+0.1% --sl -2%-0.1% --reduce-only
+
+# 触发限价单；也可以把限价偏移写进同一个参数里
+BTC sell 25 --sl 65000+50 --reduce-only
+BTC buy --tp 2%+0.1% --sl -2%-0.1%
+BTC sell --tp -2%-0.1% --sl 2%+0.1%
+
+# 开仓同时挂止盈止损
+BTC buy 100 --price 68000 --tp 72000 --sl 65000
+
+# 分批挂单，从 67000 到 63000 平均拆 5 笔
+BTC buy 100 --scale 5 --from 67000 --to 63000
 
 # 取消 BTC 所有挂单
 BTC --cancel
@@ -405,6 +465,34 @@ BTC buy 10 --market --slippage 1%
 ```
 
 `--market` 会使用 IOC 订单；默认滑点保护是 `0.05`，也就是 `5%`。如果要更保守，可以用 `--slippage 1%` 或 `--slippage 0.01`。
+
+止盈 / 止损：
+
+```bash
+# 保护已有多仓：到价后卖出平仓
+BTC sell 25 --tp 72000 --reduce-only
+BTC sell 25 --sl 65000 --reduce-only
+
+# 突破后开仓
+BTC sell 25 --stop 70000
+BTC buy 25 --stop 80000
+
+# 开多时同时挂止盈和止损
+BTC buy 100 --price 68000 --tp 72000 --sl 65000
+
+# 子止盈 / 止损默认是触发市价单；指定 limit 就会变成触发限价单
+BTC sell 25 --sl 65000 --sl-limit 64800 --reduce-only
+BTC buy 100 --price 68000 --tp 72000 --tp-limit 71900 --sl 65000 --sl-limit 64800
+```
+
+分批挂单：
+
+```bash
+BTC buy 100 --scale 5 --from 67000 --to 63000
+BTC sell 200 --scale 4 --from 72000 --to 76000 --reduce-only
+```
+
+`--scale` 会把总金额平均分到每个价格；例如 `100` 美元拆 `5` 笔，就是每笔约 `20` 美元。拆分后每笔必须至少 `10` 美元。
 
 查询指令会返回当前所有 DEX 的持仓和未成订单：
 

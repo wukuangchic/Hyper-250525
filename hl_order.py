@@ -8,6 +8,11 @@ Examples:
   ./hl_order.py BTC buy 10 --market
   ./hl_order.py BTC buy --price 75000
   ./hl_order.py BTC sell 25 --price 80000
+  ./hl_order.py BTC sell 25 --stop 70000
+  ./hl_order.py BTC sell 25 --stop 70000+50
+  ./hl_order.py BTC buy 25 --take 70000
+  ./hl_order.py BTC buy 25 --take 70000+0.2%
+  ./hl_order.py BTC buy --tp 2%+0.1% --sl -2%-0.1%
   ./hl_order.py BTC --cancel
   ./hl_order.py BTC --cancel 123456789
   ./hl_order.py BTC buy --dry-run
@@ -20,6 +25,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import sys
 import time
 import traceback
@@ -167,6 +173,12 @@ class CachedInfo:
 
     def open_orders(self, account: str, dex: str = "") -> Any:
         return self._cached(("open_orders", account, dex), lambda: self._info.open_orders(account, dex=dex))
+
+    def frontend_open_orders(self, account: str, dex: str = "") -> Any:
+        return self._cached(
+            ("frontend_open_orders", account, dex),
+            lambda: self._info.frontend_open_orders(account, dex=dex),
+        )
 
     def user_fills(self, account: str) -> Any:
         return self._cached(("user_fills", account), lambda: self._info.user_fills(account))
@@ -621,6 +633,37 @@ def calc_market_size(
     return size, reference_notional, target_notional, worst_notional
 
 
+def side_code(is_buy: bool) -> str:
+    return "B" if is_buy else "A"
+
+
+def rounded_perp_price(price: Decimal, sz_decimals: int) -> Decimal:
+    """Match the SDK's perp price rounding rules before submitting an order."""
+    if price <= 0:
+        raise ValueError("price must be positive")
+    if price > Decimal("100000"):
+        rounded = Decimal(str(round(float(price))))
+    else:
+        decimal_places = max(0, 6 - sz_decimals)
+        rounded = Decimal(str(round(float(f"{float(price):.5g}"), decimal_places)))
+    if rounded <= 0:
+        raise ValueError("price must be positive")
+    return rounded
+
+
+def scale_prices(start: Decimal, end: Decimal, count: int, sz_decimals: int) -> list[Decimal]:
+    if count < 2:
+        raise ValueError("--scale must be >= 2")
+    if start <= 0 or end <= 0:
+        raise ValueError("--from and --to prices must be positive")
+    step = (end - start) / Decimal(count - 1)
+    prices = [rounded_perp_price(start + step * Decimal(index), sz_decimals) for index in range(count)]
+    price_keys = {decimal_to_plain(price) for price in prices}
+    if len(price_keys) != len(prices):
+        raise ValueError("Scale prices collapse to duplicates after rounding; widen the range or reduce --scale")
+    return prices
+
+
 def parse_slippage(value: str) -> Decimal:
     text = value.strip()
     if text.endswith("%"):
@@ -632,9 +675,193 @@ def parse_slippage(value: str) -> Decimal:
     return slippage
 
 
+ENTRY_TRIGGER_SPEC_RE = re.compile(r"^\s*(?P<trigger>\d+(?:\.\d+)?)(?:(?P<op>[+-])(?P<adjust>\d+(?:\.\d+)?%?))?\s*$")
+
+
+def parse_entry_trigger_spec(value: str, label: str) -> tuple[Decimal, Decimal | None]:
+    text = value.strip().replace(" ", "")
+    match = ENTRY_TRIGGER_SPEC_RE.fullmatch(text)
+    if not match:
+        raise ValueError(
+            f"Invalid {label} value: {value}. Use PRICE, PRICE+OFFSET, PRICE-OFFSET, PRICE+PERCENT, or PRICE-PERCENT."
+        )
+
+    trigger_px = Decimal(match.group("trigger"))
+    if trigger_px <= 0:
+        raise ValueError(f"{label} trigger price must be positive")
+
+    adjust_text = match.group("adjust")
+    if adjust_text is None:
+        return trigger_px, None
+
+    sign = Decimal("1") if match.group("op") == "+" else Decimal("-1")
+    if adjust_text.endswith("%"):
+        adjust = trigger_px * (Decimal(adjust_text[:-1]) / Decimal("100"))
+    else:
+        adjust = Decimal(adjust_text)
+    limit_px = trigger_px + sign * adjust
+    if limit_px <= 0:
+        raise ValueError(f"{label} limit price must be positive")
+    return trigger_px, limit_px
+
+
+def parse_entry_trigger_with_limit(value: str, explicit_limit: str | None, label: str) -> tuple[Decimal, Decimal | None]:
+    trigger_px, inline_limit_px = parse_entry_trigger_spec(value, label)
+    if explicit_limit is not None and inline_limit_px is not None:
+        raise ValueError(f"--{label}-limit cannot be combined with inline +/- syntax in --{label}")
+    if explicit_limit is None:
+        return trigger_px, inline_limit_px
+
+    limit_px = Decimal(explicit_limit)
+    if limit_px <= 0:
+        raise ValueError(f"--{label}-limit must be positive")
+    return trigger_px, limit_px
+
+
+TPSL_SPEC_RE = re.compile(
+    r"^\s*(?P<trigger_sign>[+-]?)(?P<trigger>\d+(?:\.\d+)?)(?P<trigger_pct>%?)"
+    r"(?:(?P<limit_sign>[+-])(?P<limit>\d+(?:\.\d+)?%?))?\s*$"
+)
+
+
+def apply_signed_offset(base_px: Decimal, sign: str, value_text: str, label: str) -> Decimal:
+    if value_text.endswith("%"):
+        offset = Decimal(value_text[:-1]) / Decimal("100")
+        if sign == "-":
+            offset = -offset
+        result = base_px * (Decimal("1") + offset)
+    else:
+        delta = Decimal(value_text)
+        result = base_px + (delta if sign == "+" else -delta)
+    if result <= 0:
+        raise ValueError(f"{label} must be positive")
+    return result
+
+
+def parse_tpsl_spec(value: str, base_px: Decimal | None, label: str) -> tuple[Decimal, Decimal | None]:
+    text = value.strip().replace(" ", "")
+    match = TPSL_SPEC_RE.fullmatch(text)
+    if not match:
+        raise ValueError(
+            f"Invalid {label} value: {value}. Use PRICE, PRICE+OFFSET, PRICE-OFFSET, PRICE+PERCENT, PRICE-PERCENT, "
+            "or REL%[+/-OFFSET] when a reference price is available."
+        )
+
+    trigger_sign = match.group("trigger_sign") or "+"
+    trigger_text = match.group("trigger")
+    if match.group("trigger_pct"):
+        if base_px is None:
+            raise ValueError(f"{label} relative trigger prices require a reference price")
+        trigger_pct = Decimal(trigger_text) / Decimal("100")
+        if trigger_sign == "-":
+            trigger_pct = -trigger_pct
+        trigger_px = base_px * (Decimal("1") + trigger_pct)
+    else:
+        trigger_px = Decimal(trigger_text)
+        if trigger_sign == "-":
+            trigger_px = -trigger_px
+
+    if trigger_px <= 0:
+        raise ValueError(f"{label} trigger price must be positive")
+
+    inline_limit_px: Decimal | None = None
+    limit_text = match.group("limit")
+    if limit_text is not None:
+        inline_limit_px = apply_signed_offset(trigger_px, match.group("limit_sign") or "+", limit_text, f"{label} limit price")
+    return trigger_px, inline_limit_px
+
+
+def resolve_tpsl_spec(
+    value: str,
+    explicit_limit: str | None,
+    base_px: Decimal | None,
+    label: str,
+) -> tuple[Decimal, Decimal | None]:
+    trigger_px, inline_limit_px = parse_tpsl_spec(value, base_px, label)
+    if explicit_limit is not None and inline_limit_px is not None:
+        raise ValueError(f"--{label}-limit cannot be combined with inline +/- syntax in --{label}")
+    if explicit_limit is not None:
+        limit_px = Decimal(explicit_limit)
+        if limit_px <= 0:
+            raise ValueError(f"--{label}-limit must be positive")
+        return trigger_px, limit_px
+    return trigger_px, inline_limit_px
+
+
+def validate_tpsl_direction(
+    label: str,
+    trigger_px: Decimal,
+    base_px: Decimal | None,
+    position_is_long: bool,
+) -> None:
+    if base_px is None:
+        return
+    if label == "tp":
+        if position_is_long and trigger_px <= base_px:
+            raise ValueError(
+                f"Take-profit for long positions must trigger above the reference price ({decimal_to_display(base_px)})"
+            )
+        if not position_is_long and trigger_px >= base_px:
+            raise ValueError(
+                f"Take-profit for short positions must trigger below the reference price ({decimal_to_display(base_px)})"
+            )
+        return
+    if position_is_long and trigger_px >= base_px:
+        raise ValueError(
+            f"Stop-loss for long positions must trigger below the reference price ({decimal_to_display(base_px)})"
+        )
+    if not position_is_long and trigger_px <= base_px:
+        raise ValueError(
+            f"Stop-loss for short positions must trigger above the reference price ({decimal_to_display(base_px)})"
+        )
+
+
+VALUE_OPTION_STRINGS = {
+    "--price",
+    "--slippage",
+    "--level",
+    "--book-level",
+    "--tif",
+    "--stop-entry",
+    "--stop",
+    "--stop-limit",
+    "--take-entry",
+    "--take",
+    "--take-limit",
+    "--tp",
+    "--take-profit",
+    "--sl",
+    "--stop-loss",
+    "--tp-limit",
+    "--sl-limit",
+    "--scale",
+    "--from",
+    "--to",
+    "--cancel",
+    "--network",
+    "--timeout",
+}
+
+
+def normalize_signed_option_values(argv: list[str]) -> list[str]:
+    normalized: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token in VALUE_OPTION_STRINGS and index + 1 < len(argv):
+            next_token = argv[index + 1]
+            if next_token.startswith("-") and next_token not in VALUE_OPTION_STRINGS:
+                normalized.append(f"{token}={next_token}")
+                index += 2
+                continue
+        normalized.append(token)
+        index += 1
+    return normalized
+
+
 def same_side_book_price(info: Info, coin: str, is_buy: bool, level: int) -> Decimal:
     if level < 1:
-        raise ValueError("--book-level must be >= 1")
+        raise ValueError("--level must be >= 1")
 
     book = info.l2_snapshot(coin)
     log_event("l2_snapshot", book)
@@ -817,6 +1044,82 @@ def print_market_order_row(
     )
 
 
+def compact_status(status: dict[str, Any] | None) -> str:
+    if status is None:
+        return "planned"
+    if "error" in status:
+        text = f"error: {status['error']}"
+        return text if len(text) <= 80 else text[:77] + "..."
+    if "resting" in status:
+        return f"resting #{status['resting'].get('oid', 'n/a')}"
+    if "filled" in status:
+        filled = status["filled"]
+        avg_px = format_optional_decimal(filled.get("avgPx"))
+        oid = filled.get("oid", "n/a")
+        return f"filled #{oid} @ {avg_px}"
+    return str(status)
+
+
+def order_plan_request(plan: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "coin": plan["coin"],
+        "is_buy": plan["is_buy"],
+        "sz": float(plan["size"]),
+        "limit_px": float(plan["limit_px"]),
+        "order_type": plan["order_type"],
+        "reduce_only": plan["reduce_only"],
+    }
+
+
+def order_plan_table_row(
+    plan: dict[str, Any],
+    price_rate: Decimal | None,
+    status: dict[str, Any] | None = None,
+) -> dict[str, str]:
+    trigger_px = plan.get("trigger_px")
+    return {
+        "label": str(plan["label"]),
+        "coin": str(plan["coin"]),
+        "side": side_code(bool(plan["is_buy"])),
+        "mode": str(plan["mode"]),
+        "triggerPx": format_price(trigger_px, price_rate) if trigger_px is not None else "-",
+        "limitPx": format_price(plan["limit_px"], price_rate),
+        "sz": decimal_to_plain(plan["size"]),
+        "amount": decimal_to_display(plan["notional"]),
+        "reduce": "1" if plan["reduce_only"] else "0",
+        "status": compact_status(status),
+    }
+
+
+def print_order_plan_table(
+    title: str,
+    plans: list[dict[str, Any]],
+    price_rate: Decimal | None = None,
+    statuses: list[dict[str, Any]] | None = None,
+) -> None:
+    rows = [
+        order_plan_table_row(plan, price_rate, statuses[index] if statuses and index < len(statuses) else None)
+        for index, plan in enumerate(plans)
+    ]
+    print_table(
+        title,
+        rows,
+        [
+            ("label", "label"),
+            ("coin", "coin"),
+            ("side", "side"),
+            ("mode", "mode"),
+            ("triggerPx", "triggerPx"),
+            ("limitPx", "limitPx"),
+            ("sz", "sz"),
+            ("amount", "amount"),
+            ("reduce", "reduce"),
+            ("status", "status"),
+        ],
+        show_count=False,
+    )
+
+
 def print_filled_row(
     coin: str,
     side: str,
@@ -860,6 +1163,55 @@ def position_matches_coin(position_coin: str, coin: str) -> bool:
 
 def fill_matches_coin(fill_coin: str, coin: str) -> bool:
     return canonical_coin_input(fill_coin).upper() == canonical_coin_input(coin).upper()
+
+
+def collect_frontend_open_orders(info: Info, account: str, dex: str) -> list[dict[str, Any]]:
+    try:
+        raw_orders = info.frontend_open_orders(account, dex=dex)
+        log_event(f"frontend_open_orders:{dex or 'default'}", raw_orders)
+    except Exception as exc:
+        log_event(f"frontend_open_orders_error:{dex or 'default'}", {"type": type(exc).__name__, "message": str(exc)})
+        raw_orders = info.open_orders(account, dex=dex)
+        log_event(f"open_orders_fallback:{dex or 'default'}", raw_orders)
+
+    rows: list[dict[str, Any]] = []
+    seen_oids: set[int] = set()
+
+    def visit(order: dict[str, Any]) -> None:
+        oid = order.get("oid")
+        if oid is not None:
+            oid_int = int(oid)
+            if oid_int in seen_oids:
+                return
+            seen_oids.add(oid_int)
+        rows.append(order)
+        for child in order.get("children") or []:
+            if isinstance(child, dict):
+                visit(child)
+
+    for order in raw_orders:
+        if isinstance(order, dict):
+            visit(order)
+    return rows
+
+
+def format_open_order_type(order: dict[str, Any]) -> str:
+    if order.get("isPositionTpsl"):
+        return "positionTpsl"
+    order_type = order.get("orderType")
+    if order_type:
+        return str(order_type)
+    if order.get("isTrigger"):
+        return "trigger"
+    tif = order.get("tif")
+    return str(tif) if tif else "limit"
+
+
+def format_open_order_trigger_price(order: dict[str, Any]) -> str:
+    trigger_px = decimal_or_none(order.get("triggerPx"))
+    if trigger_px is None or trigger_px == 0:
+        return "-"
+    return decimal_to_display(trigger_px)
 
 
 def find_current_position(info: Info, account: str, coin: str, dex: str) -> dict[str, Any] | None:
@@ -953,6 +1305,8 @@ def print_market_overview(
             [
                 ("coin", "coin"),
                 ("side", "side"),
+                ("type", "type"),
+                ("triggerPx", "triggerPx"),
                 ("limitPx", "limitPx"),
                 ("sz", "sz"),
                 ("oid", "oid"),
@@ -994,8 +1348,7 @@ def collect_account_positions_and_orders(info: Info, account: str) -> tuple[list
                 }
             )
 
-        open_orders = info.open_orders(account, dex=dex)
-        log_event(f"query_open_orders:{dex_name}", open_orders)
+        open_orders = collect_frontend_open_orders(info, account, dex)
         for order in open_orders:
             oid = int(order["oid"])
             order_key = (str(order.get("coin", "")), oid)
@@ -1007,6 +1360,8 @@ def collect_account_positions_and_orders(info: Info, account: str) -> tuple[list
                     "dex": dex_name,
                     "coin": str(order.get("coin", "")),
                     "side": str(order.get("side", "")),
+                    "type": format_open_order_type(order),
+                    "triggerPx": format_open_order_trigger_price(order),
                     "limitPx": format_optional_decimal(order.get("limitPx")),
                     "sz": format_optional_quantity(order.get("sz", order.get("origSz"))),
                     "oid": str(oid),
@@ -1020,8 +1375,7 @@ def collect_account_positions_and_orders(info: Info, account: str) -> tuple[list
 
 
 def collect_open_orders_for_coin(info: Info, account: str, coin: str, dex: str) -> list[dict[str, str]]:
-    open_orders = info.open_orders(account, dex=dex)
-    log_event(f"market_open_orders:{dex or 'default'}", open_orders)
+    open_orders = collect_frontend_open_orders(info, account, dex)
     rows: list[dict[str, str]] = []
 
     for order in open_orders:
@@ -1031,6 +1385,8 @@ def collect_open_orders_for_coin(info: Info, account: str, coin: str, dex: str) 
             {
                 "coin": str(order.get("coin", "")),
                 "side": str(order.get("side", "")),
+                "type": format_open_order_type(order),
+                "triggerPx": format_open_order_trigger_price(order),
                 "limitPx": format_optional_decimal(order.get("limitPx")),
                 "sz": format_optional_quantity(order.get("sz", order.get("origSz"))),
                 "oid": str(order.get("oid", "")),
@@ -1155,6 +1511,8 @@ def query_account(args: argparse.Namespace) -> None:
             ("dex", "dex"),
             ("coin", "coin"),
             ("side", "side"),
+            ("type", "type"),
+            ("triggerPx", "triggerPx"),
             ("limitPx", "limitPx"),
             ("sz", "sz"),
             ("oid", "oid"),
@@ -1242,6 +1600,488 @@ def update_order_leverage(exchange: Exchange, max_leverage: int, coin: str) -> t
     return "isolated", result
 
 
+def build_entry_order_plan(
+    args: argparse.Namespace,
+    info: Info,
+    exchange: Exchange,
+    coin: str,
+    asset: dict[str, Any],
+    is_buy: bool,
+    amount: Decimal,
+    current_mid: Decimal | None,
+    slippage: Decimal,
+) -> dict[str, Any]:
+    sz_decimals = int(asset["szDecimals"])
+    if args.market:
+        if current_mid is None:
+            raise ValueError(f"No mid price found for {coin}, cannot place market order")
+        reference_price = current_mid
+        price = Decimal(str(exchange._slippage_price(coin, is_buy, float(slippage), float(reference_price))))
+        price_source = f"mid with {format_percent(slippage)} slippage protection"
+        size, notional, target_notional, worst_notional = calc_market_size(
+            amount,
+            reference_price,
+            price,
+            sz_decimals,
+        )
+        order_type = {"limit": {"tif": "Ioc"}}
+        mode = "market"
+        minimum_value_notional = None
+        min_value_price = None
+    else:
+        if args.price:
+            price = Decimal(args.price)
+            price_source = "user"
+        else:
+            price = same_side_book_price(info, coin, is_buy, args.book_level)
+            price_source = f"same-side book level {args.book_level}"
+        price = rounded_perp_price(price, sz_decimals)
+        min_value_price = min(price, current_mid) if current_mid is not None else price
+        size, notional, target_notional, minimum_value_notional = calc_size(
+            amount,
+            price,
+            sz_decimals,
+            min_value_price,
+        )
+        reference_price = price
+        worst_notional = notional
+        order_type = {"limit": {"tif": args.tif or "Alo"}}
+        mode = "limit"
+
+    return {
+        "label": "entry",
+        "coin": coin,
+        "is_buy": is_buy,
+        "size": size,
+        "limit_px": price,
+        "order_type": order_type,
+        "reduce_only": args.reduce_only,
+        "mode": mode,
+        "notional": notional,
+        "target_notional": target_notional,
+        "worst_notional": worst_notional,
+        "reference_price": reference_price,
+        "price_source": price_source,
+        "minimum_value_notional": minimum_value_notional,
+        "min_value_price": min_value_price,
+    }
+
+
+def build_trigger_order_plan(
+    coin: str,
+    is_buy: bool,
+    amount: Decimal,
+    asset: dict[str, Any],
+    exchange: Exchange,
+    slippage: Decimal,
+    label: str,
+    trigger_px: Decimal,
+    trigger_limit_px: Decimal | None,
+    reduce_only: bool,
+    tpsl: str | None = None,
+    size: Decimal | None = None,
+) -> dict[str, Any]:
+    if trigger_px <= 0:
+        raise ValueError(f"{label} trigger price must be positive")
+    sz_decimals = int(asset["szDecimals"])
+    trigger_px = rounded_perp_price(trigger_px, sz_decimals)
+    if trigger_limit_px is not None:
+        trigger_limit_px = rounded_perp_price(trigger_limit_px, sz_decimals)
+    is_market_trigger = trigger_limit_px is None
+    if is_market_trigger:
+        limit_px = Decimal(str(exchange._slippage_price(coin, is_buy, float(slippage), float(trigger_px))))
+        limit_px = rounded_perp_price(limit_px, sz_decimals)
+        mode = f"{label}-market"
+        if size is None:
+            size, notional, target_notional, worst_notional = calc_market_size(
+                amount,
+                trigger_px,
+                limit_px,
+                sz_decimals,
+            )
+        else:
+            notional = size * trigger_px
+            target_notional = notional
+            worst_notional = size * limit_px
+    else:
+        limit_px = trigger_limit_px
+        mode = f"{label}-limit"
+        if limit_px <= 0:
+            raise ValueError(f"{label} limit price must be positive")
+        if size is None:
+            min_value_price = min(trigger_px, limit_px)
+            size, notional, target_notional, _minimum_value_notional = calc_size(
+                amount,
+                limit_px,
+                sz_decimals,
+                min_value_price,
+            )
+        else:
+            notional = size * limit_px
+            target_notional = notional
+        worst_notional = notional
+
+    return {
+        "label": label,
+        "coin": coin,
+        "is_buy": is_buy,
+        "size": size,
+        "limit_px": limit_px,
+        "trigger_px": trigger_px,
+        "order_type": {
+            "trigger": {
+                "triggerPx": float(trigger_px),
+                "isMarket": is_market_trigger,
+                "tpsl": tpsl or ("tp" if label == "tp" else "sl"),
+            }
+        },
+        "reduce_only": reduce_only,
+        "mode": mode,
+        "notional": notional,
+        "target_notional": target_notional,
+        "worst_notional": worst_notional,
+    }
+
+
+def build_stop_entry_order_plan(
+    coin: str,
+    is_buy: bool,
+    amount: Decimal,
+    asset: dict[str, Any],
+    exchange: Exchange,
+    slippage: Decimal,
+    trigger_px: Decimal,
+    trigger_limit_px: Decimal | None,
+    current_mid: Decimal | None,
+) -> dict[str, Any]:
+    sz_decimals = int(asset["szDecimals"])
+    trigger_px = rounded_perp_price(trigger_px, sz_decimals)
+    if trigger_limit_px is not None:
+        trigger_limit_px = rounded_perp_price(trigger_limit_px, sz_decimals)
+    if current_mid is not None:
+        if is_buy and trigger_px <= current_mid:
+            raise ValueError(
+                f"Stop-entry buy orders must trigger above the current mid ({decimal_to_display(current_mid)}); "
+                "use --take-entry for if-touched entries below the market."
+            )
+        if not is_buy and trigger_px >= current_mid:
+            raise ValueError(
+                f"Stop-entry sell orders must trigger below the current mid ({decimal_to_display(current_mid)}); "
+                "use --take-entry for if-touched entries above the market."
+            )
+
+    return build_trigger_order_plan(
+        coin,
+        is_buy,
+        amount,
+        asset,
+        exchange,
+        slippage,
+        "stop-entry",
+        trigger_px,
+        trigger_limit_px,
+        False,
+        tpsl="sl",
+    )
+
+
+def build_take_entry_order_plan(
+    coin: str,
+    is_buy: bool,
+    amount: Decimal,
+    asset: dict[str, Any],
+    exchange: Exchange,
+    slippage: Decimal,
+    trigger_px: Decimal,
+    trigger_limit_px: Decimal | None,
+    current_mid: Decimal | None,
+) -> dict[str, Any]:
+    sz_decimals = int(asset["szDecimals"])
+    trigger_px = rounded_perp_price(trigger_px, sz_decimals)
+    if trigger_limit_px is not None:
+        trigger_limit_px = rounded_perp_price(trigger_limit_px, sz_decimals)
+    if current_mid is not None:
+        if is_buy and trigger_px >= current_mid:
+            raise ValueError(
+                f"Take-entry buy orders must trigger below the current mid ({decimal_to_display(current_mid)}); "
+                "use --stop-entry for breakouts above the market."
+            )
+        if not is_buy and trigger_px <= current_mid:
+            raise ValueError(
+                f"Take-entry sell orders must trigger above the current mid ({decimal_to_display(current_mid)}); "
+                "use --stop-entry for breakouts below the market."
+            )
+
+    return build_trigger_order_plan(
+        coin,
+        is_buy,
+        amount,
+        asset,
+        exchange,
+        slippage,
+        "take-entry",
+        trigger_px,
+        trigger_limit_px,
+        False,
+        tpsl="tp",
+    )
+
+
+def build_tpsl_child_plans(
+    args: argparse.Namespace,
+    exchange: Exchange,
+    coin: str,
+    asset: dict[str, Any],
+    parent_is_buy: bool,
+    size: Decimal,
+    amount: Decimal,
+    slippage: Decimal,
+    base_px: Decimal | None,
+) -> list[dict[str, Any]]:
+    child_is_buy = not parent_is_buy
+    parent_is_long = parent_is_buy
+    plans: list[dict[str, Any]] = []
+    if args.take_profit:
+        take_trigger_px, take_limit_px = resolve_tpsl_spec(
+            args.take_profit,
+            args.take_profit_limit,
+            base_px,
+            "tp",
+        )
+        take_trigger_px = rounded_perp_price(take_trigger_px, int(asset["szDecimals"]))
+        if take_limit_px is not None:
+            take_limit_px = rounded_perp_price(take_limit_px, int(asset["szDecimals"]))
+        validate_tpsl_direction("tp", take_trigger_px, base_px, parent_is_long)
+        plans.append(
+            build_trigger_order_plan(
+                coin,
+                child_is_buy,
+                amount,
+                asset,
+                exchange,
+                slippage,
+                "tp",
+                take_trigger_px,
+                take_limit_px,
+                True,
+                size=size,
+            )
+        )
+    if args.stop_loss:
+        stop_trigger_px, stop_limit_px = resolve_tpsl_spec(
+            args.stop_loss,
+            args.stop_loss_limit,
+            base_px,
+            "sl",
+        )
+        stop_trigger_px = rounded_perp_price(stop_trigger_px, int(asset["szDecimals"]))
+        if stop_limit_px is not None:
+            stop_limit_px = rounded_perp_price(stop_limit_px, int(asset["szDecimals"]))
+        validate_tpsl_direction("sl", stop_trigger_px, base_px, parent_is_long)
+        plans.append(
+            build_trigger_order_plan(
+                coin,
+                child_is_buy,
+                amount,
+                asset,
+                exchange,
+                slippage,
+                "sl",
+                stop_trigger_px,
+                stop_limit_px,
+                True,
+                size=size,
+            )
+        )
+    return plans
+
+
+def submit_order_plans(
+    exchange: Exchange,
+    info: Info,
+    account: str,
+    coin: str,
+    max_leverage: int,
+    plans: list[dict[str, Any]],
+    grouping: str,
+    args: argparse.Namespace,
+    price_rate: Decimal | None,
+    title: str,
+) -> None:
+    if args.dry_run:
+        print_account_metrics(info, account)
+        print_box("Run", [("dry_run", "1")])
+        print_order_plan_table(title, plans, price_rate)
+        return
+
+    leverage_mode, leverage_result = update_order_leverage(exchange, max_leverage, coin)
+    if args.verbose:
+        print("leverage_mode:", leverage_mode)
+        print("update_leverage_result:", leverage_result)
+    if leverage_result.get("status") != "ok":
+        raise RuntimeError(f"Failed to update {leverage_mode} leverage; order was not submitted.")
+
+    requests = [order_plan_request(plan) for plan in plans]
+    result = exchange.bulk_orders(requests, grouping=grouping)
+    if args.verbose:
+        print("order_result:", result)
+    log_event("bulk_order_requests", requests)
+    log_event("order_result", result)
+
+    clear_info_cache(info)
+    print_account_metrics(info, account)
+    if result.get("status") != "ok":
+        print("error:", result)
+        return
+
+    statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+    print_order_plan_table(title, plans, price_rate, statuses)
+
+
+def place_protective_tpsl_orders(
+    args: argparse.Namespace,
+    exchange: Exchange,
+    info: Info,
+    account: str,
+    coin: str,
+    dex: str,
+    asset: dict[str, Any],
+    is_buy: bool,
+    amount: Decimal,
+    slippage: Decimal,
+    max_leverage: int,
+    price_rate: Decimal | None,
+) -> None:
+    position = find_current_position(info, account, coin, dex)
+    position_base_px = Decimal(str(position.get("entryPx"))) if position and position.get("entryPx") is not None else None
+    position_is_long = not is_buy
+    plans: list[dict[str, Any]] = []
+    if args.take_profit:
+        take_trigger_px, take_limit_px = resolve_tpsl_spec(
+            args.take_profit,
+            args.take_profit_limit,
+            position_base_px,
+            "tp",
+        )
+        take_trigger_px = rounded_perp_price(take_trigger_px, int(asset["szDecimals"]))
+        if take_limit_px is not None:
+            take_limit_px = rounded_perp_price(take_limit_px, int(asset["szDecimals"]))
+        validate_tpsl_direction("tp", take_trigger_px, position_base_px, position_is_long)
+        plans.append(
+            build_trigger_order_plan(
+                coin,
+                is_buy,
+                amount,
+                asset,
+                exchange,
+                slippage,
+                "tp",
+                take_trigger_px,
+                take_limit_px,
+                True,
+            )
+        )
+    if args.stop_loss:
+        stop_trigger_px, stop_limit_px = resolve_tpsl_spec(
+            args.stop_loss,
+            args.stop_loss_limit,
+            position_base_px,
+            "sl",
+        )
+        stop_trigger_px = rounded_perp_price(stop_trigger_px, int(asset["szDecimals"]))
+        if stop_limit_px is not None:
+            stop_limit_px = rounded_perp_price(stop_limit_px, int(asset["szDecimals"]))
+        validate_tpsl_direction("sl", stop_trigger_px, position_base_px, position_is_long)
+        plans.append(
+            build_trigger_order_plan(
+                coin,
+                is_buy,
+                amount,
+                asset,
+                exchange,
+                slippage,
+                "sl",
+                stop_trigger_px,
+                stop_limit_px,
+                True,
+            )
+        )
+    if not plans:
+        raise ValueError("at least one of --tp or --sl is required")
+    submit_order_plans(
+        exchange,
+        info,
+        account,
+        coin,
+        max_leverage,
+        plans,
+        "positionTpsl",
+        args,
+        price_rate,
+        "Protective TP/SL",
+    )
+
+
+def place_scale_orders(
+    args: argparse.Namespace,
+    exchange: Exchange,
+    info: Info,
+    account: str,
+    coin: str,
+    asset: dict[str, Any],
+    is_buy: bool,
+    amount: Decimal,
+    current_mid: Decimal | None,
+    max_leverage: int,
+    price_rate: Decimal | None,
+) -> None:
+    scale_count = int(args.scale)
+    amount_each = amount / Decimal(scale_count)
+    if amount_each < MIN_NOTIONAL:
+        raise ValueError(f"Scale amount is too small: each order must be at least {MIN_NOTIONAL} USD")
+
+    sz_decimals = int(asset["szDecimals"])
+    prices = scale_prices(Decimal(args.scale_from), Decimal(args.scale_to), scale_count, sz_decimals)
+    plans: list[dict[str, Any]] = []
+    for index, price in enumerate(prices, start=1):
+        min_value_price = min(price, current_mid) if current_mid is not None else price
+        size, notional, target_notional, minimum_value_notional = calc_size(
+            amount_each,
+            price,
+            sz_decimals,
+            min_value_price,
+        )
+        plans.append(
+            {
+                "label": f"{index}/{scale_count}",
+                "coin": coin,
+                "is_buy": is_buy,
+                "size": size,
+                "limit_px": price,
+                "order_type": {"limit": {"tif": args.tif or "Alo"}},
+                "reduce_only": args.reduce_only,
+                "mode": "scale",
+                "notional": notional,
+                "target_notional": target_notional,
+                "minimum_value_notional": minimum_value_notional,
+                "min_value_price": min_value_price,
+            }
+        )
+
+    submit_order_plans(
+        exchange,
+        info,
+        account,
+        coin,
+        max_leverage,
+        plans,
+        "na",
+        args,
+        price_rate,
+        "Scale Orders",
+    )
+
+
 def place_order(args: argparse.Namespace) -> None:
     if args.query:
         query_account(args)
@@ -1266,6 +2106,13 @@ def place_order(args: argparse.Namespace) -> None:
             or args.book_level != 10
             or args.tif is not None
             or args.slippage != str(Exchange.DEFAULT_SLIPPAGE)
+            or args.stop_entry
+            or args.take_entry
+            or args.take_profit
+            or args.stop_loss
+            or args.scale
+            or args.scale_from
+            or args.scale_to
         )
         if order_flags_without_side:
             raise ValueError("side is required when order options are used")
@@ -1281,45 +2128,168 @@ def place_order(args: argparse.Namespace) -> None:
     if amount <= 0:
         raise ValueError("amount must be positive")
     slippage = parse_slippage(args.slippage)
+    has_tpsl = bool(args.take_profit or args.stop_loss)
 
     mids = info.all_mids(dex)
     current_mid = Decimal(str(mids[coin])) if mids.get(coin) is not None else None
     log_event("all_mids_sample", {"dex": dex or "default", "coin": coin, "mid": mids.get(coin)})
     max_leverage = int(asset["maxLeverage"])
-    if args.market:
-        if current_mid is None:
-            raise ValueError(f"No mid price found for {coin}, cannot place market order")
-        reference_price = current_mid
-        price = Decimal(str(exchange._slippage_price(coin, is_buy, float(slippage), float(reference_price))))
-        price_source = f"mid with {format_percent(slippage)} slippage protection"
-    elif args.price:
-        price = Decimal(args.price)
-        price_source = "user"
-    else:
-        price = same_side_book_price(info, coin, is_buy, args.book_level)
-        price_source = f"same-side book level {args.book_level}"
 
-    if args.market:
-        size, notional, target_notional, worst_notional = calc_market_size(
+    if args.scale:
+        place_scale_orders(
+            args,
+            exchange,
+            info,
+            account,
+            coin,
+            asset,
+            is_buy,
             amount,
-            reference_price,
-            price,
-            int(asset["szDecimals"]),
+            current_mid,
+            max_leverage,
+            price_rate,
         )
-        order_type = {"limit": {"tif": "Ioc"}}
-    else:
-        min_value_price = min(price, current_mid) if current_mid is not None else price
-        size, notional, target_notional, minimum_value_notional = calc_size(
-            amount,
-            price,
-            int(asset["szDecimals"]),
-            min_value_price,
-        )
-        worst_notional = notional
-        reference_price = price
-        order_type = {"limit": {"tif": args.tif or "Alo"}}
+        return
 
-    side_code = "B" if is_buy else "A"
+    if args.stop_entry:
+        stop_trigger_px, stop_limit_px = parse_entry_trigger_with_limit(args.stop_entry, args.stop_entry_limit, "stop")
+        entry_trigger_plan = build_stop_entry_order_plan(
+            coin,
+            is_buy,
+            amount,
+            asset,
+            exchange,
+            slippage,
+            stop_trigger_px,
+            stop_limit_px,
+            current_mid,
+        )
+        if args.verbose:
+            print("dex:", dex or "default")
+            print("current_mid:", mids.get(coin))
+            print("max_leverage:", max_leverage)
+            print("stop_entry:", decimal_to_plain(stop_trigger_px))
+            if stop_limit_px is not None:
+                print("stop_entry_limit:", decimal_to_plain(stop_limit_px))
+        submit_order_plans(
+            exchange,
+            info,
+            account,
+            coin,
+            max_leverage,
+            [entry_trigger_plan],
+            "na",
+            args,
+            price_rate,
+            "Stop Entry",
+        )
+        return
+
+    if args.take_entry:
+        take_trigger_px, take_limit_px = parse_entry_trigger_with_limit(args.take_entry, args.take_entry_limit, "take")
+        entry_trigger_plan = build_take_entry_order_plan(
+            coin,
+            is_buy,
+            amount,
+            asset,
+            exchange,
+            slippage,
+            take_trigger_px,
+            take_limit_px,
+            current_mid,
+        )
+        if args.verbose:
+            print("dex:", dex or "default")
+            print("current_mid:", mids.get(coin))
+            print("max_leverage:", max_leverage)
+            print("take_entry:", decimal_to_plain(take_trigger_px))
+            if take_limit_px is not None:
+                print("take_entry_limit:", decimal_to_plain(take_limit_px))
+        submit_order_plans(
+            exchange,
+            info,
+            account,
+            coin,
+            max_leverage,
+            [entry_trigger_plan],
+            "na",
+            args,
+            price_rate,
+            "Take Entry",
+        )
+        return
+
+    if args.reduce_only and has_tpsl:
+        place_protective_tpsl_orders(
+            args,
+            exchange,
+            info,
+            account,
+            coin,
+            dex,
+            asset,
+            is_buy,
+            amount,
+            slippage,
+            max_leverage,
+            price_rate,
+        )
+        return
+
+    entry_plan = build_entry_order_plan(
+        args,
+        info,
+        exchange,
+        coin,
+        asset,
+        is_buy,
+        amount,
+        current_mid,
+        slippage,
+    )
+    if args.take_profit or args.stop_loss:
+        child_plans = build_tpsl_child_plans(
+            args,
+            exchange,
+            coin,
+            asset,
+            is_buy,
+            entry_plan["size"],
+            amount,
+            slippage,
+            Decimal(str(entry_plan["reference_price"])),
+        )
+        plans = [entry_plan, *child_plans]
+        if args.verbose:
+            print("dex:", dex or "default")
+            print("current_mid:", mids.get(coin))
+            print("max_leverage:", max_leverage)
+            print("bracket_orders:", len(plans))
+        submit_order_plans(
+            exchange,
+            info,
+            account,
+            coin,
+            max_leverage,
+            plans,
+            "normalTpsl",
+            args,
+            price_rate,
+            "Bracket Orders",
+        )
+        return
+
+    price = entry_plan["limit_px"]
+    price_source = entry_plan["price_source"]
+    size = entry_plan["size"]
+    notional = entry_plan["notional"]
+    target_notional = entry_plan["target_notional"]
+    worst_notional = entry_plan["worst_notional"]
+    reference_price = entry_plan["reference_price"]
+    order_type = entry_plan["order_type"]
+    min_value_price = entry_plan["min_value_price"]
+    minimum_value_notional = entry_plan["minimum_value_notional"]
+    side = side_code(is_buy)
     if args.verbose:
         print("dex:", dex or "default")
         print("price_source:", price_source)
@@ -1331,7 +2301,7 @@ def place_order(args: argparse.Namespace) -> None:
         print("target_usd:", decimal_to_plain(target_notional))
         print("sz_decimals:", asset["szDecimals"])
         print("order_notional:", decimal_to_plain(notional))
-        if not args.market:
+        if min_value_price is not None and minimum_value_notional is not None:
             print("min_value_price:", decimal_to_plain(min_value_price))
             print("min_value_notional:", decimal_to_plain(minimum_value_notional))
         print("worst_notional:", decimal_to_plain(worst_notional))
@@ -1344,7 +2314,7 @@ def place_order(args: argparse.Namespace) -> None:
         if args.market:
             print_market_order_row(
                 coin,
-                side_code,
+                side,
                 reference_price,
                 price,
                 size,
@@ -1354,7 +2324,7 @@ def place_order(args: argparse.Namespace) -> None:
                 price_rate,
             )
         else:
-            print_order_row(coin, side_code, current_mid, price, notional, price_rate)
+            print_order_row(coin, side, current_mid, price, notional, price_rate)
         return
 
     leverage_mode, leverage_result = update_order_leverage(exchange, max_leverage, coin)
@@ -1402,10 +2372,10 @@ def place_order(args: argparse.Namespace) -> None:
                     price_rate,
                 )
             else:
-                print_order_row(coin, side_code, current_mid, price, notional, price_rate)
+                print_order_row(coin, side, current_mid, price, notional, price_rate)
             continue
         if "filled" in status:
-            print_filled_row(coin, side_code, status["filled"], size, price_rate)
+            print_filled_row(coin, side, status["filled"], size, price_rate)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1416,9 +2386,60 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--price", help="Limit price. Defaults to same-side book level 10.")
     parser.add_argument("--market", action="store_true", help="Submit as a market order using IOC with slippage protection.")
     parser.add_argument("--slippage", default=str(Exchange.DEFAULT_SLIPPAGE), help="Market slippage protection. Default: 0.05. Also accepts 5%%.")
-    parser.add_argument("--book-level", type=int, default=10, help="Same-side book level when --price is omitted.")
+    parser.add_argument("--level", "--book-level", dest="book_level", type=int, default=10, help="Same-side book level when --price is omitted.")
     parser.add_argument("--tif", choices=["Gtc", "Ioc", "Alo"], help="Time in force. Limit orders default to Alo.")
-    parser.add_argument("--reduce-only", action="store_true", help="Place a reduce-only order.")
+    parser.add_argument(
+        "--reduce-only",
+        action="store_true",
+        help="Place a reduce-only order. With --tp/--sl, this becomes a protective position TP/SL order.",
+    )
+    parser.add_argument(
+        "--stop-entry",
+        "--stop",
+        dest="stop_entry",
+        help="Stop entry trigger price. Use PRICE, PRICE+OFFSET, PRICE-OFFSET, PRICE+PERCENT, or PRICE-PERCENT.",
+    )
+    parser.add_argument(
+        "--stop-limit",
+        dest="stop_entry_limit",
+        help="Explicit limit price after --stop. Optional when you use PRICE+OFFSET inline syntax.",
+    )
+    parser.add_argument(
+        "--take-entry",
+        "--take",
+        dest="take_entry",
+        help="Take entry trigger price. Use PRICE, PRICE+OFFSET, PRICE-OFFSET, PRICE+PERCENT, or PRICE-PERCENT.",
+    )
+    parser.add_argument(
+        "--take-limit",
+        dest="take_entry_limit",
+        help="Explicit limit price after --take. Optional when you use PRICE+OFFSET inline syntax.",
+    )
+    parser.add_argument(
+        "--tp",
+        "--take-profit",
+        dest="take_profit",
+        help="Take-profit trigger price. Use ABS, ABS+OFFSET, or REL%%[+/-OFFSET] from the entry/position price.",
+    )
+    parser.add_argument(
+        "--sl",
+        "--stop-loss",
+        dest="stop_loss",
+        help="Stop-loss trigger price. Use ABS, ABS+OFFSET, or REL%%[+/-OFFSET] from the entry/position price.",
+    )
+    parser.add_argument(
+        "--tp-limit",
+        dest="take_profit_limit",
+        help="Explicit limit price for --tp. Inline +/- syntax can be used instead.",
+    )
+    parser.add_argument(
+        "--sl-limit",
+        dest="stop_loss_limit",
+        help="Explicit limit price for --sl. Inline +/- syntax can be used instead.",
+    )
+    parser.add_argument("--scale", type=int, help="Split total USD notional into this many limit orders.")
+    parser.add_argument("--from", dest="scale_from", help="First scale order price.")
+    parser.add_argument("--to", dest="scale_to", help="Last scale order price.")
     kline_group = parser.add_mutually_exclusive_group()
     kline_group.add_argument("--day", action="store_true", help="Show the last 30 daily candles in market overview mode.")
     kline_group.add_argument("--week", action="store_true", help="Show the last 52 weekly candles in market overview mode.")
@@ -1434,7 +2455,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query", "--status", action="store_true", help="Query all current positions and open orders.")
     parser.add_argument("--verbose", action="store_true", help="Print diagnostic details.")
     parser.add_argument("--submit", action="store_true", help=argparse.SUPPRESS)
-    args = parser.parse_args()
+    args = parser.parse_args(normalize_signed_option_values(sys.argv[1:]))
     query_words = {"query", "status", "positions", "orders", "持仓", "订单", "查询"}
     if args.coin and args.side is None and args.coin.strip().lower() in query_words:
         args.query = True
@@ -1445,6 +2466,54 @@ def parse_args() -> argparse.Namespace:
         parser.error("--market cannot be used with --price")
     if args.market and args.cancel is not None:
         parser.error("--market cannot be used with --cancel")
+    if args.stop_entry:
+        try:
+            parse_entry_trigger_with_limit(args.stop_entry, args.stop_entry_limit, "stop")
+        except ValueError as exc:
+            parser.error(str(exc))
+    elif args.stop_entry_limit:
+        parser.error("--stop-limit requires --stop/--stop-entry")
+    if args.take_entry:
+        try:
+            parse_entry_trigger_with_limit(args.take_entry, args.take_entry_limit, "take")
+        except ValueError as exc:
+            parser.error(str(exc))
+    elif args.take_entry_limit:
+        parser.error("--take-limit requires --take/--take-entry")
+    if args.stop_entry and args.reduce_only:
+        parser.error("--stop-entry cannot be used with --reduce-only")
+    if args.take_entry and args.reduce_only:
+        parser.error("--take-entry cannot be used with --reduce-only")
+    if args.stop_entry and (args.price or args.market or args.book_level != 10 or args.tif is not None):
+        parser.error("--stop-entry cannot be combined with --price, --market, --level, or --tif")
+    if args.take_entry and (args.price or args.market or args.book_level != 10 or args.tif is not None):
+        parser.error("--take-entry cannot be combined with --price, --market, --level, or --tif")
+    if (args.take_profit_limit and not args.take_profit) or (args.stop_loss_limit and not args.stop_loss):
+        parser.error("--tp-limit requires --tp, and --sl-limit requires --sl")
+    has_tpsl = bool(args.take_profit or args.stop_loss)
+    if args.stop_entry and args.take_entry:
+        parser.error("--stop-entry and --take-entry are mutually exclusive")
+    if args.stop_entry and has_tpsl:
+        parser.error("--stop-entry cannot be combined with --tp/--sl")
+    if args.take_entry and has_tpsl:
+        parser.error("--take-entry cannot be combined with --tp/--sl")
+    if args.scale is not None:
+        if args.scale < 2:
+            parser.error("--scale must be >= 2")
+        if not args.scale_from or not args.scale_to:
+            parser.error("--scale requires --from and --to")
+        if args.price or args.market or args.book_level != 10:
+            parser.error("--scale cannot be combined with --price, --market, or --level")
+        if has_tpsl or args.stop_entry or args.take_entry:
+            parser.error("--scale cannot be combined with --tp/--sl, --stop-entry, or --take-entry")
+    elif args.scale_from or args.scale_to:
+        parser.error("--from/--to require --scale")
+    if has_tpsl and args.cancel is not None:
+        parser.error("--tp/--sl cannot be combined with --cancel")
+    if args.stop_entry and args.cancel is not None:
+        parser.error("--stop-entry cannot be combined with --cancel")
+    if args.take_entry and args.cancel is not None:
+        parser.error("--take-entry cannot be combined with --cancel")
     return args
 
 
