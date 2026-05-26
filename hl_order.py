@@ -830,6 +830,21 @@ def cancel_order(
         )
 
 
+def update_order_leverage(exchange: Exchange, max_leverage: int, coin: str) -> tuple[str, dict[str, Any]]:
+    result = exchange.update_leverage(max_leverage, coin, is_cross=True)
+    log_event("update_leverage_result", {"mode": "cross", "result": result})
+    if result.get("status") == "ok":
+        return "cross", result
+
+    response = str(result.get("response", ""))
+    if "Cross margin is not allowed" not in response:
+        return "cross", result
+
+    result = exchange.update_leverage(max_leverage, coin, is_cross=False)
+    log_event("update_leverage_result", {"mode": "isolated", "result": result})
+    return "isolated", result
+
+
 def place_order(args: argparse.Namespace) -> None:
     if args.query:
         query_account(args)
@@ -935,12 +950,12 @@ def place_order(args: argparse.Namespace) -> None:
             print_order_row(coin, side_code, current_mid, price, notional, price_rate)
         return
 
-    leverage_result = exchange.update_leverage(max_leverage, coin, is_cross=True)
-    log_event("update_leverage_result", leverage_result)
+    leverage_mode, leverage_result = update_order_leverage(exchange, max_leverage, coin)
     if args.verbose:
+        print("leverage_mode:", leverage_mode)
         print("update_leverage_result:", leverage_result)
     if leverage_result.get("status") != "ok":
-        raise RuntimeError("Failed to update leverage; order was not submitted.")
+        raise RuntimeError(f"Failed to update {leverage_mode} leverage; order was not submitted.")
 
     result = exchange.order(
         coin,
