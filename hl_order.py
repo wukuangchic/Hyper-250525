@@ -920,7 +920,7 @@ def collect_account_positions_and_orders(info: Info, account: str) -> tuple[list
 
 def collect_recent_history(info: Info, account: str, coin: str | None = None, limit: int = 10) -> list[dict[str, str]]:
     now_ms = int(time.time() * 1000)
-    windows_days = [7, 30, 90, 365, 3650]
+    windows_days = [7, 14, 30]
     seen: set[tuple[str, int, int, str, str, str, str]] = set()
     entries: list[tuple[int, dict[str, str]]] = []
 
