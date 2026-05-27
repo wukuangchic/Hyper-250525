@@ -179,6 +179,17 @@ INDEX_HTML = r"""<!doctype html>
       margin-top: 6px;
     }
 
+    .history {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 10px;
+    }
+
+    .history.hidden {
+      display: none;
+    }
+
     .verified-row {
       display: grid;
       grid-template-columns: 1fr auto;
@@ -222,6 +233,19 @@ INDEX_HTML = r"""<!doctype html>
       color: var(--accent);
       border-color: var(--line);
       background: #fff;
+    }
+
+    button.history-item {
+      min-height: 32px;
+      padding: 6px 8px;
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--accent);
+      border-color: var(--line);
+      background: #fff;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
 
     button:disabled {
@@ -330,6 +354,7 @@ INDEX_HTML = r"""<!doctype html>
         <button id="clear" class="secondary small narrow">Clear</button>
         <button id="submit" class="flex">Run</button>
       </div>
+      <div id="history" class="history hidden"></div>
     </section>
 
     <section class="panel output-panel">
@@ -347,7 +372,12 @@ INDEX_HTML = r"""<!doctype html>
       account_address: "",
       secret_key: "",
       verified: false,
+      command_history: [],
+      command_history_index: -1,
+      command_history_draft: "",
     };
+
+    const COMMAND_HISTORY_LIMIT = 50;
 
     function setStatus(text, ready = false) {
       $("status").textContent = text;
@@ -384,6 +414,69 @@ INDEX_HTML = r"""<!doctype html>
           /\b(\d{2})-(\d{2}) (\d{2}):(\d{2})(?!:\d{2})\b/g,
           (_, month, day, hour, minute) => formatLocalShortTimestamp(month, day, hour, minute),
         );
+    }
+
+    function normalizeHistoryCommand(command) {
+      return String(command || "").trim();
+    }
+
+    function renderHistory() {
+      const history = $("history");
+      if (!state.command_history.length) {
+        history.innerHTML = "";
+        history.classList.add("hidden");
+        return;
+      }
+      history.classList.remove("hidden");
+      history.innerHTML = state.command_history.slice(0, 8).map((command, index) => {
+        const escaped = command
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;");
+        return `<button type="button" class="history-item" data-history-index="${index}" title="${escaped}">${escaped}</button>`;
+      }).join("");
+    }
+
+    function pushHistory(command) {
+      const normalized = normalizeHistoryCommand(command);
+      if (!normalized) return;
+      const existing = state.command_history.indexOf(normalized);
+      if (existing === 0) {
+        state.command_history_index = -1;
+        state.command_history_draft = "";
+        renderHistory();
+        return;
+      }
+      if (existing > 0) {
+        state.command_history.splice(existing, 1);
+      }
+      state.command_history.unshift(normalized);
+      if (state.command_history.length > COMMAND_HISTORY_LIMIT) {
+        state.command_history.length = COMMAND_HISTORY_LIMIT;
+      }
+      state.command_history_index = -1;
+      state.command_history_draft = "";
+      renderHistory();
+    }
+
+    function recallHistory(direction) {
+      if (!state.command_history.length) return;
+      const input = $("command");
+      if (state.command_history_index === -1) {
+        state.command_history_draft = input.value;
+      }
+      if (direction < 0) {
+        state.command_history_index = Math.min(state.command_history_index + 1, state.command_history.length - 1);
+      } else {
+        state.command_history_index = Math.max(state.command_history_index - 1, -1);
+      }
+      if (state.command_history_index === -1) {
+        input.value = state.command_history_draft;
+        return;
+      }
+      input.value = state.command_history[state.command_history_index];
+      input.setSelectionRange(input.value.length, input.value.length);
     }
 
     function credentials() {
@@ -441,9 +534,13 @@ INDEX_HTML = r"""<!doctype html>
         setOutput("Verify your wallet first.");
         return;
       }
+      const normalized = normalizeHistoryCommand(command);
+      if (normalized) {
+        pushHistory(normalized);
+      }
       try {
         setBusy(true);
-        renderRun(await apiRun(command));
+        renderRun(await apiRun(normalized));
       } catch (error) {
         setOutput(`error: ${error.message}`);
       } finally {
@@ -485,6 +582,8 @@ INDEX_HTML = r"""<!doctype html>
     function clearCommand() {
       const input = $("command");
       input.value = "";
+      state.command_history_index = -1;
+      state.command_history_draft = "";
       input.focus();
       input.setSelectionRange(0, 0);
     }
@@ -495,6 +594,20 @@ INDEX_HTML = r"""<!doctype html>
     });
     $("reverify").addEventListener("click", reverify);
     $("clear").addEventListener("click", clearCommand);
+    $("history").addEventListener("click", (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLButtonElement)) return;
+      const index = Number(target.dataset.historyIndex);
+      if (!Number.isInteger(index)) return;
+      const command = state.command_history[index];
+      if (!command) return;
+      const input = $("command");
+      input.value = command;
+      input.focus();
+      input.setSelectionRange(command.length, command.length);
+      state.command_history_index = -1;
+      state.command_history_draft = "";
+    });
     $("submit").addEventListener("click", () => {
       const command = $("command").value.trim();
       if (command && !isReadOnlyCommand(command)) {
@@ -504,12 +617,23 @@ INDEX_HTML = r"""<!doctype html>
     });
     $("query").addEventListener("click", () => run("query"));
     $("command").addEventListener("keydown", (event) => {
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        recallHistory(-1);
+        return;
+      }
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        recallHistory(1);
+        return;
+      }
       if (event.key === "Enter") {
         $("submit").click();
       }
     });
 
     syncAuth();
+    renderHistory();
   </script>
 </body>
 </html>
