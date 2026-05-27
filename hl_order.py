@@ -517,6 +517,36 @@ def parse_side(side: str) -> bool:
     raise ValueError(f"Unknown side: {side}. Use buy/long/看多 or sell/short/看空.")
 
 
+LADDER_FOR_SIDE_SPEC_RE = re.compile(r"^(?P<base_side>.+?)-for(?P<count>\d+)(?P<step_sign>[+-])(?P<step>\d+(?:\.\d+)?%?)$")
+LADDER_WHILE_SIDE_SPEC_RE = re.compile(r"^(?P<base_side>.+?)-while(?P<end>\d+(?:\.\d+)?)(?P<step_sign>[+-])(?P<step>\d+(?:\.\d+)?%?)$")
+
+
+def parse_side_ladder(side: str) -> tuple[bool, str | None, int | Decimal | None, str | None]:
+    text = side.strip().replace(" ", "")
+    match = LADDER_FOR_SIDE_SPEC_RE.fullmatch(text)
+    if match:
+        is_buy = parse_side(match.group("base_side"))
+        count = int(match.group("count"))
+        if count < 2:
+            raise ValueError("Ladder count must be >= 2")
+        step_spec = f"{match.group('step_sign')}{match.group('step')}"
+        return is_buy, "for", count, step_spec
+
+    match = LADDER_WHILE_SIDE_SPEC_RE.fullmatch(text)
+    if match:
+        is_buy = parse_side(match.group("base_side"))
+        end_px = Decimal(match.group("end"))
+        if end_px <= 0:
+            raise ValueError("Ladder end price must be positive")
+        step_spec = f"{match.group('step_sign')}{match.group('step')}"
+        return is_buy, "while", end_px, step_spec
+
+    if "*" in text:
+        raise ValueError("Old * ladder syntax is no longer supported. Use -forCOUNT+STEP or -whileEND+STEP.")
+
+    return parse_side(text), None, None, None
+
+
 def normalize_coin_input(raw_coin: str) -> list[str]:
     coin = canonical_coin_input(raw_coin)
     upper = coin.upper().replace("-", "").replace("/", "")
@@ -679,6 +709,80 @@ def scale_prices(start: Decimal, end: Decimal, count: int, sz_decimals: int) -> 
     price_keys = {decimal_to_plain(price) for price in prices}
     if len(price_keys) != len(prices):
         raise ValueError("Scale prices collapse to duplicates after rounding; widen the range or reduce --scale")
+    return prices
+
+
+def ladder_for_prices(start: Decimal, count: int, step: Decimal, sz_decimals: int, label: str) -> list[Decimal]:
+    if count < 2:
+        raise ValueError(f"{label} count must be >= 2")
+    if start <= 0:
+        raise ValueError(f"{label} start price must be positive")
+    if step == 0:
+        raise ValueError(f"{label} step must be non-zero")
+
+    prices: list[Decimal] = []
+    seen: set[str] = set()
+    current = start
+    for _ in range(count):
+        price = rounded_perp_price(current, sz_decimals)
+        price_key = decimal_to_plain(price)
+        if price_key in seen:
+            raise ValueError(f"{label} prices collapse to duplicates after rounding; widen the ladder or use a larger step")
+        seen.add(price_key)
+        prices.append(price)
+        current = current + step
+    return prices
+
+
+def resolve_ladder_step(base_px: Decimal, step_spec: str, label: str) -> Decimal:
+    text = step_spec.strip()
+    if not text or text[0] not in "+-":
+        raise ValueError(f"Invalid {label} step: {step_spec}. Use +STEP, -STEP, +PERCENT, or -PERCENT.")
+
+    sign = text[0]
+    magnitude_text = text[1:]
+    if not magnitude_text:
+        raise ValueError(f"Invalid {label} step: {step_spec}. Use +STEP, -STEP, +PERCENT, or -PERCENT.")
+
+    if magnitude_text.endswith("%"):
+        step = base_px * (Decimal(magnitude_text[:-1]) / Decimal("100"))
+    else:
+        step = Decimal(magnitude_text)
+    if step <= 0:
+        raise ValueError(f"{label} step must be positive")
+
+    return step if sign == "+" else -step
+
+
+def ladder_while_prices(start: Decimal, end: Decimal, step: Decimal, sz_decimals: int, label: str) -> list[Decimal]:
+    if step == 0:
+        raise ValueError(f"{label} step must be non-zero")
+    if start <= 0 or end <= 0:
+        raise ValueError(f"{label} start and end prices must be positive")
+    if step > 0 and end < start:
+        raise ValueError(f"{label} end price must be at or above the start price for a positive step")
+    if step < 0 and end > start:
+        raise ValueError(f"{label} end price must be at or below the start price for a negative step")
+
+    prices: list[Decimal] = []
+    seen: set[str] = set()
+    current = start
+    while True:
+        price = rounded_perp_price(current, sz_decimals)
+        price_key = decimal_to_plain(price)
+        if price_key in seen:
+            raise ValueError(f"{label} prices collapse to duplicates after rounding; widen the ladder or use a larger step")
+        seen.add(price_key)
+        prices.append(price)
+
+        next_raw = current + step
+        if step > 0:
+            if next_raw > end:
+                break
+        else:
+            if next_raw < end:
+                break
+        current = next_raw
     return prices
 
 
@@ -1634,6 +1738,46 @@ def update_order_leverage(exchange: Exchange, max_leverage: int, coin: str) -> t
     return "isolated", result
 
 
+def build_limit_order_plan(
+    coin: str,
+    is_buy: bool,
+    amount: Decimal,
+    asset: dict[str, Any],
+    price: Decimal,
+    reduce_only: bool,
+    tif: str | None,
+    current_mid: Decimal | None,
+    label: str = "entry",
+    price_source: str = "user",
+) -> dict[str, Any]:
+    sz_decimals = int(asset["szDecimals"])
+    price = rounded_perp_price(price, sz_decimals)
+    min_value_price = min(price, current_mid) if current_mid is not None else price
+    size, notional, target_notional, minimum_value_notional = calc_size(
+        amount,
+        price,
+        sz_decimals,
+        min_value_price,
+    )
+    return {
+        "label": label,
+        "coin": coin,
+        "is_buy": is_buy,
+        "size": size,
+        "limit_px": price,
+        "order_type": {"limit": {"tif": tif or "Alo"}},
+        "reduce_only": reduce_only,
+        "mode": "limit",
+        "notional": notional,
+        "target_notional": target_notional,
+        "worst_notional": notional,
+        "reference_price": price,
+        "price_source": price_source,
+        "minimum_value_notional": minimum_value_notional,
+        "min_value_price": min_value_price,
+    }
+
+
 def build_entry_order_plan(
     args: argparse.Namespace,
     info: Info,
@@ -1669,18 +1813,18 @@ def build_entry_order_plan(
         else:
             price = same_side_book_price(info, coin, is_buy, args.book_level)
             price_source = f"same-side book level {args.book_level}"
-        price = rounded_perp_price(price, sz_decimals)
-        min_value_price = min(price, current_mid) if current_mid is not None else price
-        size, notional, target_notional, minimum_value_notional = calc_size(
+        return build_limit_order_plan(
+            coin,
+            is_buy,
             amount,
-            price,
-            sz_decimals,
-            min_value_price,
+            asset,
+            Decimal(price),
+            args.reduce_only,
+            args.tif,
+            current_mid,
+            label="entry",
+            price_source=price_source,
         )
-        reference_price = price
-        worst_notional = notional
-        order_type = {"limit": {"tif": args.tif or "Alo"}}
-        mode = "limit"
 
     return {
         "label": "entry",
@@ -1956,6 +2100,7 @@ def submit_order_plans(
     args: argparse.Namespace,
     price_rate: Decimal | None,
     title: str,
+    update_leverage: bool = True,
 ) -> None:
     if args.dry_run:
         print_account_metrics(info, account)
@@ -1963,12 +2108,13 @@ def submit_order_plans(
         print_order_plan_table(title, plans, price_rate)
         return
 
-    leverage_mode, leverage_result = update_order_leverage(exchange, max_leverage, coin)
-    if args.verbose:
-        print("leverage_mode:", leverage_mode)
-        print("update_leverage_result:", leverage_result)
-    if leverage_result.get("status") != "ok":
-        raise RuntimeError(f"Failed to update {leverage_mode} leverage; order was not submitted.")
+    if update_leverage:
+        leverage_mode, leverage_result = update_order_leverage(exchange, max_leverage, coin)
+        if args.verbose:
+            print("leverage_mode:", leverage_mode)
+            print("update_leverage_result:", leverage_result)
+        if leverage_result.get("status") != "ok":
+            raise RuntimeError(f"Failed to update {leverage_mode} leverage; order was not submitted.")
 
     requests = [order_plan_request(plan) for plan in plans]
     result = exchange.bulk_orders(requests, grouping=grouping)
@@ -2133,6 +2279,163 @@ def place_scale_orders(
     )
 
 
+def place_ladder_orders(
+    args: argparse.Namespace,
+    exchange: Exchange,
+    info: Info,
+    account: str,
+    coin: str,
+    asset: dict[str, Any],
+    is_buy: bool,
+    amount: Decimal,
+    current_mid: Decimal | None,
+    slippage: Decimal,
+    max_leverage: int,
+    price_rate: Decimal | None,
+) -> None:
+    sz_decimals = int(asset["szDecimals"])
+    has_tpsl = bool(args.take_profit or args.stop_loss)
+    ladder_mode = args.ladder_mode
+    ladder_step_spec = str(args.ladder_step)
+    trigger_mode = None
+    trigger_limit_offset: Decimal | None = None
+    if args.stop_entry:
+        trigger_mode = "stop-entry"
+        trigger_start_px, trigger_limit_px = parse_entry_trigger_with_limit(args.stop_entry, args.stop_entry_limit, "stop")
+        base_price = rounded_perp_price(trigger_start_px, sz_decimals)
+        if trigger_limit_px is not None:
+            trigger_limit_offset = rounded_perp_price(trigger_limit_px, sz_decimals) - base_price
+        price_source = "stop-entry anchor"
+    elif args.take_entry:
+        trigger_mode = "take-entry"
+        trigger_start_px, trigger_limit_px = parse_entry_trigger_with_limit(args.take_entry, args.take_entry_limit, "take")
+        base_price = rounded_perp_price(trigger_start_px, sz_decimals)
+        if trigger_limit_px is not None:
+            trigger_limit_offset = rounded_perp_price(trigger_limit_px, sz_decimals) - base_price
+        price_source = "take-entry anchor"
+    elif args.price:
+        base_price = Decimal(args.price)
+        price_source = "user"
+        base_price = rounded_perp_price(base_price, sz_decimals)
+    else:
+        base_price = same_side_book_price(info, coin, is_buy, args.book_level)
+        price_source = f"same-side book level {args.book_level}"
+        base_price = rounded_perp_price(base_price, sz_decimals)
+
+    step = resolve_ladder_step(base_price, ladder_step_spec, "ladder")
+    if ladder_mode == "for":
+        ladder_count = int(args.ladder_count)
+        prices = ladder_for_prices(base_price, ladder_count, step, sz_decimals, "ladder")
+    elif ladder_mode == "while":
+        ladder_end_px = rounded_perp_price(Decimal(str(args.ladder_end)), sz_decimals)
+        prices = ladder_while_prices(base_price, ladder_end_px, step, sz_decimals, "ladder")
+    else:
+        raise ValueError("Ladder orders require -for or -while syntax")
+
+    if trigger_mode and has_tpsl:
+        raise ValueError(
+            "Ladder trigger orders cannot be combined with --tp/--sl in a single submit. "
+            "Hyperliquid normalTpsl requires a non-trigger main order. "
+            "Use trigger ladders alone, or place TP/SL separately after fill."
+        )
+
+    if trigger_mode:
+        title = "Ladder Trigger Orders Bracket" if has_tpsl else "Ladder Trigger Orders"
+        prefix = f"ladder-{trigger_mode}"
+    else:
+        title = "Ladder Orders Bracket" if has_tpsl else "Ladder Orders"
+        prefix = f"ladder-{ladder_mode}"
+
+    plans: list[dict[str, Any]] = []
+    grouped_plans: list[list[dict[str, Any]]] = []
+    for index, price in enumerate(prices, start=1):
+        if trigger_mode:
+            trigger_limit_px = None if trigger_limit_offset is None else rounded_perp_price(price + trigger_limit_offset, sz_decimals)
+            entry_plan = build_trigger_order_plan(
+                coin,
+                is_buy,
+                amount,
+                asset,
+                exchange,
+                slippage,
+                trigger_mode,
+                price,
+                trigger_limit_px,
+                args.reduce_only,
+            )
+            entry_plan["label"] = f"{index}/{len(prices)} {trigger_mode}"
+            entry_plan["price_source"] = f"{price_source} {prefix} {index}/{len(prices)}"
+        else:
+            entry_plan = build_limit_order_plan(
+                coin,
+                is_buy,
+                amount,
+                asset,
+                price,
+                args.reduce_only,
+                args.tif,
+                current_mid,
+                label=f"{index}/{len(prices)}",
+                price_source=f"{price_source} {prefix} {index}/{len(prices)}",
+            )
+        entry_plan["mode"] = prefix
+        plans.append(entry_plan)
+        group_plans = [entry_plan]
+        if has_tpsl:
+            child_plans = build_tpsl_child_plans(
+                args,
+                exchange,
+                coin,
+                asset,
+                is_buy,
+                entry_plan["size"],
+                amount,
+                slippage,
+                Decimal(str(entry_plan["reference_price"])),
+            )
+            for child in child_plans:
+                child["label"] = f"{index}/{len(prices)} {child['label']}"
+            group_plans.extend(child_plans)
+        grouped_plans.append(group_plans)
+
+    if args.dry_run:
+        display_plans = plans if not has_tpsl else [plan for group in grouped_plans for plan in group]
+        print_account_metrics(info, account)
+        print_box("Run", [("dry_run", "1")])
+        print_order_plan_table(title, display_plans, price_rate)
+        return
+
+    if not has_tpsl:
+        submit_order_plans(
+            exchange,
+            info,
+            account,
+            coin,
+            max_leverage,
+            plans,
+            "na",
+            args,
+            price_rate,
+            title,
+        )
+        return
+
+    for index, group_plans in enumerate(grouped_plans):
+        submit_order_plans(
+            exchange,
+            info,
+            account,
+            coin,
+            max_leverage,
+            group_plans,
+            "normalTpsl",
+            args,
+            price_rate,
+            title,
+            update_leverage=index == 0,
+        )
+
+
 def place_order(args: argparse.Namespace) -> None:
     if args.query:
         query_account(args)
@@ -2185,6 +2488,23 @@ def place_order(args: argparse.Namespace) -> None:
     current_mid = Decimal(str(mids[coin])) if mids.get(coin) is not None else None
     log_event("all_mids_sample", {"dex": dex or "default", "coin": coin, "mid": mids.get(coin)})
     max_leverage = int(asset["maxLeverage"])
+
+    if args.ladder_mode is not None:
+        place_ladder_orders(
+            args,
+            exchange,
+            info,
+            account,
+            coin,
+            asset,
+            is_buy,
+            amount,
+            current_mid,
+            slippage,
+            max_leverage,
+            price_rate,
+        )
+        return
 
     if args.scale:
         place_scale_orders(
@@ -2500,7 +2820,11 @@ def place_order(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Place or cancel a small Hyperliquid perp order.")
     parser.add_argument("coin", nargs="?", help="Perp name, e.g. BTC, ETH, SOL, or BTCUSDC. Use query/status to list account state.")
-    parser.add_argument("side", nargs="?", help="buy/long/看多 or sell/short/看空. Not needed with --cancel.")
+    parser.add_argument(
+        "side",
+        nargs="?",
+        help="buy/long/看多 or sell/short/看空. You can append -forCOUNT+STEP for count ladders or -whileEND+STEP for range ladders, e.g. buy-for5-1000 or sell-while85000+1000. Not needed with --cancel.",
+    )
     parser.add_argument("amount", nargs="?", default="10", help="USD notional. Default: 10.")
     parser.add_argument("--price", help="Limit price. Defaults to same-side book level 10.")
     parser.add_argument("--market", action="store_true", help="Submit as a market order using IOC with slippage protection.")
@@ -2579,12 +2903,30 @@ def parse_args() -> argparse.Namespace:
     if args.coin and args.side is None and args.coin.strip().lower() in query_words:
         args.query = True
         args.coin = ""
+    args.ladder_mode = None
+    args.ladder_count = None
+    args.ladder_end = None
+    args.ladder_step = None
+    if args.side is not None:
+        try:
+            is_buy, ladder_mode, ladder_value, ladder_step = parse_side_ladder(args.side)
+        except ValueError as exc:
+            parser.error(str(exc))
+        args.side = "buy" if is_buy else "sell"
+        args.ladder_mode = ladder_mode
+        args.ladder_step = ladder_step
+        if ladder_mode == "for":
+            args.ladder_count = int(ladder_value)
+        elif ladder_mode == "while":
+            args.ladder_end = ladder_value
     if not args.query and not args.coin:
         parser.error("coin is required unless query/status or --query is used")
     if args.market and args.price:
         parser.error("--market cannot be used with --price")
     if args.market and args.cancel is not None:
         parser.error("--market cannot be used with --cancel")
+    if args.ladder_mode is not None and args.market:
+        parser.error("Ladder orders cannot use --market")
     if args.stop_entry:
         try:
             parse_entry_trigger_with_limit(args.stop_entry, args.stop_entry_limit, "stop")
@@ -2599,19 +2941,25 @@ def parse_args() -> argparse.Namespace:
             parser.error(str(exc))
     elif args.take_entry_limit:
         parser.error("--take-limit requires --take/--take-entry")
-    if args.stop_entry and args.reduce_only:
+    if args.stop_entry and args.reduce_only and args.ladder_mode is None:
         parser.error("--stop-entry cannot be used with --reduce-only")
-    if args.take_entry and args.reduce_only:
+    if args.take_entry and args.reduce_only and args.ladder_mode is None:
         parser.error("--take-entry cannot be used with --reduce-only")
-    if args.stop_entry and (args.price or args.market or args.book_level != 10 or args.tif is not None):
+    if args.stop_entry and args.ladder_mode is None and (args.price or args.market or args.book_level != 10 or args.tif is not None):
         parser.error("--stop-entry cannot be combined with --price, --market, --level, or --tif")
-    if args.take_entry and (args.price or args.market or args.book_level != 10 or args.tif is not None):
+    if args.take_entry and args.ladder_mode is None and (args.price or args.market or args.book_level != 10 or args.tif is not None):
         parser.error("--take-entry cannot be combined with --price, --market, --level, or --tif")
     if (args.take_profit_limit and not args.take_profit) or (args.stop_loss_limit and not args.stop_loss):
         parser.error("--tp-limit requires --tp, and --sl-limit requires --sl")
     has_tpsl = bool(args.take_profit or args.stop_loss)
     if args.stop_entry and args.take_entry:
         parser.error("--stop-entry and --take-entry are mutually exclusive")
+    if args.ladder_mode is not None and args.scale is not None:
+        parser.error("Ladder orders cannot be combined with --scale")
+    if args.ladder_mode is not None and (args.stop_entry or args.take_entry) and has_tpsl:
+        parser.error("Ladder trigger orders cannot combine --stop/--take with --tp/--sl")
+    if args.ladder_mode is not None and has_tpsl and args.reduce_only:
+        parser.error("Ladder orders cannot combine --reduce-only with --tp/--sl")
     if args.scale is not None:
         if args.scale < 2:
             parser.error("--scale must be >= 2")

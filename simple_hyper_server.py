@@ -548,13 +548,13 @@ README_HTML = r"""<!doctype html>
       <h2>Command Shape</h2>
       <ul>
         <li><code>coin</code>, for example <code>BTC</code></li>
-        <li><code>buy/sell</code>, or <code>query</code></li>
+        <li><code>buy/sell</code>, or <code>query</code>. You can also write a count ladder like <code>buy-for5-1000</code> or a range ladder like <code>sell-while85000+1000</code>.</li>
         <li><code>amount</code>, default <code>10</code></li>
         <li><code>entry/exec</code> options: <code>--market</code>, <code>--price</code>, <code>--stop</code>, <code>--stop-limit</code>, <code>--take</code>, <code>--take-limit</code>, <code>--level</code>, <code>--tif</code>, <code>--slippage</code></li>
         <li><code>tp/sl</code>: <code>--tp</code>, <code>--sl</code></li>
         <li><code>--reduce-only</code></li>
       </ul>
-      <p><code>--stop</code> / <code>--take</code> are entry triggers. <code>--stop</code> is breakout style and <code>--take</code> is if-touched style. You can append <code>+50</code>, <code>-50</code>, <code>+0.2%</code>, or <code>-0.2%</code> to set the post-trigger limit price; without a suffix the order is a market trigger. <code>--stop-limit</code> / <code>--take-limit</code> still work as explicit equivalents. Percent is literal: <code>70000+2%</code> means <code>71400</code>, while <code>70140</code> is <code>70000+0.2%</code>. These trigger-limit styles are not <code>ALO</code>; only plain limit orders use <code>--tif</code>. <code>--tp</code> / <code>--sl</code> also accept absolute prices, absolute prices plus offsets, or relative percentages from the entry / position price such as <code>2%+0.1%</code> and <code>-2%-0.1%</code>. You can append <code>d0.6</code> or <code>d60%</code> to close only part of the order. Entry triggers can also be combined with <code>--tp</code> / <code>--sl</code> into a bracket order. Without <code>--reduce-only</code> they form a bracket order, and with it they protect an existing position. <code>--level</code> is the main name for the same-side book depth; <code>--book-level</code> still works as an alias.</p>
+      <p><code>--stop</code> / <code>--take</code> are entry triggers. <code>--stop</code> is breakout style and <code>--take</code> is if-touched style. You can append <code>+50</code>, <code>-50</code>, <code>+0.2%</code>, or <code>-0.2%</code> to set the post-trigger limit price; without a suffix the order is a market trigger. <code>--stop-limit</code> / <code>--take-limit</code> still work as explicit equivalents. Percent is literal: <code>70000+2%</code> means <code>71400</code>, while <code>70140</code> is <code>70000+0.2%</code>. These trigger-limit styles are not <code>ALO</code>; only plain limit orders use <code>--tif</code>. <code>--tp</code> / <code>--sl</code> also accept absolute prices, absolute prices plus offsets, or relative percentages from the entry / position price such as <code>2%+0.1%</code> and <code>-2%-0.1%</code>. You can append <code>d0.6</code> or <code>d60%</code> to close only part of the order. <code>buy-forCOUNT+STEP</code> is a count ladder and <code>buy-whileEND+STEP</code> is a range ladder; both place independent orders. Ordinary ladders can also carry <code>--tp</code> / <code>--sl</code>, with each ladder leg getting its own bracket. Trigger ladders can also use <code>--stop</code> / <code>--take</code> so each leg gets its own trigger anchor. That trigger-ladder mode can work with <code>--reduce-only</code>, but it cannot share the same submit with <code>--tp</code> / <code>--sl</code> because <code>normalTpsl</code> requires a non-trigger main order. It is different from <code>--scale</code>, which splits a total amount evenly. <code>--level</code> is the main name for the same-side book depth; <code>--book-level</code> still works as an alias.</p>
     </section>
     <section>
       <h2>Flow</h2>
@@ -584,6 +584,10 @@ README_HTML = r"""<!doctype html>
         <li><code>BTC buy 100 --price 68000 --tp 72000 --sl 65000 --dry-run</code></li>
         <li><code>BTC buy 30 --stop 80000-10 --tp 0.6%+0d0.6 --dry-run</code></li>
         <li><code>BTC buy 100 --scale 5 --from 67000 --to 63000 --dry-run</code></li>
+        <li><code>BTC buy-for5-1000 --price 67000 --dry-run</code></li>
+        <li><code>BTC sell-while85000+1000 --price 80000 --dry-run</code></li>
+        <li><code>BTC sell-while80000+1000 10 --stop 77000 --reduce-only --dry-run</code></li>
+        <li><code>BTC buy-for5-1000 --price 67000 --tp 5%+0 --sl -2%-10 --dry-run</code></li>
         <li><code>BTC --cancel --dry-run</code></li>
         <li><code>BTC --cancel 441260592983 --dry-run</code></li>
       </ul>
@@ -603,6 +607,7 @@ README_HTML = r"""<!doctype html>
         <li>Trigger-limit orders are not <code>ALO</code>; only plain limit orders use <code>--tif</code>.</li>
         <li><code>--tp</code> / <code>--sl</code> can use absolute prices, absolute prices plus offsets, or relative percentages from the entry / position price such as <code>2%+0.1%</code> and <code>-2%-0.1%</code>.</li>
         <li><code>--tp</code> / <code>--sl</code> without <code>--reduce-only</code> create a bracket order; with <code>--reduce-only</code> they create protective position TP/SL orders.</li>
+        <li><code>buy-forCOUNT+STEP</code> is a count ladder and <code>buy-whileEND+STEP</code> is a range ladder; both place independent orders. Ordinary ladders can also carry <code>--tp</code> / <code>--sl</code>, with each ladder leg getting its own bracket. Trigger ladders can also use <code>--stop</code> / <code>--take</code> so each leg gets its own trigger anchor. That trigger-ladder mode can work with <code>--reduce-only</code>, but it cannot share the same submit with <code>--tp</code> / <code>--sl</code> because <code>normalTpsl</code> requires a non-trigger main order. It is different from <code>--scale</code>, which splits a total amount evenly.</li>
         <li><code>--level</code> is the main name for the same-side book depth; <code>--book-level</code> still works as an alias.</li>
         <li><code>--scale</code> splits a total USD amount into multiple limit orders.</li>
         <li>The command box is parsed as <code>hl_order.py</code> arguments, not as a shell command.</li>

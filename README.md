@@ -7,7 +7,7 @@
 下单命令从前到后可以记成 6 段：
 
 1. `coin`，例如 `BTC`
-2. `buy/sell`，或 `query`
+2. `buy/sell`，或 `query`。你也可以写成 `buy-for5-1000` 这种 count 梯子，或者 `sell-while85000+1000` 这种 range 梯子。
 3. `amount`，默认 `10`
 4. `entry/exec` 选项，常用的是 `--market`、`--price`、`--stop`、`--stop-limit`、`--take`、`--take-limit`、`--level`、`--tif`、`--slippage`
 5. `tp/sl`，就是 `--tp`、`--sl`
@@ -23,6 +23,9 @@
 - `--stop` / `--take` 可以和 `--tp` / `--sl` 组合成 entry-trigger bracket，和普通价格单的 bracket 一样，只是父单先变成触发单。
 - 这类百分比算出来的触发价和限价，会先对齐到交易所可接受的价格精度，再提交下单。
 - 这种带触发的偏移限价不是 `ALO`；它们是 trigger-limit。只有普通限价单才会走 `--tif`。
+- `buy-forCOUNT+STEP` 这种 count 梯子和 `buy-whileEND+STEP` 这种 range 梯子，都会按每一档独立下单。它们和 `--scale` 不一样，`--scale` 还是把总金额平均拆成多张限价单。
+- 普通梯子可以再配 `--tp` / `--sl`，每一档都会带自己的 bracket。
+- 触发梯子可以再配 `--stop` / `--take`，让每一档按自己的触发点展开；这种模式可以和 `--reduce-only` 一起用，但不能再把 `--tp` / `--sl` 放进同一条命令里。
 - `--tp` / `--sl` 是止盈止损；不加 `--reduce-only` 时是 bracket，加了 `--reduce-only` 时是保护已有仓位。
 - 不写价格时，限价单默认按同向订单簿第 `10` 档挂单，且默认 `ALO`。`--level` 是主写法，`--book-level` 仍然保留作兼容别名。
 
@@ -277,6 +280,8 @@ journalctl -u simple-hyper-sync.service -n 80 --no-pager
 - 加 `--tp` / `--sl` 且不加 `--reduce-only` 时，会用 `normalTpsl` 一次提交开仓单和子止盈 / 止损单。
 - 加 `--tp` / `--sl` 且同时加 `--reduce-only` 时，会按 `positionTpsl` 提交保护已有仓位的触发单。
 - 加 `--scale` 时，会把总金额平均拆成多张限价单；每张子单金额必须至少 `10` 美元。
+- 写成 `buy-forCOUNT+STEP` 或 `buy-whileEND+STEP` 的梯子单时，会按每一档独立下单。普通梯子可以再配 `--tp` / `--sl`，每一档都会带自己的 bracket。
+- 触发梯子可以再配 `--stop` / `--take`，让每一档按自己的触发点展开；这种模式可以和 `--reduce-only` 一起用，但不能再把 `--tp` / `--sl` 放进同一条命令里。
 - 真实下单前，默认把当前合约 cross 杠杆设置为 `maxLeverage`；如果标的不支持 cross，会自动切到 isolated，默认使用 `5x`。
 - 如果数量 round 后名义价值低于 `10` 美元，会向上补一个数量步进。
 - 前台默认精简输出，完整日志写入 `logs/`。
@@ -349,6 +354,18 @@ BTC buy 30 --stop 80000-10 --tp 0.6%+0d0.6
 
 # 分批挂单，从 67000 到 63000 平均拆 5 笔
 BTC buy 100 --scale 5 --from 67000 --to 63000
+
+# 梯子单，从 67000 开始每档差 1000
+BTC buy-for5-1000 --price 67000
+
+# 区间梯子单，从 80000 一路挂到 85000，每档差 1000
+BTC sell-while85000+1000 --price 80000
+
+# 触发梯子，只做减仓
+BTC sell-while80000+1000 10 --stop 77000 --reduce-only
+
+# 普通梯子 + 每档自己的 TP/SL
+BTC buy-for5-1000 --price 67000 --tp 5%+0 --sl -2%-10
 
 # 取消 BTC 所有挂单
 BTC --cancel
@@ -498,9 +515,15 @@ BTC buy 100 --price 68000 --tp 72000 --tp-limit 71900 --sl 65000 --sl-limit 6480
 ```bash
 BTC buy 100 --scale 5 --from 67000 --to 63000
 BTC sell 200 --scale 4 --from 72000 --to 76000 --reduce-only
+
+# 梯子单
+BTC buy-for5-1000 --price 67000
+BTC sell-while85000+1000 --price 80000
+BTC buy-for5-1000 --price 67000 --tp 5%+0 --sl -2%-10
 ```
 
 `--scale` 会把总金额平均分到每个价格；例如 `100` 美元拆 `5` 笔，就是每笔约 `20` 美元。拆分后每笔必须至少 `10` 美元。
+`buy-forCOUNT+STEP` 这种 count 梯子和 `buy-whileEND+STEP` 这种 range 梯子，会把每一档当成独立订单；普通梯子可以再配 `--tp` / `--sl`，每一档都会带自己的 bracket。梯子如果再配 `--stop` / `--take`，每一档会按自己的触发点展开，但这时不能再把 `--tp` / `--sl` 和它们放进同一条命令里。
 
 查询指令会返回当前所有 DEX 的持仓和未成订单：
 
