@@ -297,19 +297,19 @@ INDEX_HTML = r"""<!doctype html>
       <div id="status" class="status">Not verified</div>
     </header>
 
-    <section id="authPanel" class="panel">
+    <form id="authPanel" class="panel" autocomplete="on">
       <div class="field">
         <label for="account">Wallet Address</label>
-        <input id="account" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="0x...">
+        <input id="account" name="account_address" autocomplete="username" autocapitalize="off" spellcheck="false" placeholder="0x...">
       </div>
       <div class="field">
         <label for="secret">Private Key or Agent Key</label>
-        <input id="secret" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="0x...">
+        <input id="secret" name="secret_key" type="password" autocomplete="current-password" autocapitalize="off" spellcheck="false" placeholder="0x...">
       </div>
       <div class="buttons">
-        <button id="verify">Verify</button>
+        <button id="verify" type="submit">Verify</button>
       </div>
-    </section>
+    </form>
 
     <section id="verifiedPanel" class="panel hidden">
       <div class="verified-row">
@@ -462,7 +462,10 @@ INDEX_HTML = r"""<!doctype html>
       input.setSelectionRange(0, 0);
     }
 
-    $("verify").addEventListener("click", verify);
+    $("authPanel").addEventListener("submit", (event) => {
+      event.preventDefault();
+      verify();
+    });
     $("reverify").addEventListener("click", reverify);
     $("clear").addEventListener("click", clearCommand);
     $("submit").addEventListener("click", () => {

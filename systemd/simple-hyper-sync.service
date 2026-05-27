@@ -1,0 +1,10 @@
+[Unit]
+Description=Simple-Hyper GitHub sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/simple-hyper
+ExecStart=/opt/simple-hyper/scripts/simple-hyper-sync.sh
+

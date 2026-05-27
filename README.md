@@ -231,6 +231,22 @@ sudo systemctl restart simple-hyper.service
 
 服务器 C 使用 `simple-hyper-sync.timer` 定时从 GitHub `main` 同步代码并重启 `simple-hyper.service`。同步脚本保留服务器本机的 `.venv/`、`logs/` 和 `coin_aliases.csv`，避免覆盖运行环境、历史日志和本机别名表。
 
+仓库里已经带了同步脚本和 systemd 单元，文件分别是：
+
+- [scripts/simple-hyper-sync.sh](/Users/wukuangchicsmacbook/Library/Mobile%20Documents/com~apple~CloudDocs/Downloads/Hyper-250525/scripts/simple-hyper-sync.sh)
+- [systemd/simple-hyper-sync.service](/Users/wukuangchicsmacbook/Library/Mobile%20Documents/com~apple~CloudDocs/Downloads/Hyper-250525/systemd/simple-hyper-sync.service)
+- [systemd/simple-hyper-sync.timer](/Users/wukuangchicsmacbook/Library/Mobile%20Documents/com~apple~CloudDocs/Downloads/Hyper-250525/systemd/simple-hyper-sync.timer)
+
+安装到服务器时，把 repo 放在 `/opt/simple-hyper`，然后执行：
+
+```bash
+chmod +x scripts/simple-hyper-sync.sh
+sudo cp systemd/simple-hyper-sync.service /etc/systemd/system/
+sudo cp systemd/simple-hyper-sync.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now simple-hyper-sync.timer
+```
+
 检查同步状态：
 
 ```bash

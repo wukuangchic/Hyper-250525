@@ -1,0 +1,13 @@
+[Unit]
+Description=Run Simple-Hyper GitHub sync periodically
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+RandomizedDelaySec=20s
+Persistent=true
+Unit=simple-hyper-sync.service
+
+[Install]
+WantedBy=timers.target
