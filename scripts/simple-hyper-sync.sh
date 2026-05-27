@@ -2,50 +2,79 @@
 set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-REMOTE="${SIMPLE_HYPER_SYNC_REMOTE:-origin}"
-BRANCH="${SIMPLE_HYPER_SYNC_BRANCH:-main}"
 SERVICE="${SIMPLE_HYPER_SERVICE:-simple-hyper.service}"
+SOURCE_URL="${SIMPLE_HYPER_SYNC_URL:-https://codeload.github.com/wukuangchic/Hyper-250525/tar.gz/refs/heads/main}"
+STATE_FILE="${SIMPLE_HYPER_SYNC_STATE_FILE:-/var/lib/simple-hyper-sync/main.etag}"
 LOCK_FILE="${SIMPLE_HYPER_SYNC_LOCK_FILE:-/run/simple-hyper-sync.lock}"
 
+mkdir -p "$(dirname "$STATE_FILE")"
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
   echo "simple-hyper-sync: another run is already active"
   exit 0
 fi
 
-cd "$PROJECT_DIR"
+current_etag=""
+if [ -f "$STATE_FILE" ]; then
+  current_etag="$(tr -d '\r\n' < "$STATE_FILE")"
+fi
 
-if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  echo "simple-hyper-sync: $PROJECT_DIR is not a git repository" >&2
+headers="$(curl -fsSI --connect-timeout 15 --max-time 60 "$SOURCE_URL")"
+target_etag="$(printf '%s\n' "$headers" | awk 'BEGIN{IGNORECASE=1} /^etag:/ {sub(/\r$/, "", $2); print $2; exit}')"
+
+if [ -z "$target_etag" ]; then
+  echo "simple-hyper-sync: unable to read GitHub tarball ETag" >&2
   exit 1
 fi
 
-current_rev="$(git rev-parse HEAD)"
-git fetch --prune "$REMOTE" "$BRANCH"
-target_rev="$(git rev-parse "$REMOTE/$BRANCH")"
-
-if [ "$current_rev" = "$target_rev" ]; then
-  echo "simple-hyper-sync: already up to date at $target_rev"
+if [ "$current_etag" = "$target_etag" ]; then
+  echo "simple-hyper-sync: already up to date at $target_etag"
   exit 0
 fi
 
+tmp_root="$(mktemp -d)"
 alias_backup=""
-if [ -f coin_aliases.csv ]; then
-  alias_backup="$(mktemp)"
-  cp coin_aliases.csv "$alias_backup"
+cleanup() {
+  rm -rf "$tmp_root"
+  if [ -n "$alias_backup" ]; then
+    rm -f "$alias_backup"
+  fi
+}
+trap cleanup EXIT
+
+curl -fsSL --connect-timeout 15 --max-time 120 "$SOURCE_URL" -o "$tmp_root/repo.tar.gz"
+tar -xzf "$tmp_root/repo.tar.gz" -C "$tmp_root"
+
+source_dir="$(find "$tmp_root" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+if [ -z "$source_dir" ] || [ ! -d "$source_dir" ]; then
+  echo "simple-hyper-sync: failed to unpack GitHub tarball" >&2
+  exit 1
 fi
 
-git checkout -B "$BRANCH" "$REMOTE/$BRANCH" >/dev/null
-git reset --hard "$REMOTE/$BRANCH" >/dev/null
+if [ -f "$PROJECT_DIR/coin_aliases.csv" ]; then
+  alias_backup="$(mktemp)"
+  cp "$PROJECT_DIR/coin_aliases.csv" "$alias_backup"
+fi
+
+rsync -a --delete \
+  --exclude '.venv/' \
+  --exclude 'logs/' \
+  --exclude '.env' \
+  --exclude '.simple-hyper-sync.etag' \
+  --exclude '.git/' \
+  --exclude 'coin_aliases.csv' \
+  "$source_dir"/ "$PROJECT_DIR"/
 
 if [ -n "$alias_backup" ] && [ -f "$alias_backup" ]; then
-  cp "$alias_backup" coin_aliases.csv
-  rm -f "$alias_backup"
+  cp "$alias_backup" "$PROJECT_DIR/coin_aliases.csv"
+elif [ -f "$source_dir/coin_aliases.csv" ]; then
+  cp "$source_dir/coin_aliases.csv" "$PROJECT_DIR/coin_aliases.csv"
 fi
 
-if [ -x .venv/bin/python ]; then
-  .venv/bin/python -m pip install -r requirements.txt >/dev/null
+if [ -x "$PROJECT_DIR/.venv/bin/python" ]; then
+  "$PROJECT_DIR/.venv/bin/python" -m pip install -r "$PROJECT_DIR/requirements.txt" >/dev/null
 fi
 
+printf '%s\n' "$target_etag" > "$STATE_FILE"
 systemctl restart "$SERVICE"
-echo "simple-hyper-sync: updated to $target_rev and restarted $SERVICE"
+echo "simple-hyper-sync: updated to $target_etag and restarted $SERVICE"
