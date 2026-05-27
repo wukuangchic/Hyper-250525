@@ -312,13 +312,13 @@ def format_optional_percent(value: Any) -> str:
 def format_timestamp_ms(value: Any) -> str:
     if value in (None, ""):
         return "n/a"
-    return datetime.fromtimestamp(int(value) / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.fromtimestamp(int(value) / 1000).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def format_short_timestamp_ms(value: Any) -> str:
     if value in (None, ""):
         return "n/a"
-    return datetime.fromtimestamp(int(value) / 1000, tz=timezone.utc).strftime("%m-%d %H:%M")
+    return datetime.fromtimestamp(int(value) / 1000).strftime("%m-%d %H:%M")
 
 
 def visible_width(text: str) -> int:
@@ -1352,6 +1352,15 @@ def format_open_order_trigger_price(order: dict[str, Any]) -> str:
     return decimal_to_display(trigger_px)
 
 
+def format_open_order_value(order: dict[str, Any]) -> str:
+    limit_px = decimal_or_none(order.get("limitPx"))
+    if limit_px is None or limit_px == 0:
+        limit_px = decimal_or_none(order.get("triggerPx"))
+    size = decimal_or_none(order.get("sz", order.get("origSz")))
+    value = order_amount(limit_px, size) if limit_px is not None and size is not None else None
+    return format_optional_decimal(value)
+
+
 def find_current_position(info: Info, account: str, coin: str, dex: str) -> dict[str, Any] | None:
     state = info.user_state(account, dex=dex)
     log_event(f"market_user_state:{dex or 'default'}", state)
@@ -1446,7 +1455,7 @@ def print_market_overview(
                 ("type", "type"),
                 ("triggerPx", "triggerPx"),
                 ("limitPx", "limitPx"),
-                ("sz", "sz"),
+                ("value", "value"),
                 ("oid", "oid"),
                 ("time", "time"),
             ],
@@ -1501,7 +1510,7 @@ def collect_account_positions_and_orders(info: Info, account: str) -> tuple[list
                     "type": format_open_order_type(order),
                     "triggerPx": format_open_order_trigger_price(order),
                     "limitPx": format_optional_decimal(order.get("limitPx")),
-                    "sz": format_optional_quantity(order.get("sz", order.get("origSz"))),
+                    "value": format_open_order_value(order),
                     "oid": str(oid),
                     "time": format_timestamp_ms(order.get("timestamp")),
                 }
@@ -1526,7 +1535,7 @@ def collect_open_orders_for_coin(info: Info, account: str, coin: str, dex: str) 
                 "type": format_open_order_type(order),
                 "triggerPx": format_open_order_trigger_price(order),
                 "limitPx": format_optional_decimal(order.get("limitPx")),
-                "sz": format_optional_quantity(order.get("sz", order.get("origSz"))),
+                "value": format_open_order_value(order),
                 "oid": str(order.get("oid", "")),
                 "time": format_timestamp_ms(order.get("timestamp")),
             }
@@ -1652,7 +1661,7 @@ def query_account(args: argparse.Namespace) -> None:
             ("type", "type"),
             ("triggerPx", "triggerPx"),
             ("limitPx", "limitPx"),
-            ("sz", "sz"),
+            ("value", "value"),
             ("oid", "oid"),
             ("time", "time"),
         ],
