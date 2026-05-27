@@ -389,33 +389,6 @@ INDEX_HTML = r"""<!doctype html>
       $("output").scrollTop = 0;
     }
 
-    function pad2(value) {
-      return String(value).padStart(2, "0");
-    }
-
-    function formatLocalFullTimestamp(year, month, day, hour, minute, second) {
-      const date = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), Number(second)));
-      return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`;
-    }
-
-    function formatLocalShortTimestamp(month, day, hour, minute) {
-      const year = new Date().getUTCFullYear();
-      const date = new Date(Date.UTC(year, Number(month) - 1, Number(day), Number(hour), Number(minute), 0));
-      return `${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
-    }
-
-    function localizeOutput(text) {
-      return String(text || "")
-        .replace(
-          /\b(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})\b/g,
-          (_, year, month, day, hour, minute, second) => formatLocalFullTimestamp(year, month, day, hour, minute, second),
-        )
-        .replace(
-          /\b(\d{2})-(\d{2}) (\d{2}):(\d{2})(?!:\d{2})\b/g,
-          (_, month, day, hour, minute) => formatLocalShortTimestamp(month, day, hour, minute),
-        );
-    }
-
     function normalizeHistoryCommand(command) {
       return String(command || "").trim();
     }
@@ -520,7 +493,7 @@ INDEX_HTML = r"""<!doctype html>
     function renderRun(data) {
       const shownCommand = data.command ? `$ ${data.command}\n\n` : "";
       const elapsed = data.elapsed_ms === undefined ? "" : `\n\n[${data.elapsed_ms} ms]`;
-      setOutput(localizeOutput(`${shownCommand}${data.output || ""}${elapsed}`));
+      setOutput(`${shownCommand}${data.output || ""}${elapsed}`);
     }
 
     function isReadOnlyCommand(command) {
@@ -546,6 +519,15 @@ INDEX_HTML = r"""<!doctype html>
       } finally {
         setBusy(false);
       }
+    }
+
+    async function executeCommand(command) {
+      const normalized = normalizeHistoryCommand(command);
+      if (!normalized) return;
+      if (!isReadOnlyCommand(normalized)) {
+        if (!confirm("This command may submit a real action. Continue?")) return;
+      }
+      await run(normalized);
     }
 
     async function verify() {
@@ -607,14 +589,9 @@ INDEX_HTML = r"""<!doctype html>
       input.setSelectionRange(command.length, command.length);
       state.command_history_index = -1;
       state.command_history_draft = "";
+      executeCommand(command);
     });
-    $("submit").addEventListener("click", () => {
-      const command = $("command").value.trim();
-      if (command && !isReadOnlyCommand(command)) {
-        if (!confirm("This command may submit a real action. Continue?")) return;
-      }
-      run(command);
-    });
+    $("submit").addEventListener("click", () => executeCommand($("command").value));
     $("query").addEventListener("click", () => run("query"));
     $("command").addEventListener("keydown", (event) => {
       if (event.key === "ArrowUp") {
@@ -762,7 +739,7 @@ README_HTML = r"""<!doctype html>
         <li><code>--tp</code> / <code>--sl</code> can use absolute prices, absolute prices plus offsets, or relative percentages from the entry / position price such as <code>2%+0.1%</code> and <code>-2%-0.1%</code>.</li>
         <li><code>--tp</code> / <code>--sl</code> without <code>--reduce-only</code> create a bracket order; with <code>--reduce-only</code> they create protective position TP/SL orders.</li>
         <li><code>buy-forCOUNT+STEP</code> is a count ladder and <code>buy-whileEND+STEP</code> is a range ladder; both place independent orders. Ordinary ladders can also carry <code>--tp</code> / <code>--sl</code>, with each ladder leg getting its own bracket. Trigger ladders can also use <code>--stop</code> / <code>--take</code> so each leg gets its own trigger anchor. That trigger-ladder mode can work with <code>--reduce-only</code>, but it cannot share the same submit with <code>--tp</code> / <code>--sl</code> because <code>normalTpsl</code> requires a non-trigger main order. It is different from <code>--scale</code>, which splits a total amount evenly.</li>
-        <li>The web page shows UTC timestamps in the browser's local timezone.</li>
+        <li>The web page shows the same local timestamps as the terminal.</li>
         <li><code>--level</code> is the main name for the same-side book depth; <code>--book-level</code> still works as an alias.</li>
         <li><code>--scale</code> splits a total USD amount into multiple limit orders.</li>
         <li>The command box is parsed as <code>hl_order.py</code> arguments, not as a shell command.</li>
