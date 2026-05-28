@@ -608,8 +608,6 @@ INDEX_HTML = r"""<!doctype html>
       if (!command) return;
       const input = $("command");
       input.value = command;
-      input.focus();
-      input.setSelectionRange(command.length, command.length);
       state.command_history_index = -1;
       state.command_history_draft = "";
       executeCommand(command);
