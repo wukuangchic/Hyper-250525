@@ -100,6 +100,25 @@ INDEX_HTML = r"""<!doctype html>
       padding: 18px 12px 28px;
     }
 
+    .content-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 10px;
+      align-items: start;
+    }
+
+    .header-block {
+      grid-column: 1 / -1;
+    }
+
+    .auth-block,
+    .verified-block,
+    .command-block,
+    .footer-block,
+    .output-block {
+      min-width: 0;
+    }
+
     header {
       display: flex;
       align-items: center;
@@ -134,7 +153,6 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     .panel {
-      margin: 10px 0;
       padding: 12px;
       border: 1px solid var(--line);
       border-radius: 8px;
@@ -312,16 +330,61 @@ INDEX_HTML = r"""<!doctype html>
         line-height: 1.5;
       }
     }
+
+    @media (orientation: landscape) and (min-width: 720px) {
+      .content-grid {
+        grid-template-columns: minmax(320px, 1fr) minmax(320px, 1.05fr);
+        grid-template-areas:
+          "header header"
+          "auth output"
+          "verified output"
+          "command output"
+          "footer output";
+        gap: 12px;
+      }
+
+      .header-block {
+        grid-area: header;
+      }
+
+      .auth-block {
+        grid-area: auth;
+      }
+
+      .verified-block {
+        grid-area: verified;
+      }
+
+      .command-block {
+        grid-area: command;
+      }
+
+      .output-block {
+        grid-area: output;
+        position: sticky;
+        top: 12px;
+        align-self: start;
+      }
+
+      .footer-block {
+        grid-area: footer;
+      }
+
+      .output {
+        min-height: calc(100vh - 94px);
+        max-height: calc(100vh - 94px);
+      }
+    }
   </style>
 </head>
 <body>
-  <main class="shell">
-    <header>
+  <main class="shell content-grid">
+    <header class="header-block">
       <h1>Simple-Hyper</h1>
       <div id="status" class="status">Not verified</div>
     </header>
 
-    <form id="authPanel" class="panel" autocomplete="on">
+    <form id="authPanel" class="panel auth-block" autocomplete="on">
       <div class="field">
         <label for="account">Wallet Address</label>
         <input id="account" name="account_address" autocomplete="username" autocapitalize="off" spellcheck="false" placeholder="0x...">
@@ -335,7 +398,7 @@ INDEX_HTML = r"""<!doctype html>
       </div>
     </form>
 
-    <section id="verifiedPanel" class="panel hidden">
+    <section id="verifiedPanel" class="panel verified-block hidden">
       <div class="verified-row">
         <div>
           <p class="verify-copy">Verification successful.</p>
@@ -345,7 +408,7 @@ INDEX_HTML = r"""<!doctype html>
       </div>
     </section>
 
-    <section class="panel">
+    <section class="panel command-block">
       <div class="field">
         <label for="command">Command</label>
         <input id="command" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="BTC buy 10 --dry-run">
@@ -357,11 +420,11 @@ INDEX_HTML = r"""<!doctype html>
       <div id="history" class="history hidden"></div>
     </section>
 
-    <section class="panel output-panel">
+    <section class="panel output-panel output-block">
       <pre id="output" class="output">Ready.</pre>
     </section>
 
-    <footer class="footer">
+    <footer class="footer footer-block">
       <a href="/readme">README</a>
     </footer>
   </main>
