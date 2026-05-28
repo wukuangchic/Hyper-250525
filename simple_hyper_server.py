@@ -386,12 +386,12 @@ INDEX_HTML = r"""<!doctype html>
 
     <form id="authPanel" class="panel auth-block" autocomplete="on">
       <div class="field">
-        <label for="account">Wallet Address</label>
-        <input id="account" name="account_address" autocomplete="username" autocapitalize="off" spellcheck="false" placeholder="0x...">
+        <label for="account">Account</label>
+        <input id="account" name="username" autocomplete="username" autocapitalize="off" spellcheck="false" placeholder="0x...">
       </div>
       <div class="field">
         <label for="secret">Private Key or Agent Key</label>
-        <input id="secret" name="secret_key" type="password" autocomplete="current-password" autocapitalize="off" spellcheck="false" placeholder="0x...">
+        <input id="secret" name="password" type="password" autocomplete="current-password" autocapitalize="off" spellcheck="false" placeholder="0x...">
       </div>
       <div class="buttons">
         <button id="verify" type="submit">Verify</button>
