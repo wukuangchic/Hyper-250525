@@ -377,7 +377,8 @@ INDEX_HTML = r"""<!doctype html>
       command_history_draft: "",
     };
 
-    const COMMAND_HISTORY_LIMIT = 50;
+    const COMMAND_HISTORY_LIMIT = 10;
+    const COMMAND_HISTORY_STORAGE_KEY = "simple_hyper.command_history.v1";
 
     function setStatus(text, ready = false) {
       $("status").textContent = text;
@@ -393,6 +394,26 @@ INDEX_HTML = r"""<!doctype html>
       return String(command || "").trim();
     }
 
+    function loadHistory() {
+      try {
+        const raw = sessionStorage.getItem(COMMAND_HISTORY_STORAGE_KEY);
+        if (!raw) return [];
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) return [];
+        return parsed.map((item) => normalizeHistoryCommand(item)).filter(Boolean).slice(0, COMMAND_HISTORY_LIMIT);
+      } catch {
+        return [];
+      }
+    }
+
+    function saveHistory() {
+      try {
+        sessionStorage.setItem(COMMAND_HISTORY_STORAGE_KEY, JSON.stringify(state.command_history.slice(0, COMMAND_HISTORY_LIMIT)));
+      } catch {
+        // Ignore storage quota or privacy mode errors.
+      }
+    }
+
     function renderHistory() {
       const history = $("history");
       if (!state.command_history.length) {
@@ -401,7 +422,7 @@ INDEX_HTML = r"""<!doctype html>
         return;
       }
       history.classList.remove("hidden");
-      history.innerHTML = state.command_history.slice(0, 8).map((command, index) => {
+      history.innerHTML = state.command_history.slice(0, COMMAND_HISTORY_LIMIT).map((command, index) => {
         const escaped = command
           .replace(/&/g, "&amp;")
           .replace(/</g, "&lt;")
@@ -418,6 +439,7 @@ INDEX_HTML = r"""<!doctype html>
       if (existing === 0) {
         state.command_history_index = -1;
         state.command_history_draft = "";
+        saveHistory();
         renderHistory();
         return;
       }
@@ -430,6 +452,7 @@ INDEX_HTML = r"""<!doctype html>
       }
       state.command_history_index = -1;
       state.command_history_draft = "";
+      saveHistory();
       renderHistory();
     }
 
@@ -610,6 +633,7 @@ INDEX_HTML = r"""<!doctype html>
     });
 
     syncAuth();
+    state.command_history = loadHistory();
     renderHistory();
   </script>
 </body>
