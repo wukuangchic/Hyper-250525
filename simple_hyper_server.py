@@ -332,8 +332,13 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     @media (orientation: landscape) and (min-width: 720px) {
+      .shell {
+        width: min(100%, 1320px);
+        padding-inline: 18px;
+      }
+
       .content-grid {
-        grid-template-columns: minmax(320px, 1fr) minmax(320px, 1.05fr);
+        grid-template-columns: minmax(360px, 0.95fr) minmax(520px, 1.25fr);
         grid-template-areas:
           "header header"
           "auth output"
