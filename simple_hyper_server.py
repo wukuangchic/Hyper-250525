@@ -377,7 +377,7 @@ INDEX_HTML = r"""<!doctype html>
       command_history_draft: "",
     };
 
-    const COMMAND_HISTORY_LIMIT = 10;
+    const COMMAND_HISTORY_LIMIT = 30;
     const COMMAND_HISTORY_STORAGE_KEY = "simple_hyper.command_history.v1";
 
     function setStatus(text, ready = false) {
@@ -422,14 +422,19 @@ INDEX_HTML = r"""<!doctype html>
         return;
       }
       history.classList.remove("hidden");
-      history.innerHTML = state.command_history.slice(0, COMMAND_HISTORY_LIMIT).map((command, index) => {
-        const escaped = command
-          .replace(/&/g, "&amp;")
-          .replace(/</g, "&lt;")
-          .replace(/>/g, "&gt;")
-          .replace(/"/g, "&quot;");
-        return `<button type="button" class="history-item" data-history-index="${index}" title="${escaped}">${escaped}</button>`;
-      }).join("");
+      history.replaceChildren();
+      const sortedHistory = [...state.command_history]
+        .slice(0, COMMAND_HISTORY_LIMIT)
+        .sort((left, right) => left.localeCompare(right, undefined, { sensitivity: "base" }));
+      for (const command of sortedHistory) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "history-item";
+        button.dataset.command = command;
+        button.title = command;
+        button.textContent = command;
+        history.appendChild(button);
+      }
     }
 
     function pushHistory(command) {
@@ -602,9 +607,7 @@ INDEX_HTML = r"""<!doctype html>
     $("history").addEventListener("click", (event) => {
       const target = event.target;
       if (!(target instanceof HTMLButtonElement)) return;
-      const index = Number(target.dataset.historyIndex);
-      if (!Number.isInteger(index)) return;
-      const command = state.command_history[index];
+      const command = normalizeHistoryCommand(target.dataset.command);
       if (!command) return;
       const input = $("command");
       input.value = command;
