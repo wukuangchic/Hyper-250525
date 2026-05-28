@@ -268,6 +268,7 @@ journalctl -u simple-hyper-sync.service -n 80 --no-pager
 ```
 
 页面底部有 `README` 链接，里面有英文命令示例。
+网页版会把最近 command 历史保存在浏览器本地，并按账号分开保存，所以刷新或重启浏览器后还会在。
 
 安全默认值：
 

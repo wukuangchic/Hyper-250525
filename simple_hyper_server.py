@@ -446,7 +446,8 @@ INDEX_HTML = r"""<!doctype html>
     };
 
     const COMMAND_HISTORY_LIMIT = 30;
-    const COMMAND_HISTORY_STORAGE_KEY = "simple_hyper.command_history.v1";
+    const COMMAND_HISTORY_STORAGE_PREFIX = "simple_hyper.command_history.v2";
+    const COMMAND_HISTORY_SHARED_SCOPE = "shared";
 
     function setStatus(text, ready = false) {
       $("status").textContent = text;
@@ -462,9 +463,22 @@ INDEX_HTML = r"""<!doctype html>
       return String(command || "").trim();
     }
 
-    function loadHistory() {
+    function normalizeHistoryScope(scope) {
+      const normalized = normalizeHistoryCommand(scope);
+      return normalized || COMMAND_HISTORY_SHARED_SCOPE;
+    }
+
+    function currentHistoryScope() {
+      return state.verified ? normalizeHistoryScope(state.account_address) : COMMAND_HISTORY_SHARED_SCOPE;
+    }
+
+    function historyStorageKey(scope = currentHistoryScope()) {
+      return `${COMMAND_HISTORY_STORAGE_PREFIX}:${normalizeHistoryScope(scope)}`;
+    }
+
+    function loadHistory(scope = currentHistoryScope()) {
       try {
-        const raw = sessionStorage.getItem(COMMAND_HISTORY_STORAGE_KEY);
+        const raw = localStorage.getItem(historyStorageKey(scope));
         if (!raw) return [];
         const parsed = JSON.parse(raw);
         if (!Array.isArray(parsed)) return [];
@@ -474,12 +488,20 @@ INDEX_HTML = r"""<!doctype html>
       }
     }
 
-    function saveHistory() {
+    function saveHistory(scope = currentHistoryScope()) {
       try {
-        sessionStorage.setItem(COMMAND_HISTORY_STORAGE_KEY, JSON.stringify(state.command_history.slice(0, COMMAND_HISTORY_LIMIT)));
+        localStorage.setItem(historyStorageKey(scope), JSON.stringify(state.command_history.slice(0, COMMAND_HISTORY_LIMIT)));
       } catch {
         // Ignore storage quota or privacy mode errors.
       }
+    }
+
+    function setHistoryScope(scope) {
+      const nextScope = normalizeHistoryScope(scope);
+      state.command_history_index = -1;
+      state.command_history_draft = "";
+      state.command_history = loadHistory(nextScope);
+      renderHistory();
     }
 
     function renderHistory() {
@@ -637,6 +659,7 @@ INDEX_HTML = r"""<!doctype html>
         }
         state.verified = true;
         syncAuth();
+        setHistoryScope(state.account_address);
         renderRun(data);
       } catch (error) {
         state.verified = false;
@@ -654,6 +677,7 @@ INDEX_HTML = r"""<!doctype html>
       $("account").value = "";
       $("secret").value = "";
       syncAuth();
+      setHistoryScope(COMMAND_HISTORY_SHARED_SCOPE);
       setOutput("Ready.");
     }
 
@@ -835,6 +859,7 @@ README_HTML = r"""<!doctype html>
         <li>The web page shows the same local timestamps as the terminal.</li>
         <li><code>--level</code> is the main name for the same-side book depth; <code>--book-level</code> still works as an alias.</li>
         <li><code>--scale</code> splits a total USD amount into multiple limit orders.</li>
+        <li>Command history is saved in the browser's local storage and grouped by account, so it stays after refresh and browser relaunch.</li>
         <li>The command box is parsed as <code>hl_order.py</code> arguments, not as a shell command.</li>
       </ul>
     </section>
