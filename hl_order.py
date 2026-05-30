@@ -2117,7 +2117,7 @@ def submit_order_plans(
         print_order_plan_table(title, plans, price_rate)
         return
 
-    if update_leverage:
+    if update_leverage and not args.reduce_only:
         leverage_mode, leverage_result = update_order_leverage(exchange, max_leverage, coin)
         if args.verbose:
             print("leverage_mode:", leverage_mode)
@@ -2775,12 +2775,13 @@ def place_order(args: argparse.Namespace) -> None:
             print_order_row(coin, side, current_mid, price, notional, price_rate)
         return
 
-    leverage_mode, leverage_result = update_order_leverage(exchange, max_leverage, coin)
-    if args.verbose:
-        print("leverage_mode:", leverage_mode)
-        print("update_leverage_result:", leverage_result)
-    if leverage_result.get("status") != "ok":
-        raise RuntimeError(f"Failed to update {leverage_mode} leverage; order was not submitted.")
+    if not args.reduce_only:
+        leverage_mode, leverage_result = update_order_leverage(exchange, max_leverage, coin)
+        if args.verbose:
+            print("leverage_mode:", leverage_mode)
+            print("update_leverage_result:", leverage_result)
+        if leverage_result.get("status") != "ok":
+            raise RuntimeError(f"Failed to update {leverage_mode} leverage; order was not submitted.")
 
     result = exchange.order(
         coin,
