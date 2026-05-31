@@ -1,47 +1,14 @@
 # Hyperliquid 本地下单工具
 
-这是一个基于官方 `hyperliquid-python-sdk` 的本地轻量下单工具。日常建议双击 `order-terminal.command` 进入专用 Terminal，也可以在普通终端里使用 `order` alias。
+一个基于官方 `hyperliquid-python-sdk` 的本地下单工具，支持本地终端、Windows CMD 和手机网页控制台。
 
-## 命令速记
+日常推荐：
 
-下单命令从前到后可以记成 6 段：
+- macOS：双击 `order-terminal.command`，打开后可以直接输入 `BTC buy`、`query`。
+- 普通终端：先执行 `. ./aliases`，再使用 `order BTC buy`。
+- Windows：双击 `order-terminal-windows.cmd`。
 
-1. `coin`，例如 `BTC`
-2. `buy/sell`，或 `query`。你也可以写成 `buy-for5-1000` 这种 count 梯子，或者 `sell-while85000+1000` 这种 range 梯子。
-3. `amount`，默认 `10`
-4. `entry/exec` 选项，常用的是 `--market`、`--price`、`--stop`、`--stop-limit`、`--take`、`--take-limit`、`--level`、`--tif`、`--slippage`
-5. `tp/sl`，就是 `--tp`、`--sl`
-6. `--reduce-only`
-
-其中：
-
-- `--stop` / `--take` 是入场触发价。`--stop` 偏突破，`--take` 偏触价。
-- 你可以直接写成 `70000+50`、`70000-50`、`70000+0.2%` 这种 `触发价+偏移` 形式；不写偏移时默认是触发市价单。`--stop-limit` / `--take-limit` 也仍然可用，作为显式写法。
-- 百分比是按触发价计算的，所以 `70000+2% = 71400`，如果你想要 `70140`，写 `70000+0.2%`。
-- `--tp` / `--sl` 也支持 `ABS+OFFSET` 或 `REL%+OFFSET` 这种写法；相对百分比是按入场价或持仓均价计算的。买多通常用正百分比止盈、负百分比止损，卖空则相反。
-- 你还可以在 `--tp` / `--sl` 后面加 `d0.6` 或 `d60%`，表示按比例处理这笔单子；当前允许范围是 `0 < ratio <= 2`，所以也可以用来做不对称卖出。
-- `--stop` / `--take` 可以和 `--tp` / `--sl` 组合成 entry-trigger bracket，和普通价格单的 bracket 一样，只是父单先变成触发单。
-- 这类百分比算出来的触发价和限价，会先对齐到交易所可接受的价格精度，再提交下单。
-- 这种带触发的偏移限价不是 `ALO`；它们是 trigger-limit。只有普通限价单才会走 `--tif`。
-- `buy-forCOUNT+STEP` 这种 count 梯子和 `buy-whileEND+STEP` 这种 range 梯子，都会按每一档独立下单。它们和 `--scale` 不一样，`--scale` 还是把总金额平均拆成多张限价单。
-- 普通梯子可以再配 `--tp` / `--sl`，每一档都会带自己的 bracket。
-- 触发梯子可以再配 `--stop` / `--take`，让每一档按自己的触发点展开；这种模式可以和 `--reduce-only` 一起用，但不能再把 `--tp` / `--sl` 放进同一条命令里。
-- `--tp` / `--sl` 是止盈止损；不加 `--reduce-only` 时是 bracket，加了 `--reduce-only` 时是保护已有仓位。
-- 不写价格时，限价单默认按同向订单簿第 `10` 档挂单，且默认 `ALO`。`--level` 是主写法，`--book-level` 仍然保留作兼容别名。
-
-当前 SDK 信息：
-
-- SDK：`0.23.0`
-- commit：`7ee976d123b1e04295e4a1e37a424ca6a13bef88`
-- 官方仓库：https://github.com/hyperliquid-dex/hyperliquid-python-sdk
-- 官方 API 文档：https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api
-
-## 代码结构
-
-- `hl_order.py` / `hl_markets.py` 保留为命令入口，现有 `order`、`query`、`.cmd` 和网页服务调用方式不变。
-- `simple_hyper/` 放可导入的 Python 业务代码：运行环境、控制台格式化、K 线渲染、订单解析、价格和数量计算。
-- `scripts/` 继续放 shell/systemd 这类运维脚本，不再塞可复用 Python 函数，避免入口脚本和脚本目录互相耦合。
-- 下单路径会复用 `Exchange` 内部已经初始化好的 `Info`，减少重复初始化和重复拉取元数据；`query` 路径不再创建交易客户端。
+> 真实下单默认会提交到 Hyperliquid。新命令建议先加 `--dry-run` 预演。
 
 ## 快速开始
 
@@ -54,273 +21,32 @@ python -m pip install -r requirements.txt
 cp .env.example .env
 ```
 
-编辑 `.env`，填入主账户地址和 API wallet / agent 私钥。
-
-双击：
+编辑 `.env`：
 
 ```text
-order-terminal.command
+account_address=0x主账户地址
+secret_key=0x私钥或agent私钥
 ```
 
-打开的新 Terminal 会进入下单专用模式，可以省略 `order`：
+说明：
 
-```bash
-query
-BTC buy --dry-run
-BTC buy
-BTC buy 10 --market
-GOLD buy
-SAMSUNG buy
-QQQ buy --dry-run
-BTC --cancel
-```
-
-普通终端里先加载 alias：
-
-```bash
-. ./aliases
-query
-order BTC buy --dry-run
-order BTC buy 10 --market
-order BTC --cancel
-```
-
-注意 alias 要分两步执行，不要写成 `. ./aliases && order BTC buy`。
-
-## Windows 用法
-
-首次安装时在项目目录里双击：
-
-```text
-setup-windows.cmd
-```
-
-安装完成后双击：
-
-```text
-order-terminal-windows.cmd
-```
-
-打开的 CMD 窗口里可以直接运行：
-
-```bat
-query
-order BTC buy --dry-run
-order BTC buy 10 --market
-markets BTC
-```
-
-也可以在普通 CMD / PowerShell 里进入项目目录后运行：
-
-```bat
-order.cmd BTC buy --dry-run
-query.cmd
-markets.cmd QQQ
-```
-
-## Simple-Hyper 手机网页
-
-`simple_hyper_server.py` 是给 iPhone/Safari 用的极简网页控制台。它不会重写交易逻辑，只是在服务器上调用当前目录的 `hl_order.py`。
-
-### 新服务器部署
-
-在任意 Ubuntu 服务器上拉代码、安装依赖：
-
-```bash
-git clone git@github.com:wukuangchic/Hyper-250525.git
-cd Hyper-250525
-
-sudo apt-get update
-sudo apt-get install -y python3-venv git
-
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -r requirements.txt
-
-cp simple-hyper.env.example simple-hyper.env
-set -a
-. ./simple-hyper.env
-set +a
-python3 simple_hyper_server.py --host 0.0.0.0 --port 8787
-```
-
-如果服务器没有配置 GitHub SSH key，可以改用 HTTPS clone：
-
-```bash
-git clone https://github.com/wukuangchic/Hyper-250525.git
-```
-
-如果 `python3 -m venv .venv` 提示缺少 `ensurepip`，在 Ubuntu 24.04 上安装：
-
-```bash
-sudo apt-get install -y python3.12-venv
-```
-
-云服务器安全组 / 防火墙需要放行：
-
-```text
-TCP 8787
-```
-
-手机访问：
-
-```text
-http://服务器地址:8787
-```
-
-如果设置了 `SIMPLE_HYPER_TLS_CERT` 和 `SIMPLE_HYPER_TLS_KEY`，则改用：
-
-```text
-https://服务器地址:8787
-```
-
-公网使用时建议启用 HTTPS，否则钱包密钥会以明文 HTTP 请求经过网络。
-
-### systemd 常驻
-
-如果要像服务器 C 一样后台常驻并开机自启，可以创建：
-
-```bash
-sudo cp simple-hyper.env.example /etc/simple-hyper.env
-sudo nano /etc/simple-hyper.env
-```
-
-示例 `/etc/simple-hyper.env`：
-
-```text
-SIMPLE_HYPER_HOST=0.0.0.0
-SIMPLE_HYPER_PORT=8787
-SIMPLE_HYPER_COMMAND_TIMEOUT=60
-SIMPLE_HYPER_MAX_COMMAND_LENGTH=240
-```
-
-创建服务：
-
-```bash
-sudo tee /etc/systemd/system/simple-hyper.service >/dev/null <<'UNIT'
-[Unit]
-Description=Simple-Hyper mobile web server
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=ubuntu
-WorkingDirectory=/home/ubuntu/Hyper-250525
-EnvironmentFile=/etc/simple-hyper.env
-ExecStart=/home/ubuntu/Hyper-250525/.venv/bin/python /home/ubuntu/Hyper-250525/simple_hyper_server.py
-Restart=on-failure
-RestartSec=3
-NoNewPrivileges=true
-PrivateTmp=true
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-sudo systemctl daemon-reload
-sudo systemctl enable --now simple-hyper.service
-sudo systemctl status simple-hyper.service
-```
-
-如果仓库目录不是 `/home/ubuntu/Hyper-250525`，把 `WorkingDirectory` 和 `ExecStart` 改成实际路径。
-
-更新代码后重启：
-
-```bash
-git pull
-. .venv/bin/activate
-python -m pip install -r requirements.txt
-sudo systemctl restart simple-hyper.service
-```
-
-### 服务器 C 自动同步
-
-服务器 C 使用 `simple-hyper-sync.timer` 定时从 GitHub `main` 同步代码并重启 `simple-hyper.service`。同步脚本会下载 GitHub `main` 的 tarball，保留服务器本机的 `.venv/`、`logs/` 和 `coin_aliases.csv`，避免覆盖运行环境、历史日志和本机别名表。
-
-仓库里已经带了同步脚本和 systemd 单元，文件分别是：
-
-- [scripts/simple-hyper-sync.sh](/Users/wukuangchicsmacbook/Library/Mobile%20Documents/com~apple~CloudDocs/Downloads/Hyper-250525/scripts/simple-hyper-sync.sh)
-- [systemd/simple-hyper-sync.service](/Users/wukuangchicsmacbook/Library/Mobile%20Documents/com~apple~CloudDocs/Downloads/Hyper-250525/systemd/simple-hyper-sync.service)
-- [systemd/simple-hyper-sync.timer](/Users/wukuangchicsmacbook/Library/Mobile%20Documents/com~apple~CloudDocs/Downloads/Hyper-250525/systemd/simple-hyper-sync.timer)
-
-安装到服务器时，把 repo 放在 `/opt/simple-hyper`，然后执行：
-
-```bash
-chmod +x scripts/simple-hyper-sync.sh
-sudo cp systemd/simple-hyper-sync.service /etc/systemd/system/
-sudo cp systemd/simple-hyper-sync.timer /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now simple-hyper-sync.timer
-```
-
-检查同步状态：
-
-```bash
-systemctl status simple-hyper-sync.timer
-journalctl -u simple-hyper-sync.service -n 80 --no-pager
-```
-
-### 网页使用
-
-页面流程：
-
-```text
-1. 输入 Wallet Address 和 Private Key or Agent Key
-2. 点击 Verify
-3. 验证成功后地址和密钥输入框会隐藏
-4. 用 Query Account 查询账户
-5. 在 Command 输入框输入命令
-6. 点击 Run 执行
-```
-
-页面底部有 `README` 链接，里面有英文命令示例。
-网页版会把最近 command 历史保存在浏览器本地，并按账号分开保存，所以刷新或重启浏览器后还会在。
-
-安全默认值：
-
-- 服务器不需要保存交易 `.env`。
-- 网页验证通过后会隐藏地址和密钥，凭证只留在当前页面内存里。
-- 每次执行请求都会带 `account_address` 和 `secret_key`，后端只放进子进程环境变量。
-- 后端用 `shlex.split()` 解析输入框命令，不走 shell。
-- 命令不含 `--dry-run` 且不是 `query` 时，前端会弹出真实提交确认。
-- 服务日志不记录请求 body，`hl_order.py` 日志也不会写入密钥。
-- 只输入单个标的，例如 `BTC`，只查询行情、文本 K 线和当前持仓，不会下单。
-
-## 默认行为
-
-- 读取根目录 `.env` 的 `account_address` 和 `secret_key`，也支持同名环境变量覆盖。
-- 如果签名地址是 agent，会自动解析到绑定的主账户。
-- 默认网络是主网。
-- 默认金额是 `10` 美元。
-- 默认真实提交下单或撤单；加 `--dry-run` 只预演。
-- 不填价格时，按同向订单簿第 `10` 档挂单：
-  - 买入 / 看多：第 10 档 bid。
-  - 卖出 / 看空：第 10 档 ask。
-- 加 `--market` 时，按当前 mid 计算数量，并用带滑点保护的 IOC 单成交，不会留下挂单。
-- 加 `--stop-entry`（或更短的 `--stop`）时，会提交 stop-entry；不写偏移时是触发市价单，写成 `70000+50` / `70000+0.2%` 这种形式时会变成触发限价单。
-- 加 `--take-entry`（或更短的 `--take`）时，会提交 take-entry；不写偏移时是触发市价单，写成 `70000+50` / `70000+0.2%` 这种形式时会变成触发限价单。
-- 加 `--tp` / `--sl` 时，可以写成绝对价、绝对价加偏移，或者相对入场价 / 持仓均价的百分比，再跟一个偏移，比如 `2%+0.1%` 或 `-2%-0.1%`。
-- 加 `--tp` / `--sl` 且不加 `--reduce-only` 时，会用 `normalTpsl` 一次提交开仓单和子止盈 / 止损单。
-- 加 `--tp` / `--sl` 且同时加 `--reduce-only` 时，会按 `positionTpsl` 提交保护已有仓位的触发单。
-- 加 `--scale` 时，会把总金额平均拆成多张限价单；每张子单金额必须至少 `10` 美元。
-- 写成 `buy-forCOUNT+STEP` 或 `buy-whileEND+STEP` 的梯子单时，会按每一档独立下单。普通梯子可以再配 `--tp` / `--sl`，每一档都会带自己的 bracket。
-- 触发梯子可以再配 `--stop` / `--take`，让每一档按自己的触发点展开；这种模式可以和 `--reduce-only` 一起用，但不能再把 `--tp` / `--sl` 放进同一条命令里。
-- 真实下单前，默认把当前合约 cross 杠杆设置为 `maxLeverage`；如果标的不支持 cross，会自动切到 isolated，默认使用 `5x`。
-- 如果数量 round 后名义价值低于 `10` 美元，会向上补一个数量步进。
-- 前台默认精简输出，完整日志写入 `logs/`。
+- `account_address` 必须是主账户地址，不是 agent 地址。
+- `secret_key` 可以是主钱包私钥，也可以是已授权的 API wallet / agent 私钥。
+- 不要把真实私钥提交进 Git。
 
 ## 常用命令
 
 ```bash
+# 查询账户持仓和挂单
+query
+order query
+order --query
+
+# 查询 BTC 行情、文本 K 线、当前持仓和近期成交
+BTC
+
 # 预演，不下单
 BTC buy --dry-run
-
-# 查询全部持仓和未成订单
-query
-
-# 查询 BTC 最近 24 小时走势、文本 K 线、最高点、最低点、成交额；如果有持仓，会显示持仓量、持仓额和杠杆
-BTC
 
 # 默认 10 美元看多
 BTC buy
@@ -331,10 +57,67 @@ BTC buy 25
 # 指定价格
 BTC buy 10 --price 75000
 
-# 市价买入 / 卖出
+# 市价买入 / 卖出，使用 IOC 和滑点保护
 BTC buy 10 --market
 BTC sell 10 --market
+BTC buy 10 --market --slippage 1%
 
+# 只减仓 / 平仓，不允许反手
+BTC sell --reduce-only
+
+# 取消 BTC 所有挂单
+BTC --cancel
+
+# 取消指定订单
+BTC --cancel 441260592983
+```
+
+## 命令结构
+
+下单命令可以理解成 6 段：
+
+```text
+coin side amount entry/exec tp/sl reduce-only
+```
+
+示例：
+
+```bash
+BTC buy 100 --price 68000 --tp 72000 --sl 65000
+```
+
+各段含义：
+
+- `coin`：标的，例如 `BTC`、`ETH`、`GOLD`、`xyz:SMSN`。
+- `side`：方向，支持 `buy/sell`、`long/short`、`看多/看空`。
+- `amount`：美元名义金额，默认 `10`。
+- `entry/exec`：入场或执行方式，例如 `--market`、`--price`、`--stop`、`--take`、`--level`、`--tif`、`--slippage`。
+- `tp/sl`：止盈止损，例如 `--tp 2%+0.1% --sl -2%-0.1%`。
+- `--reduce-only`：只减仓，不允许反手。
+
+默认行为：
+
+- 默认网络是主网。
+- 默认真实提交下单或撤单；加 `--dry-run` 只预演。
+- 不填价格时，限价单默认按同向订单簿第 `10` 档挂单，且默认 `ALO`。
+- `--market` 会按当前 mid 计算数量，并用带滑点保护的 IOC 单成交。
+- 真实下单前会尝试把当前合约 cross 杠杆设置为 `maxLeverage`；如果标的不支持 cross，会自动切到 isolated，默认 `5x`。
+- 如果数量 round 后名义价值低于 `10` 美元，会向上补一个数量步进。
+- 前台只显示核心结果，完整日志写入 `logs/`。
+
+## 触发单和止盈止损
+
+`--stop` / `--take` 是入场触发价：
+
+- `--stop` 偏突破入场。
+- `--take` 偏触价入场。
+- 不写偏移时是触发市价单。
+- 写成 `70000+50`、`70000-50`、`70000+0.2%` 时会变成触发限价单。
+- 百分比按触发价计算，所以 `70000+2% = 71400`；如果想要 `70140`，写 `70000+0.2%`。
+
+示例：
+
+```bash
 # 突破后开仓
 BTC sell 25 --stop 70000
 BTC buy 25 --stop 80000
@@ -350,82 +133,72 @@ BTC sell 25 --take 80000
 # 触价后开仓，并指定触发限价
 BTC buy 25 --take 70000+50
 BTC sell 25 --take 80000+100
+```
 
-# 调整市价单滑点保护，默认 5%
-BTC buy 10 --market --slippage 1%
+`--tp` / `--sl` 支持绝对价、相对百分比和限价偏移：
 
-# 指定同向订单簿档位
-BTC sell 10 --level 5
-
-# 只减仓 / 平仓，不允许反手
-BTC sell --reduce-only
-
-# 保护已有仓位的止盈 / 止损触发单
+```bash
+# 保护已有多仓：到价后卖出平仓
 BTC sell 25 --tp 72000 --reduce-only
 BTC sell 25 --sl 65000 --reduce-only
-BTC sell --tp 2%+0.1% --sl -2%-0.1% --reduce-only
 
-# 触发限价单；也可以把限价偏移写进同一个参数里
-BTC sell 25 --sl 65000+50 --reduce-only
-BTC buy --tp 2%+0.1% --sl -2%-0.1%
-BTC sell --tp -2%-0.1% --sl 2%+0.1%
+# 按持仓均价计算相对止盈止损
+BTC sell --tp 2%+0.1% --sl -2%-0.1% --reduce-only
 
 # 开仓同时挂止盈止损
 BTC buy 100 --price 68000 --tp 72000 --sl 65000
 
-# 触发入场，并只平掉 60% 的止盈
+# 触发入场，并只处理 60% 的止盈数量
 BTC buy 30 --stop 80000-10 --tp 0.6%+0d0.6
+```
 
-# 分批挂单，从 67000 到 63000 平均拆 5 笔
+数量比例后缀：
+
+- 在 `--tp` / `--sl` 后面加 `d0.6` 或 `d60%`，表示按比例处理这笔单子。
+- 当前允许范围是 `0 < ratio <= 2`，可以用于部分止盈，也可以用于不对称卖出。
+
+组合规则：
+
+- `--tp` / `--sl` 不加 `--reduce-only` 时，会用 `normalTpsl` 一次提交开仓单和子止盈 / 止损单。
+- `--tp` / `--sl` 加 `--reduce-only` 时，会按 `positionTpsl` 提交保护已有仓位的触发单。
+- `--stop` / `--take` 可以和 `--tp` / `--sl` 组合成 entry-trigger bracket。
+
+## 分批和梯子单
+
+`--scale` 会把总金额平均拆成多张限价单：
+
+```bash
 BTC buy 100 --scale 5 --from 67000 --to 63000
+BTC sell 200 --scale 4 --from 72000 --to 76000 --reduce-only
+```
 
-# 梯子单，从 67000 开始每档差 1000
+梯子单把每一档当成独立订单：
+
+```bash
+# 从 67000 开始，每档差 1000，一共 5 档
 BTC buy-for5-1000 --price 67000
 
-# 区间梯子单，从 80000 一路挂到 85000，每档差 1000
+# 从 80000 一路挂到 85000，每档差 1000
 BTC sell-while85000+1000 --price 80000
-
-# 触发梯子，只做减仓
-BTC sell-while80000+1000 10 --stop 77000 --reduce-only
 
 # 普通梯子 + 每档自己的 TP/SL
 BTC buy-for5-1000 --price 67000 --tp 5%+0 --sl -2%-10
 
-# 取消 BTC 所有挂单
-BTC --cancel
-
-# 取消指定订单
-BTC --cancel 441260592983
+# 触发梯子，只做减仓
+BTC sell-while80000+1000 10 --stop 77000 --reduce-only
 ```
 
-普通终端里加 `order` 前缀：
+注意：
 
-```bash
-order query
-order --query
-order BTC buy
-order BTC buy 10 --market
-order BTC --cancel
-```
+- `--scale` 每张子单金额必须至少 `10` 美元。
+- 普通梯子可以再配 `--tp` / `--sl`，每一档都会带自己的 bracket。
+- 触发梯子可以再配 `--stop` / `--take`，但不能再把 `--tp` / `--sl` 放进同一条命令。
 
-## 标的索引
+## 标的和别名
 
 官方可交易标的以 Hyperliquid `meta` API 返回的名字为准，不以 App URL 为准。比如 App 路由能打开 `xyz:SAMSUNG`，但 API 真实标的是 `xyz:SMSN`。
 
-本地别名统一维护在：
-
-```text
-coin_aliases.csv
-```
-
-字段：
-
-- `alias`：你日常输入的名字。
-- `target`：Hyperliquid API / SDK 实际下单用的标的。
-- `note`：备注。
-- `rate`：可选换算倍率。前台 `price` 会显示为 `原始报价(原始报价/rate)`。
-
-当前示例：
+本地别名维护在 `coin_aliases.csv`：
 
 ```csv
 alias,target,note,rate
@@ -434,7 +207,14 @@ SAMSUNG,xyz:SMSN,Samsung Electronics on xyz,
 QQQ,xyz:XYZ100,Nasdaq100,41.09
 ```
 
-因此这些命令都可以用：
+字段说明：
+
+- `alias`：日常输入的名字。
+- `target`：Hyperliquid API / SDK 实际下单用的标的。
+- `note`：备注。
+- `rate`：可选换算倍率。前台价格会显示为 `原始报价 (原始报价/rate)`。
+
+这些命令都可以使用：
 
 ```bash
 GOLD buy
@@ -444,46 +224,107 @@ xyz:GOLD buy
 xyz:SMSN buy
 ```
 
-`rate` 适合处理永续合约报价和日常习惯报价不一致的标的。例如 `QQQ -> xyz:XYZ100`，终端会保留原始永续报价，同时在括号里显示除以 `rate` 后的习惯价格。
-
 查询官方标的：
 
 ```bash
 markets BTC
 markets GOLD
-markets SAMSUNG
-markets QQQ
 markets --dex xyz --limit 10
-```
-
-也可以直接运行：
-
-```bash
-./hl_markets.py BTC
 ./hl_markets.py --csv > perp_markets.csv
 ```
 
-市场表字段：
+## macOS 和 Windows
 
-- `asset_id`：永续合约资产 id。
-- `dex`：默认主 DEX 或 builder DEX 名称。
-- `name`：SDK/API 下单用的合约代码。
-- `szDecimals`：数量精度。
-- `maxLeverage`：最大杠杆。
-- `marginTableId`：保证金表 id。
-- `isDelisted`：是否下架。
+macOS 专用终端：
 
-## 前台输出
+```text
+order-terminal.command
+```
 
-前台只显示账户指标和订单核心字段。完整运行日志仍写入 `logs/`，但前台不显示日志路径。数字统一使用千分位并保留 2 位小数。
+普通终端：
+
+```bash
+. ./aliases
+order BTC buy --dry-run
+```
+
+Windows 首次安装：
+
+```text
+setup-windows.cmd
+```
+
+Windows 日常使用：
+
+```text
+order-terminal-windows.cmd
+```
+
+或者在 CMD / PowerShell 里运行：
+
+```bat
+order.cmd BTC buy --dry-run
+query.cmd
+markets.cmd QQQ
+```
+
+## 手机网页控制台
+
+`simple_hyper_server.py` 是给 iPhone/Safari 用的极简网页控制台。它不会重写交易逻辑，只是在服务器上调用当前目录的 `hl_order.py`。
+
+本地或服务器启动：
+
+```bash
+cp simple-hyper.env.example simple-hyper.env
+set -a
+. ./simple-hyper.env
+set +a
+python3 simple_hyper_server.py --host 0.0.0.0 --port 8787
+```
+
+访问：
+
+```text
+http://服务器地址:8787
+```
+
+如果设置了 `SIMPLE_HYPER_TLS_CERT` 和 `SIMPLE_HYPER_TLS_KEY`，则使用：
+
+```text
+https://服务器地址:8787
+```
+
+安全设计：
+
+- 服务器不需要保存交易 `.env`。
+- 网页验证通过后会隐藏地址和密钥，凭证只留在当前页面内存里。
+- 每次执行请求都会带 `account_address` 和 `secret_key`，后端只放进子进程环境变量。
+- 后端用 `shlex.split()` 解析输入框命令，不走 shell。
+- 命令不含 `--dry-run` 且不是 `query` 时，前端会弹出真实提交确认。
+- 服务日志不记录请求 body，`hl_order.py` 日志也不会写入密钥。
+
+systemd 常驻可参考：
+
+- `systemd/simple-hyper-sync.service`
+- `systemd/simple-hyper-sync.timer`
+- `scripts/simple-hyper-sync.sh`
+
+常用命令：
+
+```bash
+sudo systemctl restart simple-hyper.service
+systemctl status simple-hyper-sync.timer
+journalctl -u simple-hyper-sync.service -n 80 --no-pager
+```
+
+## 输出和日志
+
+前台输出只显示账户指标和订单核心字段。数字统一使用千分位并保留 2 位小数。
 
 ```text
 +- Account ----------------+
 | 统一账户比率: 0.19%        |
 | 统一账户杠杆: 0.09x        |
-+----------------------------+
-+- Run --------------------+
-| dry_run: 1                 |
 +----------------------------+
 +- Order ------------------+
 | coin: xyz:XYZ100           |
@@ -502,82 +343,11 @@ markets --dex xyz --limit 10
 - `limitPx`：交易所返回的挂单价格。
 - `amount`：按挂单价格和数量计算出的实际名义金额。
 
-市价单：
-
-```bash
-BTC buy 10 --market
-BTC sell 10 --market
-BTC buy 10 --market --slippage 1%
-```
-
-`--market` 会使用 IOC 订单；默认滑点保护是 `0.05`，也就是 `5%`。如果要更保守，可以用 `--slippage 1%` 或 `--slippage 0.01`。
-
-止盈 / 止损：
-
-```bash
-# 保护已有多仓：到价后卖出平仓
-BTC sell 25 --tp 72000 --reduce-only
-BTC sell 25 --sl 65000 --reduce-only
-
-# 突破后开仓
-BTC sell 25 --stop 70000
-BTC buy 25 --stop 80000
-
-# 开多时同时挂止盈和止损
-BTC buy 100 --price 68000 --tp 72000 --sl 65000
-
-# 触发入场，并只平掉 60% 的止盈
-BTC buy 30 --stop 80000-10 --tp 0.6%+0d0.6
-
-# 子止盈 / 止损默认是触发市价单；指定 limit 就会变成触发限价单
-BTC sell 25 --sl 65000 --sl-limit 64800 --reduce-only
-BTC buy 100 --price 68000 --tp 72000 --tp-limit 71900 --sl 65000 --sl-limit 64800
-```
-
-分批挂单：
-
-```bash
-BTC buy 100 --scale 5 --from 67000 --to 63000
-BTC sell 200 --scale 4 --from 72000 --to 76000 --reduce-only
-
-# 梯子单
-BTC buy-for5-1000 --price 67000
-BTC sell-while85000+1000 --price 80000
-BTC buy-for5-1000 --price 67000 --tp 5%+0 --sl -2%-10
-```
-
-`--scale` 会把总金额平均分到每个价格；例如 `100` 美元拆 `5` 笔，就是每笔约 `20` 美元。拆分后每笔必须至少 `10` 美元。
-`buy-forCOUNT+STEP` 这种 count 梯子和 `buy-whileEND+STEP` 这种 range 梯子，会把每一档当成独立订单；普通梯子可以再配 `--tp` / `--sl`，每一档都会带自己的 bracket。梯子如果再配 `--stop` / `--take`，每一档会按自己的触发点展开，但这时不能再把 `--tp` / `--sl` 和它们放进同一条命令里。
-
-查询指令会返回当前所有 DEX 的持仓和未成订单：
-
-```bash
-query
-order query
-order --query
-```
-
-其中 `Positions` 显示当前持仓，`Open Orders` 显示当前未成订单。`side=B` 是买入 / 看多挂单，`side=A` 是卖出 / 看空挂单。
-
-## 日志和排错
-
-每次运行都会在这里保存完整日志：
+完整日志保存在：
 
 ```text
 logs/
 ```
-
-日志包括：
-
-- 命令参数
-- 账户上下文
-- L2 订单簿
-- `user_state`
-- `spot_state`
-- 统一账户指标计算过程
-- 杠杆更新结果
-- 下单 / 撤单返回
-- 异常 traceback
 
 排错时可以加：
 
@@ -587,67 +357,38 @@ BTC buy --dry-run --verbose
 
 如果出现 `Unknown perp coin`，优先用 `markets` 查真实 API 标的，再把常用缩写写入 `coin_aliases.csv`。
 
-## 统一账户指标
-
-真实下单流程：
+## 项目结构
 
 ```text
-1. 解析标的 / 方向 / 金额 / 价格
-2. 设置该合约杠杆；cross 用最大杠杆，不支持 cross 时 isolated 用 5x
-3. 提交下单
-4. 下单接口返回
-5. 扫所有 DEX 计算统一账户比率和统一账户杠杆
-6. 前台显示精简结果
+hl_order.py              # 下单 / 查询主入口
+hl_markets.py            # 标的查询入口
+simple_hyper/            # 可复用 Python 业务代码
+simple_hyper_server.py   # 手机网页控制台
+coin_aliases.csv         # 本地标的别名
+scripts/                 # 运维脚本
+systemd/                 # systemd 单元
+requirements.txt         # Python 依赖
 ```
 
-撤单也是撤单返回后再计算指标。`--dry-run` 不提交动作，只显示当前状态。
+设计约定：
 
-当前本地口径：
-
-- 统一账户比率：将各 DEX 的 maintenance margin 按 collateral token 聚合，再除以对应 spot 抵押品余额，取风险最高的一组。
-- 统一账户杠杆：当前总名义仓位 / 活跃抵押品余额。
-
-## 价格、数量和持仓规则
-
-直接调用 API 时，价格和数量需要是字符串，不能有多余尾随零。
-
-```text
-正确："50000", "0.01"
-错误："50000.00", "0.010"
-```
-
-使用 SDK 下单时可以传 `float`，SDK 会通过 `float_to_wire()` 转成规范字符串；如果传入会造成非法舍入的数值，SDK 会抛 `ValueError`。
-
-精度规则：
-
-- 价格最多 `5` 个有效数字。
-- 永续价格小数位最多 `6 - szDecimals`。
-- 现货价格小数位最多 `8 - szDecimals`。
-- 数量精度由该资产的 `szDecimals` 控制。
-
-参考：
-
-```text
-https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/7ee976d123b1e04295e4a1e37a424ca6a13bef88/examples/rounding.py
-```
-
-Hyperliquid 同一合约是净仓位逻辑，不会同时存在一条多仓和一条空仓。
-
-```text
-reduce_only=False：允许开仓、加仓、减仓、反手
-reduce_only=True：只允许减仓/平仓，不允许反手
-```
-
-只减仓 / 平仓：
-
-```bash
-BTC sell --reduce-only
-GOLD sell --reduce-only
-```
+- `hl_order.py` / `hl_markets.py` 保留为命令入口，现有 `order`、`query`、`.cmd` 和网页服务调用方式不变。
+- `simple_hyper/` 放可导入业务代码：运行环境、控制台格式化、K 线渲染、订单解析、价格和数量计算。
+- `scripts/` 只放 shell/systemd 这类运维脚本。
+- 下单路径复用 `Exchange` 内部已经初始化好的 `Info`，减少重复初始化和重复拉取元数据；`query` 路径不创建交易客户端。
 
 ## 环境和依赖
 
-`.venv/` 是当前目录专用 Python 虚拟环境，由首次安装命令创建。公开仓库不提交 `.venv/` 和本地 SDK 源码目录，依赖统一由 `requirements.txt` 安装并锁定到当前 SDK commit。
+`.venv/` 是当前目录专用 Python 虚拟环境，由首次安装命令创建。公开仓库不提交 `.venv/` 和本地 SDK 源码目录，依赖统一由 `requirements.txt` 安装。
+
+当前 SDK 信息：
+
+- SDK：`0.23.0`
+- commit：`7ee976d123b1e04295e4a1e37a424ca6a13bef88`
+- 官方仓库：https://github.com/hyperliquid-dex/hyperliquid-python-sdk
+- 官方 API 文档：https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api
+
+核心依赖：
 
 ```text
 hyperliquid-python-sdk
@@ -659,83 +400,39 @@ msgpack
 
 如果依赖损坏，可以删掉 `.venv/` 后重新执行首次安装命令。
 
-`.env` 需要包含：
+## 技术备注
+
+价格和数量规则：
+
+- 价格最多 `5` 个有效数字。
+- 永续价格小数位最多 `6 - szDecimals`。
+- 现货价格小数位最多 `8 - szDecimals`。
+- 数量精度由该资产的 `szDecimals` 控制。
+- Hyperliquid 同一合约是净仓位逻辑，不会同时存在一条多仓和一条空仓。
+
+`reduce_only` 规则：
 
 ```text
-account_address=0x主账户地址
-secret_key=0x私钥或agent私钥
+reduce_only=False：允许开仓、加仓、减仓、反手
+reduce_only=True：只允许减仓 / 平仓，不允许反手
 ```
 
-注意：
+统一账户指标口径：
 
-- `secret_key` 可以是主钱包私钥，也可以是已授权的 API wallet / agent 私钥。
-- `account_address` 必须是主账户地址，不是 agent 地址。
-- 不要把真实私钥提交进 Git。
+- 统一账户比率：将各 DEX 的 maintenance margin 按 collateral token 聚合，再除以对应 spot 抵押品余额，取风险最高的一组。
+- 统一账户杠杆：当前总名义仓位 / 活跃抵押品余额。
 
-## SDK 速查
-
-只读查询用 `Info`：
+SDK 用法：
 
 ```python
+import eth_account
+from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
 
 info = Info(constants.MAINNET_API_URL, skip_ws=True)
 print(info.all_mids()["BTC"])
-```
-
-交易动作使用 `Exchange`：
-
-```python
-import eth_account
-from hyperliquid.exchange import Exchange
-from hyperliquid.utils import constants
 
 wallet = eth_account.Account.from_key("0x你的私钥")
 exchange = Exchange(wallet, constants.MAINNET_API_URL, account_address="0x主账户地址")
-```
-
-当前 SDK 不是 `Exchange(address, private_key, url)` 这种接口。
-
-常用 `Info` 方法：
-
-- `info.all_mids()`
-- `info.meta()`
-- `info.meta(dex="xyz")`
-- `info.spot_meta()`
-- `info.user_state(address)`
-- `info.user_state(address, dex="xyz")`
-- `info.spot_user_state(address)`
-- `info.open_orders(address)`
-- `info.open_orders(address, dex="xyz")`
-- `info.l2_snapshot("BTC")`
-- `info.l2_snapshot("xyz:GOLD")`
-
-## 签名和限制
-
-优先让 SDK 自动签名。
-
-两类签名：
-
-1. 交易类 L1 action，例如下单、撤单、改单、杠杆调整。
-   - SDK 会构造 action hash，再签 phantom agent。
-   - EIP-712 domain 的 `chainId` 是 `1337`。
-   - mainnet/testnet 通过 phantom agent 的 `source` 区分。
-
-2. user-signed action，例如 USD 转账、spot 转账、提现、staking delegation。
-   - SDK 会写入 `signatureChainId` 和 `hyperliquidChain`。
-   - 当前 SDK 默认 `signatureChainId` 是 `0x66eee`。
-   - 一些官方/前端兼容示例里会看到 Arbitrum `0xa4b1`。
-
-速率限制常见值：
-
-- REST：每 IP 聚合权重约 `1200/min`。
-- WebSocket：每 IP 最多 `10` 个连接。
-- WebSocket：每 IP 最多 `1000` 个订阅。
-- WebSocket：每分钟最多 `30` 个新连接。
-
-官方说明：
-
-```text
-https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/rate-limits-and-user-limits
 ```
