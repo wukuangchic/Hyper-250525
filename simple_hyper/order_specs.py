@@ -189,6 +189,21 @@ def scale_prices(start: Decimal, end: Decimal, count: int, sz_decimals: int) -> 
     return prices
 
 
+def ladder_count_to_end_prices(start: Decimal, end: Decimal, count: int, sz_decimals: int, label: str) -> list[Decimal]:
+    if count < 2:
+        raise ValueError(f"{label} count must be >= 2")
+    if start <= 0 or end <= 0:
+        raise ValueError(f"{label} start and end prices must be positive")
+    if start == end:
+        raise ValueError(f"{label} start and end prices must be different")
+    step = (end - start) / Decimal(count - 1)
+    prices = [rounded_perp_price(start + step * Decimal(index), sz_decimals) for index in range(count)]
+    price_keys = {decimal_to_plain(price) for price in prices}
+    if len(price_keys) != len(prices):
+        raise ValueError(f"{label} prices collapse to duplicates after rounding; widen the range or reduce count")
+    return prices
+
+
 def ladder_for_prices(start: Decimal, count: int, step: Decimal, sz_decimals: int, label: str) -> list[Decimal]:
     if count < 2:
         raise ValueError(f"{label} count must be >= 2")

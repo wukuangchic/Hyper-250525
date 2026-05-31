@@ -218,6 +218,9 @@ HYPE buy 12 --while 65 -0.05 --tp 0.07%+0.01d0.9
 # 总金额 120，自动均分到 10 档
 HYPE buy --total 120 --for 10 -0.05 --tp 0.07%+0.01d0.9
 
+# 到 68 为止一共 3 档，步长自动计算
+HYPE buy --total 50 --while 68 --for 3 --tp 0.07%+0.02d0.9
+
 # 明确起点、终点、步长
 HYPE buy 12 --range 66 65 -0.05 --tp 0.07%+0.01d0.9
 
@@ -230,6 +233,7 @@ HYPE buy --total 120 --range 66 65 -0.05 --tp 0.07%+0.01d0.9 --explain
 - `--scale` 每张子单金额必须至少 `10` 美元。
 - `--for COUNT STEP` 表示从当前基准价格开始，按 `STEP` 间隔下 `COUNT` 档。
 - `--while END STEP` 表示从当前基准价格开始，按 `STEP` 间隔下到 `END` 为止。
+- `--while END --for COUNT` 表示从当前基准价格开始，到 `END` 为止一共 `COUNT` 档，程序自动计算步长。
 - `--range START END STEP` 表示从 `START` 开始，按 `STEP` 间隔下到 `END` 为止，等价于 `--price START --while END STEP`。
 - `--total TOTAL` 在梯子单或对称单里表示总金额，会按实际档数均分；不写 `--total` 时，位置参数 `amount` 是每一档金额。
 - `STEP` 必须带方向符号，例如 `-0.2`、`+1000`、`-0.5%`。

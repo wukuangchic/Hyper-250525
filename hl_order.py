@@ -67,6 +67,7 @@ from simple_hyper.order_specs import (
     coin_dex,
     coin_display_rate,
     ladder_for_prices,
+    ladder_count_to_end_prices,
     ladder_while_prices,
     normalize_signed_option_values,
     parse_entry_trigger_with_limit,
@@ -511,7 +512,10 @@ def print_explain(title: str, plans: list[dict[str, Any]], args: argparse.Namesp
         ("reduce_only", "1" if args.reduce_only else "0"),
     ]
     if args.ladder_mode:
-        rows.append(("ladder", f"{args.ladder_mode} {args.ladder_end or args.ladder_count} {args.ladder_step}"))
+        if args.ladder_step:
+            rows.append(("ladder", f"{args.ladder_mode} {args.ladder_end or args.ladder_count} {args.ladder_step}"))
+        else:
+            rows.append(("ladder", f"while {args.ladder_end} for {args.ladder_count}"))
     if args.range_spec:
         rows.append(("range", " ".join(args.range_spec)))
     if getattr(args, "symmetric", False):
@@ -1709,15 +1713,20 @@ def place_ladder_orders(
         price_source = f"same-side book level {args.book_level}"
         base_price = rounded_perp_price(base_price, sz_decimals)
 
-    step = resolve_ladder_step(base_price, ladder_step_spec, "ladder")
     if ladder_mode == "for":
+        step = resolve_ladder_step(base_price, ladder_step_spec, "ladder")
         ladder_count = int(args.ladder_count)
         prices = ladder_for_prices(base_price, ladder_count, step, sz_decimals, "ladder")
     elif ladder_mode == "while":
+        step = resolve_ladder_step(base_price, ladder_step_spec, "ladder")
         ladder_end_px = rounded_perp_price(Decimal(str(args.ladder_end)), sz_decimals)
         prices = ladder_while_prices(base_price, ladder_end_px, step, sz_decimals, "ladder")
+    elif ladder_mode == "count_to_end":
+        ladder_count = int(args.ladder_count)
+        ladder_end_px = rounded_perp_price(Decimal(str(args.ladder_end)), sz_decimals)
+        prices = ladder_count_to_end_prices(base_price, ladder_end_px, ladder_count, sz_decimals, "ladder")
     else:
-        raise ValueError("Ladder orders require -for or -while syntax")
+        raise ValueError("Ladder orders require --for, --while, or --while END --for COUNT syntax")
 
     amount_each = amount
     if args.amount_is_total:
@@ -1737,7 +1746,7 @@ def place_ladder_orders(
         prefix = f"ladder-{trigger_mode}"
     else:
         title = "Ladder Orders Bracket" if has_tpsl else "Ladder Orders"
-        prefix = f"ladder-{ladder_mode}"
+        prefix = "ladder-count-to-end" if ladder_mode == "count_to_end" else f"ladder-{ladder_mode}"
 
     plans: list[dict[str, Any]] = []
     grouped_plans: list[list[dict[str, Any]]] = []
@@ -2311,16 +2320,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--for",
         dest="ladder_for",
-        nargs=2,
+        nargs="+",
         metavar=("COUNT", "STEP"),
-        help="Place COUNT ladder orders separated by signed STEP, e.g. --for 10 -0.2.",
+        help="Place COUNT ladder orders. Use --for COUNT STEP, or combine --while END --for COUNT to auto-calculate the step.",
     )
     parser.add_argument(
         "--while",
         dest="ladder_while",
-        nargs=2,
+        nargs="+",
         metavar=("END", "STEP"),
-        help="Place ladder orders until END, separated by signed STEP, e.g. --while 65 -0.05.",
+        help="Place ladder orders until END. Use --while END STEP, or combine --while END --for COUNT to auto-calculate the step.",
     )
     parser.add_argument(
         "--range",
@@ -2357,7 +2366,10 @@ def parse_args() -> argparse.Namespace:
     args.ladder_step = None
     args.symmetric = False
     args.amount_is_total = False
-    explicit_ladder_count = bool(args.ladder_for) + bool(args.ladder_while) + bool(args.range_spec)
+    combined_count_to_end = bool(args.ladder_for) and bool(args.ladder_while)
+    if combined_count_to_end and (len(args.ladder_for) != 1 or len(args.ladder_while) != 1):
+        parser.error("combine --while END --for COUNT only when both options have one value")
+    explicit_ladder_count = (1 if combined_count_to_end else bool(args.ladder_for) + bool(args.ladder_while)) + bool(args.range_spec)
     if explicit_ladder_count > 1:
         parser.error("--for, --while, and --range are mutually exclusive")
     if args.total_amount is not None:
@@ -2378,7 +2390,25 @@ def parse_args() -> argparse.Namespace:
             except ValueError as exc:
                 parser.error(str(exc))
             args.side = "buy" if is_buy else "sell"
-    if args.ladder_for:
+    if combined_count_to_end:
+        end_text = args.ladder_while[0]
+        count_text = args.ladder_for[0]
+        try:
+            args.ladder_count = int(count_text)
+        except ValueError:
+            parser.error("--for COUNT must be an integer")
+        if args.ladder_count < 2:
+            parser.error("--for COUNT must be >= 2")
+        try:
+            args.ladder_end = Decimal(end_text)
+        except InvalidOperation:
+            parser.error("--while END must be a positive number")
+        if args.ladder_end <= 0:
+            parser.error("--while END must be positive")
+        args.ladder_mode = "count_to_end"
+    elif args.ladder_for:
+        if len(args.ladder_for) != 2:
+            parser.error("--for requires COUNT STEP unless combined as --while END --for COUNT")
         count_text, step_text = args.ladder_for
         try:
             args.ladder_count = int(count_text)
@@ -2388,7 +2418,9 @@ def parse_args() -> argparse.Namespace:
             parser.error("--for COUNT must be >= 2")
         args.ladder_mode = "for"
         args.ladder_step = unprotect_ladder_step_value(step_text)
-    if args.ladder_while:
+    elif args.ladder_while:
+        if len(args.ladder_while) != 2:
+            parser.error("--while requires END STEP unless combined as --while END --for COUNT")
         end_text, step_text = args.ladder_while
         try:
             args.ladder_end = Decimal(end_text)
