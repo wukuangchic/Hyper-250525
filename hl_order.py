@@ -2334,9 +2334,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--range",
         dest="range_spec",
-        nargs=3,
-        metavar=("START", "END", "STEP"),
-        help="Price-anchored ladder shorthand, e.g. --range 66 65 -0.05.",
+        nargs="+",
+        metavar="VALUE",
+        help="Price-anchored ladder shorthand. Use --range START END STEP, or combine --range START END --for COUNT.",
     )
     kline_group = parser.add_mutually_exclusive_group()
     kline_group.add_argument("--day", action="store_true", help="Show the last 30 daily candles in market overview mode.")
@@ -2366,10 +2366,19 @@ def parse_args() -> argparse.Namespace:
     args.ladder_step = None
     args.symmetric = False
     args.amount_is_total = False
-    combined_count_to_end = bool(args.ladder_for) and bool(args.ladder_while)
+    combined_count_to_end = bool(args.ladder_for) and bool(args.ladder_while) and not args.range_spec
+    combined_range_count_to_end = bool(args.ladder_for) and bool(args.range_spec) and not args.ladder_while
+    if args.ladder_for and args.ladder_while and args.range_spec:
+        parser.error("--for, --while, and --range cannot all be combined")
     if combined_count_to_end and (len(args.ladder_for) != 1 or len(args.ladder_while) != 1):
         parser.error("combine --while END --for COUNT only when both options have one value")
-    explicit_ladder_count = (1 if combined_count_to_end else bool(args.ladder_for) + bool(args.ladder_while)) + bool(args.range_spec)
+    if combined_range_count_to_end and (len(args.ladder_for) != 1 or len(args.range_spec) != 2):
+        parser.error("combine --range START END --for COUNT only when --range has START END and --for has COUNT")
+    explicit_ladder_count = (
+        1
+        if combined_count_to_end or combined_range_count_to_end
+        else bool(args.ladder_for) + bool(args.ladder_while) + bool(args.range_spec)
+    )
     if explicit_ladder_count > 1:
         parser.error("--for, --while, and --range are mutually exclusive")
     if args.total_amount is not None:
@@ -2406,9 +2415,30 @@ def parse_args() -> argparse.Namespace:
         if args.ladder_end <= 0:
             parser.error("--while END must be positive")
         args.ladder_mode = "count_to_end"
+    elif combined_range_count_to_end:
+        start_text, end_text = args.range_spec
+        count_text = args.ladder_for[0]
+        if args.price:
+            parser.error("--range cannot be combined with --price")
+        try:
+            args.ladder_count = int(count_text)
+        except ValueError:
+            parser.error("--for COUNT must be an integer")
+        if args.ladder_count < 2:
+            parser.error("--for COUNT must be >= 2")
+        try:
+            start_px = Decimal(start_text)
+            args.ladder_end = Decimal(end_text)
+        except InvalidOperation:
+            parser.error("--range START and END must be positive numbers")
+        if start_px <= 0 or args.ladder_end <= 0:
+            parser.error("--range START and END must be positive")
+        args.price = decimal_to_plain(start_px)
+        args.ladder_mode = "count_to_end"
+        args.range_spec = [decimal_to_plain(start_px), decimal_to_plain(args.ladder_end), f"for {args.ladder_count}"]
     elif args.ladder_for:
         if len(args.ladder_for) != 2:
-            parser.error("--for requires COUNT STEP unless combined as --while END --for COUNT")
+            parser.error("--for requires COUNT STEP unless combined as --while END --for COUNT or --range START END --for COUNT")
         count_text, step_text = args.ladder_for
         try:
             args.ladder_count = int(count_text)
@@ -2430,7 +2460,9 @@ def parse_args() -> argparse.Namespace:
             parser.error("--while END must be positive")
         args.ladder_mode = "while"
         args.ladder_step = unprotect_ladder_step_value(step_text)
-    if args.range_spec:
+    if args.range_spec and not combined_range_count_to_end:
+        if len(args.range_spec) != 3:
+            parser.error("--range requires START END STEP unless combined as --range START END --for COUNT")
         start_text, end_text, step_text = args.range_spec
         if args.price:
             parser.error("--range cannot be combined with --price")

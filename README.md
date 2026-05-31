@@ -224,6 +224,9 @@ HYPE buy --total 50 --while 68 --for 3 --tp 0.07%+0.02d0.9
 # 明确起点、终点、步长
 HYPE buy 12 --range 66 65 -0.05 --tp 0.07%+0.01d0.9
 
+# 明确起点、终点、档数，步长自动计算
+HYPE buy --total 50 --range 68.5 68 --for 3 --tp 0.07%+0.02d0.9
+
 # 只解释解析结果，不提交
 HYPE buy --total 120 --range 66 65 -0.05 --tp 0.07%+0.01d0.9 --explain
 ```
@@ -235,6 +238,7 @@ HYPE buy --total 120 --range 66 65 -0.05 --tp 0.07%+0.01d0.9 --explain
 - `--while END STEP` 表示从当前基准价格开始，按 `STEP` 间隔下到 `END` 为止。
 - `--while END --for COUNT` 表示从当前基准价格开始，到 `END` 为止一共 `COUNT` 档，程序自动计算步长。
 - `--range START END STEP` 表示从 `START` 开始，按 `STEP` 间隔下到 `END` 为止，等价于 `--price START --while END STEP`。
+- `--range START END --for COUNT` 表示从 `START` 到 `END` 一共 `COUNT` 档，程序自动计算步长。
 - `--total TOTAL` 在梯子单或对称单里表示总金额，会按实际档数均分；不写 `--total` 时，位置参数 `amount` 是每一档金额。
 - `STEP` 必须带方向符号，例如 `-0.2`、`+1000`、`-0.5%`。
 - 普通梯子可以再配 `--tp` / `--sl`，每一档都会带自己的 bracket。
