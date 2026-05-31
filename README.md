@@ -92,7 +92,7 @@ BTC buy 100 --price 68000 --tp 72000 --sl 65000
 - `side`：方向，支持 `buy/sell`、`long/short`、`看多/看空`，也支持 `both/sym/对称`。
 - `amount`：美元名义金额，默认 `10`；也可以用 `--total` 表示总金额。
 - `entry/exec`：入场或执行方式，例如 `--market`、`--price`、`--offset`、`--stop`、`--take`、`--level`、`--range`、`--for`、`--while`、`--tif`、`--slippage`。
-- `tp/sl`：止盈止损，例如 `--tp 2%+0.1% --sl -2%-0.1%`。
+- `tp/sl`：止盈止损，例如 `--tp 2%+0.1% --sl 2%-0.1%`；百分比不写正负号时会按方向自动判断。
 - `--reduce-only`：只减仓，不允许反手。
 
 默认行为：
@@ -167,7 +167,7 @@ BTC sell 25 --tp 72000 --reduce-only
 BTC sell 25 --sl 65000 --reduce-only
 
 # 按持仓均价计算相对止盈止损
-BTC sell --tp 2%+0.1% --sl -2%-0.1% --reduce-only
+BTC sell --tp 2%+0.1% --sl 2%-0.1% --reduce-only
 
 # 开仓同时挂止盈止损
 BTC buy 100 --price 68000 --tp 72000 --sl 65000
@@ -175,6 +175,12 @@ BTC buy 100 --price 68000 --tp 72000 --sl 65000
 # 触发入场，并只处理 60% 的止盈数量
 BTC buy 30 --stop 80000-10 --tp 0.6%+0d0.6
 ```
+
+百分比不写正负号时，程序按方向自动判断：
+
+- `buy/long`：`--tp 2%` 表示上涨 2% 止盈，`--sl 2%` 表示下跌 2% 止损。
+- `sell/short`：`--tp 2%` 表示下跌 2% 止盈，`--sl 2%` 表示上涨 2% 止损。
+- 仍然可以显式写 `+2%` 或 `-2%`，显式符号优先。
 
 数量比例后缀：
 
@@ -206,7 +212,7 @@ BTC buy --for 5 -1000 --price 67000
 BTC sell --while 85000 +1000 --price 80000
 
 # 普通梯子 + 每档自己的 TP/SL
-BTC buy --for 5 -1000 --price 67000 --tp 5%+0 --sl -2%-10
+BTC buy --for 5 -1000 --price 67000 --tp 5%+0 --sl 2%-10
 
 # 触发梯子，只做减仓
 BTC sell 10 --while 80000 +1000 --stop 77000 --reduce-only

@@ -1338,6 +1338,7 @@ def build_tpsl_child_plans(
             args.take_profit_limit,
             base_px,
             "tp",
+            parent_is_long,
         )
         take_trigger_px = rounded_perp_price(take_trigger_px, int(asset["szDecimals"]))
         if take_limit_px is not None:
@@ -1365,6 +1366,7 @@ def build_tpsl_child_plans(
             args.stop_loss_limit,
             base_px,
             "sl",
+            parent_is_long,
         )
         stop_trigger_px = rounded_perp_price(stop_trigger_px, int(asset["szDecimals"]))
         if stop_limit_px is not None:
@@ -1461,6 +1463,7 @@ def place_protective_tpsl_orders(
             args.take_profit_limit,
             position_base_px,
             "tp",
+            position_is_long,
         )
         take_trigger_px = rounded_perp_price(take_trigger_px, int(asset["szDecimals"]))
         if take_limit_px is not None:
@@ -1487,6 +1490,7 @@ def place_protective_tpsl_orders(
             args.stop_loss_limit,
             position_base_px,
             "sl",
+            position_is_long,
         )
         stop_trigger_px = rounded_perp_price(stop_trigger_px, int(asset["szDecimals"]))
         if stop_limit_px is not None:
@@ -2296,13 +2300,13 @@ def parse_args() -> argparse.Namespace:
         "--tp",
         "--take-profit",
         dest="take_profit",
-        help="Take-profit trigger price. Use ABS, ABS+OFFSET, or REL%%[+/-OFFSET] from the entry/position price. Append dRATIO to close only part of the order.",
+        help="Take-profit trigger price. Use ABS, ABS+OFFSET, or REL%%[+/-OFFSET] from the entry/position price. Unsigned REL%% auto-follows side. Append dRATIO to close only part of the order.",
     )
     parser.add_argument(
         "--sl",
         "--stop-loss",
         dest="stop_loss",
-        help="Stop-loss trigger price. Use ABS, ABS+OFFSET, or REL%%[+/-OFFSET] from the entry/position price. Append dRATIO to close only part of the order.",
+        help="Stop-loss trigger price. Use ABS, ABS+OFFSET, or REL%%[+/-OFFSET] from the entry/position price. Unsigned REL%% auto-follows side. Append dRATIO to close only part of the order.",
     )
     parser.add_argument(
         "--tp-limit",

@@ -364,7 +364,18 @@ def parse_size_ratio(value: str, label: str) -> Decimal:
     return ratio
 
 
-def parse_tpsl_spec(value: str, base_px: Decimal | None, label: str) -> tuple[Decimal, Decimal | None, Decimal]:
+def tpsl_relative_sign(label: str, position_is_long: bool) -> str:
+    if label == "tp":
+        return "+" if position_is_long else "-"
+    return "-" if position_is_long else "+"
+
+
+def parse_tpsl_spec(
+    value: str,
+    base_px: Decimal | None,
+    label: str,
+    position_is_long: bool | None = None,
+) -> tuple[Decimal, Decimal | None, Decimal]:
     text = value.strip().replace(" ", "")
     match = TPSL_SPEC_RE.fullmatch(text)
     if not match:
@@ -373,11 +384,14 @@ def parse_tpsl_spec(value: str, base_px: Decimal | None, label: str) -> tuple[De
             "or REL%[+/-OFFSET] when a reference price is available. Append dRATIO to close only part of the order."
         )
 
-    trigger_sign = match.group("trigger_sign") or "+"
+    raw_trigger_sign = match.group("trigger_sign")
+    trigger_sign = raw_trigger_sign or "+"
     trigger_text = match.group("trigger")
     if match.group("trigger_pct"):
         if base_px is None:
             raise ValueError(f"{label} relative trigger prices require a reference price")
+        if not raw_trigger_sign and position_is_long is not None:
+            trigger_sign = tpsl_relative_sign(label, position_is_long)
         trigger_pct = Decimal(trigger_text) / Decimal("100")
         if trigger_sign == "-":
             trigger_pct = -trigger_pct
@@ -406,8 +420,9 @@ def resolve_tpsl_spec(
     explicit_limit: str | None,
     base_px: Decimal | None,
     label: str,
+    position_is_long: bool | None = None,
 ) -> tuple[Decimal, Decimal | None, Decimal]:
-    trigger_px, inline_limit_px, size_ratio = parse_tpsl_spec(value, base_px, label)
+    trigger_px, inline_limit_px, size_ratio = parse_tpsl_spec(value, base_px, label, position_is_long)
     if explicit_limit is not None and inline_limit_px is not None:
         raise ValueError(f"--{label}-limit cannot be combined with inline +/- syntax in --{label}")
     if explicit_limit is not None:
