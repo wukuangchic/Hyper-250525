@@ -289,6 +289,8 @@ set +a
 python3 simple_hyper_server.py --host 0.0.0.0 --port 8787
 ```
 
+网页控制台等待命令完成的默认超时是 `300` 秒，可通过 `SIMPLE_HYPER_COMMAND_TIMEOUT` 调整。循环单档数较多时，建议保持 `300` 秒或更高。
+
 访问：
 
 ```text
