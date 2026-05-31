@@ -1596,10 +1596,12 @@ def place_symmetric_orders(
     asset: dict[str, Any],
     amount: Decimal,
     current_mid: Decimal | None,
+    slippage: Decimal,
     max_leverage: int,
     price_rate: Decimal | None,
 ) -> None:
     sz_decimals = int(asset["szDecimals"])
+    has_tpsl = bool(args.take_profit or args.stop_loss)
     if args.price:
         base_price = Decimal(args.price)
         price_source = "user center"
@@ -1654,11 +1656,60 @@ def place_symmetric_orders(
     for plan in plans:
         plan["mode"] = "symmetric"
 
+    grouped_plans: list[list[dict[str, Any]]] = []
+    for index, entry_plan in enumerate(plans, start=1):
+        group_plans = [entry_plan]
+        if has_tpsl:
+            child_plans = build_tpsl_child_plans(
+                args,
+                exchange,
+                coin,
+                asset,
+                bool(entry_plan["is_buy"]),
+                entry_plan["size"],
+                amount_each,
+                slippage,
+                Decimal(str(entry_plan["reference_price"])),
+            )
+            for child in child_plans:
+                child["label"] = f"{index}/2 {child['label']}"
+            group_plans.extend(child_plans)
+        grouped_plans.append(group_plans)
+
     if args.verbose:
         print("base_price:", decimal_to_plain(base_price))
         print("offset:", decimal_to_plain(offset))
         print("buy_price:", decimal_to_plain(buy_price))
         print("sell_price:", decimal_to_plain(sell_price))
+
+    if args.explain:
+        display_plans = plans if not has_tpsl else [plan for group in grouped_plans for plan in group]
+        print_explain("Symmetric Orders Bracket" if has_tpsl else "Symmetric Orders", display_plans, args, price_rate)
+        return
+
+    if args.dry_run:
+        display_plans = plans if not has_tpsl else [plan for group in grouped_plans for plan in group]
+        print_account_metrics(info, account)
+        print_box("Run", [("dry_run", "1")])
+        print_order_plan_table("Symmetric Orders Bracket" if has_tpsl else "Symmetric Orders", display_plans, price_rate)
+        return
+
+    if has_tpsl:
+        for index, group_plans in enumerate(grouped_plans):
+            submit_order_plans(
+                exchange,
+                info,
+                account,
+                coin,
+                max_leverage,
+                group_plans,
+                "normalTpsl",
+                args,
+                price_rate,
+                "Symmetric Orders Bracket",
+                update_leverage=index == 0,
+            )
+        return
 
     submit_order_plans(
         exchange,
@@ -1913,6 +1964,7 @@ def place_order(args: argparse.Namespace) -> None:
             asset,
             amount,
             current_mid,
+            slippage,
             max_leverage,
             price_rate,
         )
@@ -2540,8 +2592,6 @@ def parse_args() -> argparse.Namespace:
             parser.error("symmetric orders cannot use --reduce-only")
         if args.stop_entry or args.take_entry:
             parser.error("symmetric orders cannot be combined with --stop/--take")
-        if has_tpsl:
-            parser.error("symmetric orders cannot be combined with --tp/--sl")
         if args.ladder_mode is not None:
             parser.error("symmetric orders cannot be combined with --for/--while/--range")
         if args.scale is not None or args.scale_from or args.scale_to:

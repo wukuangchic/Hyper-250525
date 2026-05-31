@@ -818,6 +818,7 @@ README_HTML = r"""<!doctype html>
         <li><code>BTC buy 10 --price 75000 --dry-run</code></li>
         <li><code>BTC both 100 --price 75000 --offset 2% --dry-run</code></li>
         <li><code>BTC sym --total 200 --offset 2% --explain</code></li>
+        <li><code>JPY both 20 --offset 2% --tp 1% --sl 0.7% --explain</code></li>
         <li><code>BTC sell 10 --market --dry-run</code></li>
         <li><code>BTC sell 25 --stop 70000 --dry-run</code></li>
         <li><code>BTC buy 25 --stop 80000 --dry-run</code></li>
@@ -860,7 +861,7 @@ README_HTML = r"""<!doctype html>
         <li>Trigger-limit orders are not <code>ALO</code>; only plain limit orders use <code>--tif</code>.</li>
         <li><code>--tp</code> / <code>--sl</code> can use absolute prices, absolute prices plus offsets, or relative percentages from the entry / position price such as <code>2%+0.1%</code>. Unsigned percentages auto-follow side; explicit <code>+</code> / <code>-</code> still override.</li>
         <li><code>--tp</code> / <code>--sl</code> without <code>--reduce-only</code> create a bracket order; with <code>--reduce-only</code> they create protective position TP/SL orders.</li>
-        <li><code>both</code> / <code>sym</code> requires <code>--offset</code>. Positional <code>amount</code> is per side; <code>--total</code> splits evenly across the buy and sell legs. Actual notional may be slightly higher after exchange size rounding and current-mid minimum-value checks.</li>
+        <li><code>both</code> / <code>sym</code> requires <code>--offset</code>. Positional <code>amount</code> is per side; <code>--total</code> splits evenly across the buy and sell legs. It can carry <code>--tp</code> / <code>--sl</code>; the buy leg uses long TP/SL direction and the sell leg uses short TP/SL direction. Actual notional may be slightly higher after exchange size rounding and current-mid minimum-value checks.</li>
         <li><code>--for COUNT STEP</code> is a count ladder, <code>--while END STEP</code> is a range ladder, and <code>--while END --for COUNT</code> auto-calculates the step so the ladder has exactly <code>COUNT</code> legs. <code>--range START END STEP</code> is shorthand for <code>--price START --while END STEP</code>; <code>--range START END --for COUNT</code> auto-calculates the step from explicit start to end. Use <code>--total</code> to divide total notional across ladder legs, and <code>--explain</code> to print the parsed plan without submitting. Ordinary ladders can also carry <code>--tp</code> / <code>--sl</code>, with each ladder leg getting its own bracket. Trigger ladders can also use <code>--stop</code> / <code>--take</code> so each leg gets its own trigger anchor. That trigger-ladder mode can work with <code>--reduce-only</code>, but it cannot share the same submit with <code>--tp</code> / <code>--sl</code> because <code>normalTpsl</code> requires a non-trigger main order. It is different from <code>--scale</code>, which splits a total amount evenly.</li>
         <li>The web page shows the same local timestamps as the terminal.</li>
         <li><code>--level</code> is the main name for the same-side book depth; <code>--book-level</code> still works as an alias.</li>

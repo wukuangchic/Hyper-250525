@@ -119,6 +119,9 @@ BTC both 100 --price 75000 --offset 2%
 
 # 总金额 200，自动拆成买卖各 100
 BTC sym --total 200 --offset 2% --explain
+
+# 对称单也可以给两边各自带 TP/SL
+JPY both 20 --offset 2% --tp 1% --sl 0.7%
 ```
 
 注意：
@@ -127,7 +130,8 @@ BTC sym --total 200 --offset 2% --explain
 - `--price` 是中心价；不写时使用当前 mid。
 - `--offset` 支持百分比或绝对价差，例如 `2%`、`1500`。
 - 实际名义金额会按交易所数量精度和当前 mid 的最小价值校验向上取整，可能略高于输入值。
-- 对称单只做普通限价单，不能和 `--market`、`--stop`、`--take`、`--tp`、`--sl`、`--for`、`--while`、`--range`、`--scale` 混用。
+- 对称单只做普通限价单，可以带 `--tp` / `--sl`；买腿按多单方向计算，卖腿按空单方向计算。
+- 对称单不能和 `--market`、`--stop`、`--take`、`--for`、`--while`、`--range`、`--scale` 混用。
 
 ## 触发单和止盈止损
 
