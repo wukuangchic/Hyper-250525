@@ -19,7 +19,7 @@
 - 你可以直接写成 `70000+50`、`70000-50`、`70000+0.2%` 这种 `触发价+偏移` 形式；不写偏移时默认是触发市价单。`--stop-limit` / `--take-limit` 也仍然可用，作为显式写法。
 - 百分比是按触发价计算的，所以 `70000+2% = 71400`，如果你想要 `70140`，写 `70000+0.2%`。
 - `--tp` / `--sl` 也支持 `ABS+OFFSET` 或 `REL%+OFFSET` 这种写法；相对百分比是按入场价或持仓均价计算的。买多通常用正百分比止盈、负百分比止损，卖空则相反。
-- 你还可以在 `--tp` / `--sl` 后面加 `d0.6` 或 `d60%`，表示只平掉 60% 的这笔单子。
+- 你还可以在 `--tp` / `--sl` 后面加 `d0.6` 或 `d60%`，表示按比例处理这笔单子；当前允许范围是 `0 < ratio <= 2`，所以也可以用来做不对称卖出。
 - `--stop` / `--take` 可以和 `--tp` / `--sl` 组合成 entry-trigger bracket，和普通价格单的 bracket 一样，只是父单先变成触发单。
 - 这类百分比算出来的触发价和限价，会先对齐到交易所可接受的价格精度，再提交下单。
 - 这种带触发的偏移限价不是 `ALO`；它们是 trigger-limit。只有普通限价单才会走 `--tif`。
@@ -35,6 +35,13 @@
 - commit：`7ee976d123b1e04295e4a1e37a424ca6a13bef88`
 - 官方仓库：https://github.com/hyperliquid-dex/hyperliquid-python-sdk
 - 官方 API 文档：https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api
+
+## 代码结构
+
+- `hl_order.py` / `hl_markets.py` 保留为命令入口，现有 `order`、`query`、`.cmd` 和网页服务调用方式不变。
+- `simple_hyper/` 放可导入的 Python 业务代码：运行环境、控制台格式化、K 线渲染、订单解析、价格和数量计算。
+- `scripts/` 继续放 shell/systemd 这类运维脚本，不再塞可复用 Python 函数，避免入口脚本和脚本目录互相耦合。
+- 下单路径会复用 `Exchange` 内部已经初始化好的 `Info`，减少重复初始化和重复拉取元数据；`query` 路径不再创建交易客户端。
 
 ## 快速开始
 

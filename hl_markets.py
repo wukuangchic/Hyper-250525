@@ -5,46 +5,14 @@ from __future__ import annotations
 
 import argparse
 import csv
-import os
 import sys
-from pathlib import Path
+
+from simple_hyper.runtime import ensure_local_venv
 
 
-def ensure_local_venv() -> None:
-    project_dir = Path(__file__).resolve().parent
-    venv_dir = project_dir / ".venv"
-    candidates = [
-        venv_dir / "bin" / "python",
-        venv_dir / "Scripts" / "python.exe",
-    ]
-    venv_python = next((path for path in candidates if path.exists()), None)
-    if venv_python is None:
-        return
-    if Path(sys.prefix).resolve() == venv_dir.resolve():
-        return
-    os.execv(str(venv_python), [str(venv_python), str(Path(__file__).resolve()), *sys.argv[1:]])
+ensure_local_venv(__file__)
 
-
-ensure_local_venv()
-
-from hyperliquid.info import Info
-from hyperliquid.utils import constants
-
-from coin_aliases import load_coin_aliases
-
-
-COIN_ALIASES = load_coin_aliases()
-
-
-def canonical_coin_input(raw_coin: str) -> str:
-    coin = raw_coin.strip()
-    alias = COIN_ALIASES.get(coin.upper())
-    if alias:
-        return alias
-    if ":" in coin:
-        dex, name = coin.split(":", 1)
-        return f"{dex.lower()}:{name.upper()}"
-    return coin
+from simple_hyper.order_specs import canonical_coin_input
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,6 +27,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    from hyperliquid.info import Info
+    from hyperliquid.utils import constants
+
     args = parse_args()
     base_url = constants.TESTNET_API_URL if args.network == "testnet" else constants.MAINNET_API_URL
     info = Info(base_url, skip_ws=True, timeout=args.timeout)
