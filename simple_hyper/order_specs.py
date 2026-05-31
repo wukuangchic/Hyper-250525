@@ -453,6 +453,7 @@ VALUE_OPTION_STRINGS = {
     "--from",
     "--to",
     "--total",
+    "--offset",
     "--range",
     "--for",
     "--while",

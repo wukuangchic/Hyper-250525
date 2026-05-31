@@ -7,6 +7,7 @@ Examples:
   ./hl_order.py BTC buy
   ./hl_order.py BTC buy 10 --market
   ./hl_order.py BTC buy --price 75000
+  ./hl_order.py BTC both 100 --price 75000 --offset 2%
   ./hl_order.py BTC sell 25 --price 80000
   ./hl_order.py BTC sell 25 --stop 70000
   ./hl_order.py BTC sell 25 --stop 70000+50
@@ -89,6 +90,7 @@ from coin_aliases import coin_alias_key
 
 DEFAULT_SLIPPAGE = "0.05"
 ISOLATED_FALLBACK_LEVERAGE = 5
+SYMMETRIC_SIDE_ALIASES = {"both", "sym", "symmetric", "dual", "双向", "对称", "对称单"}
 
 
 class RunLogger:
@@ -512,6 +514,8 @@ def print_explain(title: str, plans: list[dict[str, Any]], args: argparse.Namesp
         rows.append(("ladder", f"{args.ladder_mode} {args.ladder_end or args.ladder_count} {args.ladder_step}"))
     if args.range_spec:
         rows.append(("range", " ".join(args.range_spec)))
+    if getattr(args, "symmetric", False):
+        rows.append(("symmetric", f"offset {args.symmetric_offset}"))
     if args.take_profit:
         rows.append(("tp", args.take_profit))
     if args.stop_loss:
@@ -1049,6 +1053,27 @@ def build_limit_order_plan(
     }
 
 
+def resolve_symmetric_offset(base_px: Decimal, offset_spec: str) -> Decimal:
+    text = offset_spec.strip()
+    if text.startswith("+"):
+        text = text[1:]
+    if not text or text.startswith("-"):
+        raise ValueError("--offset must be positive, e.g. 2% or 1500")
+    try:
+        if text.endswith("%"):
+            pct_text = text[:-1]
+            if not pct_text:
+                raise InvalidOperation
+            offset = base_px * (Decimal(pct_text) / Decimal("100"))
+        else:
+            offset = Decimal(text)
+    except InvalidOperation as exc:
+        raise ValueError("--offset must be a positive number or percent, e.g. 2% or 1500") from exc
+    if offset <= 0:
+        raise ValueError("--offset must be positive")
+    return offset
+
+
 def build_entry_order_plan(
     args: argparse.Namespace,
     info: Info,
@@ -1554,6 +1579,93 @@ def place_scale_orders(
     )
 
 
+def place_symmetric_orders(
+    args: argparse.Namespace,
+    exchange: Exchange,
+    info: Info,
+    account: str,
+    coin: str,
+    asset: dict[str, Any],
+    amount: Decimal,
+    current_mid: Decimal | None,
+    max_leverage: int,
+    price_rate: Decimal | None,
+) -> None:
+    sz_decimals = int(asset["szDecimals"])
+    if args.price:
+        base_price = Decimal(args.price)
+        price_source = "user center"
+    else:
+        if current_mid is None:
+            raise ValueError(f"No mid price found for {coin}, cannot place symmetric orders")
+        base_price = current_mid
+        price_source = "current mid"
+
+    base_price = rounded_perp_price(base_price, sz_decimals)
+    offset = resolve_symmetric_offset(base_price, args.symmetric_offset)
+    buy_price_raw = base_price - offset
+    if buy_price_raw <= 0:
+        raise ValueError("Symmetric buy price must be positive; use a smaller --offset")
+    buy_price = rounded_perp_price(buy_price_raw, sz_decimals)
+    sell_price = rounded_perp_price(base_price + offset, sz_decimals)
+    if buy_price >= sell_price:
+        raise ValueError("Symmetric prices collapse after rounding; use a larger --offset")
+
+    amount_each = amount
+    if args.amount_is_total:
+        amount_each = amount / Decimal("2")
+        if amount_each < MIN_NOTIONAL:
+            raise ValueError(f"Symmetric total is too small: each order must be at least {MIN_NOTIONAL} USD")
+
+    plans = [
+        build_limit_order_plan(
+            coin,
+            True,
+            amount_each,
+            asset,
+            buy_price,
+            False,
+            args.tif,
+            None,
+            label="buy -offset",
+            price_source=f"{price_source} - {args.symmetric_offset}",
+        ),
+        build_limit_order_plan(
+            coin,
+            False,
+            amount_each,
+            asset,
+            sell_price,
+            False,
+            args.tif,
+            None,
+            label="sell +offset",
+            price_source=f"{price_source} + {args.symmetric_offset}",
+        ),
+    ]
+    for plan in plans:
+        plan["mode"] = "symmetric"
+
+    if args.verbose:
+        print("base_price:", decimal_to_plain(base_price))
+        print("offset:", decimal_to_plain(offset))
+        print("buy_price:", decimal_to_plain(buy_price))
+        print("sell_price:", decimal_to_plain(sell_price))
+
+    submit_order_plans(
+        exchange,
+        info,
+        account,
+        coin,
+        max_leverage,
+        plans,
+        "na",
+        args,
+        price_rate,
+        "Symmetric Orders",
+    )
+
+
 def place_ladder_orders(
     args: argparse.Namespace,
     exchange: Exchange,
@@ -1751,6 +1863,7 @@ def place_order(args: argparse.Namespace) -> None:
             or args.take_profit
             or args.stop_loss
             or args.total_amount
+            or args.symmetric_offset
             or args.ladder_mode
             or args.scale
             or args.scale_from
@@ -1766,7 +1879,6 @@ def place_order(args: argparse.Namespace) -> None:
         cancel_order(exchange, info, account, coin, dex, args.cancel, args.dry_run, price_rate)
         return
 
-    is_buy = parse_side(args.side)
     amount = Decimal(args.amount)
     if amount <= 0:
         raise ValueError("amount must be positive")
@@ -1777,6 +1889,23 @@ def place_order(args: argparse.Namespace) -> None:
     current_mid = Decimal(str(mids[coin])) if mids.get(coin) is not None else None
     log_event("all_mids_sample", {"dex": dex or "default", "coin": coin, "mid": mids.get(coin)})
     max_leverage = int(asset["maxLeverage"])
+
+    if args.symmetric:
+        place_symmetric_orders(
+            args,
+            exchange,
+            info,
+            account,
+            coin,
+            asset,
+            amount,
+            current_mid,
+            max_leverage,
+            price_rate,
+        )
+        return
+
+    is_buy = parse_side(args.side)
 
     if args.ladder_mode is not None:
         place_ladder_orders(
@@ -2117,11 +2246,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "side",
         nargs="?",
-        help="buy/long/看多 or sell/short/看空. Not needed with --cancel.",
+        help="buy/long/看多, sell/short/看空, or both/sym/对称. Not needed with --cancel.",
     )
     parser.add_argument("amount", nargs="?", help="USD notional. Default: 10.")
-    parser.add_argument("--total", dest="total_amount", help="Total USD notional. Ladder orders divide it across all legs.")
+    parser.add_argument("--total", dest="total_amount", help="Total USD notional. Ladder and symmetric orders divide it across legs.")
     parser.add_argument("--price", help="Limit price. Defaults to same-side book level 10.")
+    parser.add_argument("--offset", dest="symmetric_offset", help="Symmetric order distance from base price, e.g. 2%% or 1500.")
     parser.add_argument("--market", action="store_true", help="Submit as a market order using IOC with slippage protection.")
     parser.add_argument("--slippage", default=DEFAULT_SLIPPAGE, help="Market slippage protection. Default: 0.05. Also accepts 5%%.")
     parser.add_argument("--level", "--book-level", dest="book_level", type=int, default=10, help="Same-side book level when --price is omitted.")
@@ -2225,6 +2355,7 @@ def parse_args() -> argparse.Namespace:
     args.ladder_count = None
     args.ladder_end = None
     args.ladder_step = None
+    args.symmetric = False
     args.amount_is_total = False
     explicit_ladder_count = bool(args.ladder_for) + bool(args.ladder_while) + bool(args.range_spec)
     if explicit_ladder_count > 1:
@@ -2237,11 +2368,16 @@ def parse_args() -> argparse.Namespace:
     else:
         args.amount = args.amount or "10"
     if args.side is not None:
-        try:
-            is_buy = parse_side(args.side)
-        except ValueError as exc:
-            parser.error(str(exc))
-        args.side = "buy" if is_buy else "sell"
+        normalized_side = args.side.strip().lower()
+        if normalized_side in SYMMETRIC_SIDE_ALIASES:
+            args.side = "both"
+            args.symmetric = True
+        else:
+            try:
+                is_buy = parse_side(args.side)
+            except ValueError as exc:
+                parser.error(str(exc))
+            args.side = "buy" if is_buy else "sell"
     if args.ladder_for:
         count_text, step_text = args.ladder_for
         try:
@@ -2277,6 +2413,15 @@ def parse_args() -> argparse.Namespace:
         args.ladder_mode = "while"
         args.ladder_step = unprotect_ladder_step_value(step_text)
         args.range_spec = [decimal_to_plain(start_px), decimal_to_plain(args.ladder_end), args.ladder_step]
+    if args.symmetric_offset and not args.symmetric:
+        parser.error("--offset requires side both/sym/对称")
+    if args.symmetric:
+        if not args.symmetric_offset:
+            parser.error("symmetric orders require --offset")
+        try:
+            resolve_symmetric_offset(Decimal("100"), args.symmetric_offset)
+        except ValueError as exc:
+            parser.error(str(exc))
     if not args.query and not args.coin:
         parser.error("coin is required unless query/status or --query is used")
     if args.market and args.price:
@@ -2316,6 +2461,23 @@ def parse_args() -> argparse.Namespace:
     has_tpsl = bool(args.take_profit or args.stop_loss)
     if args.stop_entry and args.take_entry:
         parser.error("--stop-entry and --take-entry are mutually exclusive")
+    if args.symmetric:
+        if args.cancel is not None:
+            parser.error("symmetric orders cannot be combined with --cancel")
+        if args.market:
+            parser.error("symmetric orders cannot use --market")
+        if args.book_level != 10:
+            parser.error("symmetric orders cannot use --level; use --price to set the center price")
+        if args.reduce_only:
+            parser.error("symmetric orders cannot use --reduce-only")
+        if args.stop_entry or args.take_entry:
+            parser.error("symmetric orders cannot be combined with --stop/--take")
+        if has_tpsl:
+            parser.error("symmetric orders cannot be combined with --tp/--sl")
+        if args.ladder_mode is not None:
+            parser.error("symmetric orders cannot be combined with --for/--while/--range")
+        if args.scale is not None or args.scale_from or args.scale_to:
+            parser.error("symmetric orders cannot be combined with --scale")
     if args.ladder_mode is not None and args.scale is not None:
         parser.error("Ladder orders cannot be combined with --scale")
     if args.range_spec and (args.stop_entry or args.take_entry):

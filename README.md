@@ -89,9 +89,9 @@ BTC buy 100 --price 68000 --tp 72000 --sl 65000
 各段含义：
 
 - `coin`：标的，例如 `BTC`、`ETH`、`GOLD`、`xyz:SMSN`。
-- `side`：方向，支持 `buy/sell`、`long/short`、`看多/看空`。
+- `side`：方向，支持 `buy/sell`、`long/short`、`看多/看空`，也支持 `both/sym/对称`。
 - `amount`：美元名义金额，默认 `10`；也可以用 `--total` 表示总金额。
-- `entry/exec`：入场或执行方式，例如 `--market`、`--price`、`--stop`、`--take`、`--level`、`--range`、`--for`、`--while`、`--tif`、`--slippage`。
+- `entry/exec`：入场或执行方式，例如 `--market`、`--price`、`--offset`、`--stop`、`--take`、`--level`、`--range`、`--for`、`--while`、`--tif`、`--slippage`。
 - `tp/sl`：止盈止损，例如 `--tp 2%+0.1% --sl -2%-0.1%`。
 - `--reduce-only`：只减仓，不允许反手。
 
@@ -105,6 +105,29 @@ BTC buy 100 --price 68000 --tp 72000 --sl 65000
 - 真实下单前会尝试把当前合约 cross 杠杆设置为 `maxLeverage`；如果标的不支持 cross，会自动切到 isolated，默认 `5x`。
 - 如果数量 round 后名义价值低于 `10` 美元，会向上补一个数量步进。
 - 前台只显示核心结果，完整日志写入 `logs/`。
+
+## 对称单
+
+对称单一次提交两个普通限价单：基准价下方挂买单，基准价上方挂卖单，两个方向金额相同。
+
+```bash
+# 用当前 mid 做中心：跌 2% 买，涨 2% 卖
+BTC both 100 --offset 2%
+
+# 指定 75000 做中心：73500 买，76500 卖
+BTC both 100 --price 75000 --offset 2%
+
+# 总金额 200，自动拆成买卖各 100
+BTC sym --total 200 --offset 2% --explain
+```
+
+注意：
+
+- `amount` 是每边金额；`--total` 会平均拆成买卖两边。
+- `--price` 是中心价；不写时使用当前 mid。
+- `--offset` 支持百分比或绝对价差，例如 `2%`、`1500`。
+- 实际名义金额会按交易所数量精度向上取整，可能略高于输入值。
+- 对称单只做普通限价单，不能和 `--market`、`--stop`、`--take`、`--tp`、`--sl`、`--for`、`--while`、`--range`、`--scale` 混用。
 
 ## 触发单和止盈止损
 
@@ -208,7 +231,7 @@ HYPE buy --total 120 --range 66 65 -0.05 --tp 0.07%+0.01d0.9 --explain
 - `--for COUNT STEP` 表示从当前基准价格开始，按 `STEP` 间隔下 `COUNT` 档。
 - `--while END STEP` 表示从当前基准价格开始，按 `STEP` 间隔下到 `END` 为止。
 - `--range START END STEP` 表示从 `START` 开始，按 `STEP` 间隔下到 `END` 为止，等价于 `--price START --while END STEP`。
-- `--total TOTAL` 在梯子单里表示总金额，会按实际档数均分；不写 `--total` 时，位置参数 `amount` 是每一档金额。
+- `--total TOTAL` 在梯子单或对称单里表示总金额，会按实际档数均分；不写 `--total` 时，位置参数 `amount` 是每一档金额。
 - `STEP` 必须带方向符号，例如 `-0.2`、`+1000`、`-0.5%`。
 - 普通梯子可以再配 `--tp` / `--sl`，每一档都会带自己的 bracket。
 - 触发梯子可以再配 `--stop` / `--take`，但不能再把 `--tp` / `--sl` 放进同一条命令。
