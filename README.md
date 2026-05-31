@@ -90,8 +90,8 @@ BTC buy 100 --price 68000 --tp 72000 --sl 65000
 
 - `coin`：标的，例如 `BTC`、`ETH`、`GOLD`、`xyz:SMSN`。
 - `side`：方向，支持 `buy/sell`、`long/short`、`看多/看空`。
-- `amount`：美元名义金额，默认 `10`。
-- `entry/exec`：入场或执行方式，例如 `--market`、`--price`、`--stop`、`--take`、`--level`、`--for`、`--while`、`--tif`、`--slippage`。
+- `amount`：美元名义金额，默认 `10`；也可以用 `--total` 表示总金额。
+- `entry/exec`：入场或执行方式，例如 `--market`、`--price`、`--stop`、`--take`、`--level`、`--range`、`--for`、`--while`、`--tif`、`--slippage`。
 - `tp/sl`：止盈止损，例如 `--tp 2%+0.1% --sl -2%-0.1%`。
 - `--reduce-only`：只减仓，不允许反手。
 
@@ -99,6 +99,7 @@ BTC buy 100 --price 68000 --tp 72000 --sl 65000
 
 - 默认网络是主网。
 - 默认真实提交下单或撤单；加 `--dry-run` 只预演。
+- 加 `--explain` 只打印解析后的订单计划，不提交，也不计算账户指标。
 - 不填价格时，限价单默认按同向订单簿第 `10` 档挂单，且默认 `ALO`。
 - `--market` 会按当前 mid 计算数量，并用带滑点保护的 IOC 单成交。
 - 真实下单前会尝试把当前合约 cross 杠杆设置为 `maxLeverage`；如果标的不支持 cross，会自动切到 isolated，默认 `5x`。
@@ -190,6 +191,15 @@ BTC sell 10 --while 80000 +1000 --stop 77000 --reduce-only
 # 更小步长示例
 HYPE buy 13 --for 10 -0.2 --tp 0.05%+0.01%d0.9
 HYPE buy 12 --while 65 -0.05 --tp 0.07%+0.01d0.9
+
+# 总金额 120，自动均分到 10 档
+HYPE buy --total 120 --for 10 -0.05 --tp 0.07%+0.01d0.9
+
+# 明确起点、终点、步长
+HYPE buy 12 --range 66 65 -0.05 --tp 0.07%+0.01d0.9
+
+# 只解释解析结果，不提交
+HYPE buy --total 120 --range 66 65 -0.05 --tp 0.07%+0.01d0.9 --explain
 ```
 
 注意：
@@ -197,6 +207,8 @@ HYPE buy 12 --while 65 -0.05 --tp 0.07%+0.01d0.9
 - `--scale` 每张子单金额必须至少 `10` 美元。
 - `--for COUNT STEP` 表示从当前基准价格开始，按 `STEP` 间隔下 `COUNT` 档。
 - `--while END STEP` 表示从当前基准价格开始，按 `STEP` 间隔下到 `END` 为止。
+- `--range START END STEP` 表示从 `START` 开始，按 `STEP` 间隔下到 `END` 为止，等价于 `--price START --while END STEP`。
+- `--total TOTAL` 在梯子单里表示总金额，会按实际档数均分；不写 `--total` 时，位置参数 `amount` 是每一档金额。
 - `STEP` 必须带方向符号，例如 `-0.2`、`+1000`、`-0.5%`。
 - 普通梯子可以再配 `--tp` / `--sl`，每一档都会带自己的 bracket。
 - 触发梯子可以再配 `--stop` / `--take`，但不能再把 `--tp` / `--sl` 放进同一条命令。

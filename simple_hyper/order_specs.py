@@ -452,6 +452,8 @@ VALUE_OPTION_STRINGS = {
     "--scale",
     "--from",
     "--to",
+    "--total",
+    "--range",
     "--for",
     "--while",
     "--cancel",
@@ -459,7 +461,7 @@ VALUE_OPTION_STRINGS = {
     "--timeout",
 }
 
-LADDER_OPTIONS_WITH_SIGNED_STEP = {"--for", "--while"}
+SIGNED_STEP_OPTION_OFFSETS = {"--for": 2, "--while": 2, "--range": 3}
 
 
 def protect_ladder_step_values(argv: list[str]) -> list[str]:
@@ -467,15 +469,15 @@ def protect_ladder_step_values(argv: list[str]) -> list[str]:
     index = 0
     while index < len(argv):
         token = argv[index]
-        if token in LADDER_OPTIONS_WITH_SIGNED_STEP and index + 2 < len(argv):
-            count_or_end = argv[index + 1]
-            step = argv[index + 2]
-            protected.extend([token, count_or_end])
+        step_offset = SIGNED_STEP_OPTION_OFFSETS.get(token)
+        if step_offset is not None and index + step_offset < len(argv):
+            protected.extend(argv[index : index + step_offset])
+            step = argv[index + step_offset]
             if step.startswith("-") and step not in VALUE_OPTION_STRINGS:
                 protected.append(f"={step}")
             else:
                 protected.append(step)
-            index += 3
+            index += step_offset + 1
             continue
         protected.append(token)
         index += 1

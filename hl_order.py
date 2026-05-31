@@ -488,6 +488,38 @@ def print_order_plan_table(
     )
 
 
+def print_explain(title: str, plans: list[dict[str, Any]], args: argparse.Namespace, price_rate: Decimal | None = None) -> None:
+    entry_plans = [plan for plan in plans if not plan.get("reduce_only")] or plans
+    entry_prices = [Decimal(str(plan.get("reference_price", plan["limit_px"]))) for plan in entry_plans]
+    total_entry_notional = sum((Decimal(str(plan["notional"])) for plan in entry_plans), Decimal("0"))
+    amount_mode = "total" if getattr(args, "amount_is_total", False) else "per-order"
+    if args.scale:
+        amount_mode = "total"
+
+    rows = [
+        ("submit", "0"),
+        ("title", title),
+        ("side", str(args.side or "-")),
+        ("amount_mode", amount_mode),
+        ("amount", decimal_to_plain(Decimal(str(args.amount)))),
+        ("entry_legs", str(len(entry_plans))),
+        ("all_orders", str(len(plans))),
+        ("entry_notional", decimal_to_display(total_entry_notional)),
+        ("price_range", f"{format_price(min(entry_prices), price_rate)} -> {format_price(max(entry_prices), price_rate)}"),
+        ("reduce_only", "1" if args.reduce_only else "0"),
+    ]
+    if args.ladder_mode:
+        rows.append(("ladder", f"{args.ladder_mode} {args.ladder_end or args.ladder_count} {args.ladder_step}"))
+    if args.range_spec:
+        rows.append(("range", " ".join(args.range_spec)))
+    if args.take_profit:
+        rows.append(("tp", args.take_profit))
+    if args.stop_loss:
+        rows.append(("sl", args.stop_loss))
+    print_box("Explain", rows)
+    print_order_plan_table(title, plans, price_rate)
+
+
 def print_filled_row(
     coin: str,
     side: str,
@@ -1341,6 +1373,10 @@ def submit_order_plans(
     title: str,
     update_leverage: bool = True,
 ) -> None:
+    if args.explain:
+        print_explain(title, plans, args, price_rate)
+        return
+
     if args.dry_run:
         print_account_metrics(info, account)
         print_box("Run", [("dry_run", "1")])
@@ -1571,6 +1607,12 @@ def place_ladder_orders(
     else:
         raise ValueError("Ladder orders require -for or -while syntax")
 
+    amount_each = amount
+    if args.amount_is_total:
+        amount_each = amount / Decimal(len(prices))
+        if amount_each < MIN_NOTIONAL:
+            raise ValueError(f"Ladder total is too small: each order must be at least {MIN_NOTIONAL} USD")
+
     if trigger_mode and has_tpsl:
         raise ValueError(
             "Ladder trigger orders cannot be combined with --tp/--sl in a single submit. "
@@ -1593,7 +1635,7 @@ def place_ladder_orders(
             entry_plan = build_trigger_order_plan(
                 coin,
                 is_buy,
-                amount,
+                amount_each,
                 asset,
                 exchange,
                 slippage,
@@ -1608,7 +1650,7 @@ def place_ladder_orders(
             entry_plan = build_limit_order_plan(
                 coin,
                 is_buy,
-                amount,
+                amount_each,
                 asset,
                 price,
                 args.reduce_only,
@@ -1628,7 +1670,7 @@ def place_ladder_orders(
                 asset,
                 is_buy,
                 entry_plan["size"],
-                amount,
+                amount_each,
                 slippage,
                 Decimal(str(entry_plan["reference_price"])),
             )
@@ -1636,6 +1678,11 @@ def place_ladder_orders(
                 child["label"] = f"{index}/{len(prices)} {child['label']}"
             group_plans.extend(child_plans)
         grouped_plans.append(group_plans)
+
+    if args.explain:
+        display_plans = plans if not has_tpsl else [plan for group in grouped_plans for plan in group]
+        print_explain(title, display_plans, args, price_rate)
+        return
 
     if args.dry_run:
         display_plans = plans if not has_tpsl else [plan for group in grouped_plans for plan in group]
@@ -1703,9 +1750,12 @@ def place_order(args: argparse.Namespace) -> None:
             or args.take_entry
             or args.take_profit
             or args.stop_loss
+            or args.total_amount
+            or args.ladder_mode
             or args.scale
             or args.scale_from
             or args.scale_to
+            or args.explain
         )
         if order_flags_without_side:
             raise ValueError("side is required when order options are used")
@@ -1986,6 +2036,10 @@ def place_order(args: argparse.Namespace) -> None:
         print("tif:", order_type["limit"]["tif"])
         print("reduce_only:", args.reduce_only)
 
+    if args.explain:
+        print_explain("Order", [entry_plan], args, price_rate)
+        return
+
     if args.dry_run:
         print_account_metrics(info, account)
         print_box("Run", [("dry_run", "1")])
@@ -2065,7 +2119,8 @@ def parse_args() -> argparse.Namespace:
         nargs="?",
         help="buy/long/看多 or sell/short/看空. Not needed with --cancel.",
     )
-    parser.add_argument("amount", nargs="?", default="10", help="USD notional. Default: 10.")
+    parser.add_argument("amount", nargs="?", help="USD notional. Default: 10.")
+    parser.add_argument("--total", dest="total_amount", help="Total USD notional. Ladder orders divide it across all legs.")
     parser.add_argument("--price", help="Limit price. Defaults to same-side book level 10.")
     parser.add_argument("--market", action="store_true", help="Submit as a market order using IOC with slippage protection.")
     parser.add_argument("--slippage", default=DEFAULT_SLIPPAGE, help="Market slippage protection. Default: 0.05. Also accepts 5%%.")
@@ -2137,6 +2192,13 @@ def parse_args() -> argparse.Namespace:
         metavar=("END", "STEP"),
         help="Place ladder orders until END, separated by signed STEP, e.g. --while 65 -0.05.",
     )
+    parser.add_argument(
+        "--range",
+        dest="range_spec",
+        nargs=3,
+        metavar=("START", "END", "STEP"),
+        help="Price-anchored ladder shorthand, e.g. --range 66 65 -0.05.",
+    )
     kline_group = parser.add_mutually_exclusive_group()
     kline_group.add_argument("--day", action="store_true", help="Show the last 30 daily candles in market overview mode.")
     kline_group.add_argument("--week", action="store_true", help="Show the last 52 weekly candles in market overview mode.")
@@ -2149,6 +2211,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--network", choices=["mainnet", "testnet"], default="mainnet", help="Default: mainnet.")
     parser.add_argument("--timeout", type=float, default=20, help="HTTP timeout in seconds. Default: 20.")
     parser.add_argument("--dry-run", action="store_true", help="Preview only; do not send cancel/order requests.")
+    parser.add_argument("--explain", action="store_true", help="Explain parsed order plans without submitting.")
     parser.add_argument("--query", "--status", action="store_true", help="Query all current positions and open orders.")
     parser.add_argument("--verbose", action="store_true", help="Print diagnostic details.")
     parser.add_argument("--submit", action="store_true", help=argparse.SUPPRESS)
@@ -2162,9 +2225,17 @@ def parse_args() -> argparse.Namespace:
     args.ladder_count = None
     args.ladder_end = None
     args.ladder_step = None
-    explicit_ladder_count = bool(args.ladder_for) + bool(args.ladder_while)
+    args.amount_is_total = False
+    explicit_ladder_count = bool(args.ladder_for) + bool(args.ladder_while) + bool(args.range_spec)
     if explicit_ladder_count > 1:
-        parser.error("--for and --while are mutually exclusive")
+        parser.error("--for, --while, and --range are mutually exclusive")
+    if args.total_amount is not None:
+        if args.amount is not None:
+            parser.error("positional amount cannot be combined with --total")
+        args.amount = args.total_amount
+        args.amount_is_total = True
+    else:
+        args.amount = args.amount or "10"
     if args.side is not None:
         try:
             is_buy = parse_side(args.side)
@@ -2191,12 +2262,31 @@ def parse_args() -> argparse.Namespace:
             parser.error("--while END must be positive")
         args.ladder_mode = "while"
         args.ladder_step = unprotect_ladder_step_value(step_text)
+    if args.range_spec:
+        start_text, end_text, step_text = args.range_spec
+        if args.price:
+            parser.error("--range cannot be combined with --price")
+        try:
+            start_px = Decimal(start_text)
+            args.ladder_end = Decimal(end_text)
+        except InvalidOperation:
+            parser.error("--range START and END must be positive numbers")
+        if start_px <= 0 or args.ladder_end <= 0:
+            parser.error("--range START and END must be positive")
+        args.price = decimal_to_plain(start_px)
+        args.ladder_mode = "while"
+        args.ladder_step = unprotect_ladder_step_value(step_text)
+        args.range_spec = [decimal_to_plain(start_px), decimal_to_plain(args.ladder_end), args.ladder_step]
     if not args.query and not args.coin:
         parser.error("coin is required unless query/status or --query is used")
     if args.market and args.price:
         parser.error("--market cannot be used with --price")
     if args.market and args.cancel is not None:
         parser.error("--market cannot be used with --cancel")
+    if args.explain and args.cancel is not None:
+        parser.error("--explain cannot be used with --cancel")
+    if args.total_amount is not None and args.cancel is not None:
+        parser.error("--total cannot be used with --cancel")
     if args.ladder_mode is not None and args.market:
         parser.error("Ladder orders cannot use --market")
     if args.stop_entry:
@@ -2228,6 +2318,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--stop-entry and --take-entry are mutually exclusive")
     if args.ladder_mode is not None and args.scale is not None:
         parser.error("Ladder orders cannot be combined with --scale")
+    if args.range_spec and (args.stop_entry or args.take_entry):
+        parser.error("--range cannot be combined with --stop/--take; use --stop/--take with --while instead")
     if args.ladder_mode is not None and (args.stop_entry or args.take_entry) and has_tpsl:
         parser.error("Ladder trigger orders cannot combine --stop/--take with --tp/--sl")
     if args.ladder_mode is not None and has_tpsl and args.reduce_only:
