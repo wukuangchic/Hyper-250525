@@ -70,7 +70,6 @@ from simple_hyper.order_specs import (
     normalize_signed_option_values,
     parse_entry_trigger_with_limit,
     parse_side,
-    parse_side_ladder,
     parse_slippage,
     protect_ladder_step_values,
     resolve_ladder_step,
@@ -2168,19 +2167,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--for and --while are mutually exclusive")
     if args.side is not None:
         try:
-            is_buy, ladder_mode, ladder_value, ladder_step = parse_side_ladder(args.side)
+            is_buy = parse_side(args.side)
         except ValueError as exc:
             parser.error(str(exc))
         args.side = "buy" if is_buy else "sell"
-        if ladder_mode is not None:
-            if explicit_ladder_count:
-                parser.error("Use either legacy side ladder syntax or --for/--while, not both")
-            args.ladder_mode = ladder_mode
-            args.ladder_step = ladder_step
-            if ladder_mode == "for":
-                args.ladder_count = int(ladder_value)
-            elif ladder_mode == "while":
-                args.ladder_end = ladder_value
     if args.ladder_for:
         count_text, step_text = args.ladder_for
         try:

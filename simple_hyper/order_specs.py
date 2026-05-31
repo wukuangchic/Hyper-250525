@@ -26,36 +26,6 @@ def parse_side(side: str) -> bool:
     raise ValueError(f"Unknown side: {side}. Use buy/long/看多 or sell/short/看空.")
 
 
-LADDER_FOR_SIDE_SPEC_RE = re.compile(r"^(?P<base_side>.+?)-for(?P<count>\d+)(?P<step_sign>[+-])(?P<step>\d+(?:\.\d+)?%?)$")
-LADDER_WHILE_SIDE_SPEC_RE = re.compile(r"^(?P<base_side>.+?)-while(?P<end>\d+(?:\.\d+)?)(?P<step_sign>[+-])(?P<step>\d+(?:\.\d+)?%?)$")
-
-
-def parse_side_ladder(side: str) -> tuple[bool, str | None, int | Decimal | None, str | None]:
-    text = side.strip().replace(" ", "")
-    match = LADDER_FOR_SIDE_SPEC_RE.fullmatch(text)
-    if match:
-        is_buy = parse_side(match.group("base_side"))
-        count = int(match.group("count"))
-        if count < 2:
-            raise ValueError("Ladder count must be >= 2")
-        step_spec = f"{match.group('step_sign')}{match.group('step')}"
-        return is_buy, "for", count, step_spec
-
-    match = LADDER_WHILE_SIDE_SPEC_RE.fullmatch(text)
-    if match:
-        is_buy = parse_side(match.group("base_side"))
-        end_px = Decimal(match.group("end"))
-        if end_px <= 0:
-            raise ValueError("Ladder end price must be positive")
-        step_spec = f"{match.group('step_sign')}{match.group('step')}"
-        return is_buy, "while", end_px, step_spec
-
-    if "*" in text:
-        raise ValueError("Old * ladder syntax is no longer supported. Use --for COUNT STEP or --while END STEP.")
-
-    return parse_side(text), None, None, None
-
-
 def normalize_coin_input(raw_coin: str) -> list[str]:
     coin = canonical_coin_input(raw_coin)
     upper = coin.upper().replace("-", "").replace("/", "")
