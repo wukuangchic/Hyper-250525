@@ -91,7 +91,7 @@ BTC buy 100 --price 68000 --tp 72000 --sl 65000
 - `coin`：标的，例如 `BTC`、`ETH`、`GOLD`、`xyz:SMSN`。
 - `side`：方向，支持 `buy/sell`、`long/short`、`看多/看空`。
 - `amount`：美元名义金额，默认 `10`。
-- `entry/exec`：入场或执行方式，例如 `--market`、`--price`、`--stop`、`--take`、`--level`、`--tif`、`--slippage`。
+- `entry/exec`：入场或执行方式，例如 `--market`、`--price`、`--stop`、`--take`、`--level`、`--for`、`--while`、`--tif`、`--slippage`。
 - `tp/sl`：止盈止损，例如 `--tp 2%+0.1% --sl -2%-0.1%`。
 - `--reduce-only`：只减仓，不允许反手。
 
@@ -172,27 +172,35 @@ BTC buy 100 --scale 5 --from 67000 --to 63000
 BTC sell 200 --scale 4 --from 72000 --to 76000 --reduce-only
 ```
 
-梯子单把每一档当成独立订单：
+梯子单把每一档当成独立订单。推荐使用显式参数：
 
 ```bash
 # 从 67000 开始，每档差 1000，一共 5 档
-BTC buy-for5-1000 --price 67000
+BTC buy --for 5 -1000 --price 67000
 
 # 从 80000 一路挂到 85000，每档差 1000
-BTC sell-while85000+1000 --price 80000
+BTC sell --while 85000 +1000 --price 80000
 
 # 普通梯子 + 每档自己的 TP/SL
-BTC buy-for5-1000 --price 67000 --tp 5%+0 --sl -2%-10
+BTC buy --for 5 -1000 --price 67000 --tp 5%+0 --sl -2%-10
 
 # 触发梯子，只做减仓
-BTC sell-while80000+1000 10 --stop 77000 --reduce-only
+BTC sell 10 --while 80000 +1000 --stop 77000 --reduce-only
+
+# 更小步长示例
+HYPE buy 13 --for 10 -0.2 --tp 0.05%+0.01%d0.9
+HYPE buy 12 --while 65 -0.05 --tp 0.07%+0.01d0.9
 ```
 
 注意：
 
 - `--scale` 每张子单金额必须至少 `10` 美元。
+- `--for COUNT STEP` 表示从当前基准价格开始，按 `STEP` 间隔下 `COUNT` 档。
+- `--while END STEP` 表示从当前基准价格开始，按 `STEP` 间隔下到 `END` 为止。
+- `STEP` 必须带方向符号，例如 `-0.2`、`+1000`、`-0.5%`。
 - 普通梯子可以再配 `--tp` / `--sl`，每一档都会带自己的 bracket。
 - 触发梯子可以再配 `--stop` / `--take`，但不能再把 `--tp` / `--sl` 放进同一条命令。
+- 旧写法 `buy-for5-1000`、`sell-while85000+1000` 暂时保留兼容，但新命令建议使用 `buy --for ...` / `sell --while ...`。
 
 ## 标的和别名
 

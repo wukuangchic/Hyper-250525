@@ -29,7 +29,7 @@ import time
 import traceback
 from threading import Lock
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Optional
 
@@ -72,6 +72,7 @@ from simple_hyper.order_specs import (
     parse_side,
     parse_side_ladder,
     parse_slippage,
+    protect_ladder_step_values,
     resolve_ladder_step,
     resolve_perp_asset,
     resolve_tpsl_spec,
@@ -79,6 +80,7 @@ from simple_hyper.order_specs import (
     scale_order_size,
     scale_prices,
     side_code,
+    unprotect_ladder_step_value,
     validate_tpsl_direction,
 )
 from simple_hyper.runtime import load_dotenv, mask
@@ -2062,7 +2064,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "side",
         nargs="?",
-        help="buy/long/看多 or sell/short/看空. You can append -forCOUNT+STEP for count ladders or -whileEND+STEP for range ladders, e.g. buy-for5-1000 or sell-while85000+1000. Not needed with --cancel.",
+        help="buy/long/看多 or sell/short/看空. Not needed with --cancel.",
     )
     parser.add_argument("amount", nargs="?", default="10", help="USD notional. Default: 10.")
     parser.add_argument("--price", help="Limit price. Defaults to same-side book level 10.")
@@ -2122,6 +2124,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scale", type=int, help="Split total USD notional into this many limit orders.")
     parser.add_argument("--from", dest="scale_from", help="First scale order price.")
     parser.add_argument("--to", dest="scale_to", help="Last scale order price.")
+    parser.add_argument(
+        "--for",
+        dest="ladder_for",
+        nargs=2,
+        metavar=("COUNT", "STEP"),
+        help="Place COUNT ladder orders separated by signed STEP, e.g. --for 10 -0.2.",
+    )
+    parser.add_argument(
+        "--while",
+        dest="ladder_while",
+        nargs=2,
+        metavar=("END", "STEP"),
+        help="Place ladder orders until END, separated by signed STEP, e.g. --while 65 -0.05.",
+    )
     kline_group = parser.add_mutually_exclusive_group()
     kline_group.add_argument("--day", action="store_true", help="Show the last 30 daily candles in market overview mode.")
     kline_group.add_argument("--week", action="store_true", help="Show the last 52 weekly candles in market overview mode.")
@@ -2137,7 +2153,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query", "--status", action="store_true", help="Query all current positions and open orders.")
     parser.add_argument("--verbose", action="store_true", help="Print diagnostic details.")
     parser.add_argument("--submit", action="store_true", help=argparse.SUPPRESS)
-    args = parser.parse_args(normalize_signed_option_values(sys.argv[1:]))
+    cli_argv = normalize_signed_option_values(protect_ladder_step_values(sys.argv[1:]))
+    args = parser.parse_args(cli_argv)
     query_words = {"query", "status", "positions", "orders", "持仓", "订单", "查询"}
     if args.coin and args.side is None and args.coin.strip().lower() in query_words:
         args.query = True
@@ -2146,18 +2163,44 @@ def parse_args() -> argparse.Namespace:
     args.ladder_count = None
     args.ladder_end = None
     args.ladder_step = None
+    explicit_ladder_count = bool(args.ladder_for) + bool(args.ladder_while)
+    if explicit_ladder_count > 1:
+        parser.error("--for and --while are mutually exclusive")
     if args.side is not None:
         try:
             is_buy, ladder_mode, ladder_value, ladder_step = parse_side_ladder(args.side)
         except ValueError as exc:
             parser.error(str(exc))
         args.side = "buy" if is_buy else "sell"
-        args.ladder_mode = ladder_mode
-        args.ladder_step = ladder_step
-        if ladder_mode == "for":
-            args.ladder_count = int(ladder_value)
-        elif ladder_mode == "while":
-            args.ladder_end = ladder_value
+        if ladder_mode is not None:
+            if explicit_ladder_count:
+                parser.error("Use either legacy side ladder syntax or --for/--while, not both")
+            args.ladder_mode = ladder_mode
+            args.ladder_step = ladder_step
+            if ladder_mode == "for":
+                args.ladder_count = int(ladder_value)
+            elif ladder_mode == "while":
+                args.ladder_end = ladder_value
+    if args.ladder_for:
+        count_text, step_text = args.ladder_for
+        try:
+            args.ladder_count = int(count_text)
+        except ValueError:
+            parser.error("--for COUNT must be an integer")
+        if args.ladder_count < 2:
+            parser.error("--for COUNT must be >= 2")
+        args.ladder_mode = "for"
+        args.ladder_step = unprotect_ladder_step_value(step_text)
+    if args.ladder_while:
+        end_text, step_text = args.ladder_while
+        try:
+            args.ladder_end = Decimal(end_text)
+        except InvalidOperation:
+            parser.error("--while END must be a positive number")
+        if args.ladder_end <= 0:
+            parser.error("--while END must be positive")
+        args.ladder_mode = "while"
+        args.ladder_step = unprotect_ladder_step_value(step_text)
     if not args.query and not args.coin:
         parser.error("coin is required unless query/status or --query is used")
     if args.market and args.price:

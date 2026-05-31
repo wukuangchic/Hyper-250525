@@ -51,7 +51,7 @@ def parse_side_ladder(side: str) -> tuple[bool, str | None, int | Decimal | None
         return is_buy, "while", end_px, step_spec
 
     if "*" in text:
-        raise ValueError("Old * ladder syntax is no longer supported. Use -forCOUNT+STEP or -whileEND+STEP.")
+        raise ValueError("Old * ladder syntax is no longer supported. Use --for COUNT STEP or --while END STEP.")
 
     return parse_side(text), None, None, None
 
@@ -482,10 +482,40 @@ VALUE_OPTION_STRINGS = {
     "--scale",
     "--from",
     "--to",
+    "--for",
+    "--while",
     "--cancel",
     "--network",
     "--timeout",
 }
+
+LADDER_OPTIONS_WITH_SIGNED_STEP = {"--for", "--while"}
+
+
+def protect_ladder_step_values(argv: list[str]) -> list[str]:
+    protected: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token in LADDER_OPTIONS_WITH_SIGNED_STEP and index + 2 < len(argv):
+            count_or_end = argv[index + 1]
+            step = argv[index + 2]
+            protected.extend([token, count_or_end])
+            if step.startswith("-") and step not in VALUE_OPTION_STRINGS:
+                protected.append(f"={step}")
+            else:
+                protected.append(step)
+            index += 3
+            continue
+        protected.append(token)
+        index += 1
+    return protected
+
+
+def unprotect_ladder_step_value(value: str) -> str:
+    if value.startswith("=-") or value.startswith("=+"):
+        return value[1:]
+    return value
 
 
 def normalize_signed_option_values(argv: list[str]) -> list[str]:
