@@ -68,6 +68,16 @@ BTC sell --reduce-only
 # 取消 BTC 所有挂单
 BTC --cancel
 
+# 取消高于 / 低于当前价的 BTC 挂单
+BTC --cancel up
+BTC --cancel down
+
+# 取消买单 / 卖单 / 止盈 / 止损
+BTC --cancel buy
+BTC --cancel sell
+BTC --cancel tp
+BTC --cancel sl
+
 # 取消指定订单
 BTC --cancel 441260592983
 ```

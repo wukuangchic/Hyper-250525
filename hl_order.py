@@ -15,6 +15,8 @@ Examples:
   ./hl_order.py BTC buy 25 --take 70000+0.2%
   ./hl_order.py BTC buy --tp 2%+0.1% --sl -2%-0.1%
   ./hl_order.py BTC --cancel
+  ./hl_order.py BTC --cancel up
+  ./hl_order.py BTC --cancel tp
   ./hl_order.py BTC --cancel 123456789
   ./hl_order.py BTC buy --dry-run
 """
@@ -92,6 +94,7 @@ from coin_aliases import coin_alias_key
 DEFAULT_SLIPPAGE = "0.05"
 ISOLATED_FALLBACK_LEVERAGE = 5
 SYMMETRIC_SIDE_ALIASES = {"both", "sym", "symmetric", "dual", "双向", "对称", "对称单"}
+CANCEL_FILTERS = {"all", "up", "down", "buy", "sell", "tp", "sl"}
 
 
 class RunLogger:
@@ -631,6 +634,75 @@ def format_open_order_value(order: dict[str, Any]) -> str:
     return format_optional_decimal(value)
 
 
+def open_order_cancel_price(order: dict[str, Any]) -> Decimal | None:
+    if order.get("isTrigger"):
+        trigger_px = decimal_or_none(order.get("triggerPx"))
+        if trigger_px is not None and trigger_px > 0:
+            return trigger_px
+    limit_px = decimal_or_none(order.get("limitPx"))
+    if limit_px is not None and limit_px > 0:
+        return limit_px
+    trigger_px = decimal_or_none(order.get("triggerPx"))
+    return trigger_px if trigger_px is not None and trigger_px > 0 else None
+
+
+def open_order_side_matches(order: dict[str, Any], side: str) -> bool:
+    normalized = str(order.get("side", "")).strip().lower()
+    if side == "buy":
+        return normalized in {"b", "buy", "bid", "long"}
+    return normalized in {"a", "sell", "ask", "short"}
+
+
+def open_order_tpsl_kind(order: dict[str, Any]) -> str | None:
+    values = [
+        order.get("tpsl"),
+        order.get("orderType"),
+        order.get("type"),
+        order.get("triggerCondition"),
+    ]
+    text = " ".join(str(value).strip().lower() for value in values if value is not None)
+    if "take profit" in text or text.split() == ["tp"] or " t/p" in text or "tp " in f"{text} ":
+        return "tp"
+    if "take market" in text or "take limit" in text:
+        return "tp"
+    if "stop loss" in text or text.split() == ["sl"] or " s/l" in text or "sl " in f"{text} ":
+        return "sl"
+    if "stop market" in text or "stop limit" in text:
+        return "sl"
+    return None
+
+
+def cancel_filter_label(cancel_arg: str) -> str:
+    return "all" if cancel_arg == "all" else cancel_arg
+
+
+def select_cancel_orders(
+    open_orders: list[dict[str, Any]],
+    coin: str,
+    cancel_arg: str,
+    current_mid: Decimal | None,
+) -> list[dict[str, Any]]:
+    coin_orders = [order for order in open_orders if position_matches_coin(str(order.get("coin", "")), coin)]
+    filter_arg = cancel_arg.strip().lower()
+    if filter_arg == "all":
+        return coin_orders
+    if filter_arg == "up":
+        if current_mid is None:
+            raise ValueError(f"current mid is unavailable for {coin}; cannot use --cancel up")
+        return [order for order in coin_orders if (price := open_order_cancel_price(order)) is not None and price > current_mid]
+    if filter_arg == "down":
+        if current_mid is None:
+            raise ValueError(f"current mid is unavailable for {coin}; cannot use --cancel down")
+        return [order for order in coin_orders if (price := open_order_cancel_price(order)) is not None and price < current_mid]
+    if filter_arg in {"buy", "sell"}:
+        return [order for order in coin_orders if open_order_side_matches(order, filter_arg)]
+    if filter_arg in {"tp", "sl"}:
+        return [order for order in coin_orders if open_order_tpsl_kind(order) == filter_arg]
+
+    oid = int(cancel_arg)
+    return [order for order in coin_orders if int(order.get("oid")) == oid]
+
+
 def find_current_position(info: Info, account: str, coin: str, dex: str) -> dict[str, Any] | None:
     state = info.user_state(account, dex=dex)
     log_event(f"market_user_state:{dex or 'default'}", state)
@@ -950,31 +1022,37 @@ def cancel_order(
     dry_run: bool,
     price_rate: Decimal | None = None,
 ) -> None:
-    open_orders = info.open_orders(account, dex=dex)
+    open_orders = collect_frontend_open_orders(info, account, dex)
     log_event("open_orders_before", open_orders)
 
-    if cancel_arg == "all":
-        matching_orders = [order for order in open_orders if order.get("coin") == coin]
-    else:
-        oid = int(cancel_arg)
-        matching_orders = [order for order in open_orders if order.get("coin") == coin and order.get("oid") == oid]
+    filter_arg = cancel_arg.strip().lower()
+    current_mid: Decimal | None = None
+    if filter_arg in {"up", "down"}:
+        mids = info.all_mids(dex)
+        current_mid = Decimal(str(mids[coin])) if mids.get(coin) is not None else None
+        log_event("cancel_current_mid", {"dex": dex or "default", "coin": coin, "mid": mids.get(coin)})
+    matching_orders = select_cancel_orders(open_orders, coin, cancel_arg, current_mid)
 
     if not matching_orders:
         print_account_metrics(info, account)
-        print_box("Cancel", [("coin", coin), ("cancelled", "0")])
+        print_box("Cancel", [("coin", coin), ("filter", cancel_filter_label(filter_arg)), ("cancelled", "0")])
         return
 
-    cancel_requests = [{"coin": coin, "oid": int(order["oid"])} for order in matching_orders]
+    cancel_requests = [{"coin": str(order.get("coin", coin)), "oid": int(order["oid"])} for order in matching_orders]
     if dry_run:
         print_account_metrics(info, account)
-        print_box("Run", [("dry_run", "1")])
+        rows = [("dry_run", "1"), ("filter", cancel_filter_label(filter_arg))]
+        if current_mid is not None:
+            rows.append(("current_mid", format_price(current_mid, price_rate)))
+        print_box("Run", rows)
         for order in matching_orders:
+            display_px = open_order_cancel_price(order) or decimal_or_none(order.get("limitPx")) or Decimal("0")
             print_order_row(
                 order["coin"],
                 order["side"],
                 None,
-                order["limitPx"],
-                order_amount(order["limitPx"], order.get("origSz", order.get("sz", "0"))),
+                display_px,
+                order_amount(display_px, order.get("origSz", order.get("sz", "0"))),
                 price_rate,
             )
         return
@@ -989,14 +1067,18 @@ def cancel_order(
 
     clear_info_cache(info)
     print_account_metrics(info, account)
-    print_box("Cancel", [("coin", coin), ("cancelled", str(len(matching_orders)))])
+    rows = [("coin", coin), ("filter", cancel_filter_label(filter_arg)), ("cancelled", str(len(matching_orders)))]
+    if current_mid is not None:
+        rows.append(("current_mid", format_price(current_mid, price_rate)))
+    print_box("Cancel", rows)
     for order in matching_orders:
+        display_px = open_order_cancel_price(order) or decimal_or_none(order.get("limitPx")) or Decimal("0")
         print_order_row(
             order["coin"],
             order["side"],
             None,
-            order["limitPx"],
-            order_amount(order["limitPx"], order.get("origSz", order.get("sz", "0"))),
+            display_px,
+            order_amount(display_px, order.get("origSz", order.get("sz", "0"))),
             price_rate,
         )
 
@@ -2401,7 +2483,7 @@ def parse_args() -> argparse.Namespace:
         "--cancel",
         nargs="?",
         const="all",
-        help="Cancel instead of placing an order. Omit OID to cancel all open orders for this coin.",
+        help="Cancel instead of placing an order. Omit value to cancel all, pass OID, or use up/down/buy/sell/tp/sl.",
     )
     parser.add_argument("--network", choices=["mainnet", "testnet"], default="mainnet", help="Default: mainnet.")
     parser.add_argument("--timeout", type=float, default=20, help="HTTP timeout in seconds. Default: 20.")
@@ -2411,11 +2493,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verbose", action="store_true", help="Print diagnostic details.")
     parser.add_argument("--submit", action="store_true", help=argparse.SUPPRESS)
     cli_argv = normalize_signed_option_values(protect_ladder_step_values(sys.argv[1:]))
-    args = parser.parse_args(cli_argv)
+    args = parser.parse_intermixed_args(cli_argv)
     query_words = {"query", "status", "positions", "orders", "持仓", "订单", "查询"}
     if args.coin and args.side is None and args.coin.strip().lower() in query_words:
         args.query = True
         args.coin = ""
+    if args.cancel is not None:
+        cancel_arg = args.cancel.strip().lower()
+        if cancel_arg in CANCEL_FILTERS:
+            args.cancel = cancel_arg
+        else:
+            try:
+                int(args.cancel)
+            except ValueError:
+                parser.error("--cancel value must be an OID or one of: up, down, buy, sell, tp, sl")
     args.ladder_mode = None
     args.ladder_count = None
     args.ladder_end = None
