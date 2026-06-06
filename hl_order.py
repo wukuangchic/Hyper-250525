@@ -32,7 +32,7 @@ import time
 import traceback
 from threading import Lock
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 from pathlib import Path
 from typing import Any, Optional
 
@@ -94,6 +94,7 @@ from coin_aliases import coin_alias_key
 DEFAULT_SLIPPAGE = "0.05"
 ISOLATED_FALLBACK_LEVERAGE = 5
 SYMMETRIC_SIDE_ALIASES = {"both", "sym", "symmetric", "dual", "双向", "对称", "对称单"}
+GRID_SIDE_ALIASES = {"grid", "网格", "网格单"}
 CANCEL_FILTERS = {"all", "up", "down", "buy", "sell", "tp", "sl"}
 
 
@@ -501,6 +502,8 @@ def print_explain(title: str, plans: list[dict[str, Any]], args: argparse.Namesp
     amount_mode = "total" if getattr(args, "amount_is_total", False) else "per-order"
     if args.scale:
         amount_mode = "total"
+    if getattr(args, "grid", False):
+        amount_mode = "one-way total"
 
     rows = [
         ("submit", "0"),
@@ -521,6 +524,9 @@ def print_explain(title: str, plans: list[dict[str, Any]], args: argparse.Namesp
             rows.append(("ladder", f"while {args.ladder_end} for {args.ladder_count}"))
     if args.range_spec:
         rows.append(("range", " ".join(args.range_spec)))
+    if getattr(args, "grid", False):
+        rows.append(("gap", " ".join(args.gap) if isinstance(args.gap, list) else args.gap or "-"))
+        rows.append(("trend", args.trend or "0"))
     if getattr(args, "symmetric", False):
         rows.append(("symmetric", f"offset {args.symmetric_offset}"))
     if args.take_profit:
@@ -1400,6 +1406,201 @@ def build_take_entry_order_plan(
     )
 
 
+def parse_percent_decimal(value: str, label: str, allow_signed: bool = True) -> Decimal:
+    text = value.strip()
+    if not text:
+        raise ValueError(f"{label} is required")
+    if text.endswith("%"):
+        number_text = text[:-1]
+        scale = Decimal("100")
+    else:
+        number_text = text
+        scale = Decimal("1")
+    if not allow_signed and number_text.startswith(("+", "-")):
+        raise ValueError(f"{label} must be positive")
+    try:
+        value_decimal = Decimal(number_text) / scale
+    except InvalidOperation as exc:
+        raise ValueError(f"{label} must be a number or percent") from exc
+    return value_decimal
+
+
+def parse_grid_gap(value: str | list[str]) -> tuple[Decimal, Decimal | None]:
+    if isinstance(value, list):
+        if len(value) not in {1, 2}:
+            raise ValueError("--gap accepts BASE or BASE OFFSET, e.g. --gap 0.1% 0.03%")
+        if len(value) == 2:
+            gap = parse_percent_decimal(value[0], "--gap", allow_signed=False)
+            if gap <= 0:
+                raise ValueError("--gap base spacing must be positive")
+            limit_offset = abs(parse_percent_decimal(value[1], "--gap limit offset", allow_signed=True))
+            if limit_offset <= 0:
+                raise ValueError("--gap limit offset must be positive")
+            return gap, limit_offset
+        value = value[0]
+
+    text = value.strip().replace(" ", "")
+    if not text:
+        raise ValueError("--gap is required for grid orders")
+
+    base_end = text.find("%")
+    if base_end >= 0:
+        base_text = text[: base_end + 1]
+        suffix = text[base_end + 1 :]
+    else:
+        split_at = None
+        for index, char in enumerate(text[1:], start=1):
+            if char in "+-":
+                split_at = index
+                break
+        if split_at is None:
+            base_text = text
+            suffix = ""
+        else:
+            base_text = text[:split_at]
+            suffix = text[split_at:]
+
+    gap = parse_percent_decimal(base_text, "--gap", allow_signed=False)
+    if gap <= 0:
+        raise ValueError("--gap base spacing must be positive")
+    if suffix == "":
+        return gap, None
+    if suffix.startswith("+-") or suffix.startswith("-+"):
+        suffix = suffix[1:]
+    limit_offset = abs(parse_percent_decimal(suffix, "--gap limit offset", allow_signed=True))
+    if limit_offset <= 0:
+        raise ValueError("--gap limit offset must be positive")
+    return gap, limit_offset
+
+
+def round_size_up(value: Decimal, sz_decimals: int) -> Decimal:
+    step = Decimal(1).scaleb(-sz_decimals)
+    return (value / step).to_integral_value(rounding=ROUND_UP) * step
+
+
+def grid_anchor_prices(start: Decimal, end: Decimal, count: int, sz_decimals: int) -> list[Decimal]:
+    if count < 1:
+        raise ValueError("grid count must be positive")
+    if count == 1:
+        return [rounded_perp_price((start + end) / Decimal("2"), sz_decimals)]
+    return [
+        rounded_perp_price(start + (end - start) * Decimal(index) / Decimal(count - 1), sz_decimals)
+        for index in range(count)
+    ]
+
+
+def build_grid_orders(
+    args: argparse.Namespace,
+    exchange: Exchange,
+    coin: str,
+    asset: dict[str, Any],
+    total_amount: Decimal,
+    current_mid: Decimal | None,
+    slippage: Decimal,
+) -> list[dict[str, Any]]:
+    if current_mid is None:
+        raise ValueError(f"No mid price found for {coin}, cannot place grid orders")
+    if not args.range_spec or len(args.range_spec) != 2:
+        raise ValueError("grid orders require --range START END")
+    if not args.gap:
+        raise ValueError("grid orders require --gap BASE[+-OFFSET], e.g. 0.15%+-0.05%")
+
+    try:
+        start_px = Decimal(args.range_spec[0])
+        end_px = Decimal(args.range_spec[1])
+    except InvalidOperation as exc:
+        raise ValueError("--range START and END must be positive numbers") from exc
+    if start_px <= 0 or end_px <= 0:
+        raise ValueError("--range START and END must be positive")
+    if start_px >= end_px:
+        raise ValueError("grid --range START must be below END")
+    if total_amount < MIN_NOTIONAL:
+        raise ValueError(f"grid --total must be at least {MIN_NOTIONAL} USD")
+
+    gap, limit_offset = parse_grid_gap(args.gap)
+    trend = parse_percent_decimal(args.trend or "0", "--trend", allow_signed=True)
+    if trend <= Decimal("-1"):
+        raise ValueError("--trend must be greater than -100%")
+
+    sz_decimals = int(asset["szDecimals"])
+    start_px = rounded_perp_price(start_px, sz_decimals)
+    end_px = rounded_perp_price(end_px, sz_decimals)
+    half_gap = gap / Decimal("2")
+    preview_anchors = [start_px, end_px]
+    buy_limits: list[Decimal] = []
+    sell_limits: list[Decimal] = []
+    for anchor in preview_anchors:
+        buy_trigger = rounded_perp_price(anchor * (Decimal("1") - half_gap), sz_decimals)
+        sell_trigger = rounded_perp_price(anchor * (Decimal("1") + half_gap), sz_decimals)
+        if limit_offset is None:
+            buy_limit = buy_trigger
+            sell_limit = sell_trigger
+        else:
+            buy_limit = rounded_perp_price(anchor * (Decimal("1") - half_gap - limit_offset), sz_decimals)
+            sell_limit = rounded_perp_price(anchor * (Decimal("1") + half_gap + limit_offset), sz_decimals)
+        buy_limits.append(buy_limit)
+        sell_limits.append(sell_limit)
+
+    min_buy_limit = min(buy_limits)
+    min_sell_limit = min(sell_limits)
+    max_buy_limit = max(buy_limits)
+    max_sell_limit = max(sell_limits)
+    if trend >= 0:
+        sell_size = round_size_up(MIN_NOTIONAL / min_sell_limit, sz_decimals)
+        buy_size = round_size_up(sell_size * (Decimal("1") + trend), sz_decimals)
+    else:
+        buy_size = round_size_up(MIN_NOTIONAL / min_buy_limit, sz_decimals)
+        sell_size = round_size_up(buy_size * (Decimal("1") + abs(trend)), sz_decimals)
+
+    max_one_way_notional = max(buy_size * max_buy_limit, sell_size * max_sell_limit)
+    grid_count = int((total_amount / max_one_way_notional).to_integral_value(rounding=ROUND_DOWN))
+    if grid_count < 1:
+        raise ValueError(
+            "grid --total is too small for one grid at the minimum order size; "
+            f"needs at least {decimal_to_display(max_one_way_notional)} USD"
+        )
+
+    anchors = grid_anchor_prices(start_px, end_px, grid_count, sz_decimals)
+    plans: list[dict[str, Any]] = []
+    for index, anchor in enumerate(anchors, start=1):
+        buy_trigger = rounded_perp_price(anchor * (Decimal("1") - half_gap), sz_decimals)
+        sell_trigger = rounded_perp_price(anchor * (Decimal("1") + half_gap), sz_decimals)
+        if limit_offset is None:
+            buy_limit = None
+            sell_limit = None
+        else:
+            buy_limit = rounded_perp_price(anchor * (Decimal("1") - half_gap - limit_offset), sz_decimals)
+            sell_limit = rounded_perp_price(anchor * (Decimal("1") + half_gap + limit_offset), sz_decimals)
+
+        buy_trigger_mode = "stop-entry" if buy_trigger > current_mid else "take-entry"
+        sell_trigger_mode = "take-entry" if sell_trigger > current_mid else "stop-entry"
+        for is_buy, trigger_px, limit_px, trigger_mode, size in (
+            (True, buy_trigger, buy_limit, buy_trigger_mode, buy_size),
+            (False, sell_trigger, sell_limit, sell_trigger_mode, sell_size),
+        ):
+            amount = size * (limit_px or trigger_px)
+            plan = build_trigger_order_plan(
+                coin,
+                is_buy,
+                amount,
+                asset,
+                exchange,
+                slippage,
+                trigger_mode,
+                trigger_px,
+                limit_px,
+                False,
+                tpsl="sl" if trigger_mode == "stop-entry" else "tp",
+                size=size,
+            )
+            plan["label"] = f"{index}/{grid_count} {'buy' if is_buy else 'sell'}"
+            plan["mode"] = f"grid-{trigger_mode}-{'limit' if limit_px is not None else 'market'}"
+            plan["price_source"] = f"grid anchor {decimal_to_plain(anchor)}"
+            plan["grid_anchor"] = anchor
+            plans.append(plan)
+    return plans
+
+
 def build_tpsl_child_plans(
     args: argparse.Namespace,
     exchange: Exchange,
@@ -2052,6 +2253,28 @@ def place_order(args: argparse.Namespace) -> None:
         )
         return
 
+    if args.grid:
+        plans = build_grid_orders(args, exchange, coin, asset, amount, current_mid, slippage)
+        if args.verbose:
+            print("dex:", dex or "default")
+            print("current_mid:", mids.get(coin))
+            print("max_leverage:", max_leverage)
+            print("grid_orders:", len(plans))
+            print("grid_anchors:", len(plans) // 2)
+        submit_order_plans(
+            exchange,
+            info,
+            account,
+            coin,
+            max_leverage,
+            plans,
+            "na",
+            args,
+            price_rate,
+            "Grid Trigger Orders",
+        )
+        return
+
     is_buy = parse_side(args.side)
 
     if args.ladder_mode is not None:
@@ -2399,6 +2622,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--total", dest="total_amount", help="Total USD notional. Ladder and symmetric orders divide it across legs.")
     parser.add_argument("--price", help="Limit price. Defaults to same-side book level 10.")
     parser.add_argument("--offset", dest="symmetric_offset", help="Symmetric order distance from base price, e.g. 2%% or 1500.")
+    parser.add_argument("--trend", help="Grid quantity tilt. Default: 0. Positive makes buy size larger, negative makes sell size larger, e.g. 10%% or -10%%.")
+    parser.add_argument(
+        "--gap",
+        nargs="+",
+        help="Grid trigger spacing and optional same-side limit offset, e.g. 0.15%% 0.05%% or 0.15%%+-0.05%%.",
+    )
     parser.add_argument("--market", action="store_true", help="Submit as a market order using IOC with slippage protection.")
     parser.add_argument("--slippage", default=DEFAULT_SLIPPAGE, help="Market slippage protection. Default: 0.05. Also accepts 5%%.")
     parser.add_argument("--level", "--book-level", dest="book_level", type=int, default=10, help="Same-side book level when --price is omitted.")
@@ -2512,9 +2741,15 @@ def parse_args() -> argparse.Namespace:
     args.ladder_end = None
     args.ladder_step = None
     args.symmetric = False
+    args.grid = False
     args.amount_is_total = False
+    if args.side is not None and args.side.strip().lower() in GRID_SIDE_ALIASES:
+        args.side = "grid"
+        args.grid = True
     combined_count_to_end = bool(args.ladder_for) and bool(args.ladder_while) and not args.range_spec
     combined_range_count_to_end = bool(args.ladder_for) and bool(args.range_spec) and not args.ladder_while
+    if args.grid and (args.ladder_for or args.ladder_while):
+        parser.error("grid orders use --range START END and cannot be combined with --for/--while")
     if args.ladder_for and args.ladder_while and args.range_spec:
         parser.error("--for, --while, and --range cannot all be combined")
     if combined_count_to_end and (len(args.ladder_for) != 1 or len(args.ladder_while) != 1):
@@ -2524,7 +2759,7 @@ def parse_args() -> argparse.Namespace:
     explicit_ladder_count = (
         1
         if combined_count_to_end or combined_range_count_to_end
-        else bool(args.ladder_for) + bool(args.ladder_while) + bool(args.range_spec)
+        else bool(args.ladder_for) + bool(args.ladder_while) + (bool(args.range_spec) and not args.grid)
     )
     if explicit_ladder_count > 1:
         parser.error("--for, --while, and --range are mutually exclusive")
@@ -2537,7 +2772,10 @@ def parse_args() -> argparse.Namespace:
         args.amount = args.amount or "10"
     if args.side is not None:
         normalized_side = args.side.strip().lower()
-        if normalized_side in SYMMETRIC_SIDE_ALIASES:
+        if normalized_side in GRID_SIDE_ALIASES:
+            args.side = "grid"
+            args.grid = True
+        elif normalized_side in SYMMETRIC_SIDE_ALIASES:
             args.side = "both"
             args.symmetric = True
         else:
@@ -2607,7 +2845,21 @@ def parse_args() -> argparse.Namespace:
             parser.error("--while END must be positive")
         args.ladder_mode = "while"
         args.ladder_step = unprotect_ladder_step_value(step_text)
-    if args.range_spec and not combined_range_count_to_end:
+    if args.range_spec and args.grid:
+        if len(args.range_spec) != 2:
+            parser.error("grid --range requires START END")
+        start_text, end_text = args.range_spec
+        try:
+            start_px = Decimal(start_text)
+            end_px = Decimal(end_text)
+        except InvalidOperation:
+            parser.error("grid --range START and END must be positive numbers")
+        if start_px <= 0 or end_px <= 0:
+            parser.error("grid --range START and END must be positive")
+        if start_px >= end_px:
+            parser.error("grid --range START must be below END")
+        args.range_spec = [decimal_to_plain(start_px), decimal_to_plain(end_px)]
+    elif args.range_spec and not combined_range_count_to_end:
         if len(args.range_spec) != 3:
             parser.error("--range requires START END STEP unless combined as --range START END --for COUNT")
         start_text, end_text, step_text = args.range_spec
@@ -2626,6 +2878,20 @@ def parse_args() -> argparse.Namespace:
         args.range_spec = [decimal_to_plain(start_px), decimal_to_plain(args.ladder_end), args.ladder_step]
     if args.symmetric_offset and not args.symmetric:
         parser.error("--offset requires side both/sym/对称")
+    if (args.trend or args.gap) and not args.grid:
+        parser.error("--trend and --gap require side grid")
+    if args.grid:
+        if not args.total_amount:
+            parser.error("grid orders require --total")
+        if not args.range_spec:
+            parser.error("grid orders require --range START END")
+        if not args.gap:
+            parser.error("grid orders require --gap")
+        try:
+            parse_grid_gap(args.gap)
+            parse_percent_decimal(args.trend or "0", "--trend", allow_signed=True)
+        except ValueError as exc:
+            parser.error(str(exc))
     if args.symmetric:
         if not args.symmetric_offset:
             parser.error("symmetric orders require --offset")
@@ -2689,7 +2955,7 @@ def parse_args() -> argparse.Namespace:
             parser.error("symmetric orders cannot be combined with --scale")
     if args.ladder_mode is not None and args.scale is not None:
         parser.error("Ladder orders cannot be combined with --scale")
-    if args.range_spec and (args.stop_entry or args.take_entry):
+    if args.range_spec and not args.grid and (args.stop_entry or args.take_entry):
         parser.error("--range cannot be combined with --stop/--take; use --stop/--take with --while instead")
     if args.ladder_mode is not None and (args.stop_entry or args.take_entry) and has_tpsl:
         parser.error("Ladder trigger orders cannot combine --stop/--take with --tp/--sl")
@@ -2706,6 +2972,19 @@ def parse_args() -> argparse.Namespace:
             parser.error("--scale cannot be combined with --tp/--sl, --stop-entry, or --take-entry")
     elif args.scale_from or args.scale_to:
         parser.error("--from/--to require --scale")
+    if args.grid:
+        if args.cancel is not None:
+            parser.error("grid orders cannot be combined with --cancel")
+        if args.market or args.price or args.book_level != 10 or args.tif is not None:
+            parser.error("grid orders cannot be combined with --market, --price, --level, or --tif")
+        if args.reduce_only:
+            parser.error("grid orders cannot use --reduce-only")
+        if args.stop_entry or args.take_entry or has_tpsl:
+            parser.error("grid orders cannot be combined with --stop/--take or --tp/--sl")
+        if args.symmetric or args.symmetric_offset:
+            parser.error("grid orders cannot be combined with symmetric order options")
+        if args.ladder_mode is not None or args.scale is not None or args.scale_from or args.scale_to:
+            parser.error("grid orders cannot be combined with ladder or scale options")
     if has_tpsl and args.cancel is not None:
         parser.error("--tp/--sl cannot be combined with --cancel")
     if args.stop_entry and args.cancel is not None:
