@@ -1437,7 +1437,7 @@ def build_tpsl_child_plans(
                 "tp",
                 take_trigger_px,
                 take_limit_px,
-                True,
+                False,
                 size=size,
                 size_ratio=take_ratio,
             )
@@ -1465,7 +1465,7 @@ def build_tpsl_child_plans(
                 "sl",
                 stop_trigger_px,
                 stop_limit_px,
-                True,
+                False,
                 size=size,
                 size_ratio=stop_ratio,
             )
