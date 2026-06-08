@@ -16,6 +16,7 @@ Examples:
   ./hl_order.py BTC buy --tp 2%+0.1% --sl -2%-0.1%
   ./hl_order.py BTC --cancel
   ./hl_order.py BTC --cancel up
+  ./hl_order.py BTC --cancel up --price 80000
   ./hl_order.py BTC --cancel tp
   ./hl_order.py BTC --cancel 123456789
   ./hl_order.py BTC buy --dry-run
@@ -730,20 +731,20 @@ def select_cancel_orders(
     open_orders: list[dict[str, Any]],
     coin: str,
     cancel_arg: str,
-    current_mid: Decimal | None,
+    threshold_price: Decimal | None,
 ) -> list[dict[str, Any]]:
     coin_orders = [order for order in open_orders if position_matches_coin(str(order.get("coin", "")), coin)]
     filter_arg = cancel_arg.strip().lower()
     if filter_arg == "all":
         return coin_orders
     if filter_arg == "up":
-        if current_mid is None:
+        if threshold_price is None:
             raise ValueError(f"current mid is unavailable for {coin}; cannot use --cancel up")
-        return [order for order in coin_orders if (price := open_order_cancel_price(order)) is not None and price > current_mid]
+        return [order for order in coin_orders if (price := open_order_cancel_price(order)) is not None and price > threshold_price]
     if filter_arg == "down":
-        if current_mid is None:
+        if threshold_price is None:
             raise ValueError(f"current mid is unavailable for {coin}; cannot use --cancel down")
-        return [order for order in coin_orders if (price := open_order_cancel_price(order)) is not None and price < current_mid]
+        return [order for order in coin_orders if (price := open_order_cancel_price(order)) is not None and price < threshold_price]
     if filter_arg in {"buy", "sell"}:
         return [order for order in coin_orders if open_order_side_matches(order, filter_arg)]
     if filter_arg in {"tp", "sl"}:
@@ -1172,18 +1173,23 @@ def cancel_order(
     dex: str,
     cancel_arg: str,
     dry_run: bool,
+    cancel_price: Decimal | None = None,
     price_rate: Decimal | None = None,
 ) -> None:
     open_orders = collect_frontend_open_orders(info, account, dex)
     log_event("open_orders_before", open_orders)
 
     filter_arg = cancel_arg.strip().lower()
-    current_mid: Decimal | None = None
+    threshold_price: Decimal | None = cancel_price
+    threshold_label = "price" if cancel_price is not None else "current_mid"
     if filter_arg in {"up", "down"}:
-        mids = info.all_mids(dex)
-        current_mid = Decimal(str(mids[coin])) if mids.get(coin) is not None else None
-        log_event("cancel_current_mid", {"dex": dex or "default", "coin": coin, "mid": mids.get(coin)})
-    matching_orders = select_cancel_orders(open_orders, coin, cancel_arg, current_mid)
+        if threshold_price is None:
+            mids = info.all_mids(dex)
+            threshold_price = Decimal(str(mids[coin])) if mids.get(coin) is not None else None
+            log_event("cancel_current_mid", {"dex": dex or "default", "coin": coin, "mid": mids.get(coin)})
+        else:
+            log_event("cancel_price", {"dex": dex or "default", "coin": coin, "price": decimal_to_plain(threshold_price)})
+    matching_orders = select_cancel_orders(open_orders, coin, cancel_arg, threshold_price)
 
     if not matching_orders:
         print_account_metrics(info, account)
@@ -1194,8 +1200,8 @@ def cancel_order(
     if dry_run:
         print_account_metrics(info, account)
         rows = [("dry_run", "1"), ("filter", cancel_filter_label(filter_arg))]
-        if current_mid is not None:
-            rows.append(("current_mid", format_price(current_mid, price_rate)))
+        if threshold_price is not None:
+            rows.append((threshold_label, format_price(threshold_price, price_rate)))
         print_box("Run", rows)
         for order in matching_orders:
             display_px = open_order_cancel_price(order) or decimal_or_none(order.get("limitPx")) or Decimal("0")
@@ -1220,8 +1226,8 @@ def cancel_order(
     clear_info_cache(info)
     print_account_metrics(info, account)
     rows = [("coin", coin), ("filter", cancel_filter_label(filter_arg)), ("cancelled", str(len(matching_orders)))]
-    if current_mid is not None:
-        rows.append(("current_mid", format_price(current_mid, price_rate)))
+    if threshold_price is not None:
+        rows.append((threshold_label, format_price(threshold_price, price_rate)))
     print_box("Cancel", rows)
     for order in matching_orders:
         display_px = open_order_cancel_price(order) or decimal_or_none(order.get("limitPx")) or Decimal("0")
@@ -2476,7 +2482,8 @@ def place_order(args: argparse.Namespace) -> None:
         return
 
     if args.cancel is not None:
-        cancel_order(exchange, info, account, coin, dex, args.cancel, args.dry_run, price_rate)
+        cancel_price = Decimal(args.price) if args.price else None
+        cancel_order(exchange, info, account, coin, dex, args.cancel, args.dry_run, cancel_price, price_rate)
         return
 
     amount = Decimal(args.amount)
@@ -2965,7 +2972,7 @@ def parse_args() -> argparse.Namespace:
         "--cancel",
         nargs="?",
         const="all",
-        help="Cancel instead of placing an order. Omit value to cancel all, pass OID, or use up/down/buy/sell/tp/sl.",
+        help="Cancel instead of placing an order. Omit value to cancel all, pass OID, or use up/down/buy/sell/tp/sl. Add --price with up/down to use a fixed threshold.",
     )
     parser.add_argument("--network", choices=["mainnet", "testnet"], default="mainnet", help="Default: mainnet.")
     parser.add_argument("--timeout", type=float, default=20, help="HTTP timeout in seconds. Default: 20.")
@@ -2993,6 +3000,15 @@ def parse_args() -> argparse.Namespace:
                 int(args.cancel)
             except ValueError:
                 parser.error("--cancel value must be an OID or one of: up, down, buy, sell, tp, sl")
+        if args.price:
+            if args.cancel not in {"up", "down"}:
+                parser.error("--price can only be used with --cancel up or --cancel down")
+            try:
+                cancel_price = Decimal(args.price)
+            except InvalidOperation:
+                parser.error("--price must be a valid decimal")
+            if not cancel_price.is_finite() or cancel_price <= 0:
+                parser.error("--price must be positive")
     args.ladder_mode = None
     args.ladder_count = None
     args.ladder_end = None

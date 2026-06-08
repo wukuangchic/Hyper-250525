@@ -72,6 +72,10 @@ BTC --cancel
 BTC --cancel up
 BTC --cancel down
 
+# 取消高于 / 低于指定价格的 BTC 挂单
+BTC --cancel up --price 80000
+BTC --cancel down --price 75000
+
 # 取消买单 / 卖单 / 止盈 / 止损
 BTC --cancel buy
 BTC --cancel sell
