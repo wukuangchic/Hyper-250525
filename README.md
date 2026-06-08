@@ -82,6 +82,15 @@ BTC --cancel sell
 BTC --cancel tp
 BTC --cancel sl
 
+# 取消距今 1 小时 / 天 / 周以上的 BTC 挂单
+BTC --cancel hour
+BTC --cancel day
+BTC --cancel week
+
+# 取消距今 3-5 小时，或 3 小时以上的 BTC 挂单
+BTC --cancel hour --range 3 5
+BTC --cancel hour --range 3
+
 # 取消指定订单
 BTC --cancel 441260592983
 ```

@@ -851,6 +851,11 @@ README_HTML = r"""<!doctype html>
         <li><code>BTC --cancel sell --dry-run</code></li>
         <li><code>BTC --cancel tp --dry-run</code></li>
         <li><code>BTC --cancel sl --dry-run</code></li>
+        <li><code>BTC --cancel hour --dry-run</code></li>
+        <li><code>BTC --cancel day --dry-run</code></li>
+        <li><code>BTC --cancel week --dry-run</code></li>
+        <li><code>BTC --cancel hour --range 3 5 --dry-run</code></li>
+        <li><code>BTC --cancel hour --range 3 --dry-run</code></li>
         <li><code>BTC --cancel 441260592983 --dry-run</code></li>
       </ul>
     </section>
@@ -861,7 +866,7 @@ README_HTML = r"""<!doctype html>
         <li>Use <code>--dry-run</code> to preview without submitting.</li>
         <li>Limit orders default to <code>ALO</code> unless you pass <code>--tif</code>.</li>
         <li>Commands without <code>--dry-run</code> can place or cancel real orders, except read-only commands like <code>query</code> or <code>BTC</code>.</li>
-        <li><code>--cancel</code> cancels all open orders for the coin by default. Use <code>--cancel up</code> / <code>down</code> for orders above / below the current mid, add <code>--price</code> to use a fixed threshold, use <code>buy</code> / <code>sell</code> for side filters, <code>tp</code> / <code>sl</code> for take-profit / stop-loss trigger filters, or pass an OID.</li>
+        <li><code>--cancel</code> cancels all open orders for the coin by default. Use <code>--cancel up</code> / <code>down</code> for orders above / below the current mid, add <code>--price</code> to use a fixed threshold, use <code>buy</code> / <code>sell</code> for side filters, <code>tp</code> / <code>sl</code> for take-profit / stop-loss trigger filters, use <code>hour</code> / <code>day</code> / <code>week</code> for orders older than 1 unit by default, add <code>--range 3 5</code> for an age range or <code>--range 3</code> for age 3+ units, or pass an OID.</li>
         <li>Market orders use <code>--market</code> and Hyperliquid IOC behavior.</li>
         <li><code>--stop-entry</code> or <code>--stop</code> creates a breakout-style entry trigger. Without a suffix it becomes a market trigger; with a suffix such as <code>+50</code> or <code>+0.2%</code> it becomes a trigger-limit order.</li>
         <li><code>--take-entry</code> or <code>--take</code> creates an if-touched entry trigger. Without a suffix it becomes a market trigger; with a suffix such as <code>+50</code> or <code>+0.2%</code> it becomes a trigger-limit order.</li>

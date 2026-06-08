@@ -17,6 +17,7 @@ Examples:
   ./hl_order.py BTC --cancel
   ./hl_order.py BTC --cancel up
   ./hl_order.py BTC --cancel up --price 80000
+  ./hl_order.py BTC --cancel hour --range 3 5
   ./hl_order.py BTC --cancel tp
   ./hl_order.py BTC --cancel 123456789
   ./hl_order.py BTC buy --dry-run
@@ -98,7 +99,13 @@ SYMMETRIC_SIDE_ALIASES = {"both", "sym", "symmetric", "dual", "双向", "对称"
 GRID_SIDE_ALIASES = {"grid", "网格", "网格单"}
 DEFAULT_GRID_GAP_LABEL = ["auto-minTick", "auto-takerFee"]
 DEFAULT_GRID_RANGE = ["auto", "auto"]
-CANCEL_FILTERS = {"all", "up", "down", "buy", "sell", "tp", "sl"}
+CANCEL_AGE_FILTERS = {"hour", "day", "week"}
+CANCEL_FILTERS = {"all", "up", "down", "buy", "sell", "tp", "sl"} | CANCEL_AGE_FILTERS
+CANCEL_AGE_UNIT_MS = {
+    "hour": 60 * 60 * 1000,
+    "day": 24 * 60 * 60 * 1000,
+    "week": 7 * 24 * 60 * 60 * 1000,
+}
 
 
 def protect_grid_range_values(argv: list[str]) -> list[str]:
@@ -697,6 +704,24 @@ def open_order_cancel_price(order: dict[str, Any]) -> Decimal | None:
     return trigger_px if trigger_px is not None and trigger_px > 0 else None
 
 
+def open_order_timestamp_ms(order: dict[str, Any]) -> int | None:
+    timestamp = order.get("timestamp")
+    if timestamp is None:
+        return None
+    try:
+        timestamp_ms = int(timestamp)
+    except (TypeError, ValueError):
+        return None
+    return timestamp_ms if timestamp_ms > 0 else None
+
+
+def open_order_age_ms(order: dict[str, Any], now_ms: int) -> int | None:
+    timestamp_ms = open_order_timestamp_ms(order)
+    if timestamp_ms is None:
+        return None
+    return max(0, now_ms - timestamp_ms)
+
+
 def open_order_side_matches(order: dict[str, Any], side: str) -> bool:
     normalized = str(order.get("side", "")).strip().lower()
     if side == "buy":
@@ -727,11 +752,38 @@ def cancel_filter_label(cancel_arg: str) -> str:
     return "all" if cancel_arg == "all" else cancel_arg
 
 
+def format_cancel_age_range(unit: str, age_range: tuple[Decimal, Decimal | None]) -> str:
+    start, end = age_range
+    if end is None:
+        return f">= {decimal_to_plain(start)} {unit}"
+    return f"{decimal_to_plain(start)}-{decimal_to_plain(end)} {unit}"
+
+
+def parse_cancel_age_range(values: list[str] | None) -> tuple[Decimal, Decimal | None]:
+    if not values:
+        return Decimal(1), None
+    if len(values) not in {1, 2}:
+        raise ValueError("--range for --cancel hour/day/week requires one or two numbers")
+    try:
+        parsed = [Decimal(value) for value in values]
+    except InvalidOperation as exc:
+        raise ValueError("--range for --cancel hour/day/week must contain valid decimals") from exc
+    if any(not value.is_finite() or value < 0 for value in parsed):
+        raise ValueError("--range for --cancel hour/day/week must be non-negative")
+    start = parsed[0]
+    end = parsed[1] if len(parsed) == 2 else None
+    if end is not None and end <= start:
+        raise ValueError("--range END must be greater than START for --cancel hour/day/week")
+    return start, end
+
+
 def select_cancel_orders(
     open_orders: list[dict[str, Any]],
     coin: str,
     cancel_arg: str,
     threshold_price: Decimal | None,
+    age_range_ms: tuple[int, int | None] | None = None,
+    now_ms: int | None = None,
 ) -> list[dict[str, Any]]:
     coin_orders = [order for order in open_orders if position_matches_coin(str(order.get("coin", "")), coin)]
     filter_arg = cancel_arg.strip().lower()
@@ -749,6 +801,21 @@ def select_cancel_orders(
         return [order for order in coin_orders if open_order_side_matches(order, filter_arg)]
     if filter_arg in {"tp", "sl"}:
         return [order for order in coin_orders if open_order_tpsl_kind(order) == filter_arg]
+    if filter_arg in CANCEL_AGE_FILTERS:
+        if age_range_ms is None or now_ms is None:
+            raise ValueError(f"age range is unavailable for {coin}; cannot use --cancel {filter_arg}")
+        start_ms, end_ms = age_range_ms
+        if end_ms is None:
+            return [
+                order
+                for order in coin_orders
+                if (age_ms := open_order_age_ms(order, now_ms)) is not None and age_ms >= start_ms
+            ]
+        return [
+            order
+            for order in coin_orders
+            if (age_ms := open_order_age_ms(order, now_ms)) is not None and start_ms <= age_ms <= end_ms
+        ]
 
     oid = int(cancel_arg)
     return [order for order in coin_orders if int(order.get("oid")) == oid]
@@ -1174,6 +1241,7 @@ def cancel_order(
     cancel_arg: str,
     dry_run: bool,
     cancel_price: Decimal | None = None,
+    cancel_age_range: tuple[Decimal, Decimal | None] | None = None,
     price_rate: Decimal | None = None,
 ) -> None:
     open_orders = collect_frontend_open_orders(info, account, dex)
@@ -1182,6 +1250,8 @@ def cancel_order(
     filter_arg = cancel_arg.strip().lower()
     threshold_price: Decimal | None = cancel_price
     threshold_label = "price" if cancel_price is not None else "current_mid"
+    age_range_ms: tuple[int, int | None] | None = None
+    now_ms: int | None = None
     if filter_arg in {"up", "down"}:
         if threshold_price is None:
             mids = info.all_mids(dex)
@@ -1189,11 +1259,31 @@ def cancel_order(
             log_event("cancel_current_mid", {"dex": dex or "default", "coin": coin, "mid": mids.get(coin)})
         else:
             log_event("cancel_price", {"dex": dex or "default", "coin": coin, "price": decimal_to_plain(threshold_price)})
-    matching_orders = select_cancel_orders(open_orders, coin, cancel_arg, threshold_price)
+    if filter_arg in CANCEL_AGE_FILTERS:
+        unit_ms = CANCEL_AGE_UNIT_MS[filter_arg]
+        age_range = cancel_age_range or (Decimal(1), None)
+        start, end = age_range
+        age_range_ms = (int(start * unit_ms), None if end is None else int(end * unit_ms))
+        now_ms = int(time.time() * 1000)
+        log_event(
+            "cancel_age_range",
+            {
+                "dex": dex or "default",
+                "coin": coin,
+                "unit": filter_arg,
+                "range": [decimal_to_plain(start), None if end is None else decimal_to_plain(end)],
+            },
+        )
+    matching_orders = select_cancel_orders(open_orders, coin, cancel_arg, threshold_price, age_range_ms, now_ms)
 
     if not matching_orders:
         print_account_metrics(info, account)
-        print_box("Cancel", [("coin", coin), ("filter", cancel_filter_label(filter_arg)), ("cancelled", "0")])
+        rows = [("coin", coin), ("filter", cancel_filter_label(filter_arg)), ("cancelled", "0")]
+        if threshold_price is not None:
+            rows.append((threshold_label, format_price(threshold_price, price_rate)))
+        if filter_arg in CANCEL_AGE_FILTERS:
+            rows.append(("age", format_cancel_age_range(filter_arg, cancel_age_range or (Decimal(1), None))))
+        print_box("Cancel", rows)
         return
 
     cancel_requests = [{"coin": str(order.get("coin", coin)), "oid": int(order["oid"])} for order in matching_orders]
@@ -1202,6 +1292,8 @@ def cancel_order(
         rows = [("dry_run", "1"), ("filter", cancel_filter_label(filter_arg))]
         if threshold_price is not None:
             rows.append((threshold_label, format_price(threshold_price, price_rate)))
+        if filter_arg in CANCEL_AGE_FILTERS:
+            rows.append(("age", format_cancel_age_range(filter_arg, cancel_age_range or (Decimal(1), None))))
         print_box("Run", rows)
         for order in matching_orders:
             display_px = open_order_cancel_price(order) or decimal_or_none(order.get("limitPx")) or Decimal("0")
@@ -1228,6 +1320,8 @@ def cancel_order(
     rows = [("coin", coin), ("filter", cancel_filter_label(filter_arg)), ("cancelled", str(len(matching_orders)))]
     if threshold_price is not None:
         rows.append((threshold_label, format_price(threshold_price, price_rate)))
+    if filter_arg in CANCEL_AGE_FILTERS:
+        rows.append(("age", format_cancel_age_range(filter_arg, cancel_age_range or (Decimal(1), None))))
     print_box("Cancel", rows)
     for order in matching_orders:
         display_px = open_order_cancel_price(order) or decimal_or_none(order.get("limitPx")) or Decimal("0")
@@ -2483,7 +2577,18 @@ def place_order(args: argparse.Namespace) -> None:
 
     if args.cancel is not None:
         cancel_price = Decimal(args.price) if args.price else None
-        cancel_order(exchange, info, account, coin, dex, args.cancel, args.dry_run, cancel_price, price_rate)
+        cancel_order(
+            exchange,
+            info,
+            account,
+            coin,
+            dex,
+            args.cancel,
+            args.dry_run,
+            cancel_price,
+            args.cancel_age_range,
+            price_rate,
+        )
         return
 
     amount = Decimal(args.amount)
@@ -2972,7 +3077,7 @@ def parse_args() -> argparse.Namespace:
         "--cancel",
         nargs="?",
         const="all",
-        help="Cancel instead of placing an order. Omit value to cancel all, pass OID, or use up/down/buy/sell/tp/sl. Add --price with up/down to use a fixed threshold.",
+        help="Cancel instead of placing an order. Omit value to cancel all, pass OID, or use up/down/buy/sell/tp/sl/hour/day/week. Add --price with up/down, or --range with hour/day/week.",
     )
     parser.add_argument("--network", choices=["mainnet", "testnet"], default="mainnet", help="Default: mainnet.")
     parser.add_argument("--timeout", type=float, default=20, help="HTTP timeout in seconds. Default: 20.")
@@ -2982,8 +3087,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verbose", action="store_true", help="Print diagnostic details.")
     parser.add_argument("--submit", action="store_true", help=argparse.SUPPRESS)
     raw_argv = sys.argv[1:]
+    has_cancel_age_filter = any(
+        token.strip().lower() in CANCEL_AGE_FILTERS
+        and index > 0
+        and raw_argv[index - 1].strip().lower() == "--cancel"
+        for index, token in enumerate(raw_argv)
+    ) or any(
+        token.strip().lower().startswith("--cancel=")
+        and token.split("=", 1)[1].strip().lower() in CANCEL_AGE_FILTERS
+        for token in raw_argv
+    )
     if any(token.strip().lower() in GRID_SIDE_ALIASES for token in raw_argv):
         cli_argv = normalize_signed_option_values(protect_grid_range_values(raw_argv))
+    elif has_cancel_age_filter:
+        cli_argv = normalize_signed_option_values(raw_argv)
     else:
         cli_argv = normalize_signed_option_values(protect_ladder_step_values(raw_argv))
     args = parser.parse_intermixed_args(cli_argv)
@@ -2999,7 +3116,7 @@ def parse_args() -> argparse.Namespace:
             try:
                 int(args.cancel)
             except ValueError:
-                parser.error("--cancel value must be an OID or one of: up, down, buy, sell, tp, sl")
+                parser.error("--cancel value must be an OID or one of: up, down, buy, sell, tp, sl, hour, day, week")
         if args.price:
             if args.cancel not in {"up", "down"}:
                 parser.error("--price can only be used with --cancel up or --cancel down")
@@ -3009,6 +3126,17 @@ def parse_args() -> argparse.Namespace:
                 parser.error("--price must be a valid decimal")
             if not cancel_price.is_finite() or cancel_price <= 0:
                 parser.error("--price must be positive")
+    args.cancel_age_range = None
+    if args.cancel is not None and args.range_spec:
+        if args.cancel not in CANCEL_AGE_FILTERS:
+            parser.error("--range can only be used with --cancel hour, --cancel day, or --cancel week")
+        try:
+            args.cancel_age_range = parse_cancel_age_range(args.range_spec)
+        except ValueError as exc:
+            parser.error(str(exc))
+        args.range_spec = [decimal_to_plain(args.cancel_age_range[0])]
+        if args.cancel_age_range[1] is not None:
+            args.range_spec.append(decimal_to_plain(args.cancel_age_range[1]))
     args.ladder_mode = None
     args.ladder_count = None
     args.ladder_end = None
@@ -3020,7 +3148,7 @@ def parse_args() -> argparse.Namespace:
         args.side = "grid"
         args.grid = True
     combined_count_to_end = bool(args.ladder_for) and bool(args.ladder_while) and not args.range_spec
-    combined_range_count_to_end = bool(args.ladder_for) and bool(args.range_spec) and not args.ladder_while
+    combined_range_count_to_end = bool(args.ladder_for) and bool(args.range_spec) and not args.ladder_while and args.cancel is None
     if args.grid and (args.ladder_for or args.ladder_while):
         parser.error("grid orders use --range START END and cannot be combined with --for/--while")
     if args.ladder_for and args.ladder_while and args.range_spec:
@@ -3032,7 +3160,7 @@ def parse_args() -> argparse.Namespace:
     explicit_ladder_count = (
         1
         if combined_count_to_end or combined_range_count_to_end
-        else bool(args.ladder_for) + bool(args.ladder_while) + (bool(args.range_spec) and not args.grid)
+        else bool(args.ladder_for) + bool(args.ladder_while) + (bool(args.range_spec) and not args.grid and args.cancel is None)
     )
     if explicit_ladder_count > 1:
         parser.error("--for, --while, and --range are mutually exclusive")
@@ -3141,7 +3269,7 @@ def parse_args() -> argparse.Namespace:
             "auto" if start_px is None else decimal_to_plain(start_px),
             "auto" if end_px is None else decimal_to_plain(end_px),
         ]
-    elif args.range_spec and not combined_range_count_to_end:
+    elif args.range_spec and not combined_range_count_to_end and args.cancel is None:
         if len(args.range_spec) != 3:
             parser.error("--range requires START END STEP unless combined as --range START END --for COUNT")
         start_text, end_text, step_text = args.range_spec
