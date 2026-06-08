@@ -95,7 +95,7 @@ DEFAULT_SLIPPAGE = "0.05"
 ISOLATED_FALLBACK_LEVERAGE = 5
 SYMMETRIC_SIDE_ALIASES = {"both", "sym", "symmetric", "dual", "双向", "对称", "对称单"}
 GRID_SIDE_ALIASES = {"grid", "网格", "网格单"}
-DEFAULT_GRID_GAP = ["0.045%", "0.025%"]
+DEFAULT_GRID_GAP_LABEL = ["auto-minTick", "auto-takerFee"]
 DEFAULT_GRID_RANGE = ["auto", "auto"]
 CANCEL_FILTERS = {"all", "up", "down", "buy", "sell", "tp", "sl"}
 
@@ -1620,9 +1620,12 @@ def parse_grid_gap(value: str | list[str]) -> tuple[Decimal, Decimal | None]:
 
 
 def grid_gap_spec(args: argparse.Namespace) -> list[str]:
+    resolved = getattr(args, "resolved_grid_gap_spec", None)
+    if resolved:
+        return list(resolved)
     gap = getattr(args, "gap", None)
     if gap is None:
-        return list(DEFAULT_GRID_GAP)
+        return list(DEFAULT_GRID_GAP_LABEL)
     if isinstance(gap, list):
         return gap
     return [gap]
@@ -1633,6 +1636,49 @@ def grid_range_spec(args: argparse.Namespace) -> list[str]:
     if range_spec:
         return list(range_spec)
     return list(DEFAULT_GRID_RANGE)
+
+
+def minimum_grid_gap(anchor: Decimal, sz_decimals: int) -> Decimal:
+    if anchor <= 0:
+        raise ValueError("grid anchor price must be positive")
+
+    price_step = Decimal(1).scaleb(-max(0, 6 - sz_decimals))
+    base_px = rounded_perp_price(anchor, sz_decimals)
+    while rounded_perp_price(anchor + price_step, sz_decimals) <= base_px:
+        price_step *= Decimal("10")
+
+    gap = price_step / anchor
+    for _ in range(12):
+        buy_trigger = rounded_perp_price(anchor * (Decimal("1") - gap / Decimal("2")), sz_decimals)
+        sell_trigger = rounded_perp_price(anchor * (Decimal("1") + gap / Decimal("2")), sz_decimals)
+        if buy_trigger < sell_trigger:
+            return gap
+        gap += price_step / anchor
+
+    raise ValueError("could not resolve a minimum grid gap for this price precision")
+
+
+def resolve_grid_gap(
+    args: argparse.Namespace,
+    info: Info,
+    account: str,
+    asset: dict[str, Any],
+    dex: str,
+    start_px: Decimal,
+    end_px: Decimal,
+) -> tuple[Decimal, Decimal | None]:
+    if getattr(args, "gap", None):
+        return parse_grid_gap(args.gap)
+
+    sz_decimals = int(asset["szDecimals"])
+    gap = max(minimum_grid_gap(start_px, sz_decimals), minimum_grid_gap(end_px, sz_decimals))
+    fee_rates = effective_perp_fee_rates(info, account, asset, dex)
+    taker_fee = fee_rates.get("taker_effective")
+    if taker_fee is None or taker_fee <= 0:
+        raise ValueError("grid default --gap requires a positive effective taker fee; specify --gap explicitly")
+
+    args.resolved_grid_gap_spec = [format_rate_percent(gap), format_rate_percent(taker_fee)]
+    return gap, taker_fee
 
 
 def round_size_up(value: Decimal, sz_decimals: int) -> Decimal:
@@ -1724,7 +1770,6 @@ def build_grid_orders(
     if total_amount < MIN_NOTIONAL:
         raise ValueError(f"grid --total must be at least {MIN_NOTIONAL} USD")
 
-    gap, limit_offset = parse_grid_gap(grid_gap_spec(args))
     trend = parse_percent_decimal(args.trend or "0", "--trend", allow_signed=True)
     if trend <= Decimal("-1"):
         raise ValueError("--trend must be greater than -100%")
@@ -1732,6 +1777,7 @@ def build_grid_orders(
     sz_decimals = int(asset["szDecimals"])
     start_px = rounded_perp_price(start_px, sz_decimals)
     end_px = rounded_perp_price(end_px, sz_decimals)
+    gap, limit_offset = resolve_grid_gap(args, info, account, asset, dex, start_px, end_px)
     half_gap = gap / Decimal("2")
     preview_anchors = [start_px, end_px]
     buy_limits: list[Decimal] = []
@@ -2833,7 +2879,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gap",
         nargs="+",
-        help="Grid trigger spacing and optional same-side limit offset. Default: 0.045%% 0.025%%. E.g. 0.15%% 0.05%% or 0.15%%+-0.05%%.",
+        help="Grid trigger spacing and optional same-side limit offset. Default: min price tick percent and effective taker fee. E.g. 0.15%% 0.05%% or 0.15%%+-0.05%%.",
     )
     parser.add_argument("--market", action="store_true", help="Submit as a market order using IOC with slippage protection.")
     parser.add_argument("--slippage", default=DEFAULT_SLIPPAGE, help="Market slippage protection. Default: 0.05. Also accepts 5%%.")
@@ -3104,7 +3150,8 @@ def parse_args() -> argparse.Namespace:
         if not args.total_amount:
             parser.error("grid orders require --total")
         try:
-            parse_grid_gap(grid_gap_spec(args))
+            if args.gap:
+                parse_grid_gap(args.gap)
             parse_percent_decimal(args.trend or "0", "--trend", allow_signed=True)
         except ValueError as exc:
             parser.error(str(exc))
