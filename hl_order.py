@@ -784,14 +784,80 @@ def market_asset_context(info: Info, coin: str, dex: str) -> dict[str, Any]:
     return {}
 
 
-def account_fee_rates(info: Info, account: str) -> tuple[Decimal | None, Decimal | None]:
+def account_fee_info(info: Info, account: str) -> dict[str, Any]:
     try:
         fees = info.user_fees(account)
         log_event("user_fees", fees)
     except Exception as exc:
         log_event("user_fees_error", {"type": type(exc).__name__, "message": str(exc)})
-        return None, None
-    return decimal_or_none(fees.get("userAddRate")), decimal_or_none(fees.get("userCrossRate"))
+        return {}
+    return fees if isinstance(fees, dict) else {}
+
+
+def perp_dex_config(info: Info, dex: str) -> dict[str, Any]:
+    if not dex:
+        return {}
+    try:
+        dexs = info.perp_dexs()
+        log_event("perp_dexs", dexs)
+    except Exception as exc:
+        log_event("perp_dexs_error", {"type": type(exc).__name__, "message": str(exc)})
+        return {}
+    for item in dexs:
+        if isinstance(item, dict) and str(item.get("name", "")).lower() == dex.lower():
+            return item
+    return {}
+
+
+def effective_perp_fee_rates(
+    info: Info,
+    account: str,
+    asset: dict[str, Any],
+    dex: str,
+) -> dict[str, Decimal | None]:
+    fees = account_fee_info(info, account)
+    maker_base = decimal_or_none(fees.get("userAddRate"))
+    taker_base = decimal_or_none(fees.get("userCrossRate"))
+    referral_discount = decimal_or_none(fees.get("activeReferralDiscount")) or Decimal("0")
+
+    dex_config = perp_dex_config(info, dex)
+    deployer_fee_scale = decimal_or_none(dex_config.get("deployerFeeScale")) if dex_config else None
+    if deployer_fee_scale is None:
+        hip3_scale = Decimal("1")
+    elif deployer_fee_scale < 1:
+        hip3_scale = deployer_fee_scale + Decimal("1")
+    else:
+        hip3_scale = deployer_fee_scale * Decimal("2")
+
+    growth_mode = str(asset.get("growthMode", "")).strip().lower() == "enabled"
+    growth_mode_scale = Decimal("0.1") if growth_mode else Decimal("1")
+    discount_scale = Decimal("1") - referral_discount
+
+    maker_effective = None
+    if maker_base is not None:
+        maker_effective = maker_base * growth_mode_scale
+        if maker_effective > 0:
+            maker_effective *= hip3_scale * discount_scale
+
+    taker_effective = None
+    if taker_base is not None:
+        taker_effective = taker_base * hip3_scale * growth_mode_scale * discount_scale
+
+    return {
+        "maker_base": maker_base,
+        "taker_base": taker_base,
+        "maker_effective": maker_effective,
+        "taker_effective": taker_effective,
+    }
+
+
+def format_fee_rate(effective: Decimal | None, base: Decimal | None) -> str:
+    if effective is None:
+        return "n/a"
+    text = format_rate_percent(effective)
+    if base is not None and effective != base:
+        text = f"{text} (base {format_rate_percent(base)})"
+    return text
 
 
 def print_market_overview(
@@ -800,6 +866,7 @@ def print_market_overview(
     raw_coin: str,
     coin: str,
     dex: str,
+    asset: dict[str, Any],
     price_rate: Decimal | None,
     kline_mode: str = "hour",
 ) -> None:
@@ -841,7 +908,7 @@ def print_market_overview(
         trend = "flat"
 
     asset_ctx = market_asset_context(info, coin, dex)
-    maker_fee, taker_fee = account_fee_rates(info, account)
+    fee_rates = effective_perp_fee_rates(info, account, asset=asset, dex=dex)
     print_box(
         mode_config["market_title"],
         [
@@ -851,8 +918,8 @@ def print_market_overview(
             ("markPx", format_optional_price(asset_ctx.get("markPx"), price_rate)),
             ("funding", format_rate_percent(asset_ctx.get("funding"))),
             ("premium", format_rate_percent(asset_ctx.get("premium"))),
-            ("makerFee", format_rate_percent(maker_fee)),
-            ("takerFee", format_rate_percent(taker_fee)),
+            ("takerFee", format_fee_rate(fee_rates.get("taker_effective"), fee_rates.get("taker_base"))),
+            ("makerFee", format_fee_rate(fee_rates.get("maker_effective"), fee_rates.get("maker_base"))),
             ("turnover", decimal_to_display(notional_volume)),
         ],
     )
@@ -2359,7 +2426,7 @@ def place_order(args: argparse.Namespace) -> None:
         )
         if order_flags_without_side:
             raise ValueError("side is required when order options are used")
-        print_market_overview(info, account, args.coin, coin, dex, price_rate, kline_mode)
+        print_market_overview(info, account, args.coin, coin, dex, asset, price_rate, kline_mode)
         return
 
     if args.cancel is not None:
