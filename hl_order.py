@@ -32,7 +32,7 @@ import time
 import traceback
 from threading import Lock
 from datetime import datetime
-from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 from pathlib import Path
 from typing import Any, Optional
 
@@ -96,6 +96,7 @@ ISOLATED_FALLBACK_LEVERAGE = 5
 SYMMETRIC_SIDE_ALIASES = {"both", "sym", "symmetric", "dual", "双向", "对称", "对称单"}
 GRID_SIDE_ALIASES = {"grid", "网格", "网格单"}
 DEFAULT_GRID_GAP = ["0.045%", "0.025%"]
+DEFAULT_GRID_RANGE = ["auto", "auto"]
 CANCEL_FILTERS = {"all", "up", "down", "buy", "sell", "tp", "sl"}
 
 
@@ -185,6 +186,14 @@ class CachedInfo:
     def meta(self, dex: str = "") -> Any:
         return self._cached(("meta", dex), lambda: self._info.meta(dex=dex))
 
+    def meta_and_asset_ctxs(self, dex: str = "") -> Any:
+        if dex:
+            return self._cached(
+                ("meta_and_asset_ctxs", dex),
+                lambda: self._info.post("/info", {"type": "metaAndAssetCtxs", "dex": dex}),
+            )
+        return self._cached(("meta_and_asset_ctxs", dex), lambda: self._info.meta_and_asset_ctxs())
+
     def all_mids(self, dex: str = "") -> Any:
         return self._cached(("all_mids", dex), lambda: self._info.all_mids(dex))
 
@@ -216,6 +225,9 @@ class CachedInfo:
             ("user_fills_by_time", account, start_time, end_time, aggregate_by_time),
             lambda: self._info.user_fills_by_time(account, start_time, end_time, aggregate_by_time),
         )
+
+    def user_fees(self, account: str) -> Any:
+        return self._cached(("user_fees", account), lambda: self._info.user_fees(account))
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._info, name)
@@ -456,6 +468,15 @@ def compact_status(status: dict[str, Any] | None) -> str:
     return str(status)
 
 
+def format_rate_percent(value: Any, decimals: int = 4) -> str:
+    decimal = decimal_or_none(value)
+    if decimal is None:
+        return "n/a"
+    quant = Decimal(1).scaleb(-decimals)
+    percent = (decimal * Decimal("100")).quantize(quant, rounding=ROUND_HALF_UP)
+    return f"{percent}%"
+
+
 def order_plan_request(plan: dict[str, Any]) -> dict[str, Any]:
     return {
         "coin": plan["coin"],
@@ -546,6 +567,8 @@ def print_explain(title: str, plans: list[dict[str, Any]], args: argparse.Namesp
     if args.range_spec:
         rows.append(("range", " ".join(args.range_spec)))
     if getattr(args, "grid", False):
+        if not args.range_spec:
+            rows.append(("range", " ".join(grid_range_spec(args))))
         rows.append(("gap", " ".join(grid_gap_spec(args))))
         rows.append(("trend", args.trend or "0"))
     if getattr(args, "symmetric", False):
@@ -743,6 +766,34 @@ def find_current_position(info: Info, account: str, coin: str, dex: str) -> dict
     return None
 
 
+def market_asset_context(info: Info, coin: str, dex: str) -> dict[str, Any]:
+    try:
+        meta, asset_ctxs = info.meta_and_asset_ctxs(dex)
+        log_event(f"meta_and_asset_ctxs:{dex or 'default'}", {"meta": meta, "assetCtxs": asset_ctxs})
+    except Exception as exc:
+        log_event(f"meta_and_asset_ctxs_error:{dex or 'default'}", {"type": type(exc).__name__, "message": str(exc)})
+        return {}
+
+    universe = meta.get("universe", []) if isinstance(meta, dict) else []
+    for index, asset in enumerate(universe):
+        if not position_matches_coin(str(asset.get("name", "")), coin):
+            continue
+        if index < len(asset_ctxs) and isinstance(asset_ctxs[index], dict):
+            return asset_ctxs[index]
+        return {}
+    return {}
+
+
+def account_fee_rates(info: Info, account: str) -> tuple[Decimal | None, Decimal | None]:
+    try:
+        fees = info.user_fees(account)
+        log_event("user_fees", fees)
+    except Exception as exc:
+        log_event("user_fees_error", {"type": type(exc).__name__, "message": str(exc)})
+        return None, None
+    return decimal_or_none(fees.get("userAddRate")), decimal_or_none(fees.get("userCrossRate"))
+
+
 def print_market_overview(
     info: Info,
     account: str,
@@ -789,12 +840,19 @@ def print_market_overview(
     else:
         trend = "flat"
 
+    asset_ctx = market_asset_context(info, coin, dex)
+    maker_fee, taker_fee = account_fee_rates(info, account)
     print_box(
         mode_config["market_title"],
         [
             ("coin", coin),
             ("trend", f"{trend} {format_signed_decimal(change)} ({format_signed_percent(change_percent)})"),
             ("latest", format_price(latest_price, price_rate)),
+            ("markPx", format_optional_price(asset_ctx.get("markPx"), price_rate)),
+            ("funding", format_rate_percent(asset_ctx.get("funding"))),
+            ("premium", format_rate_percent(asset_ctx.get("premium"))),
+            ("makerFee", format_rate_percent(maker_fee)),
+            ("takerFee", format_rate_percent(taker_fee)),
             ("turnover", decimal_to_display(notional_volume)),
         ],
     )
@@ -1503,6 +1561,13 @@ def grid_gap_spec(args: argparse.Namespace) -> list[str]:
     return [gap]
 
 
+def grid_range_spec(args: argparse.Namespace) -> list[str]:
+    range_spec = getattr(args, "range_spec", None)
+    if range_spec:
+        return list(range_spec)
+    return list(DEFAULT_GRID_RANGE)
+
+
 def round_size_up(value: Decimal, sz_decimals: int) -> Decimal:
     step = Decimal(1).scaleb(-sz_decimals)
     return (value / step).to_integral_value(rounding=ROUND_UP) * step
@@ -1576,12 +1641,13 @@ def build_grid_orders(
 ) -> list[dict[str, Any]]:
     if current_mid is None:
         raise ValueError(f"No mid price found for {coin}, cannot place grid orders")
-    if not args.range_spec or len(args.range_spec) != 2:
+    range_spec = grid_range_spec(args)
+    if len(range_spec) != 2:
         raise ValueError("grid orders require --range START END")
 
     try:
-        start_px = resolve_grid_auto_range_value(args.range_spec[0], "lower", info, account, coin, dex, current_mid)
-        end_px = resolve_grid_auto_range_value(args.range_spec[1], "upper", info, account, coin, dex, current_mid)
+        start_px = resolve_grid_auto_range_value(range_spec[0], "lower", info, account, coin, dex, current_mid)
+        end_px = resolve_grid_auto_range_value(range_spec[1], "upper", info, account, coin, dex, current_mid)
     except InvalidOperation as exc:
         raise ValueError("--range START and END must be positive numbers or auto") from exc
     if start_px <= 0 or end_px <= 0:
@@ -2923,6 +2989,8 @@ def parse_args() -> argparse.Namespace:
             parser.error("--while END must be positive")
         args.ladder_mode = "while"
         args.ladder_step = unprotect_ladder_step_value(step_text)
+    if args.grid and not args.range_spec:
+        args.range_spec = list(DEFAULT_GRID_RANGE)
     if args.range_spec and args.grid:
         if len(args.range_spec) == 1 and "," in args.range_spec[0]:
             args.range_spec = args.range_spec[0].split(",", 1)
@@ -2968,8 +3036,6 @@ def parse_args() -> argparse.Namespace:
     if args.grid:
         if not args.total_amount:
             parser.error("grid orders require --total")
-        if not args.range_spec:
-            parser.error("grid orders require --range START END")
         try:
             parse_grid_gap(grid_gap_spec(args))
             parse_percent_decimal(args.trend or "0", "--trend", allow_signed=True)

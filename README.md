@@ -152,11 +152,13 @@ BTC grid --total 300 --range 50000 70000 --trend 10% --gap 0.15% 0.05% --explain
 BTC grid --total 300 --range 50000 70000 --explain
 BTC grid --total 300 --range auto 70000 --trend 10% --gap 0.15% 0.05% --explain
 BTC grid --total 300 --range auto auto --gap 0.15% 0.05% --explain
+BTC grid --total 300 --explain
 ```
 
 含义：
 
 - `--range START END`：网格 anchor 范围。
+- 不写 `--range` 时默认 `--range auto auto`。
 - `--range auto END`：从当前 mid 向下找当前标的未成交触发单，取最近的触发价作为下限。
 - `--range START auto`：从当前 mid 向上找当前标的未成交触发单，取最近的触发价作为上限。
 - `--range auto auto`：同时自动推断上下限；对应方向没找到未成交触发单会报错。
