@@ -95,7 +95,28 @@ DEFAULT_SLIPPAGE = "0.05"
 ISOLATED_FALLBACK_LEVERAGE = 5
 SYMMETRIC_SIDE_ALIASES = {"both", "sym", "symmetric", "dual", "双向", "对称", "对称单"}
 GRID_SIDE_ALIASES = {"grid", "网格", "网格单"}
+DEFAULT_GRID_GAP = ["0.045%", "0.025%"]
 CANCEL_FILTERS = {"all", "up", "down", "buy", "sell", "tp", "sl"}
+
+
+def protect_grid_range_values(argv: list[str]) -> list[str]:
+    if not any(token.strip().lower() in GRID_SIDE_ALIASES for token in argv):
+        return argv
+    protected: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--range" and index + 2 < len(argv):
+            protected.extend([token, f"{argv[index + 1]},{argv[index + 2]}"])
+            index += 3
+            continue
+        protected.append(token)
+        index += 1
+    return protected
+
+
+def unprotect_grid_range_value(value: str) -> str:
+    return value[1:] if value.startswith("=") else value
 
 
 class RunLogger:
@@ -525,7 +546,7 @@ def print_explain(title: str, plans: list[dict[str, Any]], args: argparse.Namesp
     if args.range_spec:
         rows.append(("range", " ".join(args.range_spec)))
     if getattr(args, "grid", False):
-        rows.append(("gap", " ".join(args.gap) if isinstance(args.gap, list) else args.gap or "-"))
+        rows.append(("gap", " ".join(grid_gap_spec(args))))
         rows.append(("trend", args.trend or "0"))
     if getattr(args, "symmetric", False):
         rows.append(("symmetric", f"offset {args.symmetric_offset}"))
@@ -1473,6 +1494,15 @@ def parse_grid_gap(value: str | list[str]) -> tuple[Decimal, Decimal | None]:
     return gap, limit_offset
 
 
+def grid_gap_spec(args: argparse.Namespace) -> list[str]:
+    gap = getattr(args, "gap", None)
+    if gap is None:
+        return list(DEFAULT_GRID_GAP)
+    if isinstance(gap, list):
+        return gap
+    return [gap]
+
+
 def round_size_up(value: Decimal, sz_decimals: int) -> Decimal:
     step = Decimal(1).scaleb(-sz_decimals)
     return (value / step).to_integral_value(rounding=ROUND_UP) * step
@@ -1489,8 +1519,54 @@ def grid_anchor_prices(start: Decimal, end: Decimal, count: int, sz_decimals: in
     ]
 
 
+def is_auto_range_value(value: str) -> bool:
+    return value.strip().lower() in {"auto", "自动"}
+
+
+def open_order_trigger_decimal(order: dict[str, Any]) -> Decimal | None:
+    trigger_px = decimal_or_none(order.get("triggerPx"))
+    if trigger_px is not None and trigger_px > 0:
+        return trigger_px
+    return None
+
+
+def resolve_grid_auto_range_value(
+    value: str,
+    side: str,
+    info: Info,
+    account: str,
+    coin: str,
+    dex: str,
+    current_mid: Decimal,
+) -> Decimal:
+    if not is_auto_range_value(value):
+        return Decimal(value)
+
+    open_orders = collect_frontend_open_orders(info, account, dex)
+    trigger_prices = [
+        trigger_px
+        for order in open_orders
+        if position_matches_coin(str(order.get("coin", "")), coin)
+        and (order.get("isTrigger") or open_order_trigger_decimal(order) is not None)
+        and (trigger_px := open_order_trigger_decimal(order)) is not None
+    ]
+    if side == "lower":
+        candidates = [price for price in trigger_prices if price < current_mid]
+        if not candidates:
+            raise ValueError(f"grid --range auto could not find an open trigger order below current mid ({decimal_to_display(current_mid)})")
+        return max(candidates)
+
+    candidates = [price for price in trigger_prices if price > current_mid]
+    if not candidates:
+        raise ValueError(f"grid --range auto could not find an open trigger order above current mid ({decimal_to_display(current_mid)})")
+    return min(candidates)
+
+
 def build_grid_orders(
     args: argparse.Namespace,
+    info: Info,
+    account: str,
+    dex: str,
     exchange: Exchange,
     coin: str,
     asset: dict[str, Any],
@@ -1502,14 +1578,12 @@ def build_grid_orders(
         raise ValueError(f"No mid price found for {coin}, cannot place grid orders")
     if not args.range_spec or len(args.range_spec) != 2:
         raise ValueError("grid orders require --range START END")
-    if not args.gap:
-        raise ValueError("grid orders require --gap BASE[+-OFFSET], e.g. 0.15%+-0.05%")
 
     try:
-        start_px = Decimal(args.range_spec[0])
-        end_px = Decimal(args.range_spec[1])
+        start_px = resolve_grid_auto_range_value(args.range_spec[0], "lower", info, account, coin, dex, current_mid)
+        end_px = resolve_grid_auto_range_value(args.range_spec[1], "upper", info, account, coin, dex, current_mid)
     except InvalidOperation as exc:
-        raise ValueError("--range START and END must be positive numbers") from exc
+        raise ValueError("--range START and END must be positive numbers or auto") from exc
     if start_px <= 0 or end_px <= 0:
         raise ValueError("--range START and END must be positive")
     if start_px >= end_px:
@@ -1517,7 +1591,7 @@ def build_grid_orders(
     if total_amount < MIN_NOTIONAL:
         raise ValueError(f"grid --total must be at least {MIN_NOTIONAL} USD")
 
-    gap, limit_offset = parse_grid_gap(args.gap)
+    gap, limit_offset = parse_grid_gap(grid_gap_spec(args))
     trend = parse_percent_decimal(args.trend or "0", "--trend", allow_signed=True)
     if trend <= Decimal("-1"):
         raise ValueError("--trend must be greater than -100%")
@@ -2254,7 +2328,7 @@ def place_order(args: argparse.Namespace) -> None:
         return
 
     if args.grid:
-        plans = build_grid_orders(args, exchange, coin, asset, amount, current_mid, slippage)
+        plans = build_grid_orders(args, info, account, dex, exchange, coin, asset, amount, current_mid, slippage)
         if args.verbose:
             print("dex:", dex or "default")
             print("current_mid:", mids.get(coin))
@@ -2626,7 +2700,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gap",
         nargs="+",
-        help="Grid trigger spacing and optional same-side limit offset, e.g. 0.15%% 0.05%% or 0.15%%+-0.05%%.",
+        help="Grid trigger spacing and optional same-side limit offset. Default: 0.045%% 0.025%%. E.g. 0.15%% 0.05%% or 0.15%%+-0.05%%.",
     )
     parser.add_argument("--market", action="store_true", help="Submit as a market order using IOC with slippage protection.")
     parser.add_argument("--slippage", default=DEFAULT_SLIPPAGE, help="Market slippage protection. Default: 0.05. Also accepts 5%%.")
@@ -2721,7 +2795,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query", "--status", action="store_true", help="Query all current positions and open orders.")
     parser.add_argument("--verbose", action="store_true", help="Print diagnostic details.")
     parser.add_argument("--submit", action="store_true", help=argparse.SUPPRESS)
-    cli_argv = normalize_signed_option_values(protect_ladder_step_values(sys.argv[1:]))
+    raw_argv = sys.argv[1:]
+    if any(token.strip().lower() in GRID_SIDE_ALIASES for token in raw_argv):
+        cli_argv = normalize_signed_option_values(protect_grid_range_values(raw_argv))
+    else:
+        cli_argv = normalize_signed_option_values(protect_ladder_step_values(raw_argv))
     args = parser.parse_intermixed_args(cli_argv)
     query_words = {"query", "status", "positions", "orders", "持仓", "订单", "查询"}
     if args.coin and args.side is None and args.coin.strip().lower() in query_words:
@@ -2801,7 +2879,7 @@ def parse_args() -> argparse.Namespace:
             parser.error("--while END must be positive")
         args.ladder_mode = "count_to_end"
     elif combined_range_count_to_end:
-        start_text, end_text = args.range_spec
+        start_text, end_text = [unprotect_grid_range_value(value) for value in args.range_spec]
         count_text = args.ladder_for[0]
         if args.price:
             parser.error("--range cannot be combined with --price")
@@ -2846,19 +2924,26 @@ def parse_args() -> argparse.Namespace:
         args.ladder_mode = "while"
         args.ladder_step = unprotect_ladder_step_value(step_text)
     if args.range_spec and args.grid:
+        if len(args.range_spec) == 1 and "," in args.range_spec[0]:
+            args.range_spec = args.range_spec[0].split(",", 1)
         if len(args.range_spec) != 2:
             parser.error("grid --range requires START END")
         start_text, end_text = args.range_spec
         try:
-            start_px = Decimal(start_text)
-            end_px = Decimal(end_text)
+            start_px = None if is_auto_range_value(start_text) else Decimal(start_text)
+            end_px = None if is_auto_range_value(end_text) else Decimal(end_text)
         except InvalidOperation:
-            parser.error("grid --range START and END must be positive numbers")
-        if start_px <= 0 or end_px <= 0:
-            parser.error("grid --range START and END must be positive")
-        if start_px >= end_px:
+            parser.error("grid --range START and END must be positive numbers or auto")
+        if start_px is not None and start_px <= 0:
+            parser.error("grid --range START must be positive")
+        if end_px is not None and end_px <= 0:
+            parser.error("grid --range END must be positive")
+        if start_px is not None and end_px is not None and start_px >= end_px:
             parser.error("grid --range START must be below END")
-        args.range_spec = [decimal_to_plain(start_px), decimal_to_plain(end_px)]
+        args.range_spec = [
+            "auto" if start_px is None else decimal_to_plain(start_px),
+            "auto" if end_px is None else decimal_to_plain(end_px),
+        ]
     elif args.range_spec and not combined_range_count_to_end:
         if len(args.range_spec) != 3:
             parser.error("--range requires START END STEP unless combined as --range START END --for COUNT")
@@ -2885,10 +2970,8 @@ def parse_args() -> argparse.Namespace:
             parser.error("grid orders require --total")
         if not args.range_spec:
             parser.error("grid orders require --range START END")
-        if not args.gap:
-            parser.error("grid orders require --gap")
         try:
-            parse_grid_gap(args.gap)
+            parse_grid_gap(grid_gap_spec(args))
             parse_percent_decimal(args.trend or "0", "--trend", allow_signed=True)
         except ValueError as exc:
             parser.error(str(exc))

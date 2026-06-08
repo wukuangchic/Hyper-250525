@@ -149,14 +149,20 @@ JPY both 20 --offset 2% --tp 1% --sl 0.7%
 
 ```bash
 BTC grid --total 300 --range 50000 70000 --trend 10% --gap 0.15% 0.05% --explain
+BTC grid --total 300 --range 50000 70000 --explain
+BTC grid --total 300 --range auto 70000 --trend 10% --gap 0.15% 0.05% --explain
+BTC grid --total 300 --range auto auto --gap 0.15% 0.05% --explain
 ```
 
 含义：
 
 - `--range START END`：网格 anchor 范围。
+- `--range auto END`：从当前 mid 向下找当前标的未成交触发单，取最近的触发价作为下限。
+- `--range START auto`：从当前 mid 向上找当前标的未成交触发单，取最近的触发价作为上限。
+- `--range auto auto`：同时自动推断上下限；对应方向没找到未成交触发单会报错。
 - `--total`：单向行情最多投入的名义金额，不是买卖两边合计。
 - `--trend`：数量倾向，默认 `0`；正数让买入数量更大，负数让卖出数量更大。
-- `--gap A% B%`：每个 anchor 上下各 `A/2` 放买卖触发价；买入限价再低 `B`，卖出限价再高 `B`，争取用同向限价成交；旧写法 `A%+-B%` 也兼容。
+- `--gap A% B%`：每个 anchor 上下各 `A/2` 放买卖触发价；买入限价再低 `B`，卖出限价再高 `B`，争取用同向限价成交；默认 `0.045% 0.025%`，旧写法 `A%+-B%` 也兼容。
 - 当前价以下：买入单用 `take`，卖出单用 `stop`。
 - 当前价以上：买入单用 `stop`，卖出单用 `take`。
 - 数量会按最低限价保证每笔至少 `10` 美元，再按最高风险侧计算 `--total` 能铺多少格。
