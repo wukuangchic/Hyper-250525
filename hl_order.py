@@ -579,6 +579,8 @@ def print_explain(title: str, plans: list[dict[str, Any]], args: argparse.Namesp
             rows.append(("range", " ".join(grid_range_spec(args))))
         rows.append(("gap", " ".join(grid_gap_spec(args))))
         rows.append(("trend", args.trend or "0"))
+        if getattr(args, "resolved_grid_trend", None):
+            rows.append(("actual_trend", args.resolved_grid_trend))
     if getattr(args, "symmetric", False):
         rows.append(("symmetric", f"offset {args.symmetric_offset}"))
     if args.take_profit:
@@ -1786,6 +1788,108 @@ def round_size_up(value: Decimal, sz_decimals: int) -> Decimal:
     return (value / step).to_integral_value(rounding=ROUND_UP) * step
 
 
+def decimal_ratio_period(value: Decimal) -> int:
+    normalized = value.normalize()
+    if normalized.as_tuple().exponent >= 0:
+        return 1
+    denominator = 10 ** abs(normalized.as_tuple().exponent)
+    numerator = int(normalized * denominator)
+    return denominator // denominator_gcd(abs(numerator), denominator)
+
+
+def denominator_gcd(a: int, b: int) -> int:
+    while b:
+        a, b = b, a % b
+    return a or 1
+
+
+def ceil_decimal_to_int(value: Decimal) -> int:
+    return int(value.to_integral_value(rounding=ROUND_UP))
+
+
+def choose_grid_size_units(
+    min_base_units: int,
+    target_ratio: Decimal,
+    total_amount: Decimal,
+    step: Decimal,
+    base_max_limit: Decimal,
+    tilted_max_limit: Decimal,
+    trend_label: str,
+) -> tuple[int, int, Decimal]:
+    def tilted_units_for(base_units: int) -> int:
+        return ceil_decimal_to_int(Decimal(base_units) * target_ratio)
+
+    def one_way_notional(base_units: int) -> Decimal:
+        tilted_units = tilted_units_for(base_units)
+        return max(Decimal(base_units) * step * base_max_limit, Decimal(tilted_units) * step * tilted_max_limit)
+
+    low = min_base_units
+    if one_way_notional(low) > total_amount:
+        return low, tilted_units_for(low), one_way_notional(low)
+
+    high = low
+    while one_way_notional(high) <= total_amount:
+        high *= 2
+
+    left, right = low, high - 1
+    while left <= right:
+        mid = (left + right) // 2
+        if one_way_notional(mid) <= total_amount:
+            left = mid + 1
+        else:
+            right = mid - 1
+    max_base_units = right
+
+    period = decimal_ratio_period(target_ratio)
+    exact_units = ((min_base_units + period - 1) // period) * period
+    if exact_units > max_base_units:
+        exact_notional = one_way_notional(exact_units)
+        raise ValueError(
+            f"grid --total is too small to fit --trend {trend_label} at this size precision; "
+            f"needs at least {decimal_to_display(exact_notional)} USD one-way total"
+        )
+
+    chosen_base_units = exact_units
+    chosen_tilted_units = tilted_units_for(chosen_base_units)
+    return chosen_base_units, chosen_tilted_units, one_way_notional(chosen_base_units)
+
+
+def grid_size_pair_for_trend(
+    trend: Decimal,
+    sz_decimals: int,
+    total_amount: Decimal,
+    min_buy_limit: Decimal,
+    min_sell_limit: Decimal,
+    max_buy_limit: Decimal,
+    max_sell_limit: Decimal,
+) -> tuple[Decimal, Decimal, Decimal]:
+    step = Decimal(1).scaleb(-sz_decimals)
+    target_ratio = Decimal("1") + abs(trend)
+    if trend >= 0:
+        min_sell_units = ceil_decimal_to_int(MIN_NOTIONAL / min_sell_limit / step)
+        sell_units, buy_units, max_one_way_notional = choose_grid_size_units(
+            min_sell_units,
+            target_ratio,
+            total_amount,
+            step,
+            max_sell_limit,
+            max_buy_limit,
+            format_signed_percent(trend),
+        )
+    else:
+        min_buy_units = ceil_decimal_to_int(MIN_NOTIONAL / min_buy_limit / step)
+        buy_units, sell_units, max_one_way_notional = choose_grid_size_units(
+            min_buy_units,
+            target_ratio,
+            total_amount,
+            step,
+            max_buy_limit,
+            max_sell_limit,
+            format_signed_percent(trend),
+        )
+    return Decimal(buy_units) * step, Decimal(sell_units) * step, max_one_way_notional
+
+
 def grid_anchor_prices(start: Decimal, end: Decimal, count: int, sz_decimals: int) -> list[Decimal]:
     if count < 1:
         raise ValueError("grid count must be positive")
@@ -1898,20 +2002,27 @@ def build_grid_orders(
     min_sell_limit = min(sell_limits)
     max_buy_limit = max(buy_limits)
     max_sell_limit = max(sell_limits)
-    if trend >= 0:
-        sell_size = round_size_up(MIN_NOTIONAL / min_sell_limit, sz_decimals)
-        buy_size = round_size_up(sell_size * (Decimal("1") + trend), sz_decimals)
-    else:
-        buy_size = round_size_up(MIN_NOTIONAL / min_buy_limit, sz_decimals)
-        sell_size = round_size_up(buy_size * (Decimal("1") + abs(trend)), sz_decimals)
-
-    max_one_way_notional = max(buy_size * max_buy_limit, sell_size * max_sell_limit)
+    buy_size, sell_size, max_one_way_notional = grid_size_pair_for_trend(
+        trend,
+        sz_decimals,
+        total_amount,
+        min_buy_limit,
+        min_sell_limit,
+        max_buy_limit,
+        max_sell_limit,
+    )
     grid_count = int((total_amount / max_one_way_notional).to_integral_value(rounding=ROUND_DOWN))
     if grid_count < 1:
         raise ValueError(
             "grid --total is too small for one grid at the minimum order size; "
             f"needs at least {decimal_to_display(max_one_way_notional)} USD"
         )
+    if buy_size > sell_size:
+        args.resolved_grid_trend = format_signed_percent(buy_size / sell_size - Decimal("1"))
+    elif sell_size > buy_size:
+        args.resolved_grid_trend = format_signed_percent(-(sell_size / buy_size - Decimal("1")))
+    else:
+        args.resolved_grid_trend = "0%"
 
     anchors = grid_anchor_prices(start_px, end_px, grid_count, sz_decimals)
     plans: list[dict[str, Any]] = []
