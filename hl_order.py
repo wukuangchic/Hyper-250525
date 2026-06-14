@@ -343,10 +343,19 @@ def all_dex_names(info: Info) -> list[str]:
 def unified_account_metrics(info: Info, account: str) -> tuple[Optional[Decimal], Optional[Decimal]]:
     spot_state = info.spot_user_state(account)
     log_event("spot_state", spot_state)
-    spot_totals = {
-        int(balance["token"]): Decimal(str(balance.get("total", "0")))
-        for balance in spot_state.get("balances", [])
-    }
+    spot_totals: dict[int, Decimal] = {}
+    skipped_balances = []
+    for balance in spot_state.get("balances", []):
+        token = balance.get("token")
+        coin = str(balance.get("coin", ""))
+        if token is None and coin.startswith("+") and coin[1:].isdigit():
+            token = coin[1:]
+        if token is None:
+            skipped_balances.append(balance)
+            continue
+        spot_totals[int(token)] = Decimal(str(balance.get("total", "0")))
+    if skipped_balances:
+        log_event("spot_balances_without_token", skipped_balances)
 
     maintenance_by_token: dict[int, Decimal] = {}
     notional_by_token: dict[int, Decimal] = {}
