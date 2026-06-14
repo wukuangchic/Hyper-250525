@@ -106,6 +106,11 @@ CANCEL_AGE_UNIT_MS = {
     "day": 24 * 60 * 60 * 1000,
     "week": 7 * 24 * 60 * 60 * 1000,
 }
+HISTORY_PNL_LOOKBACK_DAYS = 365
+HISTORY_PNL_CHUNK_DAYS = 30
+HISTORY_PNL_MAX_FILLS = 5000
+INFO_RETRY_STATUS_CODES = {502, 503, 504}
+INFO_RETRY_DELAYS = (0.4, 1.0, 2.0)
 
 
 def protect_grid_range_values(argv: list[str]) -> list[str]:
@@ -174,10 +179,32 @@ class CachedInfo:
         with self._lock:
             if key in self._cache:
                 return self._cache[key]
-        value = loader()
+        value = self._load_with_retries(key, loader)
         with self._lock:
             self._cache[key] = value
         return value
+
+    def _load_with_retries(self, key: tuple[Any, ...], loader: Any) -> Any:
+        attempts = len(INFO_RETRY_DELAYS) + 1
+        for attempt in range(attempts):
+            try:
+                return loader()
+            except Exception as exc:
+                status_code = getattr(exc, "status_code", None)
+                if status_code not in INFO_RETRY_STATUS_CODES or attempt >= len(INFO_RETRY_DELAYS):
+                    raise
+                delay = INFO_RETRY_DELAYS[attempt]
+                log_event(
+                    "info_retry",
+                    {
+                        "key": key,
+                        "attempt": attempt + 1,
+                        "status_code": status_code,
+                        "delay_seconds": delay,
+                        "message": str(exc),
+                    },
+                )
+                time.sleep(delay)
 
     def user_role(self, address: str) -> Any:
         return self._cached(("user_role", address), lambda: self._info.user_role(address))
@@ -237,6 +264,12 @@ class CachedInfo:
     def user_fees(self, account: str) -> Any:
         return self._cached(("user_fees", account), lambda: self._info.user_fees(account))
 
+    def user_funding_history(self, user: str, startTime: int, endTime: Optional[int] = None) -> Any:
+        return self._cached(
+            ("user_funding_history", user, startTime, endTime),
+            lambda: self._info.user_funding_history(user, startTime, endTime),
+        )
+
     def __getattr__(self, name: str) -> Any:
         return getattr(self._info, name)
 
@@ -258,6 +291,110 @@ def fetch_user_fills_window(info: Info, account: str, start_ms: int, end_ms: int
         },
     )
     return fills
+
+
+def fetch_user_fills_for_history_pnl(info: Info, account: str, coin: str | None = None) -> list[dict[str, Any]]:
+    now_ms = int(time.time() * 1000)
+    chunk_ms = HISTORY_PNL_CHUNK_DAYS * 24 * 60 * 60 * 1000
+    earliest_ms = now_ms - HISTORY_PNL_LOOKBACK_DAYS * 24 * 60 * 60 * 1000
+    seen: set[tuple[str, int, int, str, str, str, str]] = set()
+    fills: list[dict[str, Any]] = []
+    end_ms = now_ms
+
+    while end_ms > earliest_ms and len(fills) < HISTORY_PNL_MAX_FILLS:
+        start_ms = max(earliest_ms, end_ms - chunk_ms)
+        try:
+            window_fills = fetch_user_fills_window(info, account, start_ms, end_ms)
+        except Exception as exc:
+            log_event(
+                "history_pnl_fills_error",
+                {"coin": coin, "startTime": start_ms, "endTime": end_ms, "type": type(exc).__name__, "message": str(exc)},
+            )
+            break
+
+        for fill in window_fills:
+            fill_coin = str(fill.get("coin", ""))
+            if coin is not None and not fill_matches_coin(fill_coin, coin):
+                continue
+            fill_time = int(fill.get("time", 0))
+            fill_key = (
+                str(fill.get("hash", "")),
+                int(fill.get("oid", -1)),
+                fill_time,
+                fill_coin,
+                str(fill.get("side", "")),
+                str(fill.get("px", "")),
+                str(fill.get("sz", "")),
+            )
+            if fill_key in seen:
+                continue
+            seen.add(fill_key)
+            fills.append(fill)
+            if len(fills) >= HISTORY_PNL_MAX_FILLS:
+                break
+
+        end_ms = start_ms - 1
+
+    fills.sort(key=lambda item: int(item.get("time", 0)))
+    log_event(
+        "history_pnl_fills",
+        {
+            "coin": coin,
+            "count": len(fills),
+            "lookbackDays": HISTORY_PNL_LOOKBACK_DAYS,
+            "maxFills": HISTORY_PNL_MAX_FILLS,
+        },
+    )
+    return fills
+
+
+def fetch_user_funding_for_history_pnl(info: Info, account: str, coin: str | None = None) -> list[dict[str, Any]]:
+    now_ms = int(time.time() * 1000)
+    chunk_ms = HISTORY_PNL_CHUNK_DAYS * 24 * 60 * 60 * 1000
+    earliest_ms = now_ms - HISTORY_PNL_LOOKBACK_DAYS * 24 * 60 * 60 * 1000
+    seen: set[tuple[int, str, str, str]] = set()
+    rows: list[dict[str, Any]] = []
+    end_ms = now_ms
+
+    while end_ms > earliest_ms:
+        start_ms = max(earliest_ms, end_ms - chunk_ms)
+        try:
+            window_rows = info.user_funding_history(account, start_ms, end_ms)
+        except Exception as exc:
+            log_event(
+                "history_pnl_funding_error",
+                {"coin": coin, "startTime": start_ms, "endTime": end_ms, "type": type(exc).__name__, "message": str(exc)},
+            )
+            break
+
+        for row in window_rows:
+            delta = row.get("delta") or {}
+            funding_coin = str(delta.get("coin", ""))
+            if coin is not None and not fill_matches_coin(funding_coin, coin):
+                continue
+            row_key = (
+                int(row.get("time", 0)),
+                str(row.get("hash", "")),
+                funding_coin,
+                str(delta.get("usdc", "")),
+            )
+            if row_key in seen:
+                continue
+            seen.add(row_key)
+            rows.append(row)
+
+        end_ms = start_ms - 1
+
+    rows.sort(key=lambda item: int(item.get("time", 0)))
+    log_event(
+        "history_pnl_funding",
+        {
+            "coin": coin,
+            "count": len(rows),
+            "lookbackDays": HISTORY_PNL_LOOKBACK_DAYS,
+        },
+    )
+    return rows
 
 
 def same_side_book_price(info: Info, coin: str, is_buy: bool, level: int) -> Decimal:
@@ -939,6 +1076,137 @@ def format_fee_rate(effective: Decimal | None, base: Decimal | None) -> str:
     return text
 
 
+def format_history_result(value: Decimal | None) -> str:
+    if value is None:
+        return "n/a"
+    if value > 0:
+        return "profit"
+    if value < 0:
+        return "loss"
+    return "flat"
+
+
+def fill_signed_size(fill: dict[str, Any]) -> Decimal | None:
+    size = decimal_or_none(fill.get("sz"))
+    if size is None:
+        return None
+    side = str(fill.get("side", "")).strip().upper()
+    if side == "B":
+        return size
+    if side == "A":
+        return -size
+
+    direction = str(fill.get("dir", "")).strip().lower()
+    if "long" in direction:
+        return size if "open" in direction else -size
+    if "short" in direction:
+        return -size if "open" in direction else size
+    return None
+
+
+def calculate_history_pnl(
+    info: Info,
+    account: str,
+    coin: str,
+    mark_px: Decimal | None = None,
+    fills: list[dict[str, Any]] | None = None,
+    funding_rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Decimal | int | bool | None]:
+    fills = [
+        fill
+        for fill in (fills if fills is not None else fetch_user_fills_for_history_pnl(info, account, coin))
+        if fill_matches_coin(str(fill.get("coin", "")), coin)
+    ]
+    funding_rows = [
+        row
+        for row in (
+            funding_rows if funding_rows is not None else fetch_user_funding_for_history_pnl(info, account, coin)
+        )
+        if fill_matches_coin(str((row.get("delta") or {}).get("coin", "")), coin)
+    ]
+    realized = Decimal("0")
+    fees = Decimal("0")
+    funding = Decimal("0")
+    position_size = Decimal("0")
+    cost_basis = Decimal("0")
+    has_cost_basis = True
+
+    for fill in fills:
+        closed_pnl = decimal_or_none(fill.get("closedPnl"))
+        if closed_pnl is not None:
+            realized += closed_pnl
+
+        fee = decimal_or_none(fill.get("fee"))
+        if fee is not None:
+            fees += fee
+
+        signed_size = fill_signed_size(fill)
+        px = decimal_or_none(fill.get("px"))
+        if signed_size is None or px is None:
+            has_cost_basis = False
+            continue
+        if signed_size == 0:
+            continue
+
+        if position_size == 0 or (position_size > 0) == (signed_size > 0):
+            position_size += signed_size
+            cost_basis += signed_size * px
+            continue
+
+        if abs(signed_size) < abs(position_size):
+            remaining_ratio = (abs(position_size) - abs(signed_size)) / abs(position_size)
+            position_size += signed_size
+            cost_basis *= remaining_ratio
+        elif abs(signed_size) == abs(position_size):
+            position_size = Decimal("0")
+            cost_basis = Decimal("0")
+        else:
+            remainder = position_size + signed_size
+            position_size = remainder
+            cost_basis = remainder * px
+
+    for row in funding_rows:
+        delta = row.get("delta") or {}
+        funding_usdc = decimal_or_none(delta.get("usdc"))
+        if funding_usdc is not None:
+            funding += funding_usdc
+
+    avg_px = cost_basis / position_size if position_size != 0 and has_cost_basis else None
+    open_pnl = None
+    if avg_px is not None and mark_px is not None:
+        open_pnl = (mark_px - avg_px) * position_size
+
+    real_pnl = realized - fees + funding
+    if open_pnl is not None:
+        real_pnl += open_pnl
+
+    return {
+        "fills": len(fills),
+        "fundingRows": len(funding_rows),
+        "realized": realized,
+        "fees": fees,
+        "funding": funding,
+        "openSize": position_size if has_cost_basis else None,
+        "avgPx": avg_px,
+        "openPnl": open_pnl,
+        "realPnl": real_pnl,
+        "netPnl": real_pnl,
+        "partial": len(fills) >= HISTORY_PNL_MAX_FILLS,
+    }
+
+
+def market_mark_price(info: Info, coin: str, dex: str) -> Decimal | None:
+    mids = info.all_mids(dex)
+    mid = mids.get(coin)
+    if mid is not None:
+        return Decimal(str(mid))
+    for mid_coin, mid_value in mids.items():
+        if position_matches_coin(str(mid_coin), coin):
+            return Decimal(str(mid_value))
+    asset_ctx = market_asset_context(info, coin, dex)
+    return decimal_or_none(asset_ctx.get("markPx"))
+
+
 def print_market_overview(
     info: Info,
     account: str,
@@ -952,58 +1220,86 @@ def print_market_overview(
     mode_config = KLINE_MODES.get(kline_mode, KLINE_MODES["hour"])
     end_ms = int(time.time() * 1000)
     start_ms = end_ms - mode_config["lookback_days"] * 24 * 60 * 60 * 1000
-    candles = info.candles_snapshot(coin, mode_config["interval"], start_ms, end_ms)
-    log_event(
-        f"candles_{kline_mode}",
-        {
-            "coin": coin,
-            "dex": dex or "default",
-            "interval": mode_config["interval"],
-            "count": len(candles),
-            "candles": candles,
-        },
-    )
-    if not candles:
-        raise ValueError(f"No candle data found for {raw_coin}")
-
-    chart_candles = candles[-mode_config["candles"] :]
-    open_price = Decimal(str(chart_candles[0]["o"]))
-    latest_price = Decimal(str(chart_candles[-1]["c"]))
-    mids = info.all_mids(dex)
-    mid = mids.get(coin)
-    if mid is not None:
-        latest_price = Decimal(str(mid))
-    notional_volume = sum(
-        (Decimal(str(candle.get("v", "0"))) * Decimal(str(candle.get("c", "0"))) for candle in chart_candles),
-        Decimal("0"),
-    )
-    change = latest_price - open_price
-    change_percent = change / open_price if open_price else Decimal("0")
-    if change > 0:
-        trend = "up"
-    elif change < 0:
-        trend = "down"
-    else:
-        trend = "flat"
-
     asset_ctx = market_asset_context(info, coin, dex)
+    latest_price = market_mark_price(info, coin, dex)
+    if latest_price is None:
+        latest_price = decimal_or_none(asset_ctx.get("markPx"))
+    if latest_price is None:
+        raise ValueError(f"No mark price found for {raw_coin}")
+
+    candles: list[dict[str, Any]] = []
+    candle_error: Exception | None = None
+    try:
+        candles = info.candles_snapshot(coin, mode_config["interval"], start_ms, end_ms)
+        log_event(
+            f"candles_{kline_mode}",
+            {
+                "coin": coin,
+                "dex": dex or "default",
+                "interval": mode_config["interval"],
+                "count": len(candles),
+                "candles": candles,
+            },
+        )
+    except Exception as exc:
+        candle_error = exc
+        log_event(
+            f"candles_{kline_mode}_error",
+            {
+                "coin": coin,
+                "dex": dex or "default",
+                "interval": mode_config["interval"],
+                "type": type(exc).__name__,
+                "message": str(exc),
+            },
+        )
+
+    chart_candles = candles[-mode_config["candles"] :] if candles else []
+    if chart_candles:
+        open_price = Decimal(str(chart_candles[0]["o"]))
+        notional_volume = sum(
+            (Decimal(str(candle.get("v", "0"))) * Decimal(str(candle.get("c", "0"))) for candle in chart_candles),
+            Decimal("0"),
+        )
+        change = latest_price - open_price
+        change_percent = change / open_price if open_price else Decimal("0")
+        if change > 0:
+            trend = "up"
+        elif change < 0:
+            trend = "down"
+        else:
+            trend = "flat"
+    else:
+        notional_volume = None
+        change = None
+        change_percent = None
+        trend = "n/a"
+
     fee_rates = effective_perp_fee_rates(info, account, asset=asset, dex=dex)
-    print_box(
-        mode_config["market_title"],
-        [
-            ("coin", coin),
-            ("trend", f"{trend} {format_signed_decimal(change)} ({format_signed_percent(change_percent)})"),
-            ("latest", format_price(latest_price, price_rate)),
-            ("markPx", format_optional_price(asset_ctx.get("markPx"), price_rate)),
-            ("funding", format_rate_percent(asset_ctx.get("funding"))),
-            ("premium", format_rate_percent(asset_ctx.get("premium"))),
-            ("takerFee", format_fee_rate(fee_rates.get("taker_effective"), fee_rates.get("taker_base"))),
-            ("makerFee", format_fee_rate(fee_rates.get("maker_effective"), fee_rates.get("maker_base"))),
-            ("turnover", decimal_to_display(notional_volume)),
-        ],
-    )
-    chart_lines, chart_overlay = render_kline_chart(chart_candles, latest_price, kline_mode)
-    print_text_box(mode_config["title"], chart_lines, chart_overlay)
+    rows = [
+        ("coin", coin),
+        (
+            "trend",
+            f"{trend} {format_signed_decimal(change)} ({format_signed_percent(change_percent)})"
+            if change is not None and change_percent is not None
+            else trend,
+        ),
+        ("latest", format_price(latest_price, price_rate)),
+        ("markPx", format_optional_price(asset_ctx.get("markPx"), price_rate)),
+        ("funding", format_rate_percent(asset_ctx.get("funding"))),
+        ("premium", format_rate_percent(asset_ctx.get("premium"))),
+        ("takerFee", format_fee_rate(fee_rates.get("taker_effective"), fee_rates.get("taker_base"))),
+        ("makerFee", format_fee_rate(fee_rates.get("maker_effective"), fee_rates.get("maker_base"))),
+        ("turnover", decimal_to_display(notional_volume) if notional_volume is not None else "n/a"),
+    ]
+    if candle_error is not None:
+        rows.append(("chart", f"skipped: {type(candle_error).__name__}"))
+    elif not chart_candles:
+        rows.append(("chart", "skipped: no candle data"))
+    print_box(mode_config["market_title"], rows)
+    if chart_candles:
+        chart_lines, chart_overlay = render_kline_chart(chart_candles, latest_price, kline_mode)
+        print_text_box(mode_config["title"], chart_lines, chart_overlay)
 
     position = find_current_position(info, account, coin, dex)
     if position is not None:
@@ -1012,11 +1308,18 @@ def print_market_overview(
             [
                 ("side", format_position_side(Decimal(str(position.get("szi", "0"))))),
                 ("entryPx", format_optional_decimal(position.get("entryPx"))),
-                ("nPnl", format_optional_decimal(position.get("unrealizedPnl"))),
                 ("value", format_optional_decimal(position.get("positionValue"))),
                 ("leverage", format_position_leverage(position)),
             ],
         )
+    history_pnl = calculate_history_pnl(info, account, coin, mark_px=latest_price)
+    history_rows = [
+        ("result", format_history_result(history_pnl.get("realPnl"))),
+        ("realPnl", format_optional_decimal(history_pnl.get("realPnl"))),
+    ]
+    if history_pnl.get("partial"):
+        history_rows.append(("note", f"limited to latest {HISTORY_PNL_MAX_FILLS} fills"))
+    print_box("Real PnL", history_rows)
     open_orders = collect_open_orders_for_coin(info, account, coin, dex)
     if open_orders:
         print_table(
@@ -1042,6 +1345,8 @@ def collect_account_positions_and_orders(info: Info, account: str) -> tuple[list
     orders: list[dict[str, str]] = []
     seen_order_keys: set[tuple[str, int]] = set()
     dex_names = all_dex_names(info)
+    history_fills = fetch_user_fills_for_history_pnl(info, account)
+    history_funding = fetch_user_funding_for_history_pnl(info, account)
     log_event("query_dex_names", dex_names)
 
     for dex in dex_names:
@@ -1053,15 +1358,27 @@ def collect_account_positions_and_orders(info: Info, account: str) -> tuple[list
             size = Decimal(str(position.get("szi", "0")))
             if size == 0:
                 continue
+            position_coin = str(position.get("coin", ""))
+            mark_px = market_mark_price(info, position_coin, dex)
+            history_pnl = calculate_history_pnl(
+                info,
+                account,
+                position_coin,
+                mark_px=mark_px,
+                fills=history_fills,
+                funding_rows=history_funding,
+            )
             positions.append(
                 {
                     "dex": dex_name,
-                    "coin": str(position.get("coin", "")),
+                    "coin": position_coin,
                     "side": format_position_side(size),
                     "szi": decimal_to_plain(size),
                     "entryPx": format_optional_decimal(position.get("entryPx")),
                     "value": format_optional_decimal(position.get("positionValue")),
                     "nPnl": format_optional_decimal(position.get("unrealizedPnl")),
+                    "realPnl": format_optional_decimal(history_pnl.get("realPnl")),
+                    "result": format_history_result(history_pnl.get("realPnl")),
                     "roe": format_optional_percent(position.get("returnOnEquity")),
                     "liqPx": format_optional_decimal(position.get("liquidationPx")),
                     "lev": format_position_leverage(position),
@@ -1129,7 +1446,14 @@ def collect_recent_history(info: Info, account: str, coin: str | None = None, li
             break
 
         start_ms = now_ms - days * 24 * 60 * 60 * 1000
-        fills = fetch_user_fills_window(info, account, start_ms, now_ms)
+        try:
+            fills = fetch_user_fills_window(info, account, start_ms, now_ms)
+        except Exception as exc:
+            log_event(
+                "recent_history_fills_error",
+                {"startTime": start_ms, "endTime": now_ms, "type": type(exc).__name__, "message": str(exc)},
+            )
+            break
         for fill in sorted(fills, key=lambda item: int(item.get("time", 0)), reverse=True):
             fill_coin = str(fill.get("coin", ""))
             if coin is not None and not fill_matches_coin(fill_coin, coin):
@@ -1161,7 +1485,6 @@ def collect_recent_history(info: Info, account: str, coin: str | None = None, li
                         "dir": str(fill.get("dir", "n/a")) or "n/a",
                         "px": format_optional_decimal(fill.get("px")),
                         "value": decimal_to_display(value) if value is not None else "n/a",
-                        "closedPnl": format_optional_decimal(fill.get("closedPnl")),
                     },
                 )
             )
@@ -1192,7 +1515,6 @@ def print_recent_history(
             ("dir", "dir"),
             ("px", "px"),
             ("value", "value"),
-            ("closedPnl", "closedPnl"),
         ],
         show_count=False,
     )
@@ -1218,7 +1540,8 @@ def query_account(args: argparse.Namespace) -> None:
             ("szi", "szi"),
             ("entryPx", "entryPx"),
             ("value", "value"),
-            ("nPnl", "nPnl"),
+            ("realPnl", "realPnl"),
+            ("result", "result"),
             ("roe", "ROE"),
             ("liqPx", "liqPx"),
             ("lev", "lev"),
