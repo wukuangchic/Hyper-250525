@@ -29,6 +29,7 @@ import argparse
 import contextlib
 import io
 import json
+import os
 import sys
 import time
 import traceback
@@ -2594,9 +2595,22 @@ def load_server_batch(path: Path = SERVER_BATCH_PATH) -> list[dict[str, Any]]:
 
 
 def save_server_batch(rows: list[dict[str, Any]], path: Path = SERVER_BATCH_PATH) -> None:
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(rows, ensure_ascii=False, default=str, indent=2))
-    tmp_path.replace(path)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp_path.write_text(json.dumps(rows, ensure_ascii=False, default=str, indent=2))
+        tmp_path.replace(path)
+    except PermissionError as exc:
+        raise PermissionError(
+            f"Cannot write server batch file {path}. "
+            f"Make sure the command user and trail worker user can write this directory, "
+            f"or fix ownership with: sudo chown -R $(whoami) {path.parent}"
+        ) from exc
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
 
 
 def append_server_batch(row: dict[str, Any], path: Path = SERVER_BATCH_PATH) -> None:
