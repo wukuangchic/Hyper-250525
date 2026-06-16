@@ -20,6 +20,7 @@ from hl_order import (  # noqa: E402
     build_clients,
     build_trigger_order_plan,
     collect_frontend_open_orders,
+    decimal_or_none,
     decimal_to_plain,
     load_server_batch,
     log_event,
@@ -36,9 +37,30 @@ DONE_RETENTION_DAYS = 7
 DONE_RETENTION_MAX = 500
 
 
-def is_order_open(info: Any, account: str, dex: str, oid: int) -> bool:
+def find_open_order_by_oid(info: Any, account: str, dex: str, oid: int) -> dict[str, Any] | None:
     open_orders = collect_frontend_open_orders(info, account, dex)
-    return any(int(order.get("oid", -1)) == oid for order in open_orders if order.get("oid") is not None)
+    return next((order for order in open_orders if order.get("oid") is not None and int(order.get("oid", -1)) == oid), None)
+
+
+def find_replacement_trail_order(info: Any, account: str, dex: str, row: dict[str, Any]) -> dict[str, Any] | None:
+    target_trigger = Decimal(str(row["stop_px"]))
+    target_size = Decimal(str(row["size"]))
+    target_coin = str(row["coin"]).upper()
+    target_side = str(row["side"]).upper()
+    open_orders = collect_frontend_open_orders(info, account, dex)
+    for order in open_orders:
+        if str(order.get("coin", "")).upper() != target_coin:
+            continue
+        if str(order.get("side", "")).upper() != target_side:
+            continue
+        trigger_px = decimal_or_none(order.get("triggerPx"))
+        if trigger_px is None or trigger_px != target_trigger:
+            continue
+        size = decimal_or_none(order.get("sz", order.get("origSz")))
+        if size is not None and size != target_size:
+            continue
+        return order
+    return None
 
 
 def modify_trail_stop(row: dict[str, Any], mid_px: Decimal) -> tuple[dict[str, Any], bool]:
@@ -51,7 +73,20 @@ def modify_trail_stop(row: dict[str, Any], mid_px: Decimal) -> tuple[dict[str, A
     dex = str(row.get("dex") or "")
     oid = int(row["oid"])
 
-    if not is_order_open(info, account, dex, oid):
+    if find_open_order_by_oid(info, account, dex, oid) is None:
+        replacement = find_replacement_trail_order(info, account, dex, row)
+        if replacement is not None and replacement.get("oid") is not None:
+            oid = int(replacement["oid"])
+            row["oid"] = oid
+            row["note"] = "recovered replacement oid after modify"
+            row["updated_at"] = int(time.time())
+        else:
+            row["status"] = "done"
+            row["done_at"] = int(time.time())
+            row["note"] = "order is no longer open"
+            return row, True
+
+    if find_open_order_by_oid(info, account, dex, oid) is None:
         row["status"] = "done"
         row["done_at"] = int(time.time())
         row["note"] = "order is no longer open"
@@ -116,6 +151,13 @@ def modify_trail_stop(row: dict[str, Any], mid_px: Decimal) -> tuple[dict[str, A
     row["stop_px"] = decimal_to_plain(new_stop_px)
     row["updated_at"] = int(time.time())
     row["plan"] = plan
+    for status in statuses:
+        if isinstance(status, dict) and "resting" in status and status["resting"].get("oid") is not None:
+            row["oid"] = int(status["resting"]["oid"])
+            break
+        if isinstance(status, dict) and "filled" in status and status["filled"].get("oid") is not None:
+            row["oid"] = int(status["filled"]["oid"])
+            break
     return row, True
 
 
