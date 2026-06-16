@@ -5,5 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+User=simplehyper
+Group=simplehyper
 WorkingDirectory=/opt/simple-hyper
 ExecStart=/opt/simple-hyper/.venv/bin/python /opt/simple-hyper/trail_worker.py

@@ -2634,14 +2634,28 @@ def batch_row_matches_context(row: dict[str, Any], network: str, account: str | 
     return batch_row_matches_coin(row, coin)
 
 
-def active_trail_batch_indexes(rows: list[dict[str, Any]], network: str, account: str | None, coin: str | None = None) -> list[int]:
+def trail_batch_indexes(
+    rows: list[dict[str, Any]],
+    network: str,
+    account: str | None,
+    coin: str | None = None,
+    statuses: set[str] | None = None,
+) -> list[int]:
     return [
         index
         for index, row in enumerate(rows)
         if row.get("type") == "trail"
-        and row.get("status") == "active"
+        and (statuses is None or str(row.get("status")) in statuses)
         and batch_row_matches_context(row, network, account, coin)
     ]
+
+
+def active_trail_batch_indexes(rows: list[dict[str, Any]], network: str, account: str | None, coin: str | None = None) -> list[int]:
+    return trail_batch_indexes(rows, network, account, coin, {"active"})
+
+
+def cancellable_trail_batch_indexes(rows: list[dict[str, Any]], network: str, account: str | None, coin: str | None = None) -> list[int]:
+    return trail_batch_indexes(rows, network, account, coin, {"active", "error"})
 
 
 def format_server_batch_rows(rows: list[dict[str, Any]], network: str, account: str | None, coin: str | None = None) -> list[dict[str, str]]:
@@ -2669,7 +2683,7 @@ def format_server_batch_rows(rows: list[dict[str, Any]], network: str, account: 
 def active_server_batch_oids(rows: list[dict[str, Any]], network: str, account: str | None, coin: str | None = None) -> set[int]:
     oids: set[int] = set()
     for row in rows:
-        if row.get("status") != "active":
+        if str(row.get("status")) not in {"active", "error"}:
             continue
         if not batch_row_matches_context(row, network, account, coin):
             continue
@@ -2712,7 +2726,7 @@ def cancel_trail_batch_orders(
     price_rate: Decimal | None = None,
 ) -> None:
     batch_rows = load_server_batch()
-    matching_indexes = active_trail_batch_indexes(batch_rows, network, account, coin)
+    matching_indexes = cancellable_trail_batch_indexes(batch_rows, network, account, coin)
 
     if not matching_indexes:
         print_account_metrics(info, account)
@@ -2770,7 +2784,7 @@ def mark_cancelled_server_batch_oids(
     now = int(time.time())
     updated = 0
     for row in batch_rows:
-        if row.get("status") != "active":
+        if str(row.get("status")) not in {"active", "error"}:
             continue
         if not batch_row_matches_context(row, network, account):
             continue

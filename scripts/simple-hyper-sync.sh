@@ -78,6 +78,13 @@ if [ -x "$PROJECT_DIR/.venv/bin/python" ]; then
   "$PROJECT_DIR/.venv/bin/python" -m pip install -r "$PROJECT_DIR/requirements.txt" >/dev/null
 fi
 
+if id simplehyper >/dev/null 2>&1; then
+  chown simplehyper:simplehyper "$PROJECT_DIR" 2>/dev/null || true
+  [ -f "$PROJECT_DIR/server_batch.json" ] && chown simplehyper:simplehyper "$PROJECT_DIR/server_batch.json" 2>/dev/null || true
+  [ -f "$PROJECT_DIR/server_batch.lock" ] && chown simplehyper:simplehyper "$PROJECT_DIR/server_batch.lock" 2>/dev/null || true
+  [ -d "$PROJECT_DIR/logs" ] && chown simplehyper:simplehyper "$PROJECT_DIR/logs" 2>/dev/null || true
+fi
+
 printf '%s\n' "$target_etag" > "$STATE_FILE"
 systemctl restart "$SERVICE"
 echo "simple-hyper-sync: updated to $target_etag and restarted $SERVICE"
