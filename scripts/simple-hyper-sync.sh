@@ -63,6 +63,9 @@ rsync -a --delete \
   --exclude '.simple-hyper-sync.etag' \
   --exclude '.git/' \
   --exclude 'coin_aliases.csv' \
+  --exclude 'server_batch.json' \
+  --exclude 'server_batch.lock' \
+  --exclude '.server_batch.json.*.tmp' \
   "$source_dir"/ "$PROJECT_DIR"/
 
 if [ -n "$alias_backup" ] && [ -f "$alias_backup" ]; then
