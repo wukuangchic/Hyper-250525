@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Simple-Hyper trail worker every 10 seconds
+
+[Timer]
+OnBootSec=10s
+OnUnitActiveSec=10s
+AccuracySec=1s
+Persistent=false
+Unit=simple-hyper-trail-worker.service
+
+[Install]
+WantedBy=timers.target

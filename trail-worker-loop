@@ -1,0 +1,14 @@
+#!/bin/sh
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$DIR" || exit 1
+
+PYTHON="./.venv/bin/python"
+if [ ! -x "$PYTHON" ]; then
+  PYTHON="python3"
+fi
+
+mkdir -p logs
+while :; do
+  "$PYTHON" ./trail_worker.py >/dev/null 2>>logs/trail-worker.log
+  sleep 10
+done

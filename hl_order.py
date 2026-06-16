@@ -95,12 +95,13 @@ from coin_aliases import coin_alias_key
 
 DEFAULT_SLIPPAGE = "0.05"
 ISOLATED_FALLBACK_LEVERAGE = 5
+SERVER_BATCH_PATH = Path(__file__).resolve().parent / "server_batch.json"
 SYMMETRIC_SIDE_ALIASES = {"both", "sym", "symmetric", "dual", "双向", "对称", "对称单"}
 GRID_SIDE_ALIASES = {"grid", "网格", "网格单"}
 DEFAULT_GRID_GAP_LABEL = ["auto-minTick", "auto-takerFee"]
 DEFAULT_GRID_RANGE = ["auto", "auto"]
 CANCEL_AGE_FILTERS = {"hour", "day", "week"}
-CANCEL_FILTERS = {"all", "up", "down", "buy", "sell", "tp", "sl"} | CANCEL_AGE_FILTERS
+CANCEL_FILTERS = {"all", "up", "down", "buy", "sell", "tp", "sl", "trail"} | CANCEL_AGE_FILTERS
 CANCEL_AGE_UNIT_MS = {
     "hour": 60 * 60 * 1000,
     "day": 24 * 60 * 60 * 1000,
@@ -1210,6 +1211,7 @@ def market_mark_price(info: Info, coin: str, dex: str) -> Decimal | None:
 def print_market_overview(
     info: Info,
     account: str,
+    network: str,
     raw_coin: str,
     coin: str,
     dex: str,
@@ -1320,7 +1322,8 @@ def print_market_overview(
     if history_pnl.get("partial"):
         history_rows.append(("note", f"limited to latest {HISTORY_PNL_MAX_FILLS} fills"))
     print_box("Real PnL", history_rows)
-    open_orders = collect_open_orders_for_coin(info, account, coin, dex)
+    batch_rows = load_server_batch()
+    open_orders = collect_open_orders_for_coin(info, account, network, coin, dex, batch_rows)
     if open_orders:
         print_table(
             "Open Orders",
@@ -1337,14 +1340,22 @@ def print_market_overview(
             ],
             show_count=False,
         )
+    print_server_batch(batch_rows, network, account, coin)
     print_recent_history(info, account, coin=coin)
 
 
-def collect_account_positions_and_orders(info: Info, account: str) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+def collect_account_positions_and_orders(
+    info: Info,
+    account: str,
+    network: str,
+    batch_rows: list[dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     positions: list[dict[str, str]] = []
     orders: list[dict[str, str]] = []
     seen_order_keys: set[tuple[str, int]] = set()
     dex_names = all_dex_names(info)
+    batch_rows = batch_rows if batch_rows is not None else load_server_batch()
+    server_batch_oids = active_server_batch_oids(batch_rows, network, account)
     history_fills = fetch_user_fills_for_history_pnl(info, account)
     history_funding = fetch_user_funding_for_history_pnl(info, account)
     log_event("query_dex_names", dex_names)
@@ -1388,6 +1399,8 @@ def collect_account_positions_and_orders(info: Info, account: str) -> tuple[list
         open_orders = collect_frontend_open_orders(info, account, dex)
         for order in open_orders:
             oid = int(order["oid"])
+            if oid in server_batch_oids:
+                continue
             order_key = (str(order.get("coin", "")), oid)
             if order_key in seen_order_keys:
                 continue
@@ -1411,12 +1424,24 @@ def collect_account_positions_and_orders(info: Info, account: str) -> tuple[list
     return positions, orders
 
 
-def collect_open_orders_for_coin(info: Info, account: str, coin: str, dex: str) -> list[dict[str, str]]:
+def collect_open_orders_for_coin(
+    info: Info,
+    account: str,
+    network: str,
+    coin: str,
+    dex: str,
+    batch_rows: list[dict[str, Any]] | None = None,
+) -> list[dict[str, str]]:
     open_orders = collect_frontend_open_orders(info, account, dex)
+    batch_rows = batch_rows if batch_rows is not None else load_server_batch()
+    server_batch_oids = active_server_batch_oids(batch_rows, network, account, coin)
     rows: list[dict[str, str]] = []
 
     for order in open_orders:
         if not position_matches_coin(str(order.get("coin", "")), coin):
+            continue
+        oid = int(order.get("oid", -1))
+        if oid in server_batch_oids:
             continue
         rows.append(
             {
@@ -1426,7 +1451,7 @@ def collect_open_orders_for_coin(info: Info, account: str, coin: str, dex: str) 
                 "triggerPx": format_open_order_trigger_price(order),
                 "limitPx": format_optional_decimal(order.get("limitPx")),
                 "value": format_open_order_value(order),
-                "oid": str(order.get("oid", "")),
+                "oid": str(oid),
                 "time": format_timestamp_ms(order.get("timestamp")),
             }
         )
@@ -1529,7 +1554,8 @@ def query_account(args: argparse.Namespace) -> None:
         print("account_role_source:", role)
 
     print_account_metrics(info, account)
-    positions, orders = collect_account_positions_and_orders(info, account)
+    batch_rows = load_server_batch()
+    positions, orders = collect_account_positions_and_orders(info, account, args.network, batch_rows)
     print_table(
         "Positions",
         positions,
@@ -1563,6 +1589,7 @@ def query_account(args: argparse.Namespace) -> None:
         ],
         show_count=False,
     )
+    print_server_batch(batch_rows, args.network, account)
     print_recent_history(info, account, show_empty=True)
 
 
@@ -1570,6 +1597,7 @@ def cancel_order(
     exchange: Exchange,
     info: Info,
     account: str,
+    network: str,
     coin: str,
     dex: str,
     cancel_arg: str,
@@ -1578,10 +1606,14 @@ def cancel_order(
     cancel_age_range: tuple[Decimal, Decimal | None] | None = None,
     price_rate: Decimal | None = None,
 ) -> None:
+    filter_arg = cancel_arg.strip().lower()
+    if filter_arg == "trail":
+        cancel_trail_batch_orders(exchange, info, account, network, coin, dry_run, price_rate)
+        return
+
     open_orders = collect_frontend_open_orders(info, account, dex)
     log_event("open_orders_before", open_orders)
 
-    filter_arg = cancel_arg.strip().lower()
     threshold_price: Decimal | None = cancel_price
     threshold_label = "price" if cancel_price is not None else "current_mid"
     age_range_ms: tuple[int, int | None] | None = None
@@ -1648,10 +1680,19 @@ def cancel_order(
         print_account_metrics(info, account)
         print("error:", result)
         return
+    cancelled_oids = {int(request["oid"]) for request in cancel_requests}
+    batch_cancelled = mark_cancelled_server_batch_oids(
+        network,
+        account,
+        cancelled_oids,
+        f"cancelled by --cancel {cancel_filter_label(filter_arg)}",
+    )
 
     clear_info_cache(info)
     print_account_metrics(info, account)
     rows = [("coin", coin), ("filter", cancel_filter_label(filter_arg)), ("cancelled", str(len(matching_orders)))]
+    if batch_cancelled:
+        rows.append(("batch", str(batch_cancelled)))
     if threshold_price is not None:
         rows.append((threshold_label, format_price(threshold_price, price_rate)))
     if filter_arg in CANCEL_AGE_FILTERS:
@@ -2518,6 +2559,359 @@ def submit_order_plans(
     print_order_plan_table(title, plans, price_rate, statuses)
 
 
+def parse_trail_distance(value: str, anchor_px: Decimal) -> tuple[Decimal, str]:
+    text = value.strip()
+    if not text:
+        raise ValueError("--trail is required")
+    try:
+        if text.endswith("%"):
+            fraction = parse_percent_decimal(text, "--trail", allow_signed=False)
+            if fraction <= 0:
+                raise ValueError("--trail must be positive")
+            return anchor_px * fraction, text
+        distance = Decimal(text)
+    except InvalidOperation as exc:
+        raise ValueError("--trail must be a positive number or percent, e.g. 2% or 800") from exc
+    if distance <= 0:
+        raise ValueError("--trail must be positive")
+    return distance, text
+
+
+def trail_stop_price(best_px: Decimal, distance: Decimal, is_buy: bool, sz_decimals: int) -> Decimal:
+    stop_px = best_px + distance if is_buy else best_px - distance
+    if stop_px <= 0:
+        raise ValueError("trail stop price must be positive")
+    return rounded_perp_price(stop_px, sz_decimals)
+
+
+def load_server_batch(path: Path = SERVER_BATCH_PATH) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    data = json.loads(path.read_text() or "[]")
+    if not isinstance(data, list):
+        raise ValueError(f"{path} must contain a JSON list")
+    return [item for item in data if isinstance(item, dict)]
+
+
+def save_server_batch(rows: list[dict[str, Any]], path: Path = SERVER_BATCH_PATH) -> None:
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(rows, ensure_ascii=False, default=str, indent=2))
+    tmp_path.replace(path)
+
+
+def append_server_batch(row: dict[str, Any], path: Path = SERVER_BATCH_PATH) -> None:
+    rows = load_server_batch(path)
+    rows.append(row)
+    save_server_batch(rows, path)
+
+
+def batch_row_matches_coin(row: dict[str, Any], coin: str | None) -> bool:
+    if coin is None:
+        return True
+    return position_matches_coin(str(row.get("coin", "")), coin)
+
+
+def batch_row_matches_context(row: dict[str, Any], network: str, account: str | None, coin: str | None = None) -> bool:
+    if str(row.get("network", "mainnet")) != network:
+        return False
+    row_account = str(row.get("account", ""))
+    if account is not None and row_account and row_account.lower() != account.lower():
+        return False
+    return batch_row_matches_coin(row, coin)
+
+
+def active_trail_batch_indexes(rows: list[dict[str, Any]], network: str, account: str | None, coin: str | None = None) -> list[int]:
+    return [
+        index
+        for index, row in enumerate(rows)
+        if row.get("type") == "trail"
+        and row.get("status") == "active"
+        and batch_row_matches_context(row, network, account, coin)
+    ]
+
+
+def format_server_batch_rows(rows: list[dict[str, Any]], network: str, account: str | None, coin: str | None = None) -> list[dict[str, str]]:
+    display_rows: list[dict[str, str]] = []
+    for row in rows:
+        if not batch_row_matches_context(row, network, account, coin):
+            continue
+        display_rows.append(
+            {
+                "type": str(row.get("type", "")),
+                "status": str(row.get("status", "")),
+                "coin": str(row.get("coin", "")),
+                "side": str(row.get("side", "")),
+                "trail": str(row.get("trail", "-")),
+                "bestPx": format_optional_decimal(row.get("best_px")),
+                "stopPx": format_optional_decimal(row.get("stop_px")),
+                "oid": str(row.get("oid", "")),
+                "updated": format_timestamp_ms(int(row.get("updated_at", 0)) * 1000) if row.get("updated_at") else "-",
+            }
+        )
+    display_rows.sort(key=lambda item: (item["status"], item["type"], item["coin"], item["oid"]))
+    return display_rows
+
+
+def active_server_batch_oids(rows: list[dict[str, Any]], network: str, account: str | None, coin: str | None = None) -> set[int]:
+    oids: set[int] = set()
+    for row in rows:
+        if row.get("status") != "active":
+            continue
+        if not batch_row_matches_context(row, network, account, coin):
+            continue
+        try:
+            oids.add(int(row["oid"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return oids
+
+
+def print_server_batch(rows: list[dict[str, Any]], network: str, account: str | None, coin: str | None = None) -> None:
+    display_rows = format_server_batch_rows(rows, network, account, coin)
+    if not display_rows:
+        return
+    print_table(
+        "Server Batch",
+        display_rows,
+        [
+            ("type", "type"),
+            ("status", "status"),
+            ("coin", "coin"),
+            ("side", "side"),
+            ("trail", "trail"),
+            ("bestPx", "bestPx"),
+            ("stopPx", "stopPx"),
+            ("oid", "oid"),
+            ("updated", "updated"),
+        ],
+        show_count=False,
+    )
+
+
+def cancel_trail_batch_orders(
+    exchange: Exchange,
+    info: Info,
+    account: str,
+    network: str,
+    coin: str,
+    dry_run: bool,
+    price_rate: Decimal | None = None,
+) -> None:
+    batch_rows = load_server_batch()
+    matching_indexes = active_trail_batch_indexes(batch_rows, network, account, coin)
+
+    if not matching_indexes:
+        print_account_metrics(info, account)
+        print_box("Cancel", [("coin", coin), ("filter", "trail"), ("cancelled", "0")])
+        return
+
+    cancel_requests = [
+        {"coin": str(batch_rows[index].get("coin", coin)), "oid": int(batch_rows[index]["oid"])}
+        for index in matching_indexes
+    ]
+
+    if dry_run:
+        print_account_metrics(info, account)
+        print_box("Run", [("dry_run", "1"), ("filter", "trail"), ("matched", str(len(matching_indexes)))])
+        print_server_batch([batch_rows[index] for index in matching_indexes], network, account, coin)
+        return
+
+    result = exchange.bulk_cancel(cancel_requests)
+    log_event("cancel_trail_batch_requests", cancel_requests)
+    log_event("cancel_trail_batch_result", result)
+    if result.get("status") != "ok":
+        print_account_metrics(info, account)
+        print("error:", result)
+        return
+    statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+    status_errors = [status.get("error") for status in statuses if isinstance(status, dict) and status.get("error")]
+    if status_errors:
+        print_account_metrics(info, account)
+        print("error:", status_errors)
+        return
+
+    now = int(time.time())
+    for index in matching_indexes:
+        batch_rows[index]["status"] = "cancelled"
+        batch_rows[index]["cancelled_at"] = now
+        batch_rows[index]["updated_at"] = now
+        batch_rows[index]["note"] = "cancelled by --cancel trail"
+    save_server_batch(batch_rows)
+
+    clear_info_cache(info)
+    print_account_metrics(info, account)
+    print_box("Cancel", [("coin", coin), ("filter", "trail"), ("cancelled", str(len(matching_indexes)))])
+    print_server_batch([batch_rows[index] for index in matching_indexes], network, account, coin)
+
+
+def mark_cancelled_server_batch_oids(
+    network: str,
+    account: str,
+    oids: set[int],
+    note: str,
+) -> int:
+    if not oids:
+        return 0
+    batch_rows = load_server_batch()
+    now = int(time.time())
+    updated = 0
+    for row in batch_rows:
+        if row.get("status") != "active":
+            continue
+        if not batch_row_matches_context(row, network, account):
+            continue
+        try:
+            oid = int(row["oid"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if oid not in oids:
+            continue
+        row["status"] = "cancelled"
+        row["cancelled_at"] = now
+        row["updated_at"] = now
+        row["note"] = note
+        updated += 1
+    if updated:
+        save_server_batch(batch_rows)
+    return updated
+
+
+def submit_trail_stop_order(
+    args: argparse.Namespace,
+    exchange: Exchange,
+    info: Info,
+    account: str,
+    coin: str,
+    asset: dict[str, Any],
+    is_buy: bool,
+    amount: Decimal,
+    stop_px: Decimal,
+    slippage: Decimal,
+) -> tuple[int, dict[str, Any]]:
+    plan = build_trigger_order_plan(
+        coin,
+        is_buy,
+        amount,
+        asset,
+        exchange,
+        slippage,
+        "trail-stop",
+        stop_px,
+        None,
+        args.reduce_only,
+        tpsl="sl",
+    )
+    if args.dry_run:
+        return 0, {"dryRun": True, "plan": plan}
+    result = exchange.order(
+        coin,
+        is_buy,
+        float(plan["size"]),
+        float(plan["limit_px"]),
+        plan["order_type"],
+        reduce_only=args.reduce_only,
+    )
+    log_event("trail_stop_order", {"stop_px": decimal_to_plain(stop_px), "result": result})
+    if result.get("status") != "ok":
+        raise RuntimeError(f"Failed to submit trail stop: {result}")
+    statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+    for status in statuses:
+        if "error" in status:
+            raise RuntimeError(f"Failed to submit trail stop: {status['error']}")
+        if "resting" in status:
+            return int(status["resting"]["oid"]), plan
+        if "filled" in status:
+            return int(status["filled"].get("oid", 0)), plan
+    raise RuntimeError(f"Trail stop response did not include an order id: {result}")
+
+
+def print_trail_status(
+    coin: str,
+    is_buy: bool,
+    mid_px: Decimal,
+    best_px: Decimal,
+    stop_px: Decimal | None,
+    oid: int | None,
+    status: str,
+    price_rate: Decimal | None,
+) -> None:
+    rows = [
+        ("coin", coin),
+        ("side", side_code(is_buy)),
+        ("midPx", format_price(mid_px, price_rate)),
+        ("bestPx", format_price(best_px, price_rate)),
+        ("stopPx", "-" if stop_px is None else format_price(stop_px, price_rate)),
+        ("oid", "-" if oid is None else str(oid)),
+        ("status", status),
+    ]
+    print_box("Trail", rows)
+
+
+def run_trailing_order(
+    args: argparse.Namespace,
+    exchange: Exchange,
+    info: Info,
+    account: str,
+    coin: str,
+    dex: str,
+    asset: dict[str, Any],
+    is_buy: bool,
+    amount: Decimal,
+    current_mid: Decimal | None,
+    slippage: Decimal,
+    price_rate: Decimal | None,
+) -> None:
+    if current_mid is None:
+        raise ValueError(f"No mid price found for {coin}, cannot start trail order")
+
+    sz_decimals = int(asset["szDecimals"])
+    best_px = rounded_perp_price(current_mid, sz_decimals)
+    distance, distance_label = parse_trail_distance(args.trail, best_px)
+    distance = rounded_perp_price(distance, sz_decimals)
+    stop_px = trail_stop_price(best_px, distance, is_buy, sz_decimals)
+
+    if args.explain or args.dry_run:
+        print_trail_status(
+            coin,
+            is_buy,
+            current_mid,
+            best_px,
+            stop_px,
+            None,
+            "dry_run" if args.dry_run else "planned",
+            price_rate,
+        )
+        return
+
+    stop_oid, plan = submit_trail_stop_order(args, exchange, info, account, coin, asset, is_buy, amount, stop_px, slippage)
+    row = {
+        "id": f"{int(time.time())}-{stop_oid}",
+        "type": "trail",
+        "status": "active",
+        "network": args.network,
+        "account": account,
+        "coin": coin,
+        "raw_coin": args.coin,
+        "dex": dex,
+        "side": side_code(is_buy),
+        "is_buy": is_buy,
+        "amount": decimal_to_plain(amount),
+        "trail": distance_label,
+        "trail_distance": decimal_to_plain(distance),
+        "best_px": decimal_to_plain(best_px),
+        "stop_px": decimal_to_plain(stop_px),
+        "oid": stop_oid,
+        "reduce_only": args.reduce_only,
+        "slippage": decimal_to_plain(slippage),
+        "size": decimal_to_plain(Decimal(str(plan["size"]))),
+        "sz_decimals": sz_decimals,
+        "updated_at": int(time.time()),
+        "plan": plan,
+    }
+    append_server_batch(row)
+    print_trail_status(coin, is_buy, current_mid, best_px, stop_px, stop_oid, "batched", price_rate)
+
+
 def place_protective_tpsl_orders(
     args: argparse.Namespace,
     exchange: Exchange,
@@ -3001,6 +3395,7 @@ def place_order(args: argparse.Namespace) -> None:
             or args.book_level != 10
             or args.tif is not None
             or args.slippage != DEFAULT_SLIPPAGE
+            or args.trail
             or args.stop_entry
             or args.take_entry
             or args.take_profit
@@ -3015,7 +3410,7 @@ def place_order(args: argparse.Namespace) -> None:
         )
         if order_flags_without_side:
             raise ValueError("side is required when order options are used")
-        print_market_overview(info, account, args.coin, coin, dex, asset, price_rate, kline_mode)
+        print_market_overview(info, account, args.network, args.coin, coin, dex, asset, price_rate, kline_mode)
         return
 
     if args.cancel is not None:
@@ -3024,6 +3419,7 @@ def place_order(args: argparse.Namespace) -> None:
             exchange,
             info,
             account,
+            args.network,
             coin,
             dex,
             args.cancel,
@@ -3084,6 +3480,23 @@ def place_order(args: argparse.Namespace) -> None:
         return
 
     is_buy = parse_side(args.side)
+
+    if args.trail:
+        run_trailing_order(
+            args,
+            exchange,
+            info,
+            account,
+            coin,
+            dex,
+            asset,
+            is_buy,
+            amount,
+            current_mid,
+            slippage,
+            price_rate,
+        )
+        return
 
     if args.ladder_mode is not None:
         place_ladder_orders(
@@ -3438,6 +3851,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--market", action="store_true", help="Submit as a market order using IOC with slippage protection.")
     parser.add_argument("--slippage", default=DEFAULT_SLIPPAGE, help="Market slippage protection. Default: 0.05. Also accepts 5%%.")
+    parser.add_argument("--trail", help="Create a server-managed trailing stop distance, e.g. 2%% or 800.")
     parser.add_argument("--level", "--book-level", dest="book_level", type=int, default=10, help="Same-side book level when --price is omitted.")
     parser.add_argument("--tif", choices=["Gtc", "Ioc", "Alo"], help="Time in force. Limit orders default to Alo.")
     parser.add_argument(
@@ -3520,7 +3934,7 @@ def parse_args() -> argparse.Namespace:
         "--cancel",
         nargs="?",
         const="all",
-        help="Cancel instead of placing an order. Omit value to cancel all, pass OID, or use up/down/buy/sell/tp/sl/hour/day/week. Add --price with up/down, or --range with hour/day/week.",
+        help="Cancel instead of placing an order. Omit value to cancel all, pass OID, or use up/down/buy/sell/tp/sl/trail/hour/day/week. Add --price with up/down, or --range with hour/day/week.",
     )
     parser.add_argument("--network", choices=["mainnet", "testnet"], default="mainnet", help="Default: mainnet.")
     parser.add_argument("--timeout", type=float, default=20, help="HTTP timeout in seconds. Default: 20.")
@@ -3559,7 +3973,7 @@ def parse_args() -> argparse.Namespace:
             try:
                 int(args.cancel)
             except ValueError:
-                parser.error("--cancel value must be an OID or one of: up, down, buy, sell, tp, sl, hour, day, week")
+                parser.error("--cancel value must be an OID or one of: up, down, buy, sell, tp, sl, trail, hour, day, week")
         if args.price:
             if args.cancel not in {"up", "down"}:
                 parser.error("--price can only be used with --cancel up or --cancel down")
@@ -3751,7 +4165,15 @@ def parse_args() -> argparse.Namespace:
             parser.error(str(exc))
     if not args.query and not args.coin:
         parser.error("coin is required unless query/status or --query is used")
-    if args.market and args.price:
+    if args.trail:
+        try:
+            parse_trail_distance(args.trail, Decimal("100"))
+        except ValueError as exc:
+            parser.error(str(exc))
+        if args.price:
+            parser.error("--trail cannot be combined with --price; it uses the current mid price")
+    has_tpsl = bool(args.take_profit or args.stop_loss)
+    if args.market and args.price and not args.trail:
         parser.error("--market cannot be used with --price")
     if args.market and args.cancel is not None:
         parser.error("--market cannot be used with --cancel")
@@ -3761,6 +4183,15 @@ def parse_args() -> argparse.Namespace:
         parser.error("--total cannot be used with --cancel")
     if args.ladder_mode is not None and args.market:
         parser.error("Ladder orders cannot use --market")
+    if args.trail:
+        if args.cancel is not None:
+            parser.error("--trail cannot be combined with --cancel")
+        if args.symmetric or args.grid or args.ladder_mode is not None or args.scale is not None:
+            parser.error("--trail cannot be combined with symmetric, grid, ladder, or scale orders")
+        if args.stop_entry or args.take_entry or has_tpsl:
+            parser.error("--trail cannot be combined with --stop/--take or --tp/--sl")
+        if args.book_level != 10 or args.tif is not None:
+            parser.error("--trail cannot be combined with --level or --tif")
     if args.stop_entry:
         try:
             parse_entry_trigger_with_limit(args.stop_entry, args.stop_entry_limit, "stop")
@@ -3785,7 +4216,6 @@ def parse_args() -> argparse.Namespace:
         parser.error("--take-entry cannot be combined with --price, --market, --level, or --tif")
     if (args.take_profit_limit and not args.take_profit) or (args.stop_loss_limit and not args.stop_loss):
         parser.error("--tp-limit requires --tp, and --sl-limit requires --sl")
-    has_tpsl = bool(args.take_profit or args.stop_loss)
     if args.stop_entry and args.take_entry:
         parser.error("--stop-entry and --take-entry are mutually exclusive")
     if args.symmetric:

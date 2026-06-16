@@ -1,0 +1,9 @@
+[Unit]
+Description=Simple-Hyper trail order worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/simple-hyper
+ExecStart=/opt/simple-hyper/.venv/bin/python /opt/simple-hyper/trail_worker.py

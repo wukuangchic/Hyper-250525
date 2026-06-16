@@ -42,6 +42,8 @@ query
 order query
 order --query
 
+# 持仓表里的 realPnl / result 会用历史成交、手续费、资金费和当前持仓浮盈亏重算真实盈亏
+
 # 查询 BTC 行情、文本 K 线、当前持仓和近期成交
 BTC
 
@@ -64,6 +66,10 @@ BTC buy 10 --market --slippage 1%
 
 # 只减仓 / 平仓，不允许反手
 BTC sell --reduce-only
+
+# 服务器跟踪止损：先按当前 mid 回撤 2% 挂 stop，并写入 server_batch.json 的 trail 任务
+BTC sell 50 --trail 2%
+# systemd/simple-hyper-trail-worker.timer 可在服务器上每 10 秒运行一次 trail_worker.py
 
 # 取消 BTC 所有挂单
 BTC --cancel
