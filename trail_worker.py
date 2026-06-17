@@ -35,6 +35,18 @@ from hl_order import (  # noqa: E402
 LOCK_PATH = Path(__file__).resolve().parent / "server_batch.lock"
 DONE_RETENTION_DAYS = 7
 DONE_RETENTION_MAX = 500
+TRANSIENT_STATUS_CODES = {429, 502, 503, 504}
+
+
+def transient_error_status(exc: Exception) -> int | None:
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None and exc.args:
+        status_code = exc.args[0]
+    try:
+        status_int = int(status_code)
+    except (TypeError, ValueError):
+        return None
+    return status_int if status_int in TRANSIENT_STATUS_CODES else None
 
 
 def find_open_order_by_oid(info: Any, account: str, dex: str, oid: int) -> dict[str, Any] | None:
@@ -212,8 +224,14 @@ def run_once() -> None:
             rows[index], row_changed = modify_trail_stop(row, mid_px)
             changed = changed or row_changed
         except Exception as exc:
-            row["status"] = "error"
-            row["error"] = str(exc)
+            transient_status = transient_error_status(exc)
+            if transient_status is None:
+                row["status"] = "error"
+                row["error"] = str(exc)
+            else:
+                row["status"] = "active"
+                row["last_error"] = str(exc)
+                row["note"] = f"transient HTTP {transient_status}; will retry"
             row["updated_at"] = int(time.time())
             rows[index] = row
             changed = True
