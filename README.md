@@ -170,29 +170,35 @@ JPY both 20 --offset 2% --tp 1% --sl 0.7%
 `grid` 使用普通 post-only limit 单，由服务器定时 worker 维护。它不是交易所原生网格；初始会在当前 mid 上下各挂 5 张 limit 单，之后 worker 会维持买卖两边各 5 张，成交后按成交价和 gap 补下一张反向 limit 单。
 
 ```bash
-BTC grid --max 300 --gap 0.5% --trend 10%
-BTC grid --max 300 --gap 0.5%
-BTC grid --max 300
-BTC grid --modify --max 500
+BTC grid --abs 300 --gap 0.5% --trend 10%
+BTC grid --long 300 --gap 0.5% --min 20
+BTC grid --short 300
+BTC grid --modify --abs 500
 BTC grid --modify --gap 0.3%
-BTC grid --recover --max 300 --gap 0.5%
+BTC grid --recover --abs 300 --gap 0.5%
+BTC grid --query
 BTC --cancel grid
 ```
 
 含义：
 
-- `--max`：最大绝对持仓价值。多仓和空仓都按 `abs(positionValue)` 计算。
+- `--long 200`：只允许开多头仓位，最大多头持仓价值 200；卖单只用于已有多仓的 reduce-only 减仓。
+- `--short 200`：只允许开空头仓位，最大空头持仓价值 200；买单只用于已有空仓的 reduce-only 减仓。
+- `--abs 200`：多空都可以开，最大绝对持仓价值 200。`grid` 新建和 `--recover` 必须在 `--long/--short/--abs` 里三选一。
+- `--min 20`：每张子单价值至少 20；不填时仍按交易所最小名义价值。
 - `--gap`：每个买卖格子的间距。初始买价从 `mid * (1 - gap)` 到 `mid * (1 - 5 * gap)`，卖价从 `mid * (1 + gap)` 到 `mid * (1 + 5 * gap)`；买单成交后在成交价上方 `gap` 补卖单，卖单成交后在成交价下方 `gap` 补买单。
-- 不写 `--gap` 时，默认使用 `最小价格变动百分比 + 折扣后 takerFee`。
+- 不写 `--gap` 时，默认使用 `最小价格变动百分比 + 折扣后 takerFee + 折扣后 makerFee`。
 - `--trend`：数量倾向，默认 `0`；正数让买入数量大于卖出数量，负数让卖出数量大于买入数量。
-- `--total` 不再用于 grid；如果写 `BTC grid --total 300` 会直接报错，请改用 `--max`。
-- 到达 `--max` 后，worker 会撤销继续加仓方向的 grid 单，只保留/恢复减仓方向；仓位降到能容纳下一张单后，再把加仓方向补回到最多 5 张。
-- `BTC grid --modify --max 500` 只更新最大仓位配置。
-- `BTC grid --modify --gap 0.3%` 或 `BTC grid --modify --trend 0` 会取消当前活跃 grid 挂单，并按当前 mid 和新配置重新铺买卖两边各 5 张。
-- `BTC grid --recover --max 300 --gap 0.5%` 会从当前该币普通 limit open orders 里按近侧最多每边 5 张接管到 `server_batch.json`，用于服务器断点或 JSON 丢失后的人工恢复。
+- `--total` 和旧 `--max` 不再用于 grid；如果写了会直接报错，请改用 `--long/--short/--abs`。
+- 到达持仓上限后，worker 会撤销继续加仓方向的 grid 单，只保留/恢复减仓方向；仓位降到能容纳下一张单后，再把加仓方向补回到最多 5 张。
+- `BTC grid --modify --abs 500` 只更新持仓限制配置。
+- `BTC grid --modify --gap 0.3%`、`BTC grid --modify --trend 0` 或 `BTC grid --modify --min 20` 会取消当前活跃 grid 挂单，并按当前 mid 和新配置重新铺买卖两边各 5 张。
+- `BTC grid --recover --abs 300 --gap 0.5%` 会从当前该币普通 limit open orders 里按近侧最多每边 5 张接管到 `server_batch.json`，用于服务器断点或 JSON 丢失后的人工恢复。
+- `BTC grid --query` 会展示该币 grid 的 limit/min/gap/仓位、买卖两边 active 数量、每张子单的 oid/价格/状态/live 情况和最近成交。
 - worker 每次至少回看最近 24 小时成交记录；如果 `last_fill_check_ms` 更早，会从更早的断点继续查。
 - worker 只维护 `server_batch.json` 里记录的 oid；手动下的新单不会被自动接管。
 - 如果 worker 发现 grid oid 消失但最近成交记录里找不到对应 fill，会按该记录原来的 side、price、size 重新挂回，并在任务 note 里记录 `recovered_missing`。
+- 如果 post-only limit 因“只限挂单”被拒绝，grid 不会变成 `error`，worker 会跳过这张并在下一轮继续维护。
 - 取消服务器维护的网格和所有活跃子单：`BTC --cancel grid`。
 
 ## 服务器 Trail 单

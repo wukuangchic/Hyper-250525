@@ -99,7 +99,7 @@ ISOLATED_FALLBACK_LEVERAGE = 5
 SERVER_BATCH_PATH = Path(__file__).resolve().parent / "server_batch.json"
 SYMMETRIC_SIDE_ALIASES = {"both", "sym", "symmetric", "dual", "双向", "对称", "对称单"}
 GRID_SIDE_ALIASES = {"grid", "网格", "网格单"}
-DEFAULT_GRID_GAP_LABEL = ["auto-minTick", "auto-takerFee"]
+DEFAULT_GRID_GAP_LABEL = ["auto-minTick", "auto-takerFee", "auto-makerFee"]
 DEFAULT_GRID_RANGE = ["auto", "auto"]
 GRID_TARGET_ORDERS_PER_SIDE = 5
 CANCEL_AGE_FILTERS = {"hour", "day", "week"}
@@ -1547,6 +1547,139 @@ def print_recent_history(
     )
 
 
+def grid_entry_sort_key(entry: dict[str, Any]) -> tuple[int, Decimal, int]:
+    side_rank = 0 if str(entry.get("side")) == "buy" else 1
+    price = decimal_or_none(entry.get("price", entry.get("limit_px"))) or Decimal("0")
+    if side_rank == 0:
+        price = -price
+    try:
+        oid = int(entry.get("oid") or 0)
+    except (TypeError, ValueError):
+        oid = 0
+    return side_rank, price, oid
+
+
+def format_grid_detail_rows(row: dict[str, Any], open_oids: set[int]) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for entry in sorted((item for item in row.get("levels") or [] if isinstance(item, dict) and item.get("side")), key=grid_entry_sort_key):
+        try:
+            oid = int(entry.get("oid") or 0)
+        except (TypeError, ValueError):
+            oid = 0
+        status = str(entry.get("status", ""))
+        live = "1" if status == "active" and oid in open_oids else "0"
+        fill = entry.get("fill") if isinstance(entry.get("fill"), dict) else {}
+        rows.append(
+            {
+                "side": str(entry.get("side", "")),
+                "status": status,
+                "live": live,
+                "price": format_optional_decimal(entry.get("price", entry.get("limit_px"))),
+                "size": format_optional_quantity(entry.get("size")),
+                "value": format_open_order_value({"limitPx": entry.get("price", entry.get("limit_px")), "sz": entry.get("size")}),
+                "oid": str(entry.get("oid", "")),
+                "updated": format_timestamp_ms(int(entry.get("submitted_at") or entry.get("recovered_at") or entry.get("filled_at") or entry.get("cancelled_at") or 0) * 1000)
+                if (entry.get("submitted_at") or entry.get("recovered_at") or entry.get("filled_at") or entry.get("cancelled_at"))
+                else "-",
+                "fillPx": format_optional_decimal(fill.get("px")) if fill else "-",
+            }
+        )
+    return rows
+
+
+def query_grid(args: argparse.Namespace) -> None:
+    info, _exchange, account, signer, role = build_clients(args.network, args.timeout, args.coin, need_exchange=False)
+    coin, _asset = resolve_perp_asset(info, args.coin)
+    dex = coin_dex(coin)
+    if args.verbose:
+        print("network:", args.network)
+        print("account:", mask(account))
+        print("signer:", mask(signer))
+        print("account_role_source:", role)
+
+    print_account_metrics(info, account)
+    batch_rows = load_server_batch()
+    rows = [
+        row
+        for row in batch_rows
+        if row.get("type") == "grid" and batch_row_matches_context(row, args.network, account, coin)
+    ]
+    if not rows:
+        print_box("Grid", [("coin", coin), ("status", "not found")])
+        return
+
+    open_oids: set[int] = set()
+    for order in collect_frontend_open_orders(info, account, dex):
+        if order.get("oid") is None or not position_matches_coin(str(order.get("coin", "")), coin):
+            continue
+        try:
+            open_oids.add(int(order["oid"]))
+        except (TypeError, ValueError):
+            continue
+    current_mid = None
+    try:
+        mids = info.all_mids(dex)
+        if mids.get(coin) is not None:
+            current_mid = Decimal(str(mids[coin]))
+    except Exception as exc:
+        log_event("grid_query_mids_error", {"type": type(exc).__name__, "message": str(exc)})
+    position_size, position_value = (
+        current_position_size_value(info, account, coin, dex, current_mid)
+        if current_mid is not None
+        else (Decimal("0"), Decimal("0"))
+    )
+
+    for row in rows:
+        active_buy = len([entry for entry in active_grid_entries_for_row(row, "buy")])
+        active_sell = len([entry for entry in active_grid_entries_for_row(row, "sell")])
+        live_count = len(grid_batch_open_oids(row) & open_oids)
+        summary = [
+            ("coin", coin),
+            ("status", str(row.get("status", ""))),
+            ("limit", f"{grid_limit_policy_from_row(row)} {row.get('max_position_value', '')}"),
+            ("min", str(row.get("min_order_value", MIN_NOTIONAL))),
+            ("position", f"{decimal_to_plain(position_size)} / {decimal_to_display(position_value)}"),
+            ("gap", f"{row.get('gap', '')} ({row.get('gap_rate', '')})"),
+            ("trend", f"{row.get('trend', '0')} actual {row.get('actual_trend', '0%')}"),
+            ("target_side", str(row.get("target_orders_per_side", GRID_TARGET_ORDERS_PER_SIDE))),
+            ("active_buy", str(active_buy)),
+            ("active_sell", str(active_sell)),
+            ("live_oids", f"{live_count}/{len(grid_batch_open_oids(row))}"),
+            ("updated", format_timestamp_ms(int(row.get("updated_at", 0)) * 1000) if row.get("updated_at") else "-"),
+            ("note", str(row.get("note", ""))),
+        ]
+        print_box("Grid", summary)
+        detail_rows = format_grid_detail_rows(row, open_oids)
+        print_table(
+            "Grid Orders",
+            detail_rows,
+            [
+                ("side", "side"),
+                ("status", "status"),
+                ("live", "live"),
+                ("price", "price"),
+                ("size", "size"),
+                ("value", "value"),
+                ("oid", "oid"),
+                ("updated", "updated"),
+                ("fillPx", "fillPx"),
+            ],
+            show_count=False,
+        )
+    print_recent_history(info, account, coin=coin, limit=10)
+
+
+def active_grid_entries_for_row(row: dict[str, Any], side: str | None = None) -> list[dict[str, Any]]:
+    return [
+        entry
+        for entry in row.get("levels") or []
+        if isinstance(entry, dict)
+        and entry.get("side")
+        and str(entry.get("status", "active")) == "active"
+        and (side is None or str(entry.get("side")) == side)
+    ]
+
+
 def query_account(args: argparse.Namespace) -> None:
     info, _exchange, account, signer, role = build_clients(args.network, args.timeout, "", need_exchange=False)
     if args.verbose:
@@ -2111,6 +2244,35 @@ def grid_gap_spec(args: argparse.Namespace) -> list[str]:
     return [gap]
 
 
+def grid_limit_policy_from_row(row: dict[str, Any]) -> str:
+    policy = str(row.get("position_limit_mode") or row.get("max_position_mode") or "abs").strip().lower()
+    if policy in {"long", "short", "abs"}:
+        return policy
+    return "abs"
+
+
+def grid_limit_arg(args: argparse.Namespace) -> tuple[str | None, str | None]:
+    values = [
+        ("long", getattr(args, "grid_long", None)),
+        ("short", getattr(args, "grid_short", None)),
+        ("abs", getattr(args, "grid_abs", None)),
+    ]
+    selected = [(policy, value) for policy, value in values if value is not None]
+    if not selected:
+        return None, None
+    return selected[0]
+
+
+def grid_min_notional(args: argparse.Namespace) -> Decimal:
+    value = getattr(args, "grid_min", None)
+    if value is None:
+        return MIN_NOTIONAL
+    amount = Decimal(str(value))
+    if not amount.is_finite() or amount <= 0:
+        raise ValueError("--min must be positive")
+    return amount
+
+
 def grid_range_spec(args: argparse.Namespace) -> list[str]:
     range_spec = getattr(args, "range_spec", None)
     if range_spec:
@@ -2154,11 +2316,18 @@ def resolve_grid_gap(
     gap = max(minimum_grid_gap(start_px, sz_decimals), minimum_grid_gap(end_px, sz_decimals))
     fee_rates = effective_perp_fee_rates(info, account, asset, dex)
     taker_fee = fee_rates.get("taker_effective")
-    if taker_fee is None or taker_fee <= 0:
-        raise ValueError("grid default --gap requires a positive effective taker fee; specify --gap explicitly")
+    maker_fee = fee_rates.get("maker_effective")
+    if taker_fee is None or maker_fee is None:
+        raise ValueError("grid default --gap requires effective taker and maker fees; specify --gap explicitly")
+    fee_gap = taker_fee + maker_fee
+    if fee_gap <= 0:
+        raise ValueError("grid default --gap resolved to a non-positive fee gap; specify --gap explicitly")
 
-    args.resolved_grid_gap_spec = [format_rate_percent(gap), format_rate_percent(taker_fee)]
-    return gap, taker_fee
+    total_gap = gap + fee_gap
+    args.resolved_grid_gap_spec = [
+        f"{format_rate_percent(total_gap)} (minTick {format_rate_percent(gap)} + taker {format_rate_percent(taker_fee)} + maker {format_rate_percent(maker_fee)})"
+    ]
+    return gap, fee_gap
 
 
 def resolve_grid_spacing(
@@ -2177,10 +2346,15 @@ def resolve_grid_spacing(
     min_gap = minimum_grid_gap(anchor_px, sz_decimals)
     fee_rates = effective_perp_fee_rates(info, account, asset, dex)
     taker_fee = fee_rates.get("taker_effective")
-    if taker_fee is None or taker_fee <= 0:
-        raise ValueError("grid default --gap requires a positive effective taker fee; specify --gap explicitly")
-    spacing = min_gap + taker_fee
-    args.resolved_grid_gap_spec = [format_rate_percent(spacing)]
+    maker_fee = fee_rates.get("maker_effective")
+    if taker_fee is None or maker_fee is None:
+        raise ValueError("grid default --gap requires effective taker and maker fees; specify --gap explicitly")
+    spacing = min_gap + taker_fee + maker_fee
+    if spacing <= 0:
+        raise ValueError("grid default --gap resolved to a non-positive spacing; specify --gap explicitly")
+    args.resolved_grid_gap_spec = [
+        f"{format_rate_percent(spacing)} (minTick {format_rate_percent(min_gap)} + taker {format_rate_percent(taker_fee)} + maker {format_rate_percent(maker_fee)})"
+    ]
     return spacing
 
 
@@ -2246,7 +2420,7 @@ def choose_grid_size_units(
     if exact_units > max_base_units:
         exact_notional = one_way_notional(exact_units)
         raise ValueError(
-            f"grid --total is too small to fit --trend {trend_label} at this size precision; "
+            f"grid max is too small to fit --trend {trend_label} at this size precision; "
             f"needs at least {decimal_to_display(exact_notional)} USD one-way total"
         )
 
@@ -2296,11 +2470,12 @@ def grid_limit_size_pair_for_trend(
     sz_decimals: int,
     buy_px: Decimal,
     sell_px: Decimal,
+    min_notional: Decimal = MIN_NOTIONAL,
 ) -> tuple[Decimal, Decimal]:
     step = Decimal(1).scaleb(-sz_decimals)
 
     def min_units(price: Decimal) -> int:
-        return max(1, ceil_decimal_to_int(MIN_NOTIONAL / price / step))
+        return max(1, ceil_decimal_to_int(min_notional / price / step))
 
     target_ratio = Decimal("1") + abs(trend)
     if trend >= 0:
@@ -2310,6 +2485,14 @@ def grid_limit_size_pair_for_trend(
         buy_units = min_units(buy_px)
         sell_units = max(min_units(sell_px), ceil_decimal_to_int(Decimal(buy_units) * target_ratio))
     return Decimal(buy_units) * step, Decimal(sell_units) * step
+
+
+def grid_size_for_min_notional(size: Decimal, price: Decimal, sz_decimals: int, min_notional: Decimal) -> Decimal:
+    if price <= 0:
+        return size
+    step = Decimal(1).scaleb(-sz_decimals)
+    min_units = ceil_decimal_to_int(min_notional / price / step)
+    return max(size, Decimal(min_units) * step)
 
 
 def current_position_size_value(info: Info, account: str, coin: str, dex: str, current_mid: Decimal) -> tuple[Decimal, Decimal]:
@@ -2329,13 +2512,34 @@ def grid_order_would_add_risk(position_size: Decimal, is_buy: bool) -> bool:
     return (position_size > 0 and is_buy) or (position_size < 0 and not is_buy)
 
 
+def grid_order_allowed_by_policy(position_size: Decimal, is_buy: bool, policy: str) -> bool:
+    if policy == "abs":
+        return True
+    if policy == "long":
+        return is_buy or position_size > 0
+    if policy == "short":
+        return (not is_buy) or position_size < 0
+    return True
+
+
+def grid_order_should_reduce_only(position_size: Decimal, is_buy: bool, policy: str) -> bool:
+    if policy == "long":
+        return not is_buy
+    if policy == "short":
+        return is_buy
+    return False
+
+
 def grid_order_allowed_by_max(
     position_size: Decimal,
     position_value: Decimal,
     is_buy: bool,
     order_notional: Decimal,
     max_position_value: Decimal,
+    policy: str = "abs",
 ) -> bool:
+    if not grid_order_allowed_by_policy(position_size, is_buy, policy):
+        return False
     if not grid_order_would_add_risk(position_size, is_buy):
         return True
     return position_value + order_notional <= max_position_value
@@ -2442,7 +2646,7 @@ def build_grid_orders(
     if current_mid is None:
         raise ValueError(f"No mid price found for {coin}, cannot place grid orders")
     if max_position_value < MIN_NOTIONAL:
-        raise ValueError(f"grid --max must be at least {MIN_NOTIONAL} USD")
+        raise ValueError(f"grid max must be at least {MIN_NOTIONAL} USD")
 
     trend = parse_percent_decimal(args.trend or "0", "--trend", allow_signed=True)
     if trend <= Decimal("-1"):
@@ -2456,7 +2660,8 @@ def build_grid_orders(
     if first_buy_px <= 0 or first_buy_px >= first_sell_px:
         raise ValueError("grid --gap is too small for this price precision")
 
-    buy_size, sell_size = grid_limit_size_pair_for_trend(trend, sz_decimals, first_buy_px, first_sell_px)
+    min_notional = grid_min_notional(args)
+    buy_size, sell_size = grid_limit_size_pair_for_trend(trend, sz_decimals, first_buy_px, first_sell_px, min_notional)
     if buy_size > sell_size:
         args.resolved_grid_trend = format_signed_percent(buy_size / sell_size - Decimal("1"))
     elif sell_size > buy_size:
@@ -2465,20 +2670,24 @@ def build_grid_orders(
         args.resolved_grid_trend = "0%"
 
     position_size, position_value = current_position_size_value(info, account, coin, dex, current_mid)
+    policy = getattr(args, "grid_position_limit_mode", None) or "abs"
     projected_position_value = position_value
     plans: list[dict[str, Any]] = []
     for depth in range(1, GRID_TARGET_ORDERS_PER_SIDE + 1):
-        for is_buy, size, label, multiplier in (
+        for is_buy, base_size, label, multiplier in (
             (True, buy_size, f"buy {depth}", Decimal("1") - gap * Decimal(depth)),
             (False, sell_size, f"sell {depth}", Decimal("1") + gap * Decimal(depth)),
         ):
             price = rounded_perp_price(anchor * multiplier, sz_decimals)
             if price <= 0:
                 continue
+            size = grid_size_for_min_notional(base_size, price, sz_decimals, min_notional)
             notional = size * price
-            if not grid_order_allowed_by_max(position_size, projected_position_value, is_buy, notional, max_position_value):
+            if not grid_order_allowed_by_max(position_size, projected_position_value, is_buy, notional, max_position_value, policy):
                 continue
-            reduce_only = position_value >= max_position_value and not grid_order_would_add_risk(position_size, is_buy)
+            reduce_only = grid_order_should_reduce_only(position_size, is_buy, policy) or (
+                position_value >= max_position_value and not grid_order_would_add_risk(position_size, is_buy)
+            )
             plan = build_grid_limit_order_plan(coin, is_buy, size, price, asset, reduce_only, label)
             plan["grid_anchor"] = anchor
             plan["grid_gap"] = gap
@@ -2489,7 +2698,7 @@ def build_grid_orders(
             if grid_order_would_add_risk(position_size, is_buy):
                 projected_position_value += notional
     if not plans:
-        raise ValueError("grid --max is already reached and no reducing grid order can be placed")
+        raise ValueError("grid position limit is already reached and no reducing grid order can be placed")
     return plans
 
 
@@ -2503,10 +2712,23 @@ def status_order_oid(status: dict[str, Any] | None) -> int | None:
     return None
 
 
+def is_post_only_reject_text(text: str) -> bool:
+    lowered = text.lower()
+    return "post only" in lowered or "would immediately match" in lowered or "only limit" in lowered or "只限挂单" in text
+
+
+def status_is_post_only_reject(status: dict[str, Any] | None) -> bool:
+    if not isinstance(status, dict) or not status.get("error"):
+        return False
+    return is_post_only_reject_text(str(status.get("error")))
+
+
 def status_order_state(status: dict[str, Any] | None) -> str:
     if not isinstance(status, dict):
         return "unknown"
     if status.get("error"):
+        if status_is_post_only_reject(status):
+            return "skipped_post_only"
         return "error"
     if "filled" in status:
         return "filled"
@@ -2553,8 +2775,13 @@ def build_grid_batch_row(
         levels.append(order_state)
 
     row_status = "active"
+    fatal_errors = [
+        status.get("error")
+        for status in statuses
+        if isinstance(status, dict) and status.get("error") and not status_is_post_only_reject(status)
+    ]
     status_errors = [status.get("error") for status in statuses if isinstance(status, dict) and status.get("error")]
-    if status_errors:
+    if fatal_errors:
         row_status = "error"
     gap_rate = Decimal(str(plans[0].get("grid_gap", "0"))) if plans else Decimal("0")
     buy_sizes = [Decimal(str(plan.get("grid_buy_size", plan["size"]))) for plan in plans]
@@ -2570,7 +2797,9 @@ def build_grid_batch_row(
         "raw_coin": args.coin,
         "dex": dex,
         "side": "grid",
+        "position_limit_mode": getattr(args, "grid_position_limit_mode", "abs"),
         "max_position_value": decimal_to_plain(max_position_value),
+        "min_order_value": decimal_to_plain(grid_min_notional(args)),
         "gap": " ".join(grid_gap_spec(args)),
         "gap_rate": decimal_to_plain(gap_rate),
         "trend": args.trend or "0",
@@ -2593,7 +2822,8 @@ def print_grid_batch_status(row: dict[str, Any], price_rate: Decimal | None) -> 
     rows = [
         ("coin", str(row.get("coin", ""))),
         ("status", str(row.get("status", ""))),
-        ("max", str(row.get("max_position_value", ""))),
+        ("limit", f"{grid_limit_policy_from_row(row)} {row.get('max_position_value', '')}"),
+        ("min", str(row.get("min_order_value", MIN_NOTIONAL))),
         ("gap", str(row.get("gap", ""))),
         ("orders", str(len(row.get("levels") or []))),
         ("open_oids", str(len(open_oids))),
@@ -3085,11 +3315,15 @@ def modify_grid_batch_order(
     index = matching_indexes[0]
     row = batch_rows[index]
     now = int(time.time())
-    regrid = bool(args.gap or args.trend)
+    regrid = bool(args.gap or args.trend or args.grid_min is not None)
     updates: list[tuple[str, str]] = []
-    if args.grid_max is not None:
-        row["max_position_value"] = decimal_to_plain(Decimal(args.grid_max))
-        updates.append(("max", row["max_position_value"]))
+    if args.grid_position_limit_value is not None:
+        row["position_limit_mode"] = str(args.grid_position_limit_mode)
+        row["max_position_value"] = decimal_to_plain(Decimal(str(args.grid_position_limit_value)))
+        updates.append(("limit", f"{row['position_limit_mode']} {row['max_position_value']}"))
+    if args.grid_min is not None:
+        row["min_order_value"] = decimal_to_plain(grid_min_notional(args))
+        updates.append(("min", row["min_order_value"]))
     if args.gap:
         gap = resolve_grid_spacing(args, info, account, asset, dex, current_mid or Decimal("1"))
         row["gap"] = " ".join(grid_gap_spec(args))
@@ -3133,7 +3367,11 @@ def modify_grid_batch_order(
                 level["status"] = "cancelled"
                 level["cancelled_at"] = now
 
-        max_position_value = Decimal(str(row.get("max_position_value") or args.grid_max))
+        args.grid_position_limit_mode = grid_limit_policy_from_row(row)
+        args.grid_position_limit_value = str(row.get("max_position_value"))
+        if args.grid_min is None and row.get("min_order_value") is not None:
+            args.grid_min = str(row.get("min_order_value"))
+        max_position_value = Decimal(str(row.get("max_position_value") or args.grid_position_limit_value))
         plans = build_grid_orders(args, info, account, dex, exchange, coin, asset, max_position_value, current_mid, slippage)
         statuses = submit_order_plans(
             exchange,
@@ -3257,6 +3495,7 @@ def build_recovered_grid_batch_row(
             sz_decimals,
             buy_px,
             sell_px,
+            grid_min_notional(args),
         )
         if buy_size <= 0:
             buy_size = inferred_buy_size
@@ -3279,7 +3518,9 @@ def build_recovered_grid_batch_row(
         "raw_coin": args.coin,
         "dex": dex,
         "side": "grid",
+        "position_limit_mode": getattr(args, "grid_position_limit_mode", "abs"),
         "max_position_value": decimal_to_plain(max_position_value),
+        "min_order_value": decimal_to_plain(grid_min_notional(args)),
         "gap": " ".join(grid_gap_spec(args)),
         "gap_rate": decimal_to_plain(gap_rate),
         "trend": args.trend or "0",
@@ -3313,7 +3554,7 @@ def recover_grid_batch_order(
     existing = grid_batch_indexes(load_server_batch(), args.network, account, coin, {"active", "error"})
     if existing:
         raise ValueError(f"active grid batch already exists for {coin}; use --modify or --cancel grid first")
-    max_position_value = Decimal(str(args.grid_max))
+    max_position_value = Decimal(str(args.grid_position_limit_value))
     gap_rate = resolve_grid_spacing(args, info, account, asset, dex, current_mid)
     orders = select_grid_recovery_orders(
         recoverable_grid_open_orders(info, account, dex, coin, args.network),
@@ -3997,6 +4238,9 @@ def place_ladder_orders(
 
 def place_order(args: argparse.Namespace) -> None:
     if args.query:
+        if args.grid and args.coin:
+            query_grid(args)
+            return
         query_account(args)
         return
 
@@ -4026,6 +4270,10 @@ def place_order(args: argparse.Namespace) -> None:
             or args.stop_loss
             or args.total_amount
             or args.grid_max
+            or args.grid_long
+            or args.grid_short
+            or args.grid_abs
+            or args.grid_min
             or args.grid_modify
             or args.grid_recover
             or args.symmetric_offset
@@ -4499,7 +4747,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("amount", nargs="?", help="USD notional. Default: 10.")
     parser.add_argument("--total", dest="total_amount", help="Total USD notional. Ladder and symmetric orders divide it across legs.")
-    parser.add_argument("--max", dest="grid_max", help="Grid maximum absolute position value in USD.")
+    parser.add_argument("--max", dest="grid_max", help=argparse.SUPPRESS)
+    parser.add_argument("--long", dest="grid_long", help="Grid long-only maximum position value in USD.")
+    parser.add_argument("--short", dest="grid_short", help="Grid short-only maximum position value in USD.")
+    parser.add_argument("--abs", dest="grid_abs", help="Grid absolute maximum position value in USD.")
+    parser.add_argument("--min", dest="grid_min", help="Grid minimum value per child order in USD. Default: exchange minimum.")
     parser.add_argument("--modify", dest="grid_modify", action="store_true", help="Modify an active server grid for this coin.")
     parser.add_argument("--recover", dest="grid_recover", action="store_true", help="Recover a server grid from current open limit orders for this coin.")
     parser.add_argument("--price", help="Limit price. Defaults to same-side book level 10.")
@@ -4508,7 +4760,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gap",
         nargs="+",
-        help="Grid trigger spacing and optional same-side limit offset. Default: min price tick percent and effective taker fee. E.g. 0.15%% 0.05%% or 0.15%%+-0.05%%.",
+        help="Grid spacing. Default: min price tick percent + effective taker fee + effective maker fee. E.g. 0.15%%.",
     )
     parser.add_argument("--market", action="store_true", help="Submit as a market order using IOC with slippage protection.")
     parser.add_argument("--slippage", default=DEFAULT_SLIPPAGE, help="Market slippage protection. Default: 0.05. Also accepts 5%%.")
@@ -4765,7 +5017,7 @@ def parse_args() -> argparse.Namespace:
         args.ladder_mode = "while"
         args.ladder_step = unprotect_ladder_step_value(step_text)
     if args.range_spec and args.grid:
-        parser.error("grid no longer uses --range; use --max and --gap")
+        parser.error("grid no longer uses --range; use --gap with one of --long, --short, or --abs")
     elif args.range_spec and not combined_range_count_to_end and args.cancel is None:
         if len(args.range_spec) != 3:
             parser.error("--range requires START END STEP unless combined as --range START END --for COUNT")
@@ -4785,32 +5037,44 @@ def parse_args() -> argparse.Namespace:
         args.range_spec = [decimal_to_plain(start_px), decimal_to_plain(args.ladder_end), args.ladder_step]
     if args.symmetric_offset and not args.symmetric:
         parser.error("--offset requires side both/sym/对称")
-    if (args.trend or args.gap) and not args.grid:
-        parser.error("--trend and --gap require side grid")
+    if (args.trend or args.gap or args.grid_min) and not args.grid:
+        parser.error("--trend, --gap, and --min require side grid")
     if args.grid:
         if args.grid_modify and args.grid_recover:
             parser.error("grid --modify and --recover are mutually exclusive")
         if args.total_amount is not None:
-            parser.error("grid no longer uses --total; use --max for maximum absolute position value")
+            parser.error("grid no longer uses --total; use one of --long, --short, or --abs")
         if args.amount and args.amount != "10":
-            parser.error("grid no longer uses positional amount; use --max")
-        if not args.grid_modify and not args.grid_max:
-            parser.error("grid orders require --max")
-        if args.grid_recover and not args.grid_max:
-            parser.error("grid --recover requires --max")
+            parser.error("grid no longer uses positional amount; use one of --long, --short, or --abs")
+        if args.grid_max is not None:
+            parser.error("grid no longer uses --max; use one of --long, --short, or --abs")
+        selected_grid_limits = [
+            value for value in (args.grid_long, args.grid_short, args.grid_abs) if value is not None
+        ]
+        if len(selected_grid_limits) > 1:
+            parser.error("grid accepts only one of --long, --short, or --abs")
+        if not args.query and not args.grid_modify and not selected_grid_limits:
+            parser.error("grid orders require one of --long, --short, or --abs")
+        if args.grid_recover and not selected_grid_limits:
+            parser.error("grid --recover requires one of --long, --short, or --abs")
         try:
             if args.gap:
                 parse_grid_gap(args.gap)
             parse_percent_decimal(args.trend or "0", "--trend", allow_signed=True)
-            if args.grid_max is not None:
-                grid_max = Decimal(args.grid_max)
-                if not grid_max.is_finite() or grid_max <= 0:
-                    parser.error("--max must be positive")
+            policy, limit_value = grid_limit_arg(args)
+            args.grid_position_limit_mode = policy
+            args.grid_position_limit_value = limit_value
+            if limit_value is not None:
+                grid_limit = Decimal(limit_value)
+                if not grid_limit.is_finite() or grid_limit <= 0:
+                    parser.error(f"--{policy} must be positive")
+            if args.grid_min is not None:
+                grid_min_notional(args)
         except ValueError as exc:
             parser.error(str(exc))
         except InvalidOperation:
-            parser.error("--max must be a positive number")
-        args.amount = args.grid_max or "10"
+            parser.error("grid limit and --min must be positive numbers")
+        args.amount = args.grid_position_limit_value or "10"
     if args.symmetric:
         if not args.symmetric_offset:
             parser.error("symmetric orders require --offset")
