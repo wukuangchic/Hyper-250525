@@ -496,6 +496,40 @@ def nearest_active_price(row: dict[str, Any], side: str) -> Decimal | None:
     return max(prices) if side == "buy" else min(prices)
 
 
+def min_grid_spacing(row: dict[str, Any], price: Decimal) -> Decimal:
+    return price * Decimal(str(row["gap_rate"])) * Decimal("0.75")
+
+
+def active_price_too_close(row: dict[str, Any], side: str, price: Decimal) -> bool:
+    for entry in active_grid_entries(row, side):
+        existing = decimal_or_none(entry.get("price", entry.get("limit_px")))
+        if existing is None or existing <= 0:
+            continue
+        if abs(existing - price) < min_grid_spacing(row, price):
+            return True
+    return False
+
+
+def dense_grid_entries(row: dict[str, Any]) -> list[dict[str, Any]]:
+    dense: list[dict[str, Any]] = []
+    for side in ("buy", "sell"):
+        entries = [
+            entry
+            for entry in active_grid_entries(row, side)
+            if (decimal_or_none(entry.get("price", entry.get("limit_px"))) or Decimal("0")) > 0
+        ]
+        reverse = side == "buy"
+        entries.sort(key=lambda entry: decimal_or_none(entry.get("price", entry.get("limit_px"))) or Decimal("0"), reverse=reverse)
+        kept_prices: list[Decimal] = []
+        for entry in entries:
+            price = decimal_or_none(entry.get("price", entry.get("limit_px"))) or Decimal("0")
+            if any(abs(price - kept) < min_grid_spacing(row, price) for kept in kept_prices):
+                dense.append(entry)
+                continue
+            kept_prices.append(price)
+    return dense
+
+
 def next_depth_order(
     row: dict[str, Any],
     coin: str,
@@ -777,6 +811,12 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         refreshed = cancel_grid_entries(exchange, coin, to_refresh, now, "refresh_reduce_only")
         changed = True
 
+    deduped = 0
+    to_dedup = dense_grid_entries(row)
+    if to_dedup:
+        deduped = cancel_grid_entries(exchange, coin, to_dedup, now, "dedup_dense")
+        changed = True
+
     near_regrids = 0
     for side in ("buy", "sell"):
         reference_px = grid_reference_price(side, current_mid, best_bid, best_ask)
@@ -792,6 +832,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             policy,
         )
         if near_order is not None:
+            if active_price_too_close(row, side, Decimal(str(near_order["price"]))):
+                continue
             submitted = submit_grid_order_entry(exchange, coin, near_order, now, row, asset, position_size, policy)
             if submitted:
                 levels.append(near_order)
@@ -806,6 +848,9 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             continue
         replacement = replacement_order_from_fill(row, coin, asset, fill, bool(entry.get("is_buy")), position_size, position_value, max_position_value, policy)
         if replacement is None:
+            continue
+        if active_price_too_close(row, str(replacement["side"]), Decimal(str(replacement["price"]))):
+            changed = True
             continue
         order_notional = Decimal(str(replacement["size"])) * Decimal(str(replacement["price"]))
         if not grid_order_allowed_by_max(position_size, projected_position_value, bool(replacement["is_buy"]), order_notional, max_position_value, policy):
@@ -832,6 +877,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             topup = next_depth_order(row, coin, asset, side, current_mid, position_size, position_value, max_position_value, policy, reference_px)
             if topup is None:
                 break
+            if active_price_too_close(row, side, Decimal(str(topup["price"]))):
+                break
             order_notional = Decimal(str(topup["size"])) * Decimal(str(topup["price"]))
             if not grid_order_allowed_by_max(position_size, projected_position_value, bool(topup["is_buy"]), order_notional, max_position_value, policy):
                 topup["status"] = "paused_max"
@@ -856,6 +903,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         order_notional = Decimal(str(entry.get("size"))) * Decimal(str(entry.get("price", entry.get("limit_px"))))
         if not grid_order_allowed_by_max(position_size, projected_position_value, bool(entry.get("is_buy")), order_notional, max_position_value, policy):
             continue
+        if active_price_too_close(row, str(entry["side"]), Decimal(str(entry.get("price", entry.get("limit_px"))))):
+            continue
         if not submit_grid_order_entry(exchange, coin, entry, now, row, asset, position_size, policy):
             changed = True
             continue
@@ -878,7 +927,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     row["open_oids"] = sorted(grid_batch_open_oids(row))
     row["note"] = (
         f"grid maintained; replacements={replacements}; topped_up={topped_up}; "
-        f"paused={paused}; refreshed={refreshed}; restored={restored}; trimmed={trimmed}; near_regrids={near_regrids}; "
+        f"paused={paused}; refreshed={refreshed}; deduped={deduped}; restored={restored}; trimmed={trimmed}; near_regrids={near_regrids}; "
         f"recovered_missing={recovered_missing}"
     )
     return (
@@ -888,6 +937,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         or topped_up > 0
         or paused > 0
         or refreshed > 0
+        or deduped > 0
         or restored > 0
         or trimmed > 0
         or near_regrids > 0
