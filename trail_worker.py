@@ -44,6 +44,7 @@ LOCK_PATH = Path(__file__).resolve().parent / "server_batch.lock"
 RATE_LIMIT_LOG_PATH = Path(__file__).resolve().parent / "logs" / "trail-rate-limit.jsonl"
 DONE_RETENTION_DAYS = 7
 DONE_RETENTION_MAX = 500
+GRID_FILL_LOOKBACK_SECONDS = 24 * 60 * 60
 TRANSIENT_STATUS_CODES = {429, 502, 503, 504}
 
 
@@ -367,6 +368,23 @@ def cancel_grid_entries(exchange: Any, coin: str, entries: list[dict[str, Any]],
     return len(cancelled)
 
 
+def trim_excess_grid_entries(exchange: Any, coin: str, row: dict[str, Any], target_per_side: int, now: int) -> int:
+    trimmed = 0
+    for side in ("buy", "sell"):
+        entries = active_grid_entries(row, side)
+        if len(entries) <= target_per_side:
+            continue
+
+        def price_key(entry: dict[str, Any]) -> Decimal:
+            return decimal_or_none(entry.get("price", entry.get("limit_px"))) or Decimal("0")
+
+        # Buy orders farther from the market have lower prices; sell orders farther from
+        # the market have higher prices. Cancel those first when a near-side order is added.
+        farthest_first = sorted(entries, key=price_key, reverse=side == "sell")
+        trimmed += cancel_grid_entries(exchange, coin, farthest_first[: len(entries) - target_per_side], now, "trimmed_excess")
+    return trimmed
+
+
 def maintain_grid(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     info, exchange, account, _signer, _role = build_clients(
         str(row.get("network") or "mainnet"),
@@ -378,7 +396,7 @@ def maintain_grid(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     now = int(time.time())
     now_ms = now * 1000
     start_ms = int(row.get("last_fill_check_ms") or (now - 24 * 60 * 60) * 1000)
-    start_ms = max(0, start_ms - 5 * 60 * 1000)
+    start_ms = max(0, min(start_ms - 5 * 60 * 1000, (now - GRID_FILL_LOOKBACK_SECONDS) * 1000))
     max_position_value = Decimal(str(row["max_position_value"]))
     mids = info.all_mids(dex)
     current_mid = Decimal(str(mids[coin]))
@@ -492,14 +510,18 @@ def maintain_grid(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         restored += 1
         changed = True
 
+    trimmed = trim_excess_grid_entries(exchange, coin, row, target_per_side, now)
+    if trimmed:
+        changed = True
+
     row["status"] = "active"
     row["updated_at"] = now
     row["last_fill_check_ms"] = now_ms
     row["position_value"] = decimal_to_plain(position_value)
     row["position_size"] = decimal_to_plain(position_size)
     row["open_oids"] = sorted(grid_batch_open_oids(row))
-    row["note"] = f"grid maintained; replacements={replacements}; topped_up={topped_up}; paused={paused}; restored={restored}"
-    return row, changed or replacements > 0 or topped_up > 0 or paused > 0 or restored > 0
+    row["note"] = f"grid maintained; replacements={replacements}; topped_up={topped_up}; paused={paused}; restored={restored}; trimmed={trimmed}"
+    return row, changed or replacements > 0 or topped_up > 0 or paused > 0 or restored > 0 or trimmed > 0
 
 
 def prune_done_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:

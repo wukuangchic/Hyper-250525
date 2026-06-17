@@ -69,7 +69,7 @@ BTC sell --reduce-only
 
 # 服务器跟踪止损：先按当前 mid 回撤 2% 挂 stop，并写入 server_batch.json 的 trail 任务
 BTC sell 50 --trail 2%
-# systemd/simple-hyper-trail-worker.timer 可在服务器上每 10 秒运行一次 trail_worker.py
+# systemd/simple-hyper-trail-worker.timer 可在服务器上每分钟运行一次 trail_worker.py
 # query 会在 Server Batch 里展示 trail 任务，并避免和 Open Orders 重复显示
 # 取消 trail 会先撤链上 stop 单，再把 server_batch.json 标记为 cancelled
 BTC --cancel trail
@@ -175,6 +175,7 @@ BTC grid --max 300 --gap 0.5%
 BTC grid --max 300
 BTC grid --modify --max 500
 BTC grid --modify --gap 0.3%
+BTC grid --recover --max 300 --gap 0.5%
 BTC --cancel grid
 ```
 
@@ -188,6 +189,9 @@ BTC --cancel grid
 - 到达 `--max` 后，worker 会撤销继续加仓方向的 grid 单，只保留/恢复减仓方向；仓位降到能容纳下一张单后，再把加仓方向补回到最多 5 张。
 - `BTC grid --modify --max 500` 只更新最大仓位配置。
 - `BTC grid --modify --gap 0.3%` 或 `BTC grid --modify --trend 0` 会取消当前活跃 grid 挂单，并按当前 mid 和新配置重新铺买卖两边各 5 张。
+- `BTC grid --recover --max 300 --gap 0.5%` 会从当前该币普通 limit open orders 里按近侧最多每边 5 张接管到 `server_batch.json`，用于服务器断点或 JSON 丢失后的人工恢复。
+- worker 每次至少回看最近 24 小时成交记录；如果 `last_fill_check_ms` 更早，会从更早的断点继续查。
+- worker 只维护 `server_batch.json` 里记录的 oid；手动下的新单不会被自动接管。
 - 如果 worker 发现 grid oid 消失但最近成交记录里找不到对应 fill，会把该网格标为 `error`，避免手动取消后又被误补。
 - 取消服务器维护的网格和所有活跃子单：`BTC --cancel grid`。
 
@@ -222,10 +226,10 @@ BTC --cancel trail
 
 服务器定时：
 
-- `systemd/simple-hyper-trail-worker.timer` 默认每 10 秒触发一次 `trail_worker.py`。
-- `trail_worker.py` 是 one-shot：每次只处理当前 `active` trail 任务，处理完即退出。
-- 如果上一轮运行超过 10 秒，文件锁会让下一轮直接跳过，避免并发改同一批订单。
-- 没有 `active` 任务时，worker 只打印 `trail_worker: no active trail orders`，不会查询价格或订单。
+- `systemd/simple-hyper-trail-worker.timer` 默认每分钟触发一次 `trail_worker.py`。
+- `trail_worker.py` 是 one-shot：每次处理当前 `active` trail/grid 任务，处理完即退出。
+- 如果上一轮运行超过 1 分钟，文件锁会让下一轮直接跳过，避免并发改同一批订单。
+- 没有 `active` 任务时，worker 只打印 `trail_worker: no active trail/grid orders`，不会查询价格或订单。
 
 查询和取消：
 

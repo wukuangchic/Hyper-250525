@@ -1,9 +1,9 @@
 [Unit]
-Description=Run Simple-Hyper trail worker every 10 seconds
+Description=Run Simple-Hyper trail/grid worker every minute
 
 [Timer]
-OnBootSec=10s
-OnUnitActiveSec=10s
+OnBootSec=60s
+OnUnitActiveSec=60s
 AccuracySec=1s
 Persistent=false
 Unit=simple-hyper-trail-worker.service

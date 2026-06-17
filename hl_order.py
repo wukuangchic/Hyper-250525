@@ -3163,6 +3163,176 @@ def modify_grid_batch_order(
     print_grid_batch_status(row, price_rate)
 
 
+def recoverable_grid_open_orders(
+    info: Info,
+    account: str,
+    dex: str,
+    coin: str,
+    network: str,
+) -> list[dict[str, Any]]:
+    batch_oids = active_server_batch_oids(load_server_batch(), network, account, coin)
+    orders: list[dict[str, Any]] = []
+    for order in collect_frontend_open_orders(info, account, dex):
+        if not position_matches_coin(str(order.get("coin", "")), coin):
+            continue
+        if order.get("isTrigger") or decimal_or_none(order.get("triggerPx")) not in {None, Decimal("0")}:
+            continue
+        try:
+            oid = int(order["oid"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if oid in batch_oids:
+            continue
+        price = decimal_or_none(order.get("limitPx"))
+        size = decimal_or_none(order.get("sz", order.get("origSz")))
+        if price is None or price <= 0 or size is None or size <= 0:
+            continue
+        side = str(order.get("side", "")).strip().upper()
+        if side not in {"B", "A"}:
+            continue
+        orders.append({**order, "oid": oid, "_price": price, "_size": size, "_is_buy": side == "B"})
+    return orders
+
+
+def select_grid_recovery_orders(orders: list[dict[str, Any]], target_per_side: int) -> list[dict[str, Any]]:
+    buys = sorted((order for order in orders if order["_is_buy"]), key=lambda order: order["_price"], reverse=True)
+    sells = sorted((order for order in orders if not order["_is_buy"]), key=lambda order: order["_price"])
+    return buys[:target_per_side] + sells[:target_per_side]
+
+
+def build_recovered_grid_batch_row(
+    args: argparse.Namespace,
+    account: str,
+    coin: str,
+    dex: str,
+    asset: dict[str, Any],
+    orders: list[dict[str, Any]],
+    max_position_value: Decimal,
+    gap_rate: Decimal,
+    slippage: Decimal,
+    current_mid: Decimal,
+) -> dict[str, Any]:
+    now = int(time.time())
+    levels: list[dict[str, Any]] = []
+    for index, order in enumerate(orders, start=1):
+        is_buy = bool(order["_is_buy"])
+        side = "buy" if is_buy else "sell"
+        plan = build_grid_limit_order_plan(
+            coin,
+            is_buy,
+            Decimal(str(order["_size"])),
+            Decimal(str(order["_price"])),
+            asset,
+            bool(order.get("reduceOnly", False)),
+            side,
+        )
+        plan["grid_gap"] = gap_rate
+        levels.append(
+            {
+                "index": index,
+                "side": side,
+                "status": "active",
+                "oid": int(order["oid"]),
+                "is_buy": is_buy,
+                "limit_px": decimal_to_plain(Decimal(str(order["_price"]))),
+                "price": decimal_to_plain(Decimal(str(order["_price"]))),
+                "size": decimal_to_plain(Decimal(str(order["_size"]))),
+                "mode": "grid-limit",
+                "reduce_only": bool(order.get("reduceOnly", False)),
+                "recovered_at": now,
+                "plan": plan,
+            }
+        )
+
+    buy_sizes = [Decimal(str(order["_size"])) for order in orders if order["_is_buy"]]
+    sell_sizes = [Decimal(str(order["_size"])) for order in orders if not order["_is_buy"]]
+    buy_size = buy_sizes[0] if buy_sizes else Decimal("0")
+    sell_size = sell_sizes[0] if sell_sizes else Decimal("0")
+    if buy_size <= 0 or sell_size <= 0:
+        sz_decimals = int(asset["szDecimals"])
+        buy_px = rounded_perp_price(current_mid * (Decimal("1") - gap_rate), sz_decimals)
+        sell_px = rounded_perp_price(current_mid * (Decimal("1") + gap_rate), sz_decimals)
+        inferred_buy_size, inferred_sell_size = grid_limit_size_pair_for_trend(
+            parse_percent_decimal(args.trend or "0", "--trend", allow_signed=True),
+            sz_decimals,
+            buy_px,
+            sell_px,
+        )
+        if buy_size <= 0:
+            buy_size = inferred_buy_size
+        if sell_size <= 0:
+            sell_size = inferred_sell_size
+    actual_trend = "0%"
+    if buy_size > 0 and sell_size > 0:
+        if buy_size > sell_size:
+            actual_trend = format_signed_percent(buy_size / sell_size - Decimal("1"))
+        elif sell_size > buy_size:
+            actual_trend = format_signed_percent(-(sell_size / buy_size - Decimal("1")))
+
+    return {
+        "id": f"{now}-grid-{coin}-recovered",
+        "type": "grid",
+        "status": "active",
+        "network": args.network,
+        "account": account,
+        "coin": coin,
+        "raw_coin": args.coin,
+        "dex": dex,
+        "side": "grid",
+        "max_position_value": decimal_to_plain(max_position_value),
+        "gap": " ".join(grid_gap_spec(args)),
+        "gap_rate": decimal_to_plain(gap_rate),
+        "trend": args.trend or "0",
+        "actual_trend": actual_trend,
+        "target_orders_per_side": GRID_TARGET_ORDERS_PER_SIDE,
+        "buy_size": decimal_to_plain(buy_size),
+        "sell_size": decimal_to_plain(sell_size),
+        "slippage": decimal_to_plain(slippage),
+        "sz_decimals": int(asset["szDecimals"]),
+        "created_at": now,
+        "updated_at": now,
+        "last_fill_check_ms": (now - 24 * 60 * 60) * 1000,
+        "levels": levels,
+        "note": "recovered from open limit orders",
+    }
+
+
+def recover_grid_batch_order(
+    args: argparse.Namespace,
+    info: Info,
+    account: str,
+    coin: str,
+    dex: str,
+    asset: dict[str, Any],
+    current_mid: Decimal | None,
+    slippage: Decimal,
+    price_rate: Decimal | None,
+) -> None:
+    if current_mid is None:
+        raise ValueError(f"No mid price found for {coin}, cannot recover grid")
+    existing = grid_batch_indexes(load_server_batch(), args.network, account, coin, {"active", "error"})
+    if existing:
+        raise ValueError(f"active grid batch already exists for {coin}; use --modify or --cancel grid first")
+    max_position_value = Decimal(str(args.grid_max))
+    gap_rate = resolve_grid_spacing(args, info, account, asset, dex, current_mid)
+    orders = select_grid_recovery_orders(
+        recoverable_grid_open_orders(info, account, dex, coin, args.network),
+        GRID_TARGET_ORDERS_PER_SIDE,
+    )
+    if not orders:
+        print_account_metrics(info, account)
+        print_box("Grid Recover", [("coin", coin), ("matched", "0")])
+        return
+    row = build_recovered_grid_batch_row(args, account, coin, dex, asset, orders, max_position_value, gap_rate, slippage, current_mid)
+    if args.dry_run or args.explain:
+        print_account_metrics(info, account)
+        print_box("Grid Recover", [("dry_run", "1" if args.dry_run else "0"), ("coin", coin), ("matched", str(len(orders)))])
+        print_grid_batch_status(row, price_rate)
+        return
+    append_server_batch(row)
+    print_grid_batch_status(row, price_rate)
+
+
 def mark_cancelled_server_batch_oids(
     network: str,
     account: str,
@@ -3857,6 +4027,7 @@ def place_order(args: argparse.Namespace) -> None:
             or args.total_amount
             or args.grid_max
             or args.grid_modify
+            or args.grid_recover
             or args.symmetric_offset
             or args.ladder_mode
             or args.scale
@@ -3914,6 +4085,19 @@ def place_order(args: argparse.Namespace) -> None:
         return
 
     if args.grid:
+        if args.grid_recover:
+            recover_grid_batch_order(
+                args,
+                info,
+                account,
+                coin,
+                dex,
+                asset,
+                current_mid,
+                slippage,
+                price_rate,
+            )
+            return
         if args.grid_modify:
             modify_grid_batch_order(
                 args,
@@ -4317,6 +4501,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--total", dest="total_amount", help="Total USD notional. Ladder and symmetric orders divide it across legs.")
     parser.add_argument("--max", dest="grid_max", help="Grid maximum absolute position value in USD.")
     parser.add_argument("--modify", dest="grid_modify", action="store_true", help="Modify an active server grid for this coin.")
+    parser.add_argument("--recover", dest="grid_recover", action="store_true", help="Recover a server grid from current open limit orders for this coin.")
     parser.add_argument("--price", help="Limit price. Defaults to same-side book level 10.")
     parser.add_argument("--offset", dest="symmetric_offset", help="Symmetric order distance from base price, e.g. 2%% or 1500.")
     parser.add_argument("--trend", help="Grid quantity tilt. Default: 0. Positive makes buy size larger, negative makes sell size larger, e.g. 10%% or -10%%.")
@@ -4603,12 +4788,16 @@ def parse_args() -> argparse.Namespace:
     if (args.trend or args.gap) and not args.grid:
         parser.error("--trend and --gap require side grid")
     if args.grid:
+        if args.grid_modify and args.grid_recover:
+            parser.error("grid --modify and --recover are mutually exclusive")
         if args.total_amount is not None:
             parser.error("grid no longer uses --total; use --max for maximum absolute position value")
         if args.amount and args.amount != "10":
             parser.error("grid no longer uses positional amount; use --max")
         if not args.grid_modify and not args.grid_max:
             parser.error("grid orders require --max")
+        if args.grid_recover and not args.grid_max:
+            parser.error("grid --recover requires --max")
         try:
             if args.gap:
                 parse_grid_gap(args.gap)
