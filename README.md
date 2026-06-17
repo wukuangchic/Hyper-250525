@@ -70,6 +70,9 @@ BTC sell --reduce-only
 # 服务器跟踪止损：先按当前 mid 回撤 2% 挂 stop，并写入 server_batch.json 的 trail 任务
 BTC sell 50 --trail 2%
 # systemd/simple-hyper-trail-worker.timer 可在服务器上每 10 秒运行一次 trail_worker.py
+# query 会在 Server Batch 里展示 trail 任务，并避免和 Open Orders 重复显示
+# 取消 trail 会先撤链上 stop 单，再把 server_batch.json 标记为 cancelled
+BTC --cancel trail
 
 # 取消 BTC 所有挂单
 BTC --cancel
@@ -188,6 +191,62 @@ BTC grid --total 300 --explain
 - 当前价以上：买入单用 `stop`，卖出单用 `take`。
 - 数量会按最低限价保证每笔至少 `10` 美元，再按最高风险侧计算 `--total` 能铺多少格。
 - 带 `--trend` 时，如果数量精度会把实际比例放大，程序会提高单笔数量并减少格数，优先让实际比例贴近 `--trend`。
+
+## 服务器 Trail 单
+
+`--trail` 是由本工具维护的服务器跟踪止损，不是 Hyperliquid 原生 trailing stop。下单时会先提交一张 stop market 触发单，再把任务写入 `server_batch.json`，后续由 `trail_worker.py` 定时检查价格并修改 stop 触发价。
+
+```bash
+# 按当前 mid 回撤 2% 做跟踪卖出
+BTC sell 50 --trail 2%
+
+# 允许反手开空；如果只想减仓，显式加 reduce-only
+BTC sell 50 --trail 2% --reduce-only
+
+# 查看账户时会展示 Server Batch
+query
+BTC
+
+# 取消当前 BTC 的 trail 任务
+BTC --cancel trail
+```
+
+运行逻辑：
+
+- `--trail` 不和 `--price` 混用，锚定价始终用下单时的当前 mid。
+- `BTC sell 50 --trail 2%` 会先按 `mid * (1 - 2%)` 挂 stop market；价格继续上涨时，worker 会抬高 stop。
+- `BTC buy 50 --trail 2%` 会先按 `mid * (1 + 2%)` 挂 stop market；价格继续下跌时，worker 会压低 stop。
+- `amount` 在任务创建后固定，后续只改 stop 触发价，不重新计算金额。
+- `reduce_only` 默认是 `False`，允许开仓、减仓或反手；要保护已有仓位时请加 `--reduce-only`。
+- 如果原 stop 单已经成交或不再 open，worker 会把任务标记为 `done`。
+- `done` 记录最多保留 7 天或 500 条，避免历史记录无限膨胀。
+
+服务器定时：
+
+- `systemd/simple-hyper-trail-worker.timer` 默认每 10 秒触发一次 `trail_worker.py`。
+- `trail_worker.py` 是 one-shot：每次只处理当前 `active` trail 任务，处理完即退出。
+- 如果上一轮运行超过 10 秒，文件锁会让下一轮直接跳过，避免并发改同一批订单。
+- 没有 `active` 任务时，worker 只打印 `trail_worker: no active trail orders`，不会查询价格或订单。
+
+查询和取消：
+
+- `query` / `BTC` 会读取 `server_batch.json`，在 `Server Batch` 表里展示 trail 状态。
+- 属于 active/error trail 的 oid 会从 `Open Orders` 表中过滤掉，避免重复显示。
+- `BTC --cancel trail` 会匹配 `active` 和 `error` 状态的 trail 任务，先撤链上订单，再把 batch 标为 `cancelled`。
+- 普通 `BTC --cancel` 如果撤到了 batch 里的 oid，也会同步把对应任务标为 `cancelled`。
+
+状态含义：
+
+- `active`：worker 会继续跟踪。
+- `done`：链上订单已不再 open，通常是已成交或被外部撤掉。
+- `cancelled`：由本工具撤单并停止跟踪。
+- `error`：非临时错误，需要人工查看 `error` 字段后处理。
+
+临时限流：
+
+- Hyperliquid / CloudFront 返回 `429/502/503/504` 时，worker 不会把任务停成 `error`。
+- 这类错误会保留任务 `active`，写入 `last_error`，并在下一轮继续重试。
+- 限流日志追加到 `logs/trail-rate-limit.jsonl`，每行一个 JSON，后续可按 `status_code`、`oid`、`coin` 统计频次。
 
 ## 触发单和止盈止损
 
@@ -467,6 +526,12 @@ journalctl -u simple-hyper-sync.service -n 80 --no-pager
 logs/
 ```
 
+服务器 trail 限流日志：
+
+```text
+logs/trail-rate-limit.jsonl
+```
+
 排错时可以加：
 
 ```bash
@@ -480,9 +545,11 @@ BTC buy --dry-run --verbose
 ```text
 hl_order.py              # 下单 / 查询主入口
 hl_markets.py            # 标的查询入口
+trail_worker.py          # server_batch.json 的 trail 任务维护器
 simple_hyper/            # 可复用 Python 业务代码
 simple_hyper_server.py   # 手机网页控制台
 coin_aliases.csv         # 本地标的别名
+server_batch.json        # 本地/服务器运行时 batch 状态，不提交 Git
 scripts/                 # 运维脚本
 systemd/                 # systemd 单元
 requirements.txt         # Python 依赖
