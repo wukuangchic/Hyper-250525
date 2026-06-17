@@ -1561,7 +1561,12 @@ def grid_entry_sort_key(entry: dict[str, Any]) -> tuple[int, Decimal, int]:
 
 def format_grid_detail_rows(row: dict[str, Any], open_oids: set[int]) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
-    for entry in sorted((item for item in row.get("levels") or [] if isinstance(item, dict) and item.get("side")), key=grid_entry_sort_key):
+    entries = [item for item in row.get("levels") or [] if isinstance(item, dict) and item.get("side")]
+    live_statuses = {"active", "pending", "paused_max", "paused_margin"}
+    live_entries = [entry for entry in entries if str(entry.get("status", "active")) in live_statuses]
+    history_entries = [entry for entry in entries if str(entry.get("status", "active")) not in live_statuses]
+    history_entries = sorted(history_entries, key=lambda entry: int(entry.get("submitted_at") or entry.get("recovered_at") or entry.get("filled_at") or entry.get("cancelled_at") or entry.get("skipped_at") or entry.get("paused_at") or 0))[-120:]
+    for entry in sorted(live_entries + history_entries, key=grid_entry_sort_key):
         try:
             oid = int(entry.get("oid") or 0)
         except (TypeError, ValueError):

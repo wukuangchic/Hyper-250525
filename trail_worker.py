@@ -48,6 +48,7 @@ LOCK_PATH = Path(__file__).resolve().parent / "server_batch.lock"
 RATE_LIMIT_LOG_PATH = Path(__file__).resolve().parent / "logs" / "trail-rate-limit.jsonl"
 DONE_RETENTION_DAYS = 7
 DONE_RETENTION_MAX = 500
+GRID_LEVEL_HISTORY_MAX = 120
 GRID_FILL_LOOKBACK_SECONDS = 24 * 60 * 60
 TRANSIENT_STATUS_CODES = {429, 502, 503, 504}
 TRANSIENT_ERROR_TEXTS = (
@@ -888,6 +889,64 @@ def prune_done_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], b
     return pruned, len(pruned) != len(rows)
 
 
+def grid_level_updated_at(entry: dict[str, Any]) -> int:
+    for key in (
+        "submitted_at",
+        "recovered_at",
+        "filled_at",
+        "cancelled_at",
+        "skipped_at",
+        "paused_at",
+        "resized_min_notional_at",
+        "resized_min_retry_at",
+    ):
+        value = entry.get(key)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def prune_grid_levels(row: dict[str, Any]) -> bool:
+    if row.get("type") != "grid":
+        return False
+    levels = row.get("levels")
+    if not isinstance(levels, list):
+        return False
+
+    keep_statuses = {"active", "pending", "paused_max", "paused_margin"}
+    live_levels: list[dict[str, Any]] = []
+    history_levels: list[dict[str, Any]] = []
+    passthrough: list[Any] = []
+
+    for entry in levels:
+        if not isinstance(entry, dict) or not entry.get("side"):
+            passthrough.append(entry)
+            continue
+        if str(entry.get("status", "active")) in keep_statuses:
+            live_levels.append(entry)
+        else:
+            history_levels.append(entry)
+
+    if len(history_levels) <= GRID_LEVEL_HISTORY_MAX:
+        return False
+
+    history_levels = sorted(history_levels, key=grid_level_updated_at)[-GRID_LEVEL_HISTORY_MAX:]
+    row["levels"] = passthrough + live_levels + history_levels
+    row["history_pruned_at"] = int(time.time())
+    return True
+
+
+def prune_grid_level_history(rows: list[dict[str, Any]]) -> bool:
+    changed = False
+    for row in rows:
+        changed = prune_grid_levels(row) or changed
+    return changed
+
+
 def run_once() -> None:
     rows = load_server_batch()
     active_trail_indexes = [
@@ -955,7 +1014,8 @@ def run_once() -> None:
             changed = True
 
     rows, pruned = prune_done_rows(rows)
-    if changed or pruned:
+    grid_history_pruned = prune_grid_level_history(rows)
+    if changed or pruned or grid_history_pruned:
         save_server_batch(rows)
 
 
