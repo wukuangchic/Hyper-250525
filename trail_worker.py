@@ -103,6 +103,31 @@ def grid_row_recoverable_from_error(row: dict[str, Any]) -> bool:
     return False
 
 
+def best_bid_ask(info: Any, coin: str) -> tuple[Decimal | None, Decimal | None]:
+    try:
+        book = info.l2_snapshot(coin)
+        log_event("grid_l2_snapshot", {"coin": coin, "book": book})
+        levels = book.get("levels") if isinstance(book, dict) else None
+        if not isinstance(levels, list) or len(levels) < 2:
+            return None, None
+        bid_level = levels[0][0] if isinstance(levels[0], list) and levels[0] else None
+        ask_level = levels[1][0] if isinstance(levels[1], list) and levels[1] else None
+        bid = decimal_or_none(bid_level.get("px")) if isinstance(bid_level, dict) else None
+        ask = decimal_or_none(ask_level.get("px")) if isinstance(ask_level, dict) else None
+        return bid, ask
+    except Exception as exc:
+        log_event("grid_l2_snapshot_error", {"coin": coin, "type": type(exc).__name__, "message": str(exc)})
+        return None, None
+
+
+def grid_reference_price(side: str, current_mid: Decimal, best_bid: Decimal | None, best_ask: Decimal | None) -> Decimal:
+    if side == "buy" and best_bid is not None and best_bid > 0:
+        return best_bid
+    if side == "sell" and best_ask is not None and best_ask > 0:
+        return best_ask
+    return current_mid
+
+
 def find_open_order_by_oid(info: Any, account: str, dex: str, oid: int) -> dict[str, Any] | None:
     open_orders = collect_frontend_open_orders(info, account, dex)
     return next((order for order in open_orders if order.get("oid") is not None and int(order.get("oid", -1)) == oid), None)
@@ -360,6 +385,17 @@ def farthest_active_price(row: dict[str, Any], side: str, current_mid: Decimal) 
     return min(prices) if side == "buy" else max(prices)
 
 
+def nearest_active_price(row: dict[str, Any], side: str) -> Decimal | None:
+    prices = [
+        price
+        for entry in active_grid_entries(row, side)
+        if (price := decimal_or_none(entry.get("price", entry.get("limit_px")))) is not None and price > 0
+    ]
+    if not prices:
+        return None
+    return max(prices) if side == "buy" else min(prices)
+
+
 def next_depth_order(
     row: dict[str, Any],
     coin: str,
@@ -370,11 +406,12 @@ def next_depth_order(
     position_value: Decimal,
     max_position_value: Decimal,
     policy: str,
+    reference_px: Decimal | None = None,
 ) -> dict[str, Any] | None:
     gap = Decimal(str(row["gap_rate"]))
     sz_decimals = int(row.get("sz_decimals") or asset["szDecimals"])
     is_buy = side == "buy"
-    base_px = farthest_active_price(row, side, current_mid)
+    base_px = farthest_active_price(row, side, reference_px or current_mid)
     multiplier = Decimal("1") - gap if is_buy else Decimal("1") + gap
     next_px = rounded_perp_price(base_px * multiplier, sz_decimals)
     if next_px <= 0:
@@ -443,6 +480,48 @@ def trim_excess_grid_entries(exchange: Any, coin: str, row: dict[str, Any], targ
     return trimmed
 
 
+def reduce_side_for_position(position_size: Decimal) -> str | None:
+    if position_size > 0:
+        return "sell"
+    if position_size < 0:
+        return "buy"
+    return None
+
+
+def near_reduce_order_if_stale(
+    row: dict[str, Any],
+    coin: str,
+    asset: dict[str, Any],
+    side: str,
+    reference_px: Decimal,
+    position_size: Decimal,
+    position_value: Decimal,
+    max_position_value: Decimal,
+    policy: str,
+) -> dict[str, Any] | None:
+    gap = Decimal(str(row["gap_rate"]))
+    sz_decimals = int(row.get("sz_decimals") or asset["szDecimals"])
+    is_buy = side == "buy"
+    target_px = rounded_perp_price(reference_px * (Decimal("1") - gap if is_buy else Decimal("1") + gap), sz_decimals)
+    if target_px <= 0:
+        return None
+
+    nearest_px = nearest_active_price(row, side)
+    stale_threshold = Decimal("1") - gap * Decimal("2") if is_buy else Decimal("1") + gap * Decimal("2")
+    if nearest_px is not None:
+        if is_buy and nearest_px >= reference_px * stale_threshold:
+            return None
+        if not is_buy and nearest_px <= reference_px * stale_threshold:
+            return None
+
+    reduce_only = True
+    entry = grid_order_entry(row, coin, asset, is_buy, target_px, reduce_only)
+    order_notional = Decimal(str(entry["size"])) * Decimal(str(entry["price"]))
+    if not grid_order_allowed_by_max(position_size, position_value, is_buy, order_notional, max_position_value, policy):
+        return None
+    return entry
+
+
 def maintain_grid(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     info, exchange, account, _signer, _role = build_clients(
         str(row.get("network") or "mainnet"),
@@ -459,6 +538,7 @@ def maintain_grid(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     policy = grid_limit_policy_from_row(row)
     mids = info.all_mids(dex)
     current_mid = Decimal(str(mids[coin]))
+    best_bid, best_ask = best_bid_ask(info, coin)
     position_size, position_value = current_position_size_value(info, account, coin, dex, current_mid)
 
     open_oids = open_order_oids(info, account, dex, coin)
@@ -509,6 +589,28 @@ def maintain_grid(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         paused = cancel_grid_entries(exchange, coin, to_pause, now, "paused_max")
         changed = True
 
+    near_regrids = 0
+    reduce_side = reduce_side_for_position(position_size)
+    if reduce_side is not None and position_value >= max_position_value:
+        reference_px = grid_reference_price(reduce_side, current_mid, best_bid, best_ask)
+        near_reduce = near_reduce_order_if_stale(
+            row,
+            coin,
+            asset,
+            reduce_side,
+            reference_px,
+            position_size,
+            position_value,
+            max_position_value,
+            policy,
+        )
+        if near_reduce is not None:
+            submitted = submit_grid_order_entry(exchange, coin, near_reduce, now)
+            if submitted:
+                levels.append(near_reduce)
+                near_regrids += 1
+            changed = True
+
     projected_position_value = position_value
     replacements = 0
     for entry in newly_filled:
@@ -539,7 +641,8 @@ def maintain_grid(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     target_per_side = int(row.get("target_orders_per_side") or GRID_TARGET_ORDERS_PER_SIDE)
     for side in ("buy", "sell"):
         while len(active_grid_entries(row, side)) < target_per_side:
-            topup = next_depth_order(row, coin, asset, side, current_mid, position_size, position_value, max_position_value, policy)
+            reference_px = grid_reference_price(side, current_mid, best_bid, best_ask)
+            topup = next_depth_order(row, coin, asset, side, current_mid, position_size, position_value, max_position_value, policy, reference_px)
             if topup is None:
                 break
             order_notional = Decimal(str(topup["size"])) * Decimal(str(topup["price"]))
@@ -588,9 +691,10 @@ def maintain_grid(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     row["open_oids"] = sorted(grid_batch_open_oids(row))
     row["note"] = (
         f"grid maintained; replacements={replacements}; topped_up={topped_up}; "
-        f"paused={paused}; restored={restored}; trimmed={trimmed}; recovered_missing={recovered_missing}"
+        f"paused={paused}; restored={restored}; trimmed={trimmed}; near_regrids={near_regrids}; "
+        f"recovered_missing={recovered_missing}"
     )
-    return row, changed or replacements > 0 or topped_up > 0 or paused > 0 or restored > 0 or trimmed > 0 or recovered_missing > 0
+    return row, changed or replacements > 0 or topped_up > 0 or paused > 0 or restored > 0 or trimmed > 0 or near_regrids > 0 or recovered_missing > 0
 
 
 def prune_done_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
