@@ -325,6 +325,8 @@ def recent_fills_by_oid(
             fill_time = int(fill.get("time") or 0)
         except (KeyError, TypeError, ValueError):
             continue
+        if fill_time < start_ms or fill_time > end_ms:
+            continue
         old = by_oid.get(oid)
         if old is None or fill_time >= int(old.get("time") or 0):
             by_oid[oid] = fill
@@ -688,7 +690,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         client_cache[client_key] = build_clients(network, timeout, raw_coin)
     info, exchange, account, _signer, _role = client_cache[client_key]
     coin, asset = resolve_perp_asset(info, str(row.get("raw_coin") or row["coin"]))
-    now = int(time.time())
+    now = int(cache.setdefault("now", int(time.time())))
     now_ms = now * 1000
     start_ms = int(row.get("last_fill_check_ms") or (now - 24 * 60 * 60) * 1000)
     start_ms = max(0, min(start_ms - 5 * 60 * 1000, (now - GRID_FILL_LOOKBACK_SECONDS) * 1000))
@@ -710,10 +712,11 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     open_oids = open_order_oids(info, account, dex, coin, open_orders_cache[open_orders_key])
 
     fills_cache = cache.setdefault("fills", {})
-    fills_key = (network, account, start_ms, now_ms)
+    common_start_ms = (now - GRID_FILL_LOOKBACK_SECONDS) * 1000
+    fills_key = (network, account, common_start_ms, now_ms)
     if fills_key not in fills_cache:
-        fills_cache[fills_key] = info.user_fills_by_time(account, start_ms, now_ms)
-        log_event("grid_user_fills_by_time", {"start_ms": start_ms, "end_ms": now_ms, "count": len(fills_cache[fills_key])})
+        fills_cache[fills_key] = info.user_fills_by_time(account, common_start_ms, now_ms)
+        log_event("grid_user_fills_by_time", {"start_ms": common_start_ms, "end_ms": now_ms, "count": len(fills_cache[fills_key])})
     fills_by_oid = recent_fills_by_oid(info, account, coin, start_ms, now_ms, fills_cache[fills_key])
     changed = False
     missing_without_fill: list[int] = []
@@ -1023,9 +1026,14 @@ def run_once() -> None:
     for index in active_grid_indexes:
         row = rows[index]
         try:
+            started_at = time.monotonic()
             rows[index], row_changed = maintain_grid(row, grid_cache)
             changed = changed or row_changed
-            print(f"trail_worker: grid maintained {row.get('network', 'mainnet')}:{row.get('coin')} open={len(grid_batch_open_oids(rows[index]))}")
+            elapsed = time.monotonic() - started_at
+            print(
+                f"trail_worker: grid maintained {row.get('network', 'mainnet')}:{row.get('coin')} "
+                f"open={len(grid_batch_open_oids(rows[index]))} elapsed={elapsed:.2f}s"
+            )
         except Exception as exc:
             transient_status = transient_error_status(exc)
             if transient_status is None:
