@@ -192,7 +192,7 @@ BTC --cancel grid
 - `BTC grid --recover --max 300 --gap 0.5%` 会从当前该币普通 limit open orders 里按近侧最多每边 5 张接管到 `server_batch.json`，用于服务器断点或 JSON 丢失后的人工恢复。
 - worker 每次至少回看最近 24 小时成交记录；如果 `last_fill_check_ms` 更早，会从更早的断点继续查。
 - worker 只维护 `server_batch.json` 里记录的 oid；手动下的新单不会被自动接管。
-- 如果 worker 发现 grid oid 消失但最近成交记录里找不到对应 fill，会把该网格标为 `error`，避免手动取消后又被误补。
+- 如果 worker 发现 grid oid 消失但最近成交记录里找不到对应 fill，会按该记录原来的 side、price、size 重新挂回，并在任务 note 里记录 `recovered_missing`。
 - 取消服务器维护的网格和所有活跃子单：`BTC --cancel grid`。
 
 ## 服务器 Trail 单

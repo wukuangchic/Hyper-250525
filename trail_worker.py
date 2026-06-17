@@ -406,6 +406,7 @@ def maintain_grid(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     fills_by_oid = recent_fills_by_oid(info, account, coin, start_ms, now_ms)
     changed = False
     missing_without_fill: list[int] = []
+    recovered_missing = 0
     newly_filled: list[dict[str, Any]] = []
 
     levels = row.setdefault("levels", [])
@@ -422,9 +423,12 @@ def maintain_grid(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
             continue
         fill = fills_by_oid.get(oid)
         if fill is None:
-            entry["status"] = "missing"
-            entry["missing_at"] = now
+            old_oid = oid
+            submit_grid_order_entry(exchange, coin, entry, now)
+            entry["recovered_missing_oid"] = old_oid
+            entry["recovered_missing_at"] = now
             missing_without_fill.append(oid)
+            recovered_missing += 1
             changed = True
             continue
         entry["status"] = "filled"
@@ -432,13 +436,6 @@ def maintain_grid(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         entry["fill"] = fill
         newly_filled.append(entry)
         changed = True
-
-    if missing_without_fill:
-        row["status"] = "error"
-        row["updated_at"] = now
-        row["last_fill_check_ms"] = now_ms
-        row["note"] = f"grid oid disappeared without matching fill: {missing_without_fill[:5]}"
-        return row, True
 
     paused = 0
     active_entries = active_grid_entries(row)
@@ -520,8 +517,11 @@ def maintain_grid(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     row["position_value"] = decimal_to_plain(position_value)
     row["position_size"] = decimal_to_plain(position_size)
     row["open_oids"] = sorted(grid_batch_open_oids(row))
-    row["note"] = f"grid maintained; replacements={replacements}; topped_up={topped_up}; paused={paused}; restored={restored}; trimmed={trimmed}"
-    return row, changed or replacements > 0 or topped_up > 0 or paused > 0 or restored > 0 or trimmed > 0
+    row["note"] = (
+        f"grid maintained; replacements={replacements}; topped_up={topped_up}; "
+        f"paused={paused}; restored={restored}; trimmed={trimmed}; recovered_missing={recovered_missing}"
+    )
+    return row, changed or replacements > 0 or topped_up > 0 or paused > 0 or restored > 0 or trimmed > 0 or recovered_missing > 0
 
 
 def prune_done_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
