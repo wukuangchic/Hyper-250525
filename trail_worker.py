@@ -115,7 +115,13 @@ def grid_row_recoverable_from_error(row: dict[str, Any]) -> bool:
     if row.get("status") != "error":
         return False
     error_text = " ".join(str(row.get(key, "")) for key in ("error", "last_error", "note"))
-    if is_post_only_reject_text(error_text) or is_transient_error_text(error_text) or is_min_order_value_error_text(error_text):
+    if (
+        is_post_only_reject_text(error_text)
+        or is_transient_error_text(error_text)
+        or is_min_order_value_error_text(error_text)
+        or is_reduce_only_would_increase_text(error_text)
+        or is_insufficient_margin_text(error_text)
+    ):
         return True
     for entry in row.get("levels") or []:
         if isinstance(entry, dict) and is_post_only_reject_text(str(entry.get("error", ""))):
@@ -126,6 +132,15 @@ def grid_row_recoverable_from_error(row: dict[str, Any]) -> bool:
 def is_min_order_value_error_text(text: str) -> bool:
     lowered = text.lower()
     return "minimum value" in lowered or "min value" in lowered
+
+
+def is_reduce_only_would_increase_text(text: str) -> bool:
+    lowered = text.lower()
+    return "reduce only" in lowered and "increase position" in lowered
+
+
+def is_insufficient_margin_text(text: str) -> bool:
+    return "insufficient margin" in text.lower()
 
 
 def best_bid_ask(info: Any, coin: str) -> tuple[Decimal | None, Decimal | None]:
@@ -497,7 +512,20 @@ def submit_grid_order_entry(exchange: Any, coin: str, order: dict[str, Any], now
         order["skipped_at"] = now
         return False
     except RuntimeError as exc:
-        if not is_min_order_value_error_text(str(exc)) or order.get("resized_min_retry_at"):
+        error_text = str(exc)
+        if is_reduce_only_would_increase_text(error_text):
+            order["status"] = "skipped_reduce_only"
+            order["oid"] = None
+            order["last_error"] = error_text
+            order["skipped_at"] = now
+            return False
+        if is_insufficient_margin_text(error_text):
+            order["status"] = "paused_margin"
+            order["oid"] = None
+            order["last_error"] = error_text
+            order["paused_at"] = now
+            return False
+        if not is_min_order_value_error_text(error_text) or order.get("resized_min_retry_at"):
             raise
         bump_grid_order_size_one_step(asset, order)
         order["resized_min_retry_at"] = now
@@ -777,7 +805,7 @@ def maintain_grid(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
 
     restored = 0
     for entry in levels:
-        if not isinstance(entry, dict) or entry.get("side") is None or str(entry.get("status")) != "paused_max":
+        if not isinstance(entry, dict) or entry.get("side") is None or str(entry.get("status")) not in {"paused_max", "paused_margin"}:
             continue
         order_notional = Decimal(str(entry.get("size"))) * Decimal(str(entry.get("price", entry.get("limit_px"))))
         if not grid_order_allowed_by_max(position_size, projected_position_value, bool(entry.get("is_buy")), order_notional, max_position_value, policy):
