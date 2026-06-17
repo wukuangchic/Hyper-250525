@@ -50,6 +50,15 @@ DONE_RETENTION_DAYS = 7
 DONE_RETENTION_MAX = 500
 GRID_FILL_LOOKBACK_SECONDS = 24 * 60 * 60
 TRANSIENT_STATUS_CODES = {429, 502, 503, 504}
+TRANSIENT_ERROR_TEXTS = (
+    "connection reset",
+    "connection aborted",
+    "connection refused",
+    "remote end closed connection",
+    "temporarily unavailable",
+    "timed out",
+    "timeout",
+)
 
 
 class GridPostOnlyRejected(Exception):
@@ -63,8 +72,13 @@ def transient_error_status(exc: Exception) -> int | None:
     try:
         status_int = int(status_code)
     except (TypeError, ValueError):
-        return None
+        return 0 if is_transient_error_text(str(exc)) else None
     return status_int if status_int in TRANSIENT_STATUS_CODES else None
+
+
+def is_transient_error_text(text: str) -> bool:
+    lowered = text.lower()
+    return any(pattern in lowered for pattern in TRANSIENT_ERROR_TEXTS)
 
 
 def append_rate_limit_log(row: dict[str, Any], status_code: int, exc: Exception) -> None:
@@ -87,6 +101,12 @@ def append_rate_limit_log(row: dict[str, Any], status_code: int, exc: Exception)
         handle.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
 
 
+def transient_note(status_code: int) -> str:
+    if status_code in TRANSIENT_STATUS_CODES:
+        return f"transient HTTP {status_code}; will retry"
+    return "transient network error; will retry"
+
+
 def grid_row_recoverable_from_error(row: dict[str, Any]) -> bool:
     if row.get("type") != "grid":
         return False
@@ -95,7 +115,7 @@ def grid_row_recoverable_from_error(row: dict[str, Any]) -> bool:
     if row.get("status") != "error":
         return False
     error_text = " ".join(str(row.get(key, "")) for key in ("error", "last_error", "note"))
-    if is_post_only_reject_text(error_text):
+    if is_post_only_reject_text(error_text) or is_transient_error_text(error_text):
         return True
     for entry in row.get("levels") or []:
         if isinstance(entry, dict) and is_post_only_reject_text(str(entry.get("error", ""))):
@@ -760,7 +780,7 @@ def run_once() -> None:
             else:
                 row["status"] = "active"
                 row["last_error"] = str(exc)
-                row["note"] = f"transient HTTP {transient_status}; will retry"
+                row["note"] = transient_note(transient_status)
                 append_rate_limit_log(row, transient_status, exc)
             row["updated_at"] = int(time.time())
             rows[index] = row
@@ -780,7 +800,7 @@ def run_once() -> None:
             else:
                 row["status"] = "active"
                 row["last_error"] = str(exc)
-                row["note"] = f"transient HTTP {transient_status}; will retry"
+                row["note"] = transient_note(transient_status)
                 append_rate_limit_log(row, transient_status, exc)
             row["updated_at"] = int(time.time())
             rows[index] = row
