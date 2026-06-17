@@ -3315,12 +3315,17 @@ def modify_grid_batch_order(
     index = matching_indexes[0]
     row = batch_rows[index]
     now = int(time.time())
-    regrid = bool(args.gap or args.trend or args.grid_min is not None)
+    old_limit_mode = grid_limit_policy_from_row(row)
+    new_limit_mode = str(args.grid_position_limit_mode) if args.grid_position_limit_value is not None else old_limit_mode
+    limit_mode_changed = new_limit_mode != old_limit_mode
+    regrid = bool(args.gap or args.trend or args.grid_min is not None or limit_mode_changed)
     updates: list[tuple[str, str]] = []
     if args.grid_position_limit_value is not None:
-        row["position_limit_mode"] = str(args.grid_position_limit_mode)
+        row["position_limit_mode"] = new_limit_mode
         row["max_position_value"] = decimal_to_plain(Decimal(str(args.grid_position_limit_value)))
         updates.append(("limit", f"{row['position_limit_mode']} {row['max_position_value']}"))
+        if limit_mode_changed:
+            updates.append(("mode_change", f"{old_limit_mode}->{new_limit_mode}"))
     if args.grid_min is not None:
         row["min_order_value"] = decimal_to_plain(grid_min_notional(args))
         updates.append(("min", row["min_order_value"]))
@@ -3395,7 +3400,7 @@ def modify_grid_batch_order(
 
     row["status"] = "active"
     row["updated_at"] = now
-    row["note"] = "modified grid"
+    row["note"] = "modified grid; regridded" if regrid else "modified grid"
     batch_rows[index] = row
     save_server_batch(batch_rows)
     print_grid_batch_status(row, price_rate)

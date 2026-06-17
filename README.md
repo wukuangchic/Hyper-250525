@@ -193,7 +193,7 @@ BTC --cancel grid
 - 到达持仓上限后，worker 会撤销继续加仓方向的 grid 单，只保留/恢复减仓方向；仓位降到能容纳下一张单后，再把加仓方向补回到最多 5 张。
 - worker 补缺失子单时优先参考盘口 best bid/ask，而不是只参考 mid；盘口读取失败时才退回 mid。
 - 到达持仓上限后，如果减仓方向最靠近市场的单已经离盘口超过约 2 个 gap，worker 会补一张新的近侧 reduce-only 平仓单，再撤远侧，保持每边最多 5 张。
-- `BTC grid --modify --abs 500` 只更新持仓限制配置。
+- `BTC grid --modify --abs 500` 在持仓限制模式不变时只更新配置；如果从 `--long` 改成 `--short` 或 `--abs` 等模式变化，会撤掉当前活跃 grid 子单并按新模式重铺。
 - `BTC grid --modify --gap 0.3%`、`BTC grid --modify --trend 0` 或 `BTC grid --modify --min 20` 会取消当前活跃 grid 挂单，并按当前 mid 和新配置重新铺买卖两边各 5 张。
 - `BTC grid --recover --abs 300 --gap 0.5%` 会从当前该币普通 limit open orders 里按近侧最多每边 5 张接管到 `server_batch.json`，用于服务器断点或 JSON 丢失后的人工恢复。
 - `BTC grid --query` 会展示该币 grid 的 limit/min/gap/仓位、买卖两边 active 数量、每张子单的 oid/价格/状态/live 情况和最近成交。
