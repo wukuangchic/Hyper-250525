@@ -293,9 +293,9 @@ def modify_trail_stop(row: dict[str, Any], mid_px: Decimal) -> tuple[dict[str, A
     return row, True
 
 
-def open_order_oids(info: Any, account: str, dex: str, coin: str) -> set[int]:
+def open_order_oids(info: Any, account: str, dex: str, coin: str, open_orders: list[dict[str, Any]] | None = None) -> set[int]:
     oids: set[int] = set()
-    for order in collect_frontend_open_orders(info, account, dex):
+    for order in open_orders if open_orders is not None else collect_frontend_open_orders(info, account, dex):
         if not fill_matches_coin(str(order.get("coin", "")), coin):
             continue
         try:
@@ -305,9 +305,17 @@ def open_order_oids(info: Any, account: str, dex: str, coin: str) -> set[int]:
     return oids
 
 
-def recent_fills_by_oid(info: Any, account: str, coin: str, start_ms: int, end_ms: int) -> dict[int, dict[str, Any]]:
-    fills = info.user_fills_by_time(account, start_ms, end_ms)
-    log_event("grid_user_fills_by_time", {"coin": coin, "start_ms": start_ms, "end_ms": end_ms, "count": len(fills)})
+def recent_fills_by_oid(
+    info: Any,
+    account: str,
+    coin: str,
+    start_ms: int,
+    end_ms: int,
+    fills: list[dict[str, Any]] | None = None,
+) -> dict[int, dict[str, Any]]:
+    if fills is None:
+        fills = info.user_fills_by_time(account, start_ms, end_ms)
+        log_event("grid_user_fills_by_time", {"coin": coin, "start_ms": start_ms, "end_ms": end_ms, "count": len(fills)})
     by_oid: dict[int, dict[str, Any]] = {}
     for fill in fills:
         if not isinstance(fill, dict) or not fill_matches_coin(str(fill.get("coin", "")), coin):
@@ -668,27 +676,45 @@ def near_grid_order_if_stale(
     return entry
 
 
-def maintain_grid(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
-    info, exchange, account, _signer, _role = build_clients(
-        str(row.get("network") or "mainnet"),
-        float(row.get("timeout") or 20),
-        str(row.get("raw_coin") or row["coin"]),
-    )
-    coin, asset = resolve_perp_asset(info, str(row.get("raw_coin") or row["coin"]))
+def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> tuple[dict[str, Any], bool]:
+    cache = cache if cache is not None else {}
+    network = str(row.get("network") or "mainnet")
+    timeout = float(row.get("timeout") or 20)
+    raw_coin = str(row.get("raw_coin") or row["coin"])
     dex = str(row.get("dex") or "")
+    client_cache = cache.setdefault("clients", {})
+    client_key = (network, timeout, dex)
+    if client_key not in client_cache:
+        client_cache[client_key] = build_clients(network, timeout, raw_coin)
+    info, exchange, account, _signer, _role = client_cache[client_key]
+    coin, asset = resolve_perp_asset(info, str(row.get("raw_coin") or row["coin"]))
     now = int(time.time())
     now_ms = now * 1000
     start_ms = int(row.get("last_fill_check_ms") or (now - 24 * 60 * 60) * 1000)
     start_ms = max(0, min(start_ms - 5 * 60 * 1000, (now - GRID_FILL_LOOKBACK_SECONDS) * 1000))
     max_position_value = Decimal(str(row["max_position_value"]))
     policy = grid_limit_policy_from_row(row)
-    mids = info.all_mids(dex)
+    mids_cache = cache.setdefault("mids", {})
+    mids_key = (network, dex)
+    if mids_key not in mids_cache:
+        mids_cache[mids_key] = info.all_mids(dex)
+    mids = mids_cache[mids_key]
     current_mid = Decimal(str(mids[coin]))
     best_bid, best_ask = best_bid_ask(info, coin)
     position_size, position_value = current_position_size_value(info, account, coin, dex, current_mid)
 
-    open_oids = open_order_oids(info, account, dex, coin)
-    fills_by_oid = recent_fills_by_oid(info, account, coin, start_ms, now_ms)
+    open_orders_cache = cache.setdefault("open_orders", {})
+    open_orders_key = (network, account, dex)
+    if open_orders_key not in open_orders_cache:
+        open_orders_cache[open_orders_key] = collect_frontend_open_orders(info, account, dex)
+    open_oids = open_order_oids(info, account, dex, coin, open_orders_cache[open_orders_key])
+
+    fills_cache = cache.setdefault("fills", {})
+    fills_key = (network, account, start_ms, now_ms)
+    if fills_key not in fills_cache:
+        fills_cache[fills_key] = info.user_fills_by_time(account, start_ms, now_ms)
+        log_event("grid_user_fills_by_time", {"start_ms": start_ms, "end_ms": now_ms, "count": len(fills_cache[fills_key])})
+    fills_by_oid = recent_fills_by_oid(info, account, coin, start_ms, now_ms, fills_cache[fills_key])
     changed = False
     missing_without_fill: list[int] = []
     recovered_missing = 0
@@ -964,6 +990,7 @@ def run_once() -> None:
         return
 
     mids_cache: dict[tuple[str, str], dict[str, Any]] = {}
+    grid_cache: dict[str, Any] = {}
     changed = False
     for index in active_trail_indexes:
         row = rows[index]
@@ -996,7 +1023,7 @@ def run_once() -> None:
     for index in active_grid_indexes:
         row = rows[index]
         try:
-            rows[index], row_changed = maintain_grid(row)
+            rows[index], row_changed = maintain_grid(row, grid_cache)
             changed = changed or row_changed
             print(f"trail_worker: grid maintained {row.get('network', 'mainnet')}:{row.get('coin')} open={len(grid_batch_open_oids(rows[index]))}")
         except Exception as exc:
