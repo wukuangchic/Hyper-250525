@@ -17,12 +17,19 @@ ensure_local_venv(__file__)
 
 from hl_order import (  # noqa: E402
     DEFAULT_SLIPPAGE,
+    GRID_TARGET_ORDERS_PER_SIDE,
     SERVER_BATCH_PATH,
     build_clients,
+    build_grid_limit_order_plan,
     build_trigger_order_plan,
     collect_frontend_open_orders,
+    current_position_size_value,
     decimal_or_none,
     decimal_to_plain,
+    fill_matches_coin,
+    grid_batch_open_oids,
+    grid_order_allowed_by_max,
+    grid_order_would_add_risk,
     load_server_batch,
     log_event,
     mask,
@@ -195,6 +202,306 @@ def modify_trail_stop(row: dict[str, Any], mid_px: Decimal) -> tuple[dict[str, A
     return row, True
 
 
+def open_order_oids(info: Any, account: str, dex: str, coin: str) -> set[int]:
+    oids: set[int] = set()
+    for order in collect_frontend_open_orders(info, account, dex):
+        if not fill_matches_coin(str(order.get("coin", "")), coin):
+            continue
+        try:
+            oids.add(int(order["oid"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return oids
+
+
+def recent_fills_by_oid(info: Any, account: str, coin: str, start_ms: int, end_ms: int) -> dict[int, dict[str, Any]]:
+    fills = info.user_fills_by_time(account, start_ms, end_ms)
+    log_event("grid_user_fills_by_time", {"coin": coin, "start_ms": start_ms, "end_ms": end_ms, "count": len(fills)})
+    by_oid: dict[int, dict[str, Any]] = {}
+    for fill in fills:
+        if not isinstance(fill, dict) or not fill_matches_coin(str(fill.get("coin", "")), coin):
+            continue
+        try:
+            oid = int(fill["oid"])
+            fill_time = int(fill.get("time") or 0)
+        except (KeyError, TypeError, ValueError):
+            continue
+        old = by_oid.get(oid)
+        if old is None or fill_time >= int(old.get("time") or 0):
+            by_oid[oid] = fill
+    return by_oid
+
+
+def submit_grid_child_order(exchange: Any, coin: str, order: dict[str, Any]) -> tuple[int | None, str, dict[str, Any] | None]:
+    plan = order.get("plan")
+    if not isinstance(plan, dict):
+        raise ValueError("grid child order is missing its saved plan")
+    result = exchange.order(
+        coin,
+        bool(plan["is_buy"]),
+        float(plan["size"]),
+        float(plan["limit_px"]),
+        plan["order_type"],
+        reduce_only=bool(plan.get("reduce_only", False)),
+    )
+    log_event("grid_child_order", {"side": "buy" if plan["is_buy"] else "sell", "result": result})
+    if result.get("status") != "ok":
+        raise RuntimeError(f"Failed to submit grid child order: {result}")
+    statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+    for status in statuses:
+        if not isinstance(status, dict):
+            continue
+        if status.get("error"):
+            raise RuntimeError(f"Failed to submit grid child order: {status['error']}")
+        if isinstance(status.get("resting"), dict):
+            return int(status["resting"]["oid"]), "active", status
+        if isinstance(status.get("filled"), dict):
+            return int(status["filled"].get("oid", 0)), "filled", status
+    raise RuntimeError(f"Grid child order response did not include an order id: {result}")
+
+
+def grid_order_entry(row: dict[str, Any], coin: str, asset: dict[str, Any], is_buy: bool, price: Decimal, reduce_only: bool) -> dict[str, Any]:
+    size_key = "buy_size" if is_buy else "sell_size"
+    size = Decimal(str(row.get(size_key) or "0"))
+    if size <= 0:
+        raise ValueError(f"grid row is missing {size_key}")
+    side = "buy" if is_buy else "sell"
+    plan = build_grid_limit_order_plan(coin, is_buy, size, price, asset, reduce_only, side)
+    plan["grid_gap"] = Decimal(str(row["gap_rate"]))
+    return {
+        "side": side,
+        "status": "pending",
+        "oid": None,
+        "is_buy": is_buy,
+        "limit_px": decimal_to_plain(Decimal(str(plan["limit_px"]))),
+        "price": decimal_to_plain(Decimal(str(plan["limit_px"]))),
+        "size": decimal_to_plain(size),
+        "mode": "grid-limit",
+        "reduce_only": reduce_only,
+        "plan": plan,
+    }
+
+
+def replacement_order_from_fill(row: dict[str, Any], coin: str, asset: dict[str, Any], fill: dict[str, Any], filled_is_buy: bool, position_value: Decimal, max_position_value: Decimal) -> dict[str, Any] | None:
+    gap = Decimal(str(row["gap_rate"]))
+    sz_decimals = int(row.get("sz_decimals") or asset["szDecimals"])
+    fill_px = decimal_or_none(fill.get("px"))
+    if fill_px is None or fill_px <= 0:
+        return None
+    next_is_buy = not filled_is_buy
+    multiplier = Decimal("1") - gap if next_is_buy else Decimal("1") + gap
+    next_px = rounded_perp_price(fill_px * multiplier, sz_decimals)
+    reduce_only = position_value >= max_position_value
+    return grid_order_entry(row, coin, asset, next_is_buy, next_px, reduce_only)
+
+
+def active_grid_entries(row: dict[str, Any], side: str | None = None) -> list[dict[str, Any]]:
+    entries = [
+        entry
+        for entry in row.get("levels") or []
+        if isinstance(entry, dict)
+        and entry.get("side")
+        and str(entry.get("status", "active")) == "active"
+        and (side is None or str(entry.get("side")) == side)
+    ]
+    return entries
+
+
+def farthest_active_price(row: dict[str, Any], side: str, current_mid: Decimal) -> Decimal:
+    entries = active_grid_entries(row, side)
+    prices = [
+        price
+        for entry in entries
+        if (price := decimal_or_none(entry.get("price", entry.get("limit_px")))) is not None and price > 0
+    ]
+    if not prices:
+        return current_mid
+    return min(prices) if side == "buy" else max(prices)
+
+
+def next_depth_order(row: dict[str, Any], coin: str, asset: dict[str, Any], side: str, current_mid: Decimal, position_value: Decimal, max_position_value: Decimal) -> dict[str, Any] | None:
+    gap = Decimal(str(row["gap_rate"]))
+    sz_decimals = int(row.get("sz_decimals") or asset["szDecimals"])
+    is_buy = side == "buy"
+    base_px = farthest_active_price(row, side, current_mid)
+    multiplier = Decimal("1") - gap if is_buy else Decimal("1") + gap
+    next_px = rounded_perp_price(base_px * multiplier, sz_decimals)
+    if next_px <= 0:
+        return None
+    reduce_only = position_value >= max_position_value
+    return grid_order_entry(row, coin, asset, is_buy, next_px, reduce_only)
+
+
+def submit_grid_order_entry(exchange: Any, coin: str, order: dict[str, Any], now: int) -> None:
+    oid, state, status = submit_grid_child_order(exchange, coin, order)
+    order["oid"] = oid
+    order["status"] = state
+    order["submitted_at"] = now
+    order["last_submit_status"] = status
+    if state == "filled":
+        order["filled_at"] = now
+
+
+def cancel_grid_entries(exchange: Any, coin: str, entries: list[dict[str, Any]], now: int, note: str) -> int:
+    requests = []
+    for entry in entries:
+        try:
+            requests.append({"coin": coin, "oid": int(entry["oid"])})
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not requests:
+        return 0
+    result = exchange.bulk_cancel(requests)
+    log_event("grid_cancel_entries", {"note": note, "requests": requests, "result": result})
+    if result.get("status") != "ok":
+        raise RuntimeError(f"Failed to cancel grid orders: {result}")
+    cancelled = {int(request["oid"]) for request in requests}
+    for entry in entries:
+        try:
+            oid = int(entry["oid"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if oid in cancelled:
+            entry["status"] = note
+            entry["cancelled_at"] = now
+    return len(cancelled)
+
+
+def maintain_grid(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    info, exchange, account, _signer, _role = build_clients(
+        str(row.get("network") or "mainnet"),
+        float(row.get("timeout") or 20),
+        str(row.get("raw_coin") or row["coin"]),
+    )
+    coin, asset = resolve_perp_asset(info, str(row.get("raw_coin") or row["coin"]))
+    dex = str(row.get("dex") or "")
+    now = int(time.time())
+    now_ms = now * 1000
+    start_ms = int(row.get("last_fill_check_ms") or (now - 24 * 60 * 60) * 1000)
+    start_ms = max(0, start_ms - 5 * 60 * 1000)
+    max_position_value = Decimal(str(row["max_position_value"]))
+    mids = info.all_mids(dex)
+    current_mid = Decimal(str(mids[coin]))
+    position_size, position_value = current_position_size_value(info, account, coin, dex, current_mid)
+
+    open_oids = open_order_oids(info, account, dex, coin)
+    fills_by_oid = recent_fills_by_oid(info, account, coin, start_ms, now_ms)
+    changed = False
+    missing_without_fill: list[int] = []
+    newly_filled: list[dict[str, Any]] = []
+
+    levels = row.setdefault("levels", [])
+    for entry in levels:
+        if not isinstance(entry, dict) or not entry.get("side"):
+            continue
+        if str(entry.get("status", "active")) != "active":
+            continue
+        try:
+            oid = int(entry["oid"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if oid in open_oids:
+            continue
+        fill = fills_by_oid.get(oid)
+        if fill is None:
+            entry["status"] = "missing"
+            entry["missing_at"] = now
+            missing_without_fill.append(oid)
+            changed = True
+            continue
+        entry["status"] = "filled"
+        entry["filled_at"] = int(fill.get("time") or now_ms) // 1000
+        entry["fill"] = fill
+        newly_filled.append(entry)
+        changed = True
+
+    if missing_without_fill:
+        row["status"] = "error"
+        row["updated_at"] = now
+        row["last_fill_check_ms"] = now_ms
+        row["note"] = f"grid oid disappeared without matching fill: {missing_without_fill[:5]}"
+        return row, True
+
+    paused = 0
+    active_entries = active_grid_entries(row)
+    to_pause: list[dict[str, Any]] = []
+    for entry in active_entries:
+        is_buy = bool(entry.get("is_buy"))
+        order_notional = Decimal(str(entry.get("size"))) * Decimal(str(entry.get("price", entry.get("limit_px"))))
+        if grid_order_allowed_by_max(position_size, position_value, is_buy, order_notional, max_position_value):
+            continue
+        to_pause.append(entry)
+    if to_pause:
+        paused = cancel_grid_entries(exchange, coin, to_pause, now, "paused_max")
+        changed = True
+
+    projected_position_value = position_value
+    replacements = 0
+    for entry in newly_filled:
+        fill = entry.get("fill")
+        if not isinstance(fill, dict):
+            continue
+        replacement = replacement_order_from_fill(row, coin, asset, fill, bool(entry.get("is_buy")), position_value, max_position_value)
+        if replacement is None:
+            continue
+        order_notional = Decimal(str(replacement["size"])) * Decimal(str(replacement["price"]))
+        if not grid_order_allowed_by_max(position_size, projected_position_value, bool(replacement["is_buy"]), order_notional, max_position_value):
+            replacement["status"] = "paused_max"
+            replacement["paused_at"] = now
+            levels.append(replacement)
+            changed = True
+            continue
+        submit_grid_order_entry(exchange, coin, replacement, now)
+        levels.append(replacement)
+        if grid_order_would_add_risk(position_size, bool(replacement["is_buy"])):
+            projected_position_value += order_notional
+        replacements += 1
+        changed = True
+
+    topped_up = 0
+    target_per_side = int(row.get("target_orders_per_side") or GRID_TARGET_ORDERS_PER_SIDE)
+    for side in ("buy", "sell"):
+        while len(active_grid_entries(row, side)) < target_per_side:
+            topup = next_depth_order(row, coin, asset, side, current_mid, position_value, max_position_value)
+            if topup is None:
+                break
+            order_notional = Decimal(str(topup["size"])) * Decimal(str(topup["price"]))
+            if not grid_order_allowed_by_max(position_size, projected_position_value, bool(topup["is_buy"]), order_notional, max_position_value):
+                topup["status"] = "paused_max"
+                topup["paused_at"] = now
+                levels.append(topup)
+                changed = True
+                break
+            submit_grid_order_entry(exchange, coin, topup, now)
+            levels.append(topup)
+            if grid_order_would_add_risk(position_size, bool(topup["is_buy"])):
+                projected_position_value += order_notional
+            topped_up += 1
+            changed = True
+
+    restored = 0
+    for entry in levels:
+        if not isinstance(entry, dict) or entry.get("side") is None or str(entry.get("status")) != "paused_max":
+            continue
+        order_notional = Decimal(str(entry.get("size"))) * Decimal(str(entry.get("price", entry.get("limit_px"))))
+        if not grid_order_allowed_by_max(position_size, projected_position_value, bool(entry.get("is_buy")), order_notional, max_position_value):
+            continue
+        submit_grid_order_entry(exchange, coin, entry, now)
+        if grid_order_would_add_risk(position_size, bool(entry.get("is_buy"))):
+            projected_position_value += order_notional
+        restored += 1
+        changed = True
+
+    row["status"] = "active"
+    row["updated_at"] = now
+    row["last_fill_check_ms"] = now_ms
+    row["position_value"] = decimal_to_plain(position_value)
+    row["position_size"] = decimal_to_plain(position_size)
+    row["open_oids"] = sorted(grid_batch_open_oids(row))
+    row["note"] = f"grid maintained; replacements={replacements}; topped_up={topped_up}; paused={paused}; restored={restored}"
+    return row, changed or replacements > 0 or topped_up > 0 or paused > 0 or restored > 0
+
+
 def prune_done_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
     cutoff = int(time.time()) - DONE_RETENTION_DAYS * 24 * 60 * 60
     kept: list[dict[str, Any]] = []
@@ -220,18 +527,23 @@ def prune_done_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], b
 
 def run_once() -> None:
     rows = load_server_batch()
-    active_indexes = [
+    active_trail_indexes = [
         index
         for index, row in enumerate(rows)
         if row.get("type") == "trail" and row.get("status") == "active"
     ]
-    if not active_indexes:
-        print("trail_worker: no active trail orders")
+    active_grid_indexes = [
+        index
+        for index, row in enumerate(rows)
+        if row.get("type") == "grid" and row.get("status") == "active"
+    ]
+    if not active_trail_indexes and not active_grid_indexes:
+        print("trail_worker: no active trail/grid orders")
         return
 
     mids_cache: dict[tuple[str, str], dict[str, Any]] = {}
     changed = False
-    for index in active_indexes:
+    for index in active_trail_indexes:
         row = rows[index]
         try:
             network = str(row.get("network") or "mainnet")
@@ -245,6 +557,26 @@ def run_once() -> None:
             mid_px = Decimal(str(mids_cache[cache_key][row["coin"]]))
             rows[index], row_changed = modify_trail_stop(row, mid_px)
             changed = changed or row_changed
+        except Exception as exc:
+            transient_status = transient_error_status(exc)
+            if transient_status is None:
+                row["status"] = "error"
+                row["error"] = str(exc)
+            else:
+                row["status"] = "active"
+                row["last_error"] = str(exc)
+                row["note"] = f"transient HTTP {transient_status}; will retry"
+                append_rate_limit_log(row, transient_status, exc)
+            row["updated_at"] = int(time.time())
+            rows[index] = row
+            changed = True
+
+    for index in active_grid_indexes:
+        row = rows[index]
+        try:
+            rows[index], row_changed = maintain_grid(row)
+            changed = changed or row_changed
+            print(f"trail_worker: grid maintained {row.get('network', 'mainnet')}:{row.get('coin')} open={len(grid_batch_open_oids(rows[index]))}")
         except Exception as exc:
             transient_status = transient_error_status(exc)
             if transient_status is None:

@@ -165,32 +165,31 @@ JPY both 20 --offset 2% --tp 1% --sl 0.7%
 - 对称单只做普通限价单，可以带 `--tp` / `--sl`；买腿按多单方向计算，卖腿按空单方向计算。
 - 对称单不能和 `--market`、`--stop`、`--take`、`--for`、`--while`、`--range`、`--scale` 混用。
 
-## 静态触发网格单
+## 服务器真实网格单
 
-`grid` 会基于 `--stop` / `--take` 一次性铺一组静态触发限价单。它不是交易所原生网格，也不会成交后自动补单。
+`grid` 使用普通 post-only limit 单，由服务器定时 worker 维护。它不是交易所原生网格；初始会在当前 mid 上下各挂 5 张 limit 单，之后 worker 会维持买卖两边各 5 张，成交后按成交价和 gap 补下一张反向 limit 单。
 
 ```bash
-BTC grid --total 300 --range 50000 70000 --trend 10% --gap 0.15% 0.05% --explain
-BTC grid --total 300 --range 50000 70000 --explain
-BTC grid --total 300 --range auto 70000 --trend 10% --gap 0.15% 0.05% --explain
-BTC grid --total 300 --range auto auto --gap 0.15% 0.05% --explain
-BTC grid --total 300 --explain
+BTC grid --max 300 --gap 0.5% --trend 10%
+BTC grid --max 300 --gap 0.5%
+BTC grid --max 300
+BTC grid --modify --max 500
+BTC grid --modify --gap 0.3%
+BTC --cancel grid
 ```
 
 含义：
 
-- `--range START END`：网格 anchor 范围。
-- 不写 `--range` 时默认 `--range auto auto`。
-- `--range auto END`：从当前 mid 向下找当前标的未成交触发单，取最近的触发价作为下限。
-- `--range START auto`：从当前 mid 向上找当前标的未成交触发单，取最近的触发价作为上限。
-- `--range auto auto`：同时自动推断上下限；对应方向没找到未成交触发单会报错。
-- `--total`：单向行情最多投入的名义金额，不是买卖两边合计。
-- `--trend`：数量倾向，默认 `0`；正数让买入数量更大，负数让卖出数量更大。
-- `--gap A% B%`：每个 anchor 上下各 `A/2` 放买卖触发价；买入限价再低 `B`，卖出限价再高 `B`，争取用同向限价成交；不写时默认 `最小价格变动百分比 + 折扣后 takerFee`，旧写法 `A%+-B%` 也兼容。
-- 当前价以下：买入单用 `take`，卖出单用 `stop`。
-- 当前价以上：买入单用 `stop`，卖出单用 `take`。
-- 数量会按最低限价保证每笔至少 `10` 美元，再按最高风险侧计算 `--total` 能铺多少格。
-- 带 `--trend` 时，如果数量精度会把实际比例放大，程序会提高单笔数量并减少格数，优先让实际比例贴近 `--trend`。
+- `--max`：最大绝对持仓价值。多仓和空仓都按 `abs(positionValue)` 计算。
+- `--gap`：每个买卖格子的间距。初始买价从 `mid * (1 - gap)` 到 `mid * (1 - 5 * gap)`，卖价从 `mid * (1 + gap)` 到 `mid * (1 + 5 * gap)`；买单成交后在成交价上方 `gap` 补卖单，卖单成交后在成交价下方 `gap` 补买单。
+- 不写 `--gap` 时，默认使用 `最小价格变动百分比 + 折扣后 takerFee`。
+- `--trend`：数量倾向，默认 `0`；正数让买入数量大于卖出数量，负数让卖出数量大于买入数量。
+- `--total` 不再用于 grid；如果写 `BTC grid --total 300` 会直接报错，请改用 `--max`。
+- 到达 `--max` 后，worker 会撤销继续加仓方向的 grid 单，只保留/恢复减仓方向；仓位降到能容纳下一张单后，再把加仓方向补回到最多 5 张。
+- `BTC grid --modify --max 500` 只更新最大仓位配置。
+- `BTC grid --modify --gap 0.3%` 或 `BTC grid --modify --trend 0` 会取消当前活跃 grid 挂单，并按当前 mid 和新配置重新铺买卖两边各 5 张。
+- 如果 worker 发现 grid oid 消失但最近成交记录里找不到对应 fill，会把该网格标为 `error`，避免手动取消后又被误补。
+- 取消服务器维护的网格和所有活跃子单：`BTC --cancel grid`。
 
 ## 服务器 Trail 单
 
