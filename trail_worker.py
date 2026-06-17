@@ -734,6 +734,19 @@ def maintain_grid(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         paused = cancel_grid_entries(exchange, coin, to_pause, now, "paused_max")
         changed = True
 
+    refreshed = 0
+    to_refresh: list[dict[str, Any]] = []
+    for entry in active_grid_entries(row):
+        desired_reduce_only = grid_order_should_reduce_only(position_size, bool(entry.get("is_buy")), policy)
+        if bool(entry.get("reduce_only", False)) == desired_reduce_only:
+            plan = entry.get("plan")
+            if not isinstance(plan, dict) or bool(plan.get("reduce_only", False)) == desired_reduce_only:
+                continue
+        to_refresh.append(entry)
+    if to_refresh:
+        refreshed = cancel_grid_entries(exchange, coin, to_refresh, now, "refresh_reduce_only")
+        changed = True
+
     near_regrids = 0
     reduce_side = reduce_side_for_position(position_size)
     add_risk_side = None if reduce_side is None else ("buy" if reduce_side == "sell" else "sell")
@@ -850,10 +863,21 @@ def maintain_grid(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     row["open_oids"] = sorted(grid_batch_open_oids(row))
     row["note"] = (
         f"grid maintained; replacements={replacements}; topped_up={topped_up}; "
-        f"paused={paused}; restored={restored}; trimmed={trimmed}; near_regrids={near_regrids}; "
+        f"paused={paused}; refreshed={refreshed}; restored={restored}; trimmed={trimmed}; near_regrids={near_regrids}; "
         f"recovered_missing={recovered_missing}"
     )
-    return row, changed or replacements > 0 or topped_up > 0 or paused > 0 or restored > 0 or trimmed > 0 or near_regrids > 0 or recovered_missing > 0
+    return (
+        row,
+        changed
+        or replacements > 0
+        or topped_up > 0
+        or paused > 0
+        or refreshed > 0
+        or restored > 0
+        or trimmed > 0
+        or near_regrids > 0
+        or recovered_missing > 0,
+    )
 
 
 def prune_done_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:

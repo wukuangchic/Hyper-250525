@@ -2529,7 +2529,7 @@ def grid_order_should_reduce_only(position_size: Decimal, is_buy: bool, policy: 
         return not is_buy
     if policy == "short":
         return is_buy
-    return not grid_order_would_add_risk(position_size, is_buy)
+    return False
 
 
 def grid_order_allowed_by_max(
