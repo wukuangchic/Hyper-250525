@@ -115,12 +115,17 @@ def grid_row_recoverable_from_error(row: dict[str, Any]) -> bool:
     if row.get("status") != "error":
         return False
     error_text = " ".join(str(row.get(key, "")) for key in ("error", "last_error", "note"))
-    if is_post_only_reject_text(error_text) or is_transient_error_text(error_text):
+    if is_post_only_reject_text(error_text) or is_transient_error_text(error_text) or is_min_order_value_error_text(error_text):
         return True
     for entry in row.get("levels") or []:
         if isinstance(entry, dict) and is_post_only_reject_text(str(entry.get("error", ""))):
             return True
     return False
+
+
+def is_min_order_value_error_text(text: str) -> bool:
+    lowered = text.lower()
+    return "minimum value" in lowered or "min value" in lowered
 
 
 def best_bid_ask(info: Any, coin: str) -> tuple[Decimal | None, Decimal | None]:
@@ -334,6 +339,47 @@ def submit_grid_child_order(exchange: Any, coin: str, order: dict[str, Any]) -> 
     raise RuntimeError(f"Grid child order response did not include an order id: {result}")
 
 
+def ensure_grid_order_min_notional(row: dict[str, Any], asset: dict[str, Any], order: dict[str, Any]) -> None:
+    plan = order.get("plan")
+    if not isinstance(plan, dict):
+        return
+    price = decimal_or_none(order.get("price", order.get("limit_px"))) or decimal_or_none(plan.get("limit_px"))
+    size = decimal_or_none(order.get("size")) or decimal_or_none(plan.get("size"))
+    if price is None or price <= 0 or size is None or size <= 0:
+        return
+    min_notional = Decimal(str(row.get("min_order_value") or "10"))
+    next_size = grid_size_for_min_notional(size, price, int(asset["szDecimals"]), min_notional)
+    if next_size <= size:
+        return
+    order["size"] = decimal_to_plain(next_size)
+    plan["size"] = next_size
+    notional = next_size * Decimal(str(plan.get("limit_px", price)))
+    plan["notional"] = notional
+    plan["target_notional"] = notional
+    plan["worst_notional"] = notional
+    order["resized_min_notional_at"] = int(time.time())
+    order["resized_min_notional_from"] = decimal_to_plain(size)
+
+
+def bump_grid_order_size_one_step(asset: dict[str, Any], order: dict[str, Any]) -> None:
+    plan = order.get("plan")
+    if not isinstance(plan, dict):
+        return
+    size = decimal_or_none(order.get("size")) or decimal_or_none(plan.get("size"))
+    if size is None or size <= 0:
+        return
+    step = Decimal(1).scaleb(-int(asset["szDecimals"]))
+    next_size = size + step
+    order["size"] = decimal_to_plain(next_size)
+    plan["size"] = next_size
+    price = Decimal(str(plan.get("limit_px", order.get("price", order.get("limit_px", "0")))))
+    notional = next_size * price
+    plan["notional"] = notional
+    plan["target_notional"] = notional
+    plan["worst_notional"] = notional
+    order["resized_min_retry_from"] = decimal_to_plain(size)
+
+
 def grid_order_entry(row: dict[str, Any], coin: str, asset: dict[str, Any], is_buy: bool, price: Decimal, reduce_only: bool) -> dict[str, Any]:
     size_key = "buy_size" if is_buy else "sell_size"
     size = Decimal(str(row.get(size_key) or "0"))
@@ -440,7 +486,8 @@ def next_depth_order(
     return grid_order_entry(row, coin, asset, is_buy, next_px, reduce_only)
 
 
-def submit_grid_order_entry(exchange: Any, coin: str, order: dict[str, Any], now: int) -> bool:
+def submit_grid_order_entry(exchange: Any, coin: str, order: dict[str, Any], now: int, row: dict[str, Any], asset: dict[str, Any]) -> bool:
+    ensure_grid_order_min_notional(row, asset, order)
     try:
         oid, state, status = submit_grid_child_order(exchange, coin, order)
     except GridPostOnlyRejected as exc:
@@ -449,6 +496,12 @@ def submit_grid_order_entry(exchange: Any, coin: str, order: dict[str, Any], now
         order["last_error"] = str(exc)
         order["skipped_at"] = now
         return False
+    except RuntimeError as exc:
+        if not is_min_order_value_error_text(str(exc)) or order.get("resized_min_retry_at"):
+            raise
+        bump_grid_order_size_one_step(asset, order)
+        order["resized_min_retry_at"] = now
+        oid, state, status = submit_grid_child_order(exchange, coin, order)
     order["oid"] = oid
     order["status"] = state
     order["submitted_at"] = now
@@ -506,6 +559,32 @@ def reduce_side_for_position(position_size: Decimal) -> str | None:
     if position_size < 0:
         return "buy"
     return None
+
+
+def grid_effectively_at_limit(
+    row: dict[str, Any],
+    asset: dict[str, Any],
+    side: str,
+    reference_px: Decimal,
+    position_size: Decimal,
+    position_value: Decimal,
+    max_position_value: Decimal,
+    policy: str,
+) -> bool:
+    gap = Decimal(str(row["gap_rate"]))
+    is_buy = side == "buy"
+    sz_decimals = int(row.get("sz_decimals") or asset["szDecimals"])
+    price = rounded_perp_price(reference_px * (Decimal("1") - gap if is_buy else Decimal("1") + gap), sz_decimals)
+    if price <= 0:
+        return position_value >= max_position_value
+    size_key = "buy_size" if is_buy else "sell_size"
+    size = Decimal(str(row.get(size_key) or "0"))
+    if size <= 0:
+        return position_value >= max_position_value
+    min_notional = Decimal(str(row.get("min_order_value") or "10"))
+    size = grid_size_for_min_notional(size, price, sz_decimals, min_notional)
+    order_notional = size * price
+    return not grid_order_allowed_by_max(position_size, position_value, is_buy, order_notional, max_position_value, policy)
 
 
 def near_reduce_order_if_stale(
@@ -583,7 +662,7 @@ def maintain_grid(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         fill = fills_by_oid.get(oid)
         if fill is None:
             old_oid = oid
-            if submit_grid_order_entry(exchange, coin, entry, now):
+            if submit_grid_order_entry(exchange, coin, entry, now, row, asset):
                 entry["recovered_missing_oid"] = old_oid
                 entry["recovered_missing_at"] = now
                 missing_without_fill.append(oid)
@@ -611,7 +690,21 @@ def maintain_grid(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
 
     near_regrids = 0
     reduce_side = reduce_side_for_position(position_size)
-    if reduce_side is not None and position_value >= max_position_value:
+    add_risk_side = None if reduce_side is None else ("buy" if reduce_side == "sell" else "sell")
+    at_effective_limit = False
+    if add_risk_side is not None:
+        add_reference_px = grid_reference_price(add_risk_side, current_mid, best_bid, best_ask)
+        at_effective_limit = grid_effectively_at_limit(
+            row,
+            asset,
+            add_risk_side,
+            add_reference_px,
+            position_size,
+            position_value,
+            max_position_value,
+            policy,
+        )
+    if reduce_side is not None and at_effective_limit:
         reference_px = grid_reference_price(reduce_side, current_mid, best_bid, best_ask)
         near_reduce = near_reduce_order_if_stale(
             row,
@@ -625,7 +718,7 @@ def maintain_grid(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
             policy,
         )
         if near_reduce is not None:
-            submitted = submit_grid_order_entry(exchange, coin, near_reduce, now)
+            submitted = submit_grid_order_entry(exchange, coin, near_reduce, now, row, asset)
             if submitted:
                 levels.append(near_reduce)
                 near_regrids += 1
@@ -647,7 +740,7 @@ def maintain_grid(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
             levels.append(replacement)
             changed = True
             continue
-        submitted = submit_grid_order_entry(exchange, coin, replacement, now)
+        submitted = submit_grid_order_entry(exchange, coin, replacement, now, row, asset)
         if not submitted:
             changed = True
             continue
@@ -672,7 +765,7 @@ def maintain_grid(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
                 levels.append(topup)
                 changed = True
                 break
-            submitted = submit_grid_order_entry(exchange, coin, topup, now)
+            submitted = submit_grid_order_entry(exchange, coin, topup, now, row, asset)
             if not submitted:
                 changed = True
                 break
@@ -689,7 +782,7 @@ def maintain_grid(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         order_notional = Decimal(str(entry.get("size"))) * Decimal(str(entry.get("price", entry.get("limit_px"))))
         if not grid_order_allowed_by_max(position_size, projected_position_value, bool(entry.get("is_buy")), order_notional, max_position_value, policy):
             continue
-        if not submit_grid_order_entry(exchange, coin, entry, now):
+        if not submit_grid_order_entry(exchange, coin, entry, now, row, asset):
             changed = True
             continue
         if grid_order_would_add_risk(position_size, bool(entry.get("is_buy"))):
