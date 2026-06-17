@@ -2523,11 +2523,13 @@ def grid_order_allowed_by_policy(position_size: Decimal, is_buy: bool, policy: s
 
 
 def grid_order_should_reduce_only(position_size: Decimal, is_buy: bool, policy: str) -> bool:
+    if position_size == 0:
+        return False
     if policy == "long":
         return not is_buy
     if policy == "short":
         return is_buy
-    return False
+    return not grid_order_would_add_risk(position_size, is_buy)
 
 
 def grid_order_allowed_by_max(
@@ -2685,9 +2687,7 @@ def build_grid_orders(
             notional = size * price
             if not grid_order_allowed_by_max(position_size, projected_position_value, is_buy, notional, max_position_value, policy):
                 continue
-            reduce_only = grid_order_should_reduce_only(position_size, is_buy, policy) or (
-                position_value >= max_position_value and not grid_order_would_add_risk(position_size, is_buy)
-            )
+            reduce_only = grid_order_should_reduce_only(position_size, is_buy, policy)
             plan = build_grid_limit_order_plan(coin, is_buy, size, price, asset, reduce_only, label)
             plan["grid_anchor"] = anchor
             plan["grid_gap"] = gap
