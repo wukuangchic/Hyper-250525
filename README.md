@@ -167,41 +167,70 @@ JPY both 20 --offset 2% --tp 1% --sl 0.7%
 
 ## 服务器真实网格单
 
-`grid` 使用普通 post-only limit 单，由服务器定时 worker 维护。它不是交易所原生网格；初始会在当前 mid 上下各挂 5 张 limit 单，之后 worker 会维持买卖两边各 5 张，成交后按成交价和 gap 补下一张反向 limit 单。
+`grid` 是本工具维护的真实挂单网格：下到交易所的是普通 post-only limit 单，不是 Hyperliquid 原生网格。服务器 worker 每分钟检查一次，目标是让买卖两边各保持最多 5 张活跃子单；成交后按成交价和 `gap` 补下一张反向 limit 单。
+
+### 创建
 
 ```bash
 BTC grid --abs 300 --gap 0.5% --trend 10%
 BTC grid --long 300 --gap 0.5% --min 20
 BTC grid --short 300
+```
+
+仓位限制三选一：
+
+- `--long 200`：只允许开多头仓位，最大多头持仓价值 200；卖单只用于已有多仓的 reduce-only 减仓。
+- `--short 200`：只允许开空头仓位，最大空头持仓价值 200；买单只用于已有空仓的 reduce-only 减仓。
+- `--abs 200`：多空都可以开，最大绝对持仓价值 200。
+
+参数：
+
+- `--gap`：每个买卖格子的间距。初始买价从 `mid * (1 - gap)` 到 `mid * (1 - 5 * gap)`，卖价从 `mid * (1 + gap)` 到 `mid * (1 + 5 * gap)`。
+- 不写 `--gap` 时，默认使用 `最小价格变动百分比 + 折扣后 takerFee + 折扣后 makerFee`。
+- `--trend`：数量倾向，默认 `0`；正数让买入数量大于卖出数量，负数让卖出数量大于买入数量。取消趋势用 `--modify --trend 0`。
+- `--min 20`：每张子单价值至少 20；不填时按交易所最小名义价值。
+- `--total` 和旧 `--max` 不再用于 grid；如果写了会直接报错。
+
+### 修改
+
+```bash
 BTC grid --modify --abs 500
+BTC grid --modify --short 300
 BTC grid --modify --gap 0.3%
+BTC grid --modify --trend 0
+BTC grid --modify --min 20
+```
+
+- 同模式修改额度，例如 `--modify --abs 500`，只更新持仓限制配置，不强制撤单重铺。
+- 模式变化，例如 `--modify --long 200` 改成 `--modify --short 200`，会撤掉当前活跃 grid 子单，包括旧 reduce-only 单，再按新模式重铺。
+- 修改 `--gap`、`--trend` 或 `--min` 会撤掉当前活跃 grid 子单，再按当前行情和新配置重铺。
+
+### 查询、恢复、取消
+
+```bash
 BTC grid --recover --abs 300 --gap 0.5%
 BTC grid --query
 BTC --cancel grid
 ```
 
-含义：
-
-- `--long 200`：只允许开多头仓位，最大多头持仓价值 200；卖单只用于已有多仓的 reduce-only 减仓。
-- `--short 200`：只允许开空头仓位，最大空头持仓价值 200；买单只用于已有空仓的 reduce-only 减仓。
-- `--abs 200`：多空都可以开，最大绝对持仓价值 200。`grid` 新建和 `--recover` 必须在 `--long/--short/--abs` 里三选一。
-- `--min 20`：每张子单价值至少 20；不填时仍按交易所最小名义价值。
-- `--gap`：每个买卖格子的间距。初始买价从 `mid * (1 - gap)` 到 `mid * (1 - 5 * gap)`，卖价从 `mid * (1 + gap)` 到 `mid * (1 + 5 * gap)`；买单成交后在成交价上方 `gap` 补卖单，卖单成交后在成交价下方 `gap` 补买单。
-- 不写 `--gap` 时，默认使用 `最小价格变动百分比 + 折扣后 takerFee + 折扣后 makerFee`。
-- `--trend`：数量倾向，默认 `0`；正数让买入数量大于卖出数量，负数让卖出数量大于买入数量。
-- `--total` 和旧 `--max` 不再用于 grid；如果写了会直接报错，请改用 `--long/--short/--abs`。
-- 到达持仓上限后，worker 会撤销继续加仓方向的 grid 单，只保留/恢复减仓方向；仓位降到能容纳下一张单后，再把加仓方向补回到最多 5 张。
-- worker 补缺失子单时优先参考盘口 best bid/ask，而不是只参考 mid；盘口读取失败时才退回 mid。
-- 到达持仓上限后，如果减仓方向最靠近市场的单已经离盘口超过约 2 个 gap，worker 会补一张新的近侧 reduce-only 平仓单，再撤远侧，保持每边最多 5 张。
-- `BTC grid --modify --abs 500` 在持仓限制模式不变时只更新配置；如果从 `--long` 改成 `--short` 或 `--abs` 等模式变化，会撤掉当前活跃 grid 子单并按新模式重铺。
-- `BTC grid --modify --gap 0.3%`、`BTC grid --modify --trend 0` 或 `BTC grid --modify --min 20` 会取消当前活跃 grid 挂单，并按当前 mid 和新配置重新铺买卖两边各 5 张。
 - `BTC grid --recover --abs 300 --gap 0.5%` 会从当前该币普通 limit open orders 里按近侧最多每边 5 张接管到 `server_batch.json`，用于服务器断点或 JSON 丢失后的人工恢复。
 - `BTC grid --query` 会展示该币 grid 的 limit/min/gap/仓位、买卖两边 active 数量、每张子单的 oid/价格/状态/live 情况和最近成交。
+- `BTC --cancel grid` 会取消服务器维护的网格和所有活跃子单。
+
+### Worker 行为
+
+- 到达持仓上限后，worker 会撤销继续加仓方向的 grid 单，只保留/恢复减仓方向。
+- 仓位降到能容纳下一张加仓单后，worker 再把加仓方向补回到最多 5 张。
+- 补缺失子单时优先参考盘口 best bid/ask，而不是只参考 mid；盘口读取失败时才退回 mid。
+- 到达持仓上限后，如果减仓方向最靠近市场的单已经离盘口超过约 2 个 gap，worker 会补一张新的近侧 reduce-only 平仓单，再撤远侧，保持每边最多 5 张。
+- post-only limit 因“只限挂单”被拒绝时，grid 不会变成 `error`；worker 会跳过这张，并在下一轮继续维护。
+
+### 接续和边界
+
 - worker 每次至少回看最近 24 小时成交记录；如果 `last_fill_check_ms` 更早，会从更早的断点继续查。
 - worker 只维护 `server_batch.json` 里记录的 oid；手动下的新单不会被自动接管。
 - 如果 worker 发现 grid oid 消失但最近成交记录里找不到对应 fill，会按该记录原来的 side、price、size 重新挂回，并在任务 note 里记录 `recovered_missing`。
-- 如果 post-only limit 因“只限挂单”被拒绝，grid 不会变成 `error`，worker 会跳过这张并在下一轮继续维护。
-- 取消服务器维护的网格和所有活跃子单：`BTC --cancel grid`。
+- 如果服务器断电或 worker 重启，只要 `server_batch.json` 还在，下一轮会继续按已有 oid 和最近成交接续维护。
 
 ## 服务器 Trail 单
 
@@ -232,12 +261,13 @@ BTC --cancel trail
 - 如果原 stop 单已经成交或不再 open，worker 会把任务标记为 `done`。
 - `done` 记录最多保留 7 天或 500 条，避免历史记录无限膨胀。
 
-服务器定时：
+服务器定时和负载：
 
 - `systemd/simple-hyper-trail-worker.timer` 默认每分钟触发一次 `trail_worker.py`。
 - `trail_worker.py` 是 one-shot：每次处理当前 `active` trail/grid 任务，处理完即退出。
 - 如果上一轮运行超过 1 分钟，文件锁会让下一轮直接跳过，避免并发改同一批订单。
 - 没有 `active` 任务时，worker 只打印 `trail_worker: no active trail/grid orders`，不会查询价格或订单。
+- 当前同一个 worker 同时维护 trail 和 grid。实际耗时主要取决于 Hyperliquid API 网络等待；近期 4 个 grid 同时维护时，每轮墙钟约 10-30 秒，CPU 通常约 1 秒。
 
 查询和取消：
 
@@ -253,11 +283,12 @@ BTC --cancel trail
 - `cancelled`：由本工具撤单并停止跟踪。
 - `error`：非临时错误，需要人工查看 `error` 字段后处理。
 
-临时限流：
+临时限流和错误：
 
 - Hyperliquid / CloudFront 返回 `429/502/503/504` 时，worker 不会把任务停成 `error`。
 - 这类错误会保留任务 `active`，写入 `last_error`，并在下一轮继续重试。
 - 限流日志追加到 `logs/trail-rate-limit.jsonl`，每行一个 JSON，后续可按 `status_code`、`oid`、`coin` 统计频次。
+- 非临时错误才会把任务标成 `error`；grid 的 post-only 拒绝属于可恢复情况，不会停掉任务。
 
 ## 触发单和止盈止损
 
