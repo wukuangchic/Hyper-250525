@@ -633,7 +633,7 @@ def grid_effectively_at_limit(
     return not grid_order_allowed_by_max(position_size, position_value, is_buy, order_notional, max_position_value, policy)
 
 
-def near_reduce_order_if_stale(
+def near_grid_order_if_stale(
     row: dict[str, Any],
     coin: str,
     asset: dict[str, Any],
@@ -659,7 +659,7 @@ def near_reduce_order_if_stale(
         if not is_buy and nearest_px <= reference_px * stale_threshold:
             return None
 
-    reduce_only = True
+    reduce_only = grid_order_should_reduce_only(position_size, is_buy, policy)
     entry = grid_order_entry(row, coin, asset, is_buy, target_px, reduce_only)
     order_notional = Decimal(str(entry["size"])) * Decimal(str(entry["price"]))
     if not grid_order_allowed_by_max(position_size, position_value, is_buy, order_notional, max_position_value, policy):
@@ -748,38 +748,23 @@ def maintain_grid(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         changed = True
 
     near_regrids = 0
-    reduce_side = reduce_side_for_position(position_size)
-    add_risk_side = None if reduce_side is None else ("buy" if reduce_side == "sell" else "sell")
-    at_effective_limit = False
-    if add_risk_side is not None:
-        add_reference_px = grid_reference_price(add_risk_side, current_mid, best_bid, best_ask)
-        at_effective_limit = grid_effectively_at_limit(
-            row,
-            asset,
-            add_risk_side,
-            add_reference_px,
-            position_size,
-            position_value,
-            max_position_value,
-            policy,
-        )
-    if reduce_side is not None and at_effective_limit:
-        reference_px = grid_reference_price(reduce_side, current_mid, best_bid, best_ask)
-        near_reduce = near_reduce_order_if_stale(
+    for side in ("buy", "sell"):
+        reference_px = grid_reference_price(side, current_mid, best_bid, best_ask)
+        near_order = near_grid_order_if_stale(
             row,
             coin,
             asset,
-            reduce_side,
+            side,
             reference_px,
             position_size,
             position_value,
             max_position_value,
             policy,
         )
-        if near_reduce is not None:
-            submitted = submit_grid_order_entry(exchange, coin, near_reduce, now, row, asset, position_size, policy)
+        if near_order is not None:
+            submitted = submit_grid_order_entry(exchange, coin, near_order, now, row, asset, position_size, policy)
             if submitted:
-                levels.append(near_reduce)
+                levels.append(near_order)
                 near_regrids += 1
             changed = True
 
@@ -812,7 +797,9 @@ def maintain_grid(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     topped_up = 0
     target_per_side = int(row.get("target_orders_per_side") or GRID_TARGET_ORDERS_PER_SIDE)
     for side in ("buy", "sell"):
-        while len(active_grid_entries(row, side)) < target_per_side:
+        topup_attempts = 0
+        while len(active_grid_entries(row, side)) < target_per_side and topup_attempts < target_per_side * 2:
+            topup_attempts += 1
             reference_px = grid_reference_price(side, current_mid, best_bid, best_ask)
             topup = next_depth_order(row, coin, asset, side, current_mid, position_size, position_value, max_position_value, policy, reference_px)
             if topup is None:
@@ -827,6 +814,9 @@ def maintain_grid(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
             submitted = submit_grid_order_entry(exchange, coin, topup, now, row, asset, position_size, policy)
             if not submitted:
                 changed = True
+                if str(topup.get("status")) == "skipped_post_only":
+                    best_bid, best_ask = best_bid_ask(info, coin)
+                    continue
                 break
             levels.append(topup)
             if grid_order_would_add_risk(position_size, bool(topup["is_buy"])):
