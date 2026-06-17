@@ -3099,16 +3099,21 @@ def format_server_batch_rows(rows: list[dict[str, Any]], network: str, account: 
     for row in rows:
         if not batch_row_matches_context(row, network, account, coin):
             continue
+        is_grid = row.get("type") == "grid"
+        limit = f"{grid_limit_policy_from_row(row)} {row.get('max_position_value', '')}" if is_grid else "-"
+        trend = f"{row.get('trend', '0')} / {row.get('actual_trend', '0%')}" if is_grid else "-"
         display_rows.append(
             {
                 "type": str(row.get("type", "")),
                 "status": str(row.get("status", "")),
                 "coin": str(row.get("coin", "")),
-                "side": str(row.get("side", "grid" if row.get("type") == "grid" else "")),
+                "side": str(row.get("side", "grid" if is_grid else "")),
+                "limit": limit,
+                "trend": trend,
                 "trail": str(row.get("trail", row.get("gap", "-"))),
                 "bestPx": format_optional_decimal(row.get("best_px")),
                 "stopPx": format_optional_decimal(row.get("stop_px")),
-                "oid": str(row.get("oid", f"{len(grid_batch_open_oids(row))} open" if row.get("type") == "grid" else "")),
+                "oid": str(row.get("oid", f"{len(grid_batch_open_oids(row))} open" if is_grid else "")),
                 "updated": format_timestamp_ms(int(row.get("updated_at", 0)) * 1000) if row.get("updated_at") else "-",
             }
         )
@@ -3143,6 +3148,8 @@ def print_server_batch(rows: list[dict[str, Any]], network: str, account: str | 
             ("status", "status"),
             ("coin", "coin"),
             ("side", "side"),
+            ("limit", "limit"),
+            ("trend", "trend"),
             ("trail", "trail"),
             ("bestPx", "bestPx"),
             ("stopPx", "stopPx"),
