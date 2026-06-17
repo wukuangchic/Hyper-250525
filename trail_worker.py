@@ -797,9 +797,7 @@ def maintain_grid(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     topped_up = 0
     target_per_side = int(row.get("target_orders_per_side") or GRID_TARGET_ORDERS_PER_SIDE)
     for side in ("buy", "sell"):
-        topup_attempts = 0
-        while len(active_grid_entries(row, side)) < target_per_side and topup_attempts < target_per_side * 2:
-            topup_attempts += 1
+        while len(active_grid_entries(row, side)) < target_per_side:
             reference_px = grid_reference_price(side, current_mid, best_bid, best_ask)
             topup = next_depth_order(row, coin, asset, side, current_mid, position_size, position_value, max_position_value, policy, reference_px)
             if topup is None:
@@ -814,9 +812,6 @@ def maintain_grid(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
             submitted = submit_grid_order_entry(exchange, coin, topup, now, row, asset, position_size, policy)
             if not submitted:
                 changed = True
-                if str(topup.get("status")) == "skipped_post_only":
-                    best_bid, best_ask = best_bid_ask(info, coin)
-                    continue
                 break
             levels.append(topup)
             if grid_order_would_add_risk(position_size, bool(topup["is_buy"])):
