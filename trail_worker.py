@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import time
 from decimal import Decimal
 from pathlib import Path
@@ -33,6 +34,7 @@ from hl_order import (  # noqa: E402
 
 
 LOCK_PATH = Path(__file__).resolve().parent / "server_batch.lock"
+RATE_LIMIT_LOG_PATH = Path(__file__).resolve().parent / "logs" / "trail-rate-limit.jsonl"
 DONE_RETENTION_DAYS = 7
 DONE_RETENTION_MAX = 500
 TRANSIENT_STATUS_CODES = {429, 502, 503, 504}
@@ -47,6 +49,26 @@ def transient_error_status(exc: Exception) -> int | None:
     except (TypeError, ValueError):
         return None
     return status_int if status_int in TRANSIENT_STATUS_CODES else None
+
+
+def append_rate_limit_log(row: dict[str, Any], status_code: int, exc: Exception) -> None:
+    RATE_LIMIT_LOG_PATH.parent.mkdir(exist_ok=True)
+    entry = {
+        "ts": int(time.time()),
+        "status_code": status_code,
+        "type": row.get("type"),
+        "id": row.get("id"),
+        "coin": row.get("coin"),
+        "oid": row.get("oid"),
+        "network": row.get("network", "mainnet"),
+        "account": mask(str(row.get("account", ""))) if row.get("account") else "",
+        "stop_px": row.get("stop_px"),
+        "best_px": row.get("best_px"),
+        "last_mid_px": row.get("last_mid_px"),
+        "error": str(exc),
+    }
+    with RATE_LIMIT_LOG_PATH.open("a") as handle:
+        handle.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
 
 
 def find_open_order_by_oid(info: Any, account: str, dex: str, oid: int) -> dict[str, Any] | None:
@@ -232,6 +254,7 @@ def run_once() -> None:
                 row["status"] = "active"
                 row["last_error"] = str(exc)
                 row["note"] = f"transient HTTP {transient_status}; will retry"
+                append_rate_limit_log(row, transient_status, exc)
             row["updated_at"] = int(time.time())
             rows[index] = row
             changed = True
