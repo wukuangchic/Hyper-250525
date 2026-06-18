@@ -52,6 +52,7 @@ DONE_RETENTION_MAX = 500
 GRID_LEVEL_HISTORY_MAX = 120
 GRID_FILL_LOOKBACK_SECONDS = 24 * 60 * 60
 GRID_MARGIN_RETRY_SECONDS = 10 * 60
+GRID_MAX_SUBMISSIONS_PER_SIDE_PER_RUN = 2
 TRANSIENT_STATUS_CODES = {429, 502, 503, 504}
 TRANSIENT_ERROR_TEXTS = (
     "connection reset",
@@ -954,6 +955,37 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     ]
 
     levels = row.setdefault("levels", [])
+    submissions_by_side = {"buy": 0, "sell": 0}
+    filled_submission_sides: set[str] = set()
+
+    def side_submission_allowed(side: str) -> bool:
+        return (
+            side not in filled_submission_sides
+            and submissions_by_side.get(side, 0) < GRID_MAX_SUBMISSIONS_PER_SIDE_PER_RUN
+        )
+
+    def submit_tracked(order: dict[str, Any]) -> bool:
+        side = str(order.get("side") or "")
+        if not side_submission_allowed(side):
+            return False
+        submitted = submit_grid_order_entry(
+            exchange,
+            coin,
+            order,
+            now,
+            row,
+            asset,
+            position_size,
+            position_value,
+            policy,
+            account_margin_protected,
+        )
+        if submitted:
+            submissions_by_side[side] = submissions_by_side.get(side, 0) + 1
+            if str(order.get("status")) == "filled":
+                filled_submission_sides.add(side)
+        return submitted
+
     for entry in levels:
         if not isinstance(entry, dict) or not entry.get("side"):
             continue
@@ -989,18 +1021,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             if grid_margin_pause_active(row, side, now, position_value, position_size):
                 changed = True
                 continue
-            if submit_grid_order_entry(
-                exchange,
-                coin,
-                entry,
-                now,
-                row,
-                asset,
-                position_size,
-                position_value,
-                policy,
-                account_margin_protected,
-            ):
+            if submit_tracked(entry):
                 entry["recovered_missing_oid"] = old_oid
                 entry["recovered_missing_at"] = now
                 missing_without_fill.append(oid)
@@ -1108,6 +1129,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 projected_near_value = max(Decimal("0"), projected_near_value - order_notional)
         submitted_near = 0
         for near_order in near_orders:
+            if not side_submission_allowed(side):
+                break
             if submitted_near >= len(farthest_old):
                 break
             if active_price_too_close(row, side, Decimal(str(near_order["price"]))):
@@ -1130,18 +1153,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 min_position_value,
             ):
                 continue
-            submitted = submit_grid_order_entry(
-                exchange,
-                coin,
-                near_order,
-                now,
-                row,
-                asset,
-                position_size,
-                position_value,
-                policy,
-                account_margin_protected,
-            )
+            submitted = submit_tracked(near_order)
             if submitted:
                 levels.append(near_order)
                 if near_order.get("replacement_pending"):
@@ -1190,9 +1202,11 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         )
         if replacement is None:
             continue
+        replacement_side = str(replacement["side"])
+        if not side_submission_allowed(replacement_side):
+            continue
         entry["replacement_pending"] = False
         entry["replacement_processed_at"] = now
-        replacement_side = str(replacement["side"])
         if grid_margin_pause_active(row, replacement_side, now, position_value, position_size):
             changed = True
             continue
@@ -1215,18 +1229,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             levels.append(replacement)
             changed = True
             continue
-        submitted = submit_grid_order_entry(
-            exchange,
-            coin,
-            replacement,
-            now,
-            row,
-            asset,
-            position_size,
-            position_value,
-            policy,
-            account_margin_protected,
-        )
+        submitted = submit_tracked(replacement)
         if not submitted:
             changed = True
             continue
@@ -1241,10 +1244,14 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     topped_up = 0
     target_per_side = int(row.get("target_orders_per_side") or GRID_TARGET_ORDERS_PER_SIDE)
     for side in ("buy", "sell"):
+        if not side_submission_allowed(side):
+            continue
         if grid_margin_pause_active(row, side, now, position_value, position_size):
             continue
         remaining_topups = max(0, target_per_side - len(active_grid_entries(row, side)))
         while remaining_topups > 0:
+            if not side_submission_allowed(side):
+                break
             projected_position_value = projected_position_values[side]
             reference_px = grid_reference_price(side, current_mid, best_bid, best_ask)
             topup = next_depth_order(row, coin, asset, side, current_mid, position_size, position_value, max_position_value, policy, reference_px)
@@ -1267,18 +1274,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 levels.append(topup)
                 changed = True
                 break
-            submitted = submit_grid_order_entry(
-                exchange,
-                coin,
-                topup,
-                now,
-                row,
-                asset,
-                position_size,
-                position_value,
-                policy,
-                account_margin_protected,
-            )
+            submitted = submit_tracked(topup)
             if not submitted:
                 changed = True
                 break
@@ -1302,6 +1298,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         }:
             continue
         side = str(entry["side"])
+        if not side_submission_allowed(side):
+            continue
         if len(active_grid_oids(row, side)) >= target_per_side:
             continue
         if grid_margin_pause_active(row, side, now, position_value, position_size):
@@ -1320,18 +1318,18 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             continue
         if active_price_too_close(row, str(entry["side"]), Decimal(str(entry.get("price", entry.get("limit_px"))))):
             continue
-        if not submit_grid_order_entry(
-            exchange,
-            coin,
-            entry,
-            now,
-            row,
-            asset,
-            position_size,
-            position_value,
-            policy,
-            account_margin_protected,
-        ):
+        entry_price = Decimal(str(entry.get("price", entry.get("limit_px"))))
+        is_buy = bool(entry.get("is_buy"))
+        marketable = (is_buy and best_ask is not None and entry_price >= best_ask) or (
+            not is_buy and best_bid is not None and entry_price <= best_bid
+        )
+        if marketable:
+            entry["status"] = "skipped_marketable_restore"
+            entry["oid"] = None
+            entry["skipped_at"] = now
+            changed = True
+            continue
+        if not submit_tracked(entry):
             changed = True
             continue
         if grid_order_would_add_risk(position_size, bool(entry.get("is_buy"))):
@@ -1361,6 +1359,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         f"grid maintained; replacements={replacements}; topped_up={topped_up}; "
         f"paused={paused}; refreshed={refreshed}; deduped={deduped}; restored={restored}; trimmed={trimmed}; near_regrids={near_regrids}; "
         f"recovered_missing={recovered_missing}; margin_cooldown={margin_cooldowns}; "
+        f"submissions=buy:{submissions_by_side['buy']},sell:{submissions_by_side['sell']}; "
+        f"filled_stop={','.join(sorted(filled_submission_sides)) or '-'}; "
         f"account_margin={margin_ratio_label}; account_protected={int(account_margin_protected)}"
     )
     return (
