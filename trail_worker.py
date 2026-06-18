@@ -847,7 +847,7 @@ def near_grid_order_if_stale(
         return None
 
     nearest_px = nearest_active_price(row, side)
-    stale_threshold = Decimal("1") - gap * Decimal("2") if is_buy else Decimal("1") + gap * Decimal("2")
+    stale_threshold = Decimal("1") - gap * Decimal("5") if is_buy else Decimal("1") + gap * Decimal("5")
     if nearest_px is not None:
         if is_buy and nearest_px >= reference_px * stale_threshold:
             return None
