@@ -253,6 +253,12 @@ class CachedInfo:
             lambda: self._info.frontend_open_orders(account, dex=dex),
         )
 
+    def query_order_by_oid(self, account: str, oid: int) -> Any:
+        return self._cached(
+            ("query_order_by_oid", account, oid),
+            lambda: self._info.query_order_by_oid(account, oid),
+        )
+
     def user_fills(self, account: str) -> Any:
         return self._cached(("user_fills", account), lambda: self._info.user_fills(account))
 
@@ -1562,7 +1568,7 @@ def grid_entry_sort_key(entry: dict[str, Any]) -> tuple[int, Decimal, int]:
 def format_grid_detail_rows(row: dict[str, Any], open_oids: set[int]) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     entries = [item for item in row.get("levels") or [] if isinstance(item, dict) and item.get("side")]
-    live_statuses = {"active", "pending", "paused_max", "paused_margin"}
+    live_statuses = {"active", "pending", "paused_max", "paused_margin", "paused_reduce_capacity"}
     live_entries = [entry for entry in entries if str(entry.get("status", "active")) in live_statuses]
     history_entries = [entry for entry in entries if str(entry.get("status", "active")) not in live_statuses]
     history_entries = sorted(history_entries, key=lambda entry: int(entry.get("submitted_at") or entry.get("recovered_at") or entry.get("filled_at") or entry.get("cancelled_at") or entry.get("skipped_at") or entry.get("paused_at") or 0))[-120:]

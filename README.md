@@ -223,6 +223,8 @@ BTC --cancel grid
 - 仓位降到能容纳下一张加仓单后，worker 再把加仓方向补回到最多 5 张。
 - 补缺失子单时优先参考盘口 best bid/ask，而不是只参考 mid；盘口读取失败时才退回 mid。
 - 到达持仓上限后，如果减仓方向最靠近市场的单已经离盘口超过约 2 个 gap，worker 会补一张新的近侧 reduce-only 平仓单，再撤远侧，保持每边最多 5 张。
+- 全仓或逐仓的加仓方向若被交易所以保证金不足拒绝，worker 会对该方向冷却 10 分钟，本轮不再继续试单；减仓方向照常维护。仓位缩小会提前解除冷却，否则到期后探测一次。
+- reduce-only 子单的活动数量总和不会超过当前可减仓数量；交易所因可减仓数量不足自动取消的 `reduceOnlyCanceled` 不会被当作手动撤单反复补回。
 - post-only limit 因“只限挂单”被拒绝时，grid 不会变成 `error`；worker 会跳过这张，并在下一轮继续维护。
 
 ### 接续和边界
@@ -266,6 +268,7 @@ BTC --cancel trail
 - `systemd/simple-hyper-trail-worker.timer` 默认每分钟触发一次 `trail_worker.py`。
 - `trail_worker.py` 是 one-shot：每次处理当前 `active` trail/grid 任务，处理完即退出。
 - 如果上一轮运行超过 1 分钟，文件锁会让下一轮直接跳过，避免并发改同一批订单。
+- 单轮运行超过 3 分钟时，systemd 会终止本轮；之后的定时轮次会继续正常运行。
 - 没有 `active` 任务时，worker 只打印 `trail_worker: no active trail/grid orders`，不会查询价格或订单。
 - 当前同一个 worker 同时维护 trail 和 grid。实际耗时主要取决于 Hyperliquid API 网络等待；近期 4 个 grid 同时维护时，每轮墙钟约 10-30 秒，CPU 通常约 1 秒。
 

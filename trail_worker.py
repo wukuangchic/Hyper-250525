@@ -50,6 +50,7 @@ DONE_RETENTION_DAYS = 7
 DONE_RETENTION_MAX = 500
 GRID_LEVEL_HISTORY_MAX = 120
 GRID_FILL_LOOKBACK_SECONDS = 24 * 60 * 60
+GRID_MARGIN_RETRY_SECONDS = 10 * 60
 TRANSIENT_STATUS_CODES = {429, 502, 503, 504}
 TRANSIENT_ERROR_TEXTS = (
     "connection reset",
@@ -142,6 +143,65 @@ def is_reduce_only_would_increase_text(text: str) -> bool:
 
 def is_insufficient_margin_text(text: str) -> bool:
     return "insufficient margin" in text.lower()
+
+
+def grid_margin_pause_active(
+    row: dict[str, Any],
+    side: str,
+    now: int,
+    position_value: Decimal,
+    position_size: Decimal,
+) -> bool:
+    pauses = row.get("margin_pauses")
+    if not isinstance(pauses, dict):
+        return False
+    pause = pauses.get(side)
+    if not isinstance(pause, dict):
+        return False
+
+    is_buy = side == "buy"
+    paused_position_value = decimal_or_none(pause.get("position_value"))
+    expired = now >= int(pause.get("retry_at") or 0)
+    position_reduced = paused_position_value is not None and position_value < paused_position_value
+    no_longer_adds_risk = not grid_order_would_add_risk(position_size, is_buy)
+    if expired or position_reduced or no_longer_adds_risk:
+        pauses.pop(side, None)
+        if not pauses:
+            row.pop("margin_pauses", None)
+        return False
+    return True
+
+
+def grid_reduce_only_capacity_available(
+    row: dict[str, Any],
+    order: dict[str, Any],
+    position_size: Decimal,
+) -> bool:
+    if not bool(order.get("reduce_only", False)):
+        return True
+    requested_size = decimal_or_none(order.get("size")) or Decimal("0")
+    if requested_size <= 0 or position_size == 0:
+        return False
+    reserved_size = Decimal("0")
+    for entry in active_grid_entries(row, str(order.get("side"))):
+        if entry is order or not bool(entry.get("reduce_only", False)):
+            continue
+        reserved_size += decimal_or_none(entry.get("size")) or Decimal("0")
+    return reserved_size + requested_size <= abs(position_size)
+
+
+def pause_grid_margin_side(
+    row: dict[str, Any],
+    side: str,
+    now: int,
+    position_value: Decimal,
+) -> None:
+    pauses = row.setdefault("margin_pauses", {})
+    pauses[side] = {
+        "paused_at": now,
+        "retry_at": now + GRID_MARGIN_RETRY_SECONDS,
+        "position_value": decimal_to_plain(position_value),
+    }
 
 
 def best_bid_ask(info: Any, coin: str) -> tuple[Decimal | None, Decimal | None]:
@@ -562,10 +622,16 @@ def submit_grid_order_entry(
     row: dict[str, Any],
     asset: dict[str, Any],
     position_size: Decimal,
+    position_value: Decimal,
     policy: str,
 ) -> bool:
     refresh_grid_order_reduce_only(order, position_size, policy)
     ensure_grid_order_min_notional(row, asset, order)
+    if not grid_reduce_only_capacity_available(row, order, position_size):
+        order["status"] = "paused_reduce_capacity"
+        order["oid"] = None
+        order["paused_at"] = now
+        return False
     try:
         oid, state, status = submit_grid_child_order(exchange, coin, order)
     except GridPostOnlyRejected as exc:
@@ -587,6 +653,8 @@ def submit_grid_order_entry(
             order["oid"] = None
             order["last_error"] = error_text
             order["paused_at"] = now
+            if grid_order_would_add_risk(position_size, bool(order.get("is_buy"))):
+                pause_grid_margin_side(row, str(order.get("side")), now, position_value)
             return False
         if not is_min_order_value_error_text(error_text) or order.get("resized_min_retry_at"):
             raise
@@ -772,7 +840,20 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         fill = fills_by_oid.get(oid)
         if fill is None:
             old_oid = oid
-            if submit_grid_order_entry(exchange, coin, entry, now, row, asset, position_size, policy):
+            order_status = info.query_order_by_oid(account, old_oid)
+            status_name = str(order_status.get("order", {}).get("status") or "")
+            if status_name == "reduceOnlyCanceled":
+                entry["status"] = "skipped_reduce_only"
+                entry["oid"] = None
+                entry["last_error"] = "exchange canceled excess reduce-only order"
+                entry["skipped_at"] = now
+                changed = True
+                continue
+            side = str(entry.get("side"))
+            if grid_margin_pause_active(row, side, now, position_value, position_size):
+                changed = True
+                continue
+            if submit_grid_order_entry(exchange, coin, entry, now, row, asset, position_size, position_value, policy):
                 entry["recovered_missing_oid"] = old_oid
                 entry["recovered_missing_at"] = now
                 missing_without_fill.append(oid)
@@ -819,6 +900,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
 
     near_regrids = 0
     for side in ("buy", "sell"):
+        if grid_margin_pause_active(row, side, now, position_value, position_size):
+            continue
         reference_px = grid_reference_price(side, current_mid, best_bid, best_ask)
         near_order = near_grid_order_if_stale(
             row,
@@ -834,7 +917,9 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         if near_order is not None:
             if active_price_too_close(row, side, Decimal(str(near_order["price"]))):
                 continue
-            submitted = submit_grid_order_entry(exchange, coin, near_order, now, row, asset, position_size, policy)
+            submitted = submit_grid_order_entry(
+                exchange, coin, near_order, now, row, asset, position_size, position_value, policy
+            )
             if submitted:
                 levels.append(near_order)
                 near_regrids += 1
@@ -849,6 +934,10 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         replacement = replacement_order_from_fill(row, coin, asset, fill, bool(entry.get("is_buy")), position_size, position_value, max_position_value, policy)
         if replacement is None:
             continue
+        replacement_side = str(replacement["side"])
+        if grid_margin_pause_active(row, replacement_side, now, position_value, position_size):
+            changed = True
+            continue
         if active_price_too_close(row, str(replacement["side"]), Decimal(str(replacement["price"]))):
             changed = True
             continue
@@ -859,7 +948,9 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             levels.append(replacement)
             changed = True
             continue
-        submitted = submit_grid_order_entry(exchange, coin, replacement, now, row, asset, position_size, policy)
+        submitted = submit_grid_order_entry(
+            exchange, coin, replacement, now, row, asset, position_size, position_value, policy
+        )
         if not submitted:
             changed = True
             continue
@@ -872,6 +963,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     topped_up = 0
     target_per_side = int(row.get("target_orders_per_side") or GRID_TARGET_ORDERS_PER_SIDE)
     for side in ("buy", "sell"):
+        if grid_margin_pause_active(row, side, now, position_value, position_size):
+            continue
         while len(active_grid_entries(row, side)) < target_per_side:
             reference_px = grid_reference_price(side, current_mid, best_bid, best_ask)
             topup = next_depth_order(row, coin, asset, side, current_mid, position_size, position_value, max_position_value, policy, reference_px)
@@ -886,7 +979,9 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 levels.append(topup)
                 changed = True
                 break
-            submitted = submit_grid_order_entry(exchange, coin, topup, now, row, asset, position_size, policy)
+            submitted = submit_grid_order_entry(
+                exchange, coin, topup, now, row, asset, position_size, position_value, policy
+            )
             if not submitted:
                 changed = True
                 break
@@ -898,14 +993,23 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
 
     restored = 0
     for entry in levels:
-        if not isinstance(entry, dict) or entry.get("side") is None or str(entry.get("status")) not in {"paused_max", "paused_margin"}:
+        if not isinstance(entry, dict) or entry.get("side") is None or str(entry.get("status")) not in {
+            "paused_max",
+            "paused_margin",
+            "paused_reduce_capacity",
+        }:
+            continue
+        side = str(entry["side"])
+        if grid_margin_pause_active(row, side, now, position_value, position_size):
             continue
         order_notional = Decimal(str(entry.get("size"))) * Decimal(str(entry.get("price", entry.get("limit_px"))))
         if not grid_order_allowed_by_max(position_size, projected_position_value, bool(entry.get("is_buy")), order_notional, max_position_value, policy):
             continue
         if active_price_too_close(row, str(entry["side"]), Decimal(str(entry.get("price", entry.get("limit_px"))))):
             continue
-        if not submit_grid_order_entry(exchange, coin, entry, now, row, asset, position_size, policy):
+        if not submit_grid_order_entry(
+            exchange, coin, entry, now, row, asset, position_size, position_value, policy
+        ):
             changed = True
             continue
         if grid_order_would_add_risk(position_size, bool(entry.get("is_buy"))):
@@ -925,10 +1029,11 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     row["position_value"] = decimal_to_plain(position_value)
     row["position_size"] = decimal_to_plain(position_size)
     row["open_oids"] = sorted(grid_batch_open_oids(row))
+    margin_cooldowns = ",".join(sorted((row.get("margin_pauses") or {}).keys())) or "-"
     row["note"] = (
         f"grid maintained; replacements={replacements}; topped_up={topped_up}; "
         f"paused={paused}; refreshed={refreshed}; deduped={deduped}; restored={restored}; trimmed={trimmed}; near_regrids={near_regrids}; "
-        f"recovered_missing={recovered_missing}"
+        f"recovered_missing={recovered_missing}; margin_cooldown={margin_cooldowns}"
     )
     return (
         row,
@@ -996,7 +1101,7 @@ def prune_grid_levels(row: dict[str, Any]) -> bool:
     if not isinstance(levels, list):
         return False
 
-    keep_statuses = {"active", "pending", "paused_max", "paused_margin"}
+    keep_statuses = {"active", "pending", "paused_max", "paused_margin", "paused_reduce_capacity"}
     live_levels: list[dict[str, Any]] = []
     history_levels: list[dict[str, Any]] = []
     passthrough: list[Any] = []
