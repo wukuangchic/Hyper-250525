@@ -563,7 +563,6 @@ def replacement_order_from_fill(
     row: dict[str, Any],
     coin: str,
     asset: dict[str, Any],
-    fill: dict[str, Any],
     submitted_limit_px: Decimal,
     filled_is_buy: bool,
     position_size: Decimal,
@@ -740,6 +739,7 @@ def submit_grid_order_entry(
     order["last_submit_status"] = status
     if state == "filled":
         order["filled_at"] = now
+        order["replacement_pending"] = True
     return True
 
 
@@ -917,7 +917,11 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     changed = False
     missing_without_fill: list[int] = []
     recovered_missing = 0
-    newly_filled: list[dict[str, Any]] = []
+    newly_filled: list[dict[str, Any]] = [
+        entry
+        for entry in row.get("levels") or []
+        if isinstance(entry, dict) and entry.get("side") and bool(entry.get("replacement_pending"))
+    ]
 
     levels = row.setdefault("levels", [])
     for entry in levels:
@@ -963,11 +967,14 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 entry["recovered_missing_at"] = now
                 missing_without_fill.append(oid)
                 recovered_missing += 1
+                if entry.get("replacement_pending"):
+                    newly_filled.append(entry)
             changed = True
             continue
         entry["status"] = "filled"
         entry["filled_at"] = int(fill.get("time") or now_ms) // 1000
         entry["fill"] = fill
+        entry["replacement_pending"] = True
         newly_filled.append(entry)
         changed = True
 
@@ -1055,6 +1062,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             )
             if submitted:
                 levels.append(near_order)
+                if near_order.get("replacement_pending"):
+                    newly_filled.append(near_order)
                 near_regrids += 1
             changed = True
 
@@ -1070,15 +1079,11 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         projected_position_values[side] = projected
     replacements = 0
     for entry in newly_filled:
-        fill = entry.get("fill")
-        if not isinstance(fill, dict):
-            continue
         submitted_limit_px = decimal_or_none(entry.get("price", entry.get("limit_px"))) or Decimal("0")
         replacement = replacement_order_from_fill(
             row,
             coin,
             asset,
-            fill,
             submitted_limit_px,
             bool(entry.get("is_buy")),
             position_size,
@@ -1088,6 +1093,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         )
         if replacement is None:
             continue
+        entry["replacement_pending"] = False
+        entry["replacement_processed_at"] = now
         replacement_side = str(replacement["side"])
         if grid_margin_pause_active(row, replacement_side, now, position_value, position_size):
             changed = True
