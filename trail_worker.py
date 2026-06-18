@@ -1242,7 +1242,11 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         changed = True
 
     topped_up = 0
-    target_per_side = int(row.get("target_orders_per_side") or GRID_TARGET_ORDERS_PER_SIDE)
+    saved_target_per_side = int(row.get("target_orders_per_side") or GRID_TARGET_ORDERS_PER_SIDE)
+    target_per_side = GRID_TARGET_ORDERS_PER_SIDE if saved_target_per_side == 5 else saved_target_per_side
+    if target_per_side != saved_target_per_side:
+        row["target_orders_per_side"] = target_per_side
+        changed = True
     for side in ("buy", "sell"):
         if not side_submission_allowed(side):
             continue
