@@ -593,6 +593,16 @@ def active_grid_entries(row: dict[str, Any], side: str | None = None) -> list[di
     return entries
 
 
+def active_grid_oids(row: dict[str, Any], side: str | None = None) -> set[int]:
+    oids: set[int] = set()
+    for entry in active_grid_entries(row, side):
+        try:
+            oids.add(int(entry["oid"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return oids
+
+
 def farthest_active_price(row: dict[str, Any], side: str, current_mid: Decimal) -> Decimal:
     entries = active_grid_entries(row, side)
     prices = [
@@ -772,16 +782,47 @@ def trim_excess_grid_entries(exchange: Any, coin: str, row: dict[str, Any], targ
     trimmed = 0
     for side in ("buy", "sell"):
         entries = active_grid_entries(row, side)
-        if len(entries) <= target_per_side:
-            continue
-
         def price_key(entry: dict[str, Any]) -> Decimal:
             return decimal_or_none(entry.get("price", entry.get("limit_px"))) or Decimal("0")
 
+        unique_entries: list[dict[str, Any]] = []
+        entries_by_oid: dict[int, list[dict[str, Any]]] = {}
+        for entry in entries:
+            try:
+                oid = int(entry["oid"])
+            except (KeyError, TypeError, ValueError):
+                entry["status"] = "invalid_active_oid"
+                entry["cancelled_at"] = now
+                trimmed += 1
+                continue
+            if oid not in entries_by_oid:
+                unique_entries.append(entry)
+                entries_by_oid[oid] = []
+            entries_by_oid[oid].append(entry)
+
+        for oid_entries in entries_by_oid.values():
+            for duplicate in oid_entries[1:]:
+                duplicate["status"] = "duplicate_active_oid"
+                duplicate["cancelled_at"] = now
+                trimmed += 1
+
+        if len(unique_entries) <= target_per_side:
+            continue
+
         # Buy orders farther from the market have lower prices; sell orders farther from
         # the market have higher prices. Cancel those first when a near-side order is added.
-        farthest_first = sorted(entries, key=price_key, reverse=side == "sell")
-        trimmed += cancel_grid_entries(exchange, coin, farthest_first[: len(entries) - target_per_side], now, "trimmed_excess")
+        farthest_first = sorted(unique_entries, key=price_key, reverse=side == "sell")
+        to_trim = farthest_first[: len(unique_entries) - target_per_side]
+        trimmed += cancel_grid_entries(exchange, coin, to_trim, now, "trimmed_excess")
+        trimmed_oids = {int(entry["oid"]) for entry in to_trim}
+        for entry in entries:
+            try:
+                oid = int(entry["oid"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if oid in trimmed_oids:
+                entry["status"] = "trimmed_excess"
+                entry["cancelled_at"] = now
     return trimmed
 
 
@@ -1205,6 +1246,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         }:
             continue
         side = str(entry["side"])
+        if len(active_grid_oids(row, side)) >= target_per_side:
+            continue
         if grid_margin_pause_active(row, side, now, position_value, position_size):
             continue
         projected_position_value = projected_position_values[side]
