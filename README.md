@@ -225,6 +225,7 @@ BTC --cancel grid
 - 到达持仓上限后，如果减仓方向最靠近市场的单已经离盘口超过约 2 个 gap，worker 会补一张新的近侧 reduce-only 平仓单，再撤远侧，保持每边最多 5 张。
 - 全仓或逐仓的加仓方向若被交易所以保证金不足拒绝，worker 会对该方向冷却 10 分钟，本轮不再继续试单；减仓方向照常维护。仓位缩小会提前解除冷却，否则到期后探测一次。
 - reduce-only 子单的活动数量总和不会超过当前可减仓数量；交易所因可减仓数量不足自动取消的 `reduceOnlyCanceled` 不会被当作手动撤单反复补回。
+- 每轮只查询一次账户 USDC 的“维护保证金后余量 / 总余额”。比例低于 `60%` 时不修改已有挂单，但所有新 grid 子单必须减少当前净仓位并强制使用 reduce-only；会加仓或反手的新单暂缓，比例恢复到 `60%` 后自动继续。
 - post-only limit 因“只限挂单”被拒绝时，grid 不会变成 `error`；worker 会跳过这张，并在下一轮继续维护。
 
 ### 接续和边界
@@ -545,6 +546,8 @@ journalctl -u simple-hyper-sync.service -n 80 --no-pager
 
 ```text
 +- Account ----------------+
+| 账户安全余量率: 47.64%     |
+| Grid保护(<60%): 开启       |
 | 统一账户比率: 0.19%        |
 | 统一账户杠杆: 0.09x        |
 +----------------------------+
@@ -649,6 +652,7 @@ reduce_only=True：只允许减仓 / 平仓，不允许反手
 
 统一账户指标口径：
 
+- 账户安全余量率：`tokenToAvailableAfterMaintenance[USDC] / balances[USDC].total`；低于 `60%` 时，新 grid 子单只允许 reduce-only 减仓。
 - 统一账户比率：将各 DEX 的 maintenance margin 按 collateral token 聚合，再除以对应 spot 抵押品余额，取风险最高的一组。
 - 统一账户杠杆：当前总名义仓位 / 活跃抵押品余额。
 

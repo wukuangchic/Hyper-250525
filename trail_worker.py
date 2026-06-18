@@ -17,6 +17,7 @@ ensure_local_venv(__file__)
 
 from hl_order import (  # noqa: E402
     DEFAULT_SLIPPAGE,
+    GRID_ACCOUNT_MARGIN_RATIO_THRESHOLD,
     GRID_TARGET_ORDERS_PER_SIDE,
     SERVER_BATCH_PATH,
     build_clients,
@@ -170,6 +171,48 @@ def grid_margin_pause_active(
             row.pop("margin_pauses", None)
         return False
     return True
+
+
+def account_margin_ratio(
+    info: Any,
+    account: str,
+    network: str,
+    cache: dict[str, Any],
+) -> Decimal | None:
+    ratio_cache = cache.setdefault("account_margin_ratios", {})
+    cache_key = (network, account)
+    if cache_key in ratio_cache:
+        return ratio_cache[cache_key]
+
+    spot_state = info.spot_user_state(account)
+    total = None
+    for balance in spot_state.get("balances", []):
+        if not isinstance(balance, dict):
+            continue
+        if balance.get("token") == 0 or str(balance.get("coin", "")).upper() == "USDC":
+            total = decimal_or_none(balance.get("total"))
+            break
+
+    available = None
+    for item in spot_state.get("tokenToAvailableAfterMaintenance", []):
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        try:
+            token = int(item[0])
+        except (TypeError, ValueError):
+            continue
+        if token == 0:
+            available = decimal_or_none(item[1])
+            break
+
+    if total is None or total <= 0:
+        ratio = Decimal("0")
+    elif available is None:
+        ratio = None
+    else:
+        ratio = max(Decimal("0"), available) / total
+    ratio_cache[cache_key] = ratio
+    return ratio
 
 
 def grid_reduce_only_capacity_available(
@@ -624,8 +667,19 @@ def submit_grid_order_entry(
     position_size: Decimal,
     position_value: Decimal,
     policy: str,
+    account_margin_protected: bool,
 ) -> bool:
     refresh_grid_order_reduce_only(order, position_size, policy)
+    if account_margin_protected:
+        if grid_order_would_add_risk(position_size, bool(order.get("is_buy"))):
+            order["status"] = "paused_account_margin"
+            order["oid"] = None
+            order["paused_at"] = now
+            return False
+        order["reduce_only"] = True
+        plan = order.get("plan")
+        if isinstance(plan, dict):
+            plan["reduce_only"] = True
     ensure_grid_order_min_notional(row, asset, order)
     if not grid_reduce_only_capacity_available(row, order, position_size):
         order["status"] = "paused_reduce_capacity"
@@ -806,6 +860,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     current_mid = Decimal(str(mids[coin]))
     best_bid, best_ask = best_bid_ask(info, coin)
     position_size, position_value = current_position_size_value(info, account, coin, dex, current_mid)
+    margin_ratio = account_margin_ratio(info, account, network, cache)
+    account_margin_protected = margin_ratio is not None and margin_ratio < GRID_ACCOUNT_MARGIN_RATIO_THRESHOLD
 
     open_orders_cache = cache.setdefault("open_orders", {})
     open_orders_key = (network, account, dex)
@@ -853,7 +909,18 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             if grid_margin_pause_active(row, side, now, position_value, position_size):
                 changed = True
                 continue
-            if submit_grid_order_entry(exchange, coin, entry, now, row, asset, position_size, position_value, policy):
+            if submit_grid_order_entry(
+                exchange,
+                coin,
+                entry,
+                now,
+                row,
+                asset,
+                position_size,
+                position_value,
+                policy,
+                account_margin_protected,
+            ):
                 entry["recovered_missing_oid"] = old_oid
                 entry["recovered_missing_at"] = now
                 missing_without_fill.append(oid)
@@ -881,13 +948,14 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
 
     refreshed = 0
     to_refresh: list[dict[str, Any]] = []
-    for entry in active_grid_entries(row):
-        desired_reduce_only = grid_order_should_reduce_only(position_size, bool(entry.get("is_buy")), policy)
-        if bool(entry.get("reduce_only", False)) == desired_reduce_only:
-            plan = entry.get("plan")
-            if not isinstance(plan, dict) or bool(plan.get("reduce_only", False)) == desired_reduce_only:
-                continue
-        to_refresh.append(entry)
+    if not account_margin_protected:
+        for entry in active_grid_entries(row):
+            desired_reduce_only = grid_order_should_reduce_only(position_size, bool(entry.get("is_buy")), policy)
+            if bool(entry.get("reduce_only", False)) == desired_reduce_only:
+                plan = entry.get("plan")
+                if not isinstance(plan, dict) or bool(plan.get("reduce_only", False)) == desired_reduce_only:
+                    continue
+            to_refresh.append(entry)
     if to_refresh:
         refreshed = cancel_grid_entries(exchange, coin, to_refresh, now, "refresh_reduce_only")
         changed = True
@@ -918,7 +986,16 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             if active_price_too_close(row, side, Decimal(str(near_order["price"]))):
                 continue
             submitted = submit_grid_order_entry(
-                exchange, coin, near_order, now, row, asset, position_size, position_value, policy
+                exchange,
+                coin,
+                near_order,
+                now,
+                row,
+                asset,
+                position_size,
+                position_value,
+                policy,
+                account_margin_protected,
             )
             if submitted:
                 levels.append(near_order)
@@ -949,7 +1026,16 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             changed = True
             continue
         submitted = submit_grid_order_entry(
-            exchange, coin, replacement, now, row, asset, position_size, position_value, policy
+            exchange,
+            coin,
+            replacement,
+            now,
+            row,
+            asset,
+            position_size,
+            position_value,
+            policy,
+            account_margin_protected,
         )
         if not submitted:
             changed = True
@@ -980,7 +1066,16 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 changed = True
                 break
             submitted = submit_grid_order_entry(
-                exchange, coin, topup, now, row, asset, position_size, position_value, policy
+                exchange,
+                coin,
+                topup,
+                now,
+                row,
+                asset,
+                position_size,
+                position_value,
+                policy,
+                account_margin_protected,
             )
             if not submitted:
                 changed = True
@@ -997,6 +1092,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             "paused_max",
             "paused_margin",
             "paused_reduce_capacity",
+            "paused_account_margin",
         }:
             continue
         side = str(entry["side"])
@@ -1008,7 +1104,16 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         if active_price_too_close(row, str(entry["side"]), Decimal(str(entry.get("price", entry.get("limit_px"))))):
             continue
         if not submit_grid_order_entry(
-            exchange, coin, entry, now, row, asset, position_size, position_value, policy
+            exchange,
+            coin,
+            entry,
+            now,
+            row,
+            asset,
+            position_size,
+            position_value,
+            policy,
+            account_margin_protected,
         ):
             changed = True
             continue
@@ -1028,12 +1133,16 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     row["last_fill_check_ms"] = now_ms
     row["position_value"] = decimal_to_plain(position_value)
     row["position_size"] = decimal_to_plain(position_size)
+    row["account_margin_ratio"] = decimal_to_plain(margin_ratio) if margin_ratio is not None else None
+    row["account_margin_protected"] = account_margin_protected
     row["open_oids"] = sorted(grid_batch_open_oids(row))
     margin_cooldowns = ",".join(sorted((row.get("margin_pauses") or {}).keys())) or "-"
+    margin_ratio_label = f"{margin_ratio * Decimal('100'):.2f}%" if margin_ratio is not None else "unknown"
     row["note"] = (
         f"grid maintained; replacements={replacements}; topped_up={topped_up}; "
         f"paused={paused}; refreshed={refreshed}; deduped={deduped}; restored={restored}; trimmed={trimmed}; near_regrids={near_regrids}; "
-        f"recovered_missing={recovered_missing}; margin_cooldown={margin_cooldowns}"
+        f"recovered_missing={recovered_missing}; margin_cooldown={margin_cooldowns}; "
+        f"account_margin={margin_ratio_label}; account_protected={int(account_margin_protected)}"
     )
     return (
         row,
@@ -1101,7 +1210,14 @@ def prune_grid_levels(row: dict[str, Any]) -> bool:
     if not isinstance(levels, list):
         return False
 
-    keep_statuses = {"active", "pending", "paused_max", "paused_margin", "paused_reduce_capacity"}
+    keep_statuses = {
+        "active",
+        "pending",
+        "paused_max",
+        "paused_margin",
+        "paused_reduce_capacity",
+        "paused_account_margin",
+    }
     live_levels: list[dict[str, Any]] = []
     history_levels: list[dict[str, Any]] = []
     passthrough: list[Any] = []

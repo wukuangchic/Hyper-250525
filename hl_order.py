@@ -102,6 +102,7 @@ GRID_SIDE_ALIASES = {"grid", "网格", "网格单"}
 DEFAULT_GRID_GAP_LABEL = ["auto-minTick", "auto-takerFee", "auto-makerFee"]
 DEFAULT_GRID_RANGE = ["auto", "auto"]
 GRID_TARGET_ORDERS_PER_SIDE = 5
+GRID_ACCOUNT_MARGIN_RATIO_THRESHOLD = Decimal("0.60")
 CANCEL_AGE_FILTERS = {"hour", "day", "week"}
 CANCEL_FILTERS = {"all", "up", "down", "buy", "sell", "tp", "sl", "trail", "grid"} | CANCEL_AGE_FILTERS
 CANCEL_AGE_UNIT_MS = {
@@ -486,7 +487,10 @@ def all_dex_names(info: Info) -> list[str]:
     return names
 
 
-def unified_account_metrics(info: Info, account: str) -> tuple[Optional[Decimal], Optional[Decimal]]:
+def unified_account_metrics(
+    info: Info,
+    account: str,
+) -> tuple[Optional[Decimal], Optional[Decimal], Optional[Decimal]]:
     spot_state = info.spot_user_state(account)
     log_event("spot_state", spot_state)
     spot_totals: dict[int, Decimal] = {}
@@ -502,6 +506,24 @@ def unified_account_metrics(info: Info, account: str) -> tuple[Optional[Decimal]
         spot_totals[int(token)] = Decimal(str(balance.get("total", "0")))
     if skipped_balances:
         log_event("spot_balances_without_token", skipped_balances)
+
+    available_after_maintenance: dict[int, Decimal] = {}
+    for item in spot_state.get("tokenToAvailableAfterMaintenance", []):
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        try:
+            available_after_maintenance[int(item[0])] = Decimal(str(item[1]))
+        except (TypeError, ValueError):
+            continue
+
+    usdc_total = spot_totals.get(0, Decimal("0"))
+    usdc_available = available_after_maintenance.get(0)
+    if usdc_total <= 0:
+        account_safety_margin_ratio = Decimal("0")
+    elif usdc_available is None:
+        account_safety_margin_ratio = None
+    else:
+        account_safety_margin_ratio = max(Decimal("0"), usdc_available) / usdc_total
 
     maintenance_by_token: dict[int, Decimal] = {}
     notional_by_token: dict[int, Decimal] = {}
@@ -547,16 +569,22 @@ def unified_account_metrics(info: Info, account: str) -> tuple[Optional[Decimal]
         "spot_totals": spot_totals,
         "unified_ratio": unified_ratio,
         "unified_leverage": unified_leverage,
+        "account_safety_margin_ratio": account_safety_margin_ratio,
     }
     log_event("unified_metrics", metrics)
-    return unified_ratio, unified_leverage
+    return unified_ratio, unified_leverage, account_safety_margin_ratio
 
 
 def print_account_metrics(info: Info, account: str) -> None:
-    unified_ratio, unified_leverage = unified_account_metrics(info, account)
+    unified_ratio, unified_leverage, account_safety_margin_ratio = unified_account_metrics(info, account)
+    protection_status = "未知"
+    if account_safety_margin_ratio is not None:
+        protection_status = "开启" if account_safety_margin_ratio < GRID_ACCOUNT_MARGIN_RATIO_THRESHOLD else "关闭"
     print_box(
         "Account",
         [
+            ("账户安全余量率", format_percent(account_safety_margin_ratio)),
+            ("Grid保护(<60%)", protection_status),
             ("统一账户比率", format_percent(unified_ratio)),
             ("统一账户杠杆", format_leverage(unified_leverage)),
         ],
@@ -1568,7 +1596,14 @@ def grid_entry_sort_key(entry: dict[str, Any]) -> tuple[int, Decimal, int]:
 def format_grid_detail_rows(row: dict[str, Any], open_oids: set[int]) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     entries = [item for item in row.get("levels") or [] if isinstance(item, dict) and item.get("side")]
-    live_statuses = {"active", "pending", "paused_max", "paused_margin", "paused_reduce_capacity"}
+    live_statuses = {
+        "active",
+        "pending",
+        "paused_max",
+        "paused_margin",
+        "paused_reduce_capacity",
+        "paused_account_margin",
+    }
     live_entries = [entry for entry in entries if str(entry.get("status", "active")) in live_statuses]
     history_entries = [entry for entry in entries if str(entry.get("status", "active")) not in live_statuses]
     history_entries = sorted(history_entries, key=lambda entry: int(entry.get("submitted_at") or entry.get("recovered_at") or entry.get("filled_at") or entry.get("cancelled_at") or entry.get("skipped_at") or entry.get("paused_at") or 0))[-120:]
