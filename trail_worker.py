@@ -869,47 +869,36 @@ def grid_effectively_at_limit(
     )
 
 
-def near_grid_order_if_stale(
+def near_grid_orders_if_stale(
     row: dict[str, Any],
     coin: str,
     asset: dict[str, Any],
     side: str,
     reference_px: Decimal,
     position_size: Decimal,
-    position_value: Decimal,
-    max_position_value: Decimal,
     policy: str,
-) -> dict[str, Any] | None:
+) -> list[dict[str, Any]]:
     gap = Decimal(str(row["gap_rate"]))
     sz_decimals = int(row.get("sz_decimals") or asset["szDecimals"])
     is_buy = side == "buy"
-    target_px = rounded_perp_price(reference_px * (Decimal("1") - gap if is_buy else Decimal("1") + gap), sz_decimals)
-    if target_px <= 0:
-        return None
 
     nearest_px = nearest_active_price(row, side)
+    if nearest_px is None:
+        return []
     stale_threshold = Decimal("1") - gap * Decimal("5") if is_buy else Decimal("1") + gap * Decimal("5")
-    if nearest_px is not None:
-        if is_buy and nearest_px >= reference_px * stale_threshold:
-            return None
-        if not is_buy and nearest_px <= reference_px * stale_threshold:
-            return None
+    if is_buy and nearest_px >= reference_px * stale_threshold:
+        return []
+    if not is_buy and nearest_px <= reference_px * stale_threshold:
+        return []
 
     reduce_only = grid_order_should_reduce_only(position_size, is_buy, policy)
-    entry = grid_order_entry(row, coin, asset, is_buy, target_px, reduce_only)
-    order_notional = Decimal(str(entry["size"])) * Decimal(str(entry["price"]))
-    min_position_value = Decimal(str(row.get("min_position_value") or "0"))
-    if not grid_order_allowed_by_max(
-        position_size,
-        position_value,
-        is_buy,
-        order_notional,
-        max_position_value,
-        policy,
-        min_position_value,
-    ):
-        return None
-    return entry
+    entries: list[dict[str, Any]] = []
+    for gap_multiple in (Decimal("3"), Decimal("4"), Decimal("5")):
+        multiplier = Decimal("1") - gap * gap_multiple if is_buy else Decimal("1") + gap * gap_multiple
+        target_px = rounded_perp_price(reference_px * multiplier, sz_decimals)
+        if target_px > 0:
+            entries.append(grid_order_entry(row, coin, asset, is_buy, target_px, reduce_only))
+    return entries
 
 
 def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> tuple[dict[str, Any], bool]:
@@ -1075,19 +1064,57 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         if grid_margin_pause_active(row, side, now, position_value, position_size):
             continue
         reference_px = grid_reference_price(side, current_mid, best_bid, best_ask)
-        near_order = near_grid_order_if_stale(
+        old_near_side_entries = active_grid_entries(row, side)
+        near_orders = near_grid_orders_if_stale(
             row,
             coin,
             asset,
             side,
             reference_px,
             position_size,
-            position_value,
-            max_position_value,
             policy,
         )
-        if near_order is not None:
+        unique_old_entries: dict[int, dict[str, Any]] = {}
+        for entry in old_near_side_entries:
+            try:
+                unique_old_entries.setdefault(int(entry["oid"]), entry)
+            except (KeyError, TypeError, ValueError):
+                continue
+        farthest_old = sorted(
+            unique_old_entries.values(),
+            key=lambda entry: decimal_or_none(entry.get("price", entry.get("limit_px"))) or Decimal("0"),
+            reverse=side == "sell",
+        )
+        projected_near_value = position_value
+        for entry in farthest_old:
+            order_notional = Decimal(str(entry.get("size"))) * Decimal(str(entry.get("price", entry.get("limit_px"))))
+            if grid_order_would_add_risk(position_size, bool(entry.get("is_buy"))):
+                projected_near_value += order_notional
+            else:
+                projected_near_value = max(Decimal("0"), projected_near_value - order_notional)
+        submitted_near = 0
+        for near_order in near_orders:
+            if submitted_near >= len(farthest_old):
+                break
             if active_price_too_close(row, side, Decimal(str(near_order["price"]))):
+                continue
+            old_entry = farthest_old[submitted_near]
+            old_notional = Decimal(str(old_entry.get("size"))) * Decimal(str(old_entry.get("price", old_entry.get("limit_px"))))
+            projected_after_old_cancel = projected_near_value
+            if grid_order_would_add_risk(position_size, bool(old_entry.get("is_buy"))):
+                projected_after_old_cancel = max(Decimal("0"), projected_after_old_cancel - old_notional)
+            else:
+                projected_after_old_cancel += old_notional
+            order_notional = Decimal(str(near_order["size"])) * Decimal(str(near_order["price"]))
+            if not grid_order_allowed_by_max(
+                position_size,
+                projected_after_old_cancel,
+                bool(near_order["is_buy"]),
+                order_notional,
+                max_position_value,
+                policy,
+                min_position_value,
+            ):
                 continue
             submitted = submit_grid_order_entry(
                 exchange,
@@ -1106,7 +1133,22 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 if near_order.get("replacement_pending"):
                     newly_filled.append(near_order)
                 near_regrids += 1
+                submitted_near += 1
+                if grid_order_would_add_risk(position_size, bool(near_order["is_buy"])):
+                    projected_near_value = projected_after_old_cancel + order_notional
+                else:
+                    projected_near_value = max(Decimal("0"), projected_after_old_cancel - order_notional)
             changed = True
+        if submitted_near:
+            replaced = cancel_grid_entries(
+                exchange,
+                coin,
+                farthest_old[:submitted_near],
+                now,
+                "replaced_far_side",
+            )
+            if replaced:
+                changed = True
 
     projected_position_values: dict[str, Decimal] = {}
     for side in ("buy", "sell"):
