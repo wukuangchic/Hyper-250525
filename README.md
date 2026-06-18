@@ -167,21 +167,25 @@ JPY both 20 --offset 2% --tp 1% --sl 0.7%
 
 ## 服务器真实网格单
 
-`grid` 是本工具维护的真实挂单网格：下到交易所的是普通 post-only limit 单，不是 Hyperliquid 原生网格。服务器 worker 每分钟检查一次，目标是让买卖两边各保持最多 5 张活跃子单；成交后按成交价和 `gap` 补下一张反向 limit 单。
+`grid` 是本工具维护的真实挂单网格：下到交易所的是普通 GTC limit 单，不是 Hyperliquid 原生网格。服务器 worker 每分钟检查一次，目标是让买卖两边各保持最多 5 张活跃子单；成交后按原子单提交限价和 `gap` 补下一张反向 limit 单。
 
 ### 创建
 
 ```bash
 BTC grid --abs 300 --gap 0.5% --trend 10%
 BTC grid --long 300 --gap 0.5% --min 20
+BTC grid --long 200 300 --gap 0.5%
 BTC grid --short 300
 ```
 
 仓位限制三选一：
 
-- `--long 200`：只允许开多头仓位，最大多头持仓价值 200；卖单只用于已有多仓的 reduce-only 减仓。
-- `--short 200`：只允许开空头仓位，最大空头持仓价值 200；买单只用于已有空仓的 reduce-only 减仓。
+- `--long 200`：只允许开多头仓位，持仓价值范围为 0–200；卖单只用于已有多仓的 reduce-only 减仓。
+- `--long 100 200`：只允许开多头仓位，并把持仓价值维持在 100–200；低于 100 时不再减仓，高于 200 时不再加仓。
+- `--short 200`：只允许开空头仓位，持仓绝对价值范围为 0–200；买单只用于已有空仓的 reduce-only 减仓。
+- `--short 100 200`：只允许开空头仓位，并把持仓绝对价值维持在 100–200。
 - `--abs 200`：多空都可以开，最大绝对持仓价值 200。
+- `--abs` 只接受一个最大值，不设置最低绝对仓位。
 
 参数：
 
@@ -190,12 +194,14 @@ BTC grid --short 300
 - `--trend`：数量倾向，默认 `0`；正数让买入数量大于卖出数量，负数让卖出数量大于买入数量。取消趋势用 `--modify --trend 0`。
 - `--min 20`：每张子单价值至少 20；不填时按交易所最小名义价值。
 - `--total` 和旧 `--max` 不再用于 grid；如果写了会直接报错。
+- grid 子单允许在限价以内立即成交并获得价格改善，可能按 taker 计费；网格档位仍按提交限价推进，不因实际成交价更优而漂移。
 
 ### 修改
 
 ```bash
 BTC grid --modify --abs 500
 BTC grid --modify --short 300
+BTC grid --modify --long 200 500
 BTC grid --modify --gap 0.3%
 BTC grid --modify --trend 0
 BTC grid --modify --min 20
@@ -204,6 +210,8 @@ BTC grid --modify --min 20
 - 同模式修改额度，例如 `--modify --abs 500`，只更新持仓限制配置，不强制撤单重铺。
 - 模式变化，例如 `--modify --long 200` 改成 `--modify --short 200`，会撤掉当前活跃 grid 子单，包括旧 reduce-only 单，再按新模式重铺。
 - 修改 `--gap`、`--trend` 或 `--min` 会撤掉当前活跃 grid 子单，再按当前行情和新配置重铺。
+- `--modify` 只改变命令中明确提供的参数；例如只传 `--trend` 时会沿用原来的 gap，只传 `--gap` 时也会沿用原来的 trend。
+- 修改 `--long` / `--short` 的下限会按新仓位范围重铺；账户安全余量率低于 70% 时，账户保护仍优先，Worker 不会为了达到下限而新增风险。
 
 ### 查询、恢复、取消
 
@@ -225,8 +233,8 @@ BTC --cancel grid
 - 到达持仓上限后，如果减仓方向最靠近市场的单已经离盘口超过约 2 个 gap，worker 会补一张新的近侧 reduce-only 平仓单，再撤远侧，保持每边最多 5 张。
 - 全仓或逐仓的加仓方向若被交易所以保证金不足拒绝，worker 会对该方向冷却 10 分钟，本轮不再继续试单；减仓方向照常维护。仓位缩小会提前解除冷却，否则到期后探测一次。
 - reduce-only 子单的活动数量总和不会超过当前可减仓数量；交易所因可减仓数量不足自动取消的 `reduceOnlyCanceled` 不会被当作手动撤单反复补回。
-- 每轮只查询一次账户 USDC 的“维护保证金后余量 / 总余额”。比例低于 `60%` 时不修改已有挂单，但所有新 grid 子单必须减少当前净仓位并强制使用 reduce-only；会加仓或反手的新单暂缓，比例恢复到 `60%` 后自动继续。
-- post-only limit 因“只限挂单”被拒绝时，grid 不会变成 `error`；worker 会跳过这张，并在下一轮继续维护。
+- 每轮只查询一次账户 USDC 的“维护保证金后余量 / 总余额”。比例低于 `70%` 时不修改已有挂单，但所有新 grid 子单必须减少当前净仓位并强制使用 reduce-only；会加仓或反手的新单暂缓，比例恢复到 `70%` 后自动继续。
+- 旧版保存的 Alo 子单在 Worker 再次提交时会自动升级为 GTC；历史 post-only 拒绝仍按可恢复状态兼容处理。
 
 ### 接续和边界
 
@@ -292,7 +300,7 @@ BTC --cancel trail
 - Hyperliquid / CloudFront 返回 `429/502/503/504` 时，worker 不会把任务停成 `error`。
 - 这类错误会保留任务 `active`，写入 `last_error`，并在下一轮继续重试。
 - 限流日志追加到 `logs/trail-rate-limit.jsonl`，每行一个 JSON，后续可按 `status_code`、`oid`、`coin` 统计频次。
-- 非临时错误才会把任务标成 `error`；grid 的 post-only 拒绝属于可恢复情况，不会停掉任务。
+- 非临时错误才会把任务标成 `error`；旧版 grid 的历史 post-only 拒绝仍属于可恢复情况，不会停掉任务。
 
 ## 触发单和止盈止损
 
@@ -547,7 +555,7 @@ journalctl -u simple-hyper-sync.service -n 80 --no-pager
 ```text
 +- Account ----------------+
 | 账户安全余量率: 47.64%     |
-| Grid保护(<60%): 开启       |
+| Grid保护(<70%): 开启       |
 | 统一账户比率: 0.19%        |
 | 统一账户杠杆: 0.09x        |
 +----------------------------+
@@ -652,7 +660,7 @@ reduce_only=True：只允许减仓 / 平仓，不允许反手
 
 统一账户指标口径：
 
-- 账户安全余量率：`tokenToAvailableAfterMaintenance[USDC] / balances[USDC].total`；低于 `60%` 时，新 grid 子单只允许 reduce-only 减仓。
+- 账户安全余量率：`tokenToAvailableAfterMaintenance[USDC] / balances[USDC].total`；低于 `70%` 时，新 grid 子单只允许 reduce-only 减仓。
 - 统一账户比率：将各 DEX 的 maintenance margin 按 collateral token 聚合，再除以对应 spot 抵押品余额，取风险最高的一组。
 - 统一账户杠杆：当前总名义仓位 / 活跃抵押品余额。
 
