@@ -893,7 +893,7 @@ def near_grid_orders_if_stale(
 
     reduce_only = grid_order_should_reduce_only(position_size, is_buy, policy)
     entries: list[dict[str, Any]] = []
-    for gap_multiple in (Decimal("3"), Decimal("4"), Decimal("5")):
+    for gap_multiple in (Decimal("3"), Decimal("4")):
         multiplier = Decimal("1") - gap * gap_multiple if is_buy else Decimal("1") + gap * gap_multiple
         target_px = rounded_perp_price(reference_px * multiplier, sz_decimals)
         if target_px > 0:
