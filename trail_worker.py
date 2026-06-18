@@ -957,7 +957,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     for entry in levels:
         if not isinstance(entry, dict) or not entry.get("side"):
             continue
-        if str(entry.get("status", "active")) != "active":
+        if str(entry.get("status", "active")) not in {"active", "recovery_deferred"}:
             continue
         try:
             oid = int(entry["oid"])
@@ -970,6 +970,14 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             old_oid = oid
             order_status = info.query_order_by_oid(account, old_oid)
             status_name = str(order_status.get("order", {}).get("status") or "")
+            if status_name == "filled":
+                entry["status"] = "filled"
+                entry["filled_at"] = now
+                entry["confirmed_filled_oid"] = old_oid
+                entry["replacement_pending"] = True
+                newly_filled.append(entry)
+                changed = True
+                continue
             if status_name == "reduceOnlyCanceled":
                 entry["status"] = "skipped_reduce_only"
                 entry["oid"] = None
@@ -999,6 +1007,12 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 recovered_missing += 1
                 if entry.get("replacement_pending"):
                     newly_filled.append(entry)
+            else:
+                deferred_status = str(entry.get("status") or "recovery_deferred")
+                entry["status"] = "recovery_deferred"
+                entry["oid"] = old_oid
+                entry["recovery_deferred_status"] = deferred_status
+                entry["recovery_deferred_at"] = now
             changed = True
             continue
         entry["status"] = "filled"

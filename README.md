@@ -242,6 +242,7 @@ BTC --cancel grid
 - worker 每次至少回看最近 24 小时成交记录；如果 `last_fill_check_ms` 更早，会从更早的断点继续查。
 - worker 只维护 `server_batch.json` 里记录的 oid；手动下的新单不会被自动接管。
 - 如果 worker 发现 grid oid 消失但最近成交记录里找不到对应 fill，会按该记录原来的 side、price、size 重新挂回，并在任务 note 里记录 `recovered_missing`。
+- grid oid 从 open orders 消失而成交查询尚未更新时，worker 会再查订单状态；已 `filled` 的直接补对向单。若恢复挂单因保证金保护等条件暂缓，会保留原 OID 供下一轮继续核实，避免漏掉稍后才可见的成交。
 - 如果服务器断电或 worker 重启，只要 `server_batch.json` 还在，下一轮会继续按已有 oid 和最近成交接续维护。
 
 ## 服务器 Trail 单
