@@ -1146,7 +1146,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     for side in ("buy", "sell"):
         if grid_margin_pause_active(row, side, now, position_value, position_size):
             continue
-        while len(active_grid_entries(row, side)) < target_per_side:
+        remaining_topups = max(0, target_per_side - len(active_grid_entries(row, side)))
+        while remaining_topups > 0:
             projected_position_value = projected_position_values[side]
             reference_px = grid_reference_price(side, current_mid, best_bid, best_ask)
             topup = next_depth_order(row, coin, asset, side, current_mid, position_size, position_value, max_position_value, policy, reference_px)
@@ -1185,6 +1186,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 changed = True
                 break
             levels.append(topup)
+            remaining_topups -= 1
             if grid_order_would_add_risk(position_size, bool(topup["is_buy"])):
                 projected_position_values[side] += order_notional
             else:
