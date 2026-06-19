@@ -52,7 +52,7 @@ DONE_RETENTION_MAX = 500
 GRID_LEVEL_HISTORY_MAX = 120
 GRID_FILL_LOOKBACK_SECONDS = 24 * 60 * 60
 GRID_MARGIN_RETRY_SECONDS = 10 * 60
-GRID_MAX_SUBMISSIONS_PER_SIDE_PER_RUN = 2
+GRID_MAX_SUBMISSIONS_PER_SIDE_PER_RUN = 1
 TRANSIENT_STATUS_CODES = {429, 502, 503, 504}
 TRANSIENT_ERROR_TEXTS = (
     "connection reset",
@@ -957,10 +957,12 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     levels = row.setdefault("levels", [])
     submissions_by_side = {"buy": 0, "sell": 0}
     filled_submission_sides: set[str] = set()
+    replacement_quota_sides: set[str] = set()
 
     def side_submission_allowed(side: str) -> bool:
         return (
-            side not in filled_submission_sides
+            side not in replacement_quota_sides
+            and side not in filled_submission_sides
             and submissions_by_side.get(side, 0) < GRID_MAX_SUBMISSIONS_PER_SIDE_PER_RUN
         )
 
@@ -984,6 +986,25 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             submissions_by_side[side] = submissions_by_side.get(side, 0) + 1
             if str(order.get("status")) == "filled":
                 filled_submission_sides.add(side)
+        return submitted
+
+    def submit_replacement(order: dict[str, Any]) -> bool:
+        side = str(order.get("side") or "")
+        submitted = submit_grid_order_entry(
+            exchange,
+            coin,
+            order,
+            now,
+            row,
+            asset,
+            position_size,
+            position_value,
+            policy,
+            account_margin_protected,
+        )
+        if submitted:
+            submissions_by_side[side] = submissions_by_side.get(side, 0) + 1
+            replacement_quota_sides.add(side)
         return submitted
 
     for entry in levels:
@@ -1043,6 +1064,12 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         newly_filled.append(entry)
         changed = True
 
+    pending_replacement_sides = {
+        "sell" if bool(entry.get("is_buy")) else "buy"
+        for entry in newly_filled
+    }
+    replacement_quota_sides.update(pending_replacement_sides)
+
     paused = 0
     to_pause: list[dict[str, Any]] = []
     for side in ("buy", "sell"):
@@ -1096,6 +1123,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
 
     near_regrids = 0
     for side in ("buy", "sell"):
+        if side in pending_replacement_sides:
+            continue
         if grid_margin_pause_active(row, side, now, position_value, position_size):
             continue
         reference_px = grid_reference_price(side, current_mid, best_bid, best_ask)
@@ -1203,8 +1232,6 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         if replacement is None:
             continue
         replacement_side = str(replacement["side"])
-        if not side_submission_allowed(replacement_side):
-            continue
         entry["replacement_pending"] = False
         entry["replacement_processed_at"] = now
         if grid_margin_pause_active(row, replacement_side, now, position_value, position_size):
@@ -1229,7 +1256,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             levels.append(replacement)
             changed = True
             continue
-        submitted = submit_tracked(replacement)
+        submitted = submit_replacement(replacement)
         if not submitted:
             changed = True
             continue
