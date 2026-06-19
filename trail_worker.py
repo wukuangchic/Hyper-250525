@@ -1433,9 +1433,12 @@ def prune_grid_levels(row: dict[str, Any]) -> bool:
     if not isinstance(levels, list):
         return False
 
-    keep_statuses = {
+    live_statuses = {
         "active",
         "pending",
+        "recovery_deferred",
+    }
+    paused_statuses = {
         "paused_max",
         "paused_limit",
         "paused_margin",
@@ -1443,6 +1446,7 @@ def prune_grid_levels(row: dict[str, Any]) -> bool:
         "paused_account_margin",
     }
     live_levels: list[dict[str, Any]] = []
+    paused_levels: list[dict[str, Any]] = []
     history_levels: list[dict[str, Any]] = []
     passthrough: list[Any] = []
 
@@ -1450,16 +1454,51 @@ def prune_grid_levels(row: dict[str, Any]) -> bool:
         if not isinstance(entry, dict) or not entry.get("side"):
             passthrough.append(entry)
             continue
-        if str(entry.get("status", "active")) in keep_statuses:
+        status = str(entry.get("status", "active"))
+        if status in live_statuses:
             live_levels.append(entry)
+        elif status in paused_statuses:
+            paused_levels.append(entry)
         else:
             history_levels.append(entry)
 
-    if len(history_levels) <= GRID_LEVEL_HISTORY_MAX:
-        return False
+    target_per_side = int(row.get("target_orders_per_side") or GRID_TARGET_ORDERS_PER_SIDE)
+    active_counts = {
+        side: len(active_grid_oids(row, side))
+        for side in ("buy", "sell")
+    }
+    kept_paused: list[dict[str, Any]] = []
+    for side in ("buy", "sell"):
+        keep_count = max(0, target_per_side - active_counts[side])
+        if keep_count == 0:
+            continue
+        side_paused = sorted(
+            (entry for entry in paused_levels if str(entry.get("side")) == side),
+            key=grid_level_updated_at,
+            reverse=True,
+        )
+        seen: set[tuple[str, str, str, bool]] = set()
+        side_kept = 0
+        for entry in side_paused:
+            key = (
+                str(entry.get("side")),
+                str(entry.get("price", entry.get("limit_px", ""))),
+                str(entry.get("size", "")),
+                bool(entry.get("reduce_only", False)),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            kept_paused.append(entry)
+            side_kept += 1
+            if side_kept >= keep_count:
+                break
 
     history_levels = sorted(history_levels, key=grid_level_updated_at)[-GRID_LEVEL_HISTORY_MAX:]
-    row["levels"] = passthrough + live_levels + history_levels
+    pruned_levels = passthrough + live_levels + kept_paused + history_levels
+    if len(pruned_levels) == len(levels):
+        return False
+    row["levels"] = pruned_levels
     row["history_pruned_at"] = int(time.time())
     return True
 

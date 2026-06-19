@@ -247,6 +247,7 @@ BTC --cancel grid
 - 如果 worker 发现 grid oid 消失但最近成交记录里找不到对应 fill，会按该记录原来的 side、price、size 重新挂回，并在任务 note 里记录 `recovered_missing`。
 - grid oid 从 open orders 消失而成交查询尚未更新时，worker 会再查订单状态；已 `filled` 的直接补对向单。若恢复挂单因保证金保护等条件暂缓，会保留原 OID 供下一轮继续核实，避免漏掉稍后才可见的成交。
 - 恢复历史暂停档位前会检查当前 best bid/ask；已经穿过盘口的旧价格不再恢复，下一轮改按当前盘口重新补档，避免旧档批量立即成交。
+- paused 档位会按 side、price、size 和 reduce-only 去重；每侧只保留填补当前活跃档位缺口所需的最新记录，已满目标档数的一侧不保留 paused 历史。其他 grid 历史仍最多保留最近 120 条。
 - 如果服务器断电或 worker 重启，只要 `server_batch.json` 还在，下一轮会继续按已有 oid 和最近成交接续维护。
 
 ## 服务器 Trail 单
