@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import fcntl
 import io
 import json
 import os
@@ -97,6 +98,7 @@ from coin_aliases import coin_alias_key
 DEFAULT_SLIPPAGE = "0.05"
 ISOLATED_FALLBACK_LEVERAGE = 5
 SERVER_BATCH_PATH = Path(__file__).resolve().parent / "server_batch.json"
+SERVER_BATCH_LOCK_PATH = Path(__file__).resolve().parent / "server_batch.lock"
 SYMMETRIC_SIDE_ALIASES = {"both", "sym", "symmetric", "dual", "双向", "对称", "对称单"}
 GRID_SIDE_ALIASES = {"grid", "网格", "网格单"}
 DEFAULT_GRID_GAP_LABEL = ["auto-minTick", "auto-takerFee", "auto-makerFee"]
@@ -3175,6 +3177,26 @@ def load_server_batch(path: Path = SERVER_BATCH_PATH) -> list[dict[str, Any]]:
     return [item for item in data if isinstance(item, dict)]
 
 
+@contextlib.contextmanager
+def server_batch_lock(path: Path = SERVER_BATCH_LOCK_PATH, blocking: bool = True):
+    path.touch(exist_ok=True)
+    with path.open("w") as lock:
+        operation = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+        try:
+            fcntl.flock(lock, operation)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def args_need_server_batch_lock(args: argparse.Namespace) -> bool:
+    return not args.query and bool(args.grid or args.trail or args.cancel is not None)
+
+
 def save_server_batch(rows: list[dict[str, Any]], path: Path = SERVER_BATCH_PATH) -> None:
     tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
@@ -5500,7 +5522,11 @@ def main() -> None:
     try:
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
-            place_order(args)
+            if args_need_server_batch_lock(args):
+                with server_batch_lock():
+                    place_order(args)
+            else:
+                place_order(args)
         output = buffer.getvalue()
         log_event("stdout", output)
         print(output, end="")

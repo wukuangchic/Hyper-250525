@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import json
 import time
 from decimal import Decimal
@@ -44,11 +43,11 @@ from hl_order import (  # noqa: E402
     resolve_perp_asset,
     rounded_perp_price,
     save_server_batch,
+    server_batch_lock,
     trail_stop_price,
 )
 
 
-LOCK_PATH = Path(__file__).resolve().parent / "server_batch.lock"
 RATE_LIMIT_LOG_PATH = Path(__file__).resolve().parent / "logs" / "trail-rate-limit.jsonl"
 DONE_RETENTION_DAYS = 7
 DONE_RETENTION_MAX = 500
@@ -1676,10 +1675,8 @@ def run_once() -> None:
 
 def main() -> None:
     SERVER_BATCH_PATH.touch(exist_ok=True)
-    with LOCK_PATH.open("w") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+    with server_batch_lock(blocking=False) as acquired:
+        if not acquired:
             print("trail_worker: previous run still active, skipping")
             return
         run_once()
