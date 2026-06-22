@@ -10,11 +10,43 @@ from hl_order import (
     grid_avg_size_pair,
     grid_avg_topup_params,
     grid_query_avg_summary,
+    refresh_grid_row_strategy_params,
 )
 from trail_worker import near_grid_orders_if_stale, next_depth_order, replacement_order_from_fill
 
 
 class GridAvgTests(unittest.TestCase):
+    def test_refresh_strategy_params_keeps_existing_levels(self) -> None:
+        levels = [
+            {"side": "buy", "status": "active", "oid": 1, "price": "90", "size": "0.1"},
+            {"side": "sell", "status": "active", "oid": 2, "price": "110", "size": "0.1"},
+        ]
+        row = {
+            "position_limit_mode": "abs",
+            "min_position_value": "0",
+            "max_position_value": "250",
+            "avg": "0",
+            "trend": "0",
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "sz_decimals": 3,
+            "levels": levels,
+        }
+        refresh_grid_row_strategy_params(
+            row,
+            {"szDecimals": 3},
+            Decimal("100"),
+            Decimal("-1"),
+            Decimal("125"),
+        )
+        self.assertIs(row["levels"], levels)
+        self.assertEqual(row["levels"][0]["oid"], 1)
+        self.assertEqual(row["avg_multiplier"], "1.2")
+        self.assertEqual(row["topup_buy_gap"], "0.01")
+        self.assertEqual(row["topup_sell_gap"], "0.012")
+        self.assertGreater(Decimal(row["topup_buy_size"]), Decimal(row["base_buy_size"]))
+        self.assertEqual(row["topup_sell_size"], row["base_sell_size"])
+
     def test_topup_params_separate_reversion_size_from_risk_gap(self) -> None:
         buy_favored = grid_avg_topup_params(
             Decimal("0.01"),

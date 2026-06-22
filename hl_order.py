@@ -2468,6 +2468,81 @@ def grid_avg_topup_params(
     return buy_size, sell_size, buy_gap, sell_gap
 
 
+def refresh_grid_row_strategy_params(
+    row: dict[str, Any],
+    asset: dict[str, Any],
+    current_mid: Decimal,
+    position_size: Decimal,
+    position_value: Decimal,
+) -> None:
+    sz_decimals = int(row.get("sz_decimals") or asset["szDecimals"])
+    base_gap = Decimal(str(row["gap_rate"]))
+    first_buy_px = rounded_perp_price(current_mid * (Decimal("1") - base_gap), sz_decimals)
+    first_sell_px = rounded_perp_price(current_mid * (Decimal("1") + base_gap), sz_decimals)
+    if first_buy_px <= 0 or first_buy_px >= first_sell_px:
+        raise ValueError("grid --gap is too small for this price precision")
+
+    trend = parse_percent_decimal(str(row.get("trend") or "0"), "--trend", allow_signed=True)
+    if trend <= Decimal("-1"):
+        raise ValueError("--trend must be greater than -100%")
+    min_notional = Decimal(str(row.get("min_order_value") or MIN_NOTIONAL))
+    base_buy_size, base_sell_size = grid_limit_size_pair_for_trend(
+        trend,
+        sz_decimals,
+        first_buy_px,
+        first_sell_px,
+        min_notional,
+    )
+
+    avg_value = decimal_or_none(row.get("avg"))
+    multiplier = Decimal("1")
+    favored_side: str | None = None
+    avg_current_value = grid_avg_position_value(
+        grid_limit_policy_from_row(row),
+        position_size,
+        position_value,
+    )
+    if avg_value is not None:
+        balanced_size = max(base_buy_size, base_sell_size)
+        base_buy_size = balanced_size
+        base_sell_size = balanced_size
+        multiplier, favored_side, avg_current_value = grid_avg_multiplier(
+            grid_limit_policy_from_row(row),
+            Decimal(str(row.get("min_position_value") or "0")),
+            Decimal(str(row.get("max_position_value") or "0")),
+            avg_value,
+            position_size,
+            position_value,
+        )
+
+    topup_buy_size, topup_sell_size, topup_buy_gap, topup_sell_gap = grid_avg_topup_params(
+        base_gap,
+        base_buy_size,
+        base_sell_size,
+        multiplier,
+        favored_side,
+        sz_decimals,
+    )
+    row["buy_size"] = decimal_to_plain(base_buy_size)
+    row["sell_size"] = decimal_to_plain(base_sell_size)
+    row["base_buy_size"] = decimal_to_plain(base_buy_size)
+    row["base_sell_size"] = decimal_to_plain(base_sell_size)
+    row["topup_buy_size"] = decimal_to_plain(topup_buy_size)
+    row["topup_sell_size"] = decimal_to_plain(topup_sell_size)
+    row["topup_buy_gap"] = decimal_to_plain(topup_buy_gap)
+    row["topup_sell_gap"] = decimal_to_plain(topup_sell_gap)
+    row["effective_gap_rate"] = decimal_to_plain(base_gap * multiplier)
+    row["avg_multiplier"] = decimal_to_plain(multiplier)
+    row["avg_favored_side"] = favored_side
+    row["avg_current_value"] = decimal_to_plain(avg_current_value)
+    if topup_buy_size > topup_sell_size:
+        row["actual_trend"] = format_signed_percent(topup_buy_size / topup_sell_size - Decimal("1"))
+    elif topup_sell_size > topup_buy_size:
+        row["actual_trend"] = format_signed_percent(-(topup_sell_size / topup_buy_size - Decimal("1")))
+    else:
+        row["actual_trend"] = "0%"
+
+
 def grid_min_notional(args: argparse.Namespace) -> Decimal:
     value = getattr(args, "grid_min", None)
     if value is None:
@@ -3633,18 +3708,15 @@ def modify_grid_batch_order(
         if args.grid_position_limit_value is not None
         else old_min_position_value
     )
-    limit_mode_changed = new_limit_mode != old_limit_mode
-    min_position_changed = new_min_position_value != old_min_position_value
     gap_changed = bool(args.gap)
     avg_changed = args.grid_avg is not None
-    regrid = bool(gap_changed or args.trend is not None or avg_changed or args.grid_min is not None or limit_mode_changed or min_position_changed)
     updates: list[tuple[str, str]] = []
     if args.grid_position_limit_value is not None:
         row["position_limit_mode"] = new_limit_mode
         row["min_position_value"] = decimal_to_plain(new_min_position_value)
         row["max_position_value"] = decimal_to_plain(Decimal(str(args.grid_position_limit_value)))
         updates.append(("limit", grid_limit_display(row)))
-        if limit_mode_changed:
+        if new_limit_mode != old_limit_mode:
             updates.append(("mode_change", f"{old_limit_mode}->{new_limit_mode}"))
     if args.grid_min is not None:
         row["min_order_value"] = decimal_to_plain(grid_min_notional(args))
@@ -3699,6 +3771,11 @@ def modify_grid_batch_order(
                 f"for --{args.grid_position_limit_mode}"
             )
 
+    if current_mid is None:
+        raise ValueError(f"No mid price found for {coin}, cannot modify grid strategy parameters")
+    position_size, position_value = current_position_size_value(info, account, coin, dex, current_mid)
+    refresh_grid_row_strategy_params(row, asset, current_mid, position_size, position_value)
+
     if args.explain or args.dry_run:
         print_account_metrics(info, account)
         print_box(
@@ -3706,72 +3783,16 @@ def modify_grid_batch_order(
             [
                 ("dry_run", "1" if args.dry_run else "0"),
                 ("coin", coin),
-                ("regrid", "1" if regrid else "0"),
+                ("regrid", "0"),
                 ("updates", ", ".join(f"{key}={value}" for key, value in updates) or "-"),
             ],
         )
         print_server_batch([row], args.network, account, coin)
         return
 
-    if regrid:
-        cancel_requests = [{"coin": coin, "oid": oid} for oid in sorted(grid_batch_open_oids(row))]
-        if cancel_requests:
-            cancel_result = exchange.bulk_cancel(cancel_requests)
-            log_event("modify_grid_cancel_requests", cancel_requests)
-            log_event("modify_grid_cancel_result", cancel_result)
-            if cancel_result.get("status") != "ok":
-                raise RuntimeError(f"Failed to cancel old grid orders: {cancel_result}")
-        cancelled_oids = {int(request["oid"]) for request in cancel_requests}
-        for level in row.get("levels") or []:
-            if not isinstance(level, dict):
-                continue
-            try:
-                oid = int(level["oid"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            if oid in cancelled_oids and str(level.get("status", "active")) == "active":
-                level["status"] = "cancelled"
-                level["cancelled_at"] = now
-
-        max_position_value = Decimal(str(row.get("max_position_value") or args.grid_position_limit_value))
-        plans = build_grid_orders(args, info, account, dex, exchange, coin, asset, max_position_value, current_mid, slippage)
-        statuses = submit_order_plans(
-            exchange,
-            info,
-            account,
-            coin,
-            max_leverage,
-            plans,
-            "na",
-            args,
-            price_rate,
-            "Grid Limit Orders",
-        )
-        if statuses is None:
-            return
-        new_row = build_grid_batch_row(args, account, coin, dex, asset, plans, statuses, max_position_value, slippage)
-        row["levels"] = (row.get("levels") or []) + (new_row.get("levels") or [])
-        row["actual_trend"] = new_row.get("actual_trend", row.get("actual_trend", "0%"))
-        row["gap"] = new_row.get("gap", row.get("gap"))
-        row["gap_rate"] = new_row.get("gap_rate", row.get("gap_rate"))
-        row["min_order_value"] = new_row.get("min_order_value", row.get("min_order_value"))
-        row["min_position_value"] = new_row.get("min_position_value", row.get("min_position_value", "0"))
-        row["buy_size"] = new_row.get("buy_size", row.get("buy_size"))
-        row["sell_size"] = new_row.get("sell_size", row.get("sell_size"))
-        row["base_buy_size"] = new_row.get("base_buy_size", row.get("base_buy_size"))
-        row["base_sell_size"] = new_row.get("base_sell_size", row.get("base_sell_size"))
-        row["topup_buy_size"] = new_row.get("topup_buy_size", row.get("topup_buy_size"))
-        row["topup_sell_size"] = new_row.get("topup_sell_size", row.get("topup_sell_size"))
-        row["topup_buy_gap"] = new_row.get("topup_buy_gap", row.get("topup_buy_gap"))
-        row["topup_sell_gap"] = new_row.get("topup_sell_gap", row.get("topup_sell_gap"))
-        row["effective_gap_rate"] = new_row.get("effective_gap_rate", row.get("effective_gap_rate"))
-        row["avg"] = new_row.get("avg")
-        row["avg_multiplier"] = new_row.get("avg_multiplier", "1")
-        row["avg_current_value"] = new_row.get("avg_current_value", "0")
-
     row["status"] = "active"
     row["updated_at"] = now
-    row["note"] = "modified grid; regridded" if regrid else "modified grid"
+    row["note"] = "modified grid config; existing orders kept"
     batch_rows[index] = row
     save_server_batch(batch_rows)
     print_grid_batch_status(row, price_rate)
