@@ -177,6 +177,7 @@ JPY both 20 --offset 2% --tp 1% --sl 0.7%
 BTC grid --abs 300 --gap 0.5% --trend 10%
 BTC grid --long 300 --gap 0.5% --min 20
 BTC grid --long 200 300 --gap 0.5%
+BTC grid --long 100 400 --avg 200
 BTC grid --short 300
 ```
 
@@ -194,6 +195,10 @@ BTC grid --short 300
 - `--gap`：每个买卖格子的间距。初始买价从 `mid * (1 - gap)` 到 `mid * (1 - 5 * gap)`，卖价从 `mid * (1 + gap)` 到 `mid * (1 + 5 * gap)`。
 - 不写 `--gap` 时，默认使用 `最小价格变动百分比 + 折扣后 takerFee + 折扣后 makerFee`。
 - `--trend`：数量倾向，默认 `0`；正数让买入数量大于卖出数量，负数让卖出数量大于买入数量。取消趋势用 `--modify --trend 0`。
+- `--avg 200`：把 200 设为目标持仓价值，并与 `--trend` 互斥。持仓从目标值靠近上下限时，回归方向的每格数量和基础 `gap` 会按偏离比例从 `1.0` 线性增加到最高 `1.4` 倍；越过上下限后仍封顶 `1.4`。
+- `--long` / `--short` 的 `avg` 使用该方向的绝对持仓价值；`--abs` 的 `avg` 可以是负数，例如 `--abs 300 --avg -100` 表示目标为空仓 100。
+- 动态数量按交易所数量精度四舍五入，不会仅为了达到回归比例而强制进一份；订单低于交易所最小名义价值时，仍沿用最小下单额保护。
+- 仓位变化只影响以后生成的成交反向单、近侧补单和常规补档，不会仅因动态倍率变化撤掉全部旧挂单重铺。
 - `--min 20`：每张子单价值至少 20；不填时按交易所最小名义价值。
 - `--total` 和旧 `--max` 不再用于 grid；如果写了会直接报错。
 - grid 子单允许在限价以内立即成交并获得价格改善，可能按 taker 计费；网格档位仍按提交限价推进，不因实际成交价更优而漂移。
@@ -210,12 +215,14 @@ BTC grid --modify --short 300
 BTC grid --modify --long 200 500
 BTC grid --modify --gap 0.3%
 BTC grid --modify --trend 0
+BTC grid --modify --avg 200
 BTC grid --modify --min 20
 ```
 
 - 同模式修改额度，例如 `--modify --abs 500`，只更新持仓限制配置，不强制撤单重铺。
 - 模式变化，例如 `--modify --long 200` 改成 `--modify --short 200`，会撤掉当前活跃 grid 子单，包括旧 reduce-only 单，再按新模式重铺。
-- 修改 `--gap`、`--trend` 或 `--min` 会撤掉当前活跃 grid 子单，再按当前行情和新配置重铺。
+- 修改 `--gap`、`--trend`、`--avg` 或 `--min` 会撤掉当前活跃 grid 子单，再按当前行情和新配置重铺。
+- 从 `avg` 模式切回无方向的普通网格可使用 `--modify --trend 0`。
 - `--modify` 只改变命令中明确提供的参数；例如只传 `--trend` 时会沿用原来的 gap，只传 `--gap` 时也会沿用原来的 trend。
 - 修改 `--long` / `--short` 的下限会按新仓位范围重铺；账户安全余量率低于 70% 时，账户保护仍优先，Worker 不会为了达到下限而新增风险。
 

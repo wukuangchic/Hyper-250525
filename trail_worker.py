@@ -28,6 +28,9 @@ from hl_order import (  # noqa: E402
     decimal_or_none,
     decimal_to_plain,
     fill_matches_coin,
+    format_signed_percent,
+    grid_avg_multiplier,
+    grid_avg_size_pair,
     grid_batch_open_oids,
     grid_limit_policy_from_row,
     grid_order_allowed_by_max,
@@ -536,6 +539,10 @@ def refresh_grid_order_tif(order: dict[str, Any]) -> None:
     plan["order_type"] = {"limit": {"tif": "Gtc"}}
 
 
+def effective_grid_gap(row: dict[str, Any]) -> Decimal:
+    return Decimal(str(row.get("effective_gap_rate") or row["gap_rate"]))
+
+
 def grid_order_entry(row: dict[str, Any], coin: str, asset: dict[str, Any], is_buy: bool, price: Decimal, reduce_only: bool) -> dict[str, Any]:
     size_key = "buy_size" if is_buy else "sell_size"
     size = Decimal(str(row.get(size_key) or "0"))
@@ -545,7 +552,7 @@ def grid_order_entry(row: dict[str, Any], coin: str, asset: dict[str, Any], is_b
     size = grid_size_for_min_notional(size, price, int(asset["szDecimals"]), min_notional)
     side = "buy" if is_buy else "sell"
     plan = build_grid_limit_order_plan(coin, is_buy, size, price, asset, reduce_only, side)
-    plan["grid_gap"] = Decimal(str(row["gap_rate"]))
+    plan["grid_gap"] = effective_grid_gap(row)
     return {
         "side": side,
         "status": "pending",
@@ -571,7 +578,7 @@ def replacement_order_from_fill(
     max_position_value: Decimal,
     policy: str,
 ) -> dict[str, Any] | None:
-    gap = Decimal(str(row["gap_rate"]))
+    gap = effective_grid_gap(row)
     sz_decimals = int(row.get("sz_decimals") or asset["szDecimals"])
     if submitted_limit_px <= 0:
         return None
@@ -673,7 +680,7 @@ def next_depth_order(
     policy: str,
     reference_px: Decimal | None = None,
 ) -> dict[str, Any] | None:
-    gap = Decimal(str(row["gap_rate"]))
+    gap = effective_grid_gap(row)
     sz_decimals = int(row.get("sz_decimals") or asset["szDecimals"])
     is_buy = side == "buy"
     base_px = farthest_active_price(row, side, reference_px or current_mid)
@@ -845,7 +852,7 @@ def grid_effectively_at_limit(
     max_position_value: Decimal,
     policy: str,
 ) -> bool:
-    gap = Decimal(str(row["gap_rate"]))
+    gap = effective_grid_gap(row)
     is_buy = side == "buy"
     sz_decimals = int(row.get("sz_decimals") or asset["szDecimals"])
     price = rounded_perp_price(reference_px * (Decimal("1") - gap if is_buy else Decimal("1") + gap), sz_decimals)
@@ -879,7 +886,7 @@ def near_grid_orders_if_stale(
     position_size: Decimal,
     policy: str,
 ) -> list[dict[str, Any]]:
-    gap = Decimal(str(row["gap_rate"]))
+    gap = effective_grid_gap(row)
     sz_decimals = int(row.get("sz_decimals") or asset["szDecimals"])
     is_buy = side == "buy"
 
@@ -929,6 +936,57 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     current_mid = Decimal(str(mids[coin]))
     best_bid, best_ask = best_bid_ask(info, coin)
     position_size, position_value = current_position_size_value(info, account, coin, dex, current_mid)
+    previous_avg_state = (
+        row.get("buy_size"),
+        row.get("sell_size"),
+        row.get("avg_multiplier"),
+        row.get("avg_favored_side"),
+        row.get("avg_current_value"),
+        row.get("effective_gap_rate"),
+    )
+    avg_value = decimal_or_none(row.get("avg"))
+    if avg_value is not None:
+        base_buy_size = Decimal(str(row.get("base_buy_size") or row.get("buy_size") or "0"))
+        base_sell_size = Decimal(str(row.get("base_sell_size") or row.get("sell_size") or "0"))
+        avg_multiplier, avg_favored_side, avg_current_value = grid_avg_multiplier(
+            policy,
+            min_position_value,
+            max_position_value,
+            avg_value,
+            position_size,
+            position_value,
+        )
+        buy_size, sell_size = grid_avg_size_pair(
+            base_buy_size,
+            base_sell_size,
+            avg_multiplier,
+            avg_favored_side,
+            int(row.get("sz_decimals") or asset["szDecimals"]),
+        )
+        row["base_buy_size"] = decimal_to_plain(base_buy_size)
+        row["base_sell_size"] = decimal_to_plain(base_sell_size)
+        row["buy_size"] = decimal_to_plain(buy_size)
+        row["sell_size"] = decimal_to_plain(sell_size)
+        if buy_size > sell_size:
+            row["actual_trend"] = format_signed_percent(buy_size / sell_size - Decimal("1"))
+        elif sell_size > buy_size:
+            row["actual_trend"] = format_signed_percent(-(sell_size / buy_size - Decimal("1")))
+        else:
+            row["actual_trend"] = "0%"
+        row["avg_multiplier"] = decimal_to_plain(avg_multiplier)
+        row["avg_favored_side"] = avg_favored_side
+        row["avg_current_value"] = decimal_to_plain(avg_current_value)
+        row["effective_gap_rate"] = decimal_to_plain(Decimal(str(row["gap_rate"])) * avg_multiplier)
+    else:
+        row["effective_gap_rate"] = decimal_to_plain(Decimal(str(row["gap_rate"])))
+    avg_state_changed = previous_avg_state != (
+        row.get("buy_size"),
+        row.get("sell_size"),
+        row.get("avg_multiplier"),
+        row.get("avg_favored_side"),
+        row.get("avg_current_value"),
+        row.get("effective_gap_rate"),
+    )
     margin_ratio = account_margin_ratio(info, account, network, cache)
     account_margin_protected = margin_ratio is not None and margin_ratio < GRID_ACCOUNT_MARGIN_RATIO_THRESHOLD
 
@@ -945,7 +1003,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         fills_cache[fills_key] = info.user_fills_by_time(account, common_start_ms, now_ms)
         log_event("grid_user_fills_by_time", {"start_ms": common_start_ms, "end_ms": now_ms, "count": len(fills_cache[fills_key])})
     fills_by_oid = recent_fills_by_oid(info, account, coin, start_ms, now_ms, fills_cache[fills_key])
-    changed = False
+    changed = avg_state_changed
     missing_without_fill: list[int] = []
     recovered_missing = 0
     newly_filled: list[dict[str, Any]] = [
@@ -1392,6 +1450,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         f"recovered_missing={recovered_missing}; margin_cooldown={margin_cooldowns}; "
         f"submissions=buy:{submissions_by_side['buy']},sell:{submissions_by_side['sell']}; "
         f"filled_stop={','.join(sorted(filled_submission_sides)) or '-'}; "
+        f"avg={row.get('avg') if row.get('avg') is not None else '-'}; avg_multiplier={row.get('avg_multiplier', '1')}; "
         f"account_margin={margin_ratio_label}; account_protected={int(account_margin_protected)}"
     )
     return (

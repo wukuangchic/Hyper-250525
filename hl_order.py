@@ -103,6 +103,7 @@ DEFAULT_GRID_GAP_LABEL = ["auto-minTick", "auto-takerFee", "auto-makerFee"]
 DEFAULT_GRID_RANGE = ["auto", "auto"]
 GRID_TARGET_ORDERS_PER_SIDE = 10
 GRID_ACCOUNT_MARGIN_RATIO_THRESHOLD = Decimal("0.70")
+GRID_AVG_MAX_MULTIPLIER = Decimal("1.4")
 CANCEL_AGE_FILTERS = {"hour", "day", "week"}
 CANCEL_FILTERS = {"all", "up", "down", "buy", "sell", "tp", "sl", "trail", "grid"} | CANCEL_AGE_FILTERS
 CANCEL_AGE_UNIT_MS = {
@@ -762,6 +763,8 @@ def print_explain(title: str, plans: list[dict[str, Any]], args: argparse.Namesp
             rows.append(("range", " ".join(grid_range_spec(args))))
         rows.append(("gap", " ".join(grid_gap_spec(args))))
         rows.append(("trend", args.trend or "0"))
+        if getattr(args, "grid_avg", None) is not None:
+            rows.append(("avg", str(args.grid_avg)))
         if getattr(args, "resolved_grid_trend", None):
             rows.append(("actual_trend", args.resolved_grid_trend))
     if getattr(args, "symmetric", False):
@@ -2329,6 +2332,63 @@ def grid_limit_arg(args: argparse.Namespace) -> tuple[str | None, str | None, st
     raise ValueError(f"--{policy} accepts one or two values")
 
 
+def grid_avg_bounds(policy: str, min_position_value: Decimal, max_position_value: Decimal) -> tuple[Decimal, Decimal]:
+    if policy == "abs":
+        return -max_position_value, max_position_value
+    return min_position_value, max_position_value
+
+
+def grid_avg_position_value(policy: str, position_size: Decimal, position_value: Decimal) -> Decimal:
+    signed_value = position_value.copy_sign(position_size) if position_size != 0 else Decimal("0")
+    return -signed_value if policy == "short" else signed_value
+
+
+def grid_avg_multiplier(
+    policy: str,
+    min_position_value: Decimal,
+    max_position_value: Decimal,
+    avg_position_value: Decimal,
+    position_size: Decimal,
+    position_value: Decimal,
+) -> tuple[Decimal, str | None, Decimal]:
+    lower, upper = grid_avg_bounds(policy, min_position_value, max_position_value)
+    current = grid_avg_position_value(policy, position_size, position_value)
+    if current == avg_position_value:
+        return Decimal("1"), None, current
+    if current < avg_position_value:
+        span = avg_position_value - lower
+        deviation = Decimal("1") if span <= 0 else (avg_position_value - current) / span
+        favored_side = "sell" if policy == "short" else "buy"
+    else:
+        span = upper - avg_position_value
+        deviation = Decimal("1") if span <= 0 else (current - avg_position_value) / span
+        favored_side = "buy" if policy == "short" else "sell"
+    deviation = max(Decimal("0"), min(Decimal("1"), deviation))
+    multiplier = Decimal("1") + (GRID_AVG_MAX_MULTIPLIER - Decimal("1")) * deviation
+    return multiplier, favored_side, current
+
+
+def round_grid_size_nearest(value: Decimal, sz_decimals: int) -> Decimal:
+    step = Decimal(1).scaleb(-sz_decimals)
+    return (value / step).to_integral_value(rounding=ROUND_HALF_UP) * step
+
+
+def grid_avg_size_pair(
+    base_buy_size: Decimal,
+    base_sell_size: Decimal,
+    multiplier: Decimal,
+    favored_side: str | None,
+    sz_decimals: int,
+) -> tuple[Decimal, Decimal]:
+    buy_size = base_buy_size
+    sell_size = base_sell_size
+    if favored_side == "buy":
+        buy_size = round_grid_size_nearest(base_buy_size * multiplier, sz_decimals)
+    elif favored_side == "sell":
+        sell_size = round_grid_size_nearest(base_sell_size * multiplier, sz_decimals)
+    return buy_size, sell_size
+
+
 def grid_min_notional(args: argparse.Namespace) -> Decimal:
     value = getattr(args, "grid_min", None)
     if value is None:
@@ -2727,14 +2787,40 @@ def build_grid_orders(
 
     sz_decimals = int(asset["szDecimals"])
     anchor = rounded_perp_price(current_mid, sz_decimals)
-    gap = resolve_grid_spacing(args, info, account, asset, dex, anchor)
+    base_gap = resolve_grid_spacing(args, info, account, asset, dex, anchor)
+    position_size, position_value = current_position_size_value(info, account, coin, dex, current_mid)
+    policy = getattr(args, "grid_position_limit_mode", None) or "abs"
+    min_position_value = Decimal(str(getattr(args, "grid_position_min_value", None) or "0"))
+    avg_value = decimal_or_none(getattr(args, "grid_avg", None))
+    avg_multiplier = Decimal("1")
+    avg_favored_side: str | None = None
+    avg_current_value = grid_avg_position_value(policy, position_size, position_value)
+    if avg_value is not None:
+        avg_multiplier, avg_favored_side, avg_current_value = grid_avg_multiplier(
+            policy,
+            min_position_value,
+            max_position_value,
+            avg_value,
+            position_size,
+            position_value,
+        )
+    gap = base_gap * avg_multiplier
     first_buy_px = rounded_perp_price(anchor * (Decimal("1") - gap), sz_decimals)
     first_sell_px = rounded_perp_price(anchor * (Decimal("1") + gap), sz_decimals)
     if first_buy_px <= 0 or first_buy_px >= first_sell_px:
         raise ValueError("grid --gap is too small for this price precision")
 
     min_notional = grid_min_notional(args)
-    buy_size, sell_size = grid_limit_size_pair_for_trend(trend, sz_decimals, first_buy_px, first_sell_px, min_notional)
+    base_buy_size, base_sell_size = grid_limit_size_pair_for_trend(trend, sz_decimals, first_buy_px, first_sell_px, min_notional)
+    if avg_value is not None:
+        balanced_size = max(base_buy_size, base_sell_size)
+        base_buy_size = balanced_size
+        base_sell_size = balanced_size
+    buy_size, sell_size = (
+        grid_avg_size_pair(base_buy_size, base_sell_size, avg_multiplier, avg_favored_side, sz_decimals)
+        if avg_value is not None
+        else (base_buy_size, base_sell_size)
+    )
     if buy_size > sell_size:
         args.resolved_grid_trend = format_signed_percent(buy_size / sell_size - Decimal("1"))
     elif sell_size > buy_size:
@@ -2742,9 +2828,6 @@ def build_grid_orders(
     else:
         args.resolved_grid_trend = "0%"
 
-    position_size, position_value = current_position_size_value(info, account, coin, dex, current_mid)
-    policy = getattr(args, "grid_position_limit_mode", None) or "abs"
-    min_position_value = Decimal(str(getattr(args, "grid_position_min_value", None) or "0"))
     projected_position_values = {"buy": position_value, "sell": position_value}
     plans: list[dict[str, Any]] = []
     for depth in range(1, GRID_TARGET_ORDERS_PER_SIDE + 1):
@@ -2773,9 +2856,15 @@ def build_grid_orders(
             plan = build_grid_limit_order_plan(coin, is_buy, size, price, asset, reduce_only, label)
             plan["grid_anchor"] = anchor
             plan["grid_gap"] = gap
+            plan["grid_base_gap"] = base_gap
             plan["grid_depth"] = depth
             plan["grid_buy_size"] = buy_size
             plan["grid_sell_size"] = sell_size
+            plan["grid_base_buy_size"] = base_buy_size
+            plan["grid_base_sell_size"] = base_sell_size
+            plan["grid_avg_multiplier"] = avg_multiplier
+            plan["grid_avg_favored_side"] = avg_favored_side
+            plan["grid_avg_current_value"] = avg_current_value
             plans.append(plan)
             if grid_order_would_add_risk(position_size, is_buy):
                 projected_position_values[side] += notional
@@ -2868,8 +2957,11 @@ def build_grid_batch_row(
     if fatal_errors:
         row_status = "error"
     gap_rate = Decimal(str(plans[0].get("grid_gap", "0"))) if plans else Decimal("0")
+    base_gap_rate = Decimal(str(plans[0].get("grid_base_gap", gap_rate))) if plans else Decimal("0")
     buy_sizes = [Decimal(str(plan.get("grid_buy_size", plan["size"]))) for plan in plans]
     sell_sizes = [Decimal(str(plan.get("grid_sell_size", plan["size"]))) for plan in plans]
+    base_buy_sizes = [Decimal(str(plan.get("grid_base_buy_size", plan.get("grid_buy_size", plan["size"])))) for plan in plans]
+    base_sell_sizes = [Decimal(str(plan.get("grid_base_sell_size", plan.get("grid_sell_size", plan["size"])))) for plan in plans]
 
     return {
         "id": f"{now}-grid-{coin}",
@@ -2887,12 +2979,18 @@ def build_grid_batch_row(
         "grid_tif": "Gtc",
         "min_order_value": decimal_to_plain(grid_min_notional(args)),
         "gap": " ".join(grid_gap_spec(args)),
-        "gap_rate": decimal_to_plain(gap_rate),
+        "gap_rate": decimal_to_plain(base_gap_rate),
+        "effective_gap_rate": decimal_to_plain(gap_rate),
         "trend": args.trend or "0",
+        "avg": str(args.grid_avg) if getattr(args, "grid_avg", None) is not None else None,
+        "avg_multiplier": decimal_to_plain(Decimal(str(plans[0].get("grid_avg_multiplier", "1")))) if plans else "1",
+        "avg_current_value": decimal_to_plain(Decimal(str(plans[0].get("grid_avg_current_value", "0")))) if plans else "0",
         "actual_trend": getattr(args, "resolved_grid_trend", "0%"),
         "target_orders_per_side": GRID_TARGET_ORDERS_PER_SIDE,
         "buy_size": decimal_to_plain(buy_sizes[0]) if buy_sizes else "",
         "sell_size": decimal_to_plain(sell_sizes[0]) if sell_sizes else "",
+        "base_buy_size": decimal_to_plain(base_buy_sizes[0]) if base_buy_sizes else "",
+        "base_sell_size": decimal_to_plain(base_sell_sizes[0]) if base_sell_sizes else "",
         "slippage": decimal_to_plain(slippage),
         "sz_decimals": int(asset["szDecimals"]),
         "created_at": now,
@@ -2911,6 +3009,9 @@ def print_grid_batch_status(row: dict[str, Any], price_rate: Decimal | None) -> 
         ("limit", grid_limit_display(row)),
         ("min", str(row.get("min_order_value", MIN_NOTIONAL))),
         ("gap", str(row.get("gap", ""))),
+        ("effective_gap", str(row.get("effective_gap_rate", row.get("gap_rate", "")))),
+        ("avg", str(row.get("avg")) if row.get("avg") is not None else "-"),
+        ("avg_multiplier", str(row.get("avg_multiplier", "1"))),
         ("orders", str(len(row.get("levels") or []))),
         ("open_oids", str(len(open_oids))),
         ("actual_trend", str(row.get("actual_trend", "0%"))),
@@ -3419,7 +3520,8 @@ def modify_grid_batch_order(
     limit_mode_changed = new_limit_mode != old_limit_mode
     min_position_changed = new_min_position_value != old_min_position_value
     gap_changed = bool(args.gap)
-    regrid = bool(gap_changed or args.trend or args.grid_min is not None or limit_mode_changed or min_position_changed)
+    avg_changed = args.grid_avg is not None
+    regrid = bool(gap_changed or args.trend is not None or avg_changed or args.grid_min is not None or limit_mode_changed or min_position_changed)
     updates: list[tuple[str, str]] = []
     if args.grid_position_limit_value is not None:
         row["position_limit_mode"] = new_limit_mode
@@ -3438,7 +3540,22 @@ def modify_grid_batch_order(
         updates.append(("gap", row["gap"]))
     if args.trend is not None:
         row["trend"] = args.trend or "0"
+        row["avg"] = None
         updates.append(("trend", row["trend"]))
+    if avg_changed:
+        avg_value = Decimal(str(args.grid_avg))
+        avg_lower, avg_upper = grid_avg_bounds(
+            new_limit_mode,
+            new_min_position_value,
+            Decimal(str(row.get("max_position_value"))),
+        )
+        if not avg_value.is_finite() or avg_value < avg_lower or avg_value > avg_upper:
+            raise ValueError(
+                f"--avg must be between {decimal_to_plain(avg_lower)} and {decimal_to_plain(avg_upper)} for --{new_limit_mode}"
+            )
+        row["avg"] = decimal_to_plain(avg_value)
+        row["trend"] = "0"
+        updates.append(("avg", row["avg"]))
 
     args.grid_position_limit_mode = grid_limit_policy_from_row(row)
     args.grid_position_min_value = str(row.get("min_position_value") or "0")
@@ -3451,6 +3568,20 @@ def modify_grid_batch_order(
         args.resolved_grid_gap_spec = [str(row.get("gap") or args.gap[0])]
     if args.trend is None:
         args.trend = str(row.get("trend") or "0")
+    if args.grid_avg is None and row.get("avg") is not None:
+        args.grid_avg = str(row["avg"])
+    if args.grid_avg is not None:
+        effective_avg = Decimal(str(args.grid_avg))
+        effective_lower, effective_upper = grid_avg_bounds(
+            args.grid_position_limit_mode,
+            Decimal(str(args.grid_position_min_value or "0")),
+            Decimal(str(args.grid_position_limit_value)),
+        )
+        if not effective_avg.is_finite() or effective_avg < effective_lower or effective_avg > effective_upper:
+            raise ValueError(
+                f"--avg must be between {decimal_to_plain(effective_lower)} and {decimal_to_plain(effective_upper)} "
+                f"for --{args.grid_position_limit_mode}"
+            )
 
     if args.explain or args.dry_run:
         print_account_metrics(info, account)
@@ -3511,6 +3642,12 @@ def modify_grid_batch_order(
         row["min_position_value"] = new_row.get("min_position_value", row.get("min_position_value", "0"))
         row["buy_size"] = new_row.get("buy_size", row.get("buy_size"))
         row["sell_size"] = new_row.get("sell_size", row.get("sell_size"))
+        row["base_buy_size"] = new_row.get("base_buy_size", row.get("base_buy_size"))
+        row["base_sell_size"] = new_row.get("base_sell_size", row.get("base_sell_size"))
+        row["effective_gap_rate"] = new_row.get("effective_gap_rate", row.get("effective_gap_rate"))
+        row["avg"] = new_row.get("avg")
+        row["avg_multiplier"] = new_row.get("avg_multiplier", "1")
+        row["avg_current_value"] = new_row.get("avg_current_value", "0")
 
     row["status"] = "active"
     row["updated_at"] = now
@@ -3620,6 +3757,12 @@ def build_recovered_grid_batch_row(
             buy_size = inferred_buy_size
         if sell_size <= 0:
             sell_size = inferred_sell_size
+    base_buy_size = buy_size
+    base_sell_size = sell_size
+    if getattr(args, "grid_avg", None) is not None:
+        balanced_size = max(buy_size, sell_size)
+        base_buy_size = balanced_size
+        base_sell_size = balanced_size
     actual_trend = "0%"
     if buy_size > 0 and sell_size > 0:
         if buy_size > sell_size:
@@ -3644,11 +3787,17 @@ def build_recovered_grid_batch_row(
         "min_order_value": decimal_to_plain(grid_min_notional(args)),
         "gap": " ".join(grid_gap_spec(args)),
         "gap_rate": decimal_to_plain(gap_rate),
+        "effective_gap_rate": decimal_to_plain(gap_rate),
         "trend": args.trend or "0",
+        "avg": str(args.grid_avg) if getattr(args, "grid_avg", None) is not None else None,
+        "avg_multiplier": "1",
+        "avg_current_value": "0",
         "actual_trend": actual_trend,
         "target_orders_per_side": GRID_TARGET_ORDERS_PER_SIDE,
         "buy_size": decimal_to_plain(buy_size),
         "sell_size": decimal_to_plain(sell_size),
+        "base_buy_size": decimal_to_plain(base_buy_size),
+        "base_sell_size": decimal_to_plain(base_sell_size),
         "slippage": decimal_to_plain(slippage),
         "sz_decimals": int(asset["szDecimals"]),
         "created_at": now,
@@ -4888,6 +5037,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--price", help="Limit price. Defaults to same-side book level 10.")
     parser.add_argument("--offset", dest="symmetric_offset", help="Symmetric order distance from base price, e.g. 2%% or 1500.")
     parser.add_argument("--trend", help="Grid quantity tilt. Default: 0. Positive makes buy size larger, negative makes sell size larger, e.g. 10%% or -10%%.")
+    parser.add_argument("--avg", dest="grid_avg", help="Grid target position value. Dynamically tilts size and gap up to 1.4x; mutually exclusive with --trend.")
     parser.add_argument(
         "--gap",
         nargs="+",
@@ -5168,9 +5318,11 @@ def parse_args() -> argparse.Namespace:
         args.range_spec = [decimal_to_plain(start_px), decimal_to_plain(args.ladder_end), args.ladder_step]
     if args.symmetric_offset and not args.symmetric:
         parser.error("--offset requires side both/sym/对称")
-    if (args.trend or args.gap or args.grid_min) and not args.grid:
-        parser.error("--trend, --gap, and --min require side grid")
+    if (args.trend or args.grid_avg is not None or args.gap or args.grid_min) and not args.grid:
+        parser.error("--trend, --avg, --gap, and --min require side grid")
     if args.grid:
+        if args.trend is not None and args.grid_avg is not None:
+            parser.error("--avg and --trend are mutually exclusive")
         if args.grid_modify and args.grid_recover:
             parser.error("grid --modify and --recover are mutually exclusive")
         if args.total_amount is not None:
@@ -5205,12 +5357,21 @@ def parse_args() -> argparse.Namespace:
                     parser.error(f"--{policy} must be positive")
                 if grid_min_limit >= grid_limit:
                     parser.error(f"--{policy} requires MIN < MAX")
+                if args.grid_avg is not None:
+                    avg_value = Decimal(str(args.grid_avg))
+                    if not avg_value.is_finite():
+                        parser.error("--avg must be a finite number")
+                    avg_lower, avg_upper = grid_avg_bounds(policy, grid_min_limit, grid_limit)
+                    if avg_value < avg_lower or avg_value > avg_upper:
+                        parser.error(
+                            f"--avg must be between {decimal_to_plain(avg_lower)} and {decimal_to_plain(avg_upper)} for --{policy}"
+                        )
             if args.grid_min is not None:
                 grid_min_notional(args)
         except ValueError as exc:
             parser.error(str(exc))
         except InvalidOperation:
-            parser.error("grid limit and --min must be positive numbers")
+            parser.error("grid limit, --avg, and --min must be valid numbers")
         args.amount = args.grid_position_limit_value or "10"
     if args.symmetric:
         if not args.symmetric_offset:
