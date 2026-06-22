@@ -8,12 +8,33 @@ from hl_order import (
     grid_avg_bounds,
     grid_avg_multiplier,
     grid_avg_size_pair,
+    grid_avg_topup_params,
     grid_query_avg_summary,
 )
 from trail_worker import near_grid_orders_if_stale, next_depth_order, replacement_order_from_fill
 
 
 class GridAvgTests(unittest.TestCase):
+    def test_topup_params_separate_reversion_size_from_risk_gap(self) -> None:
+        buy_favored = grid_avg_topup_params(
+            Decimal("0.01"),
+            Decimal("0.100"),
+            Decimal("0.100"),
+            Decimal("1.4"),
+            "buy",
+            3,
+        )
+        sell_favored = grid_avg_topup_params(
+            Decimal("0.01"),
+            Decimal("0.100"),
+            Decimal("0.100"),
+            Decimal("1.4"),
+            "sell",
+            3,
+        )
+        self.assertEqual(buy_favored, (Decimal("0.140"), Decimal("0.100"), Decimal("0.01"), Decimal("0.014")))
+        self.assertEqual(sell_favored, (Decimal("0.100"), Decimal("0.140"), Decimal("0.014"), Decimal("0.01")))
+
     def test_query_summary_displays_live_avg_values(self) -> None:
         row = {
             "position_limit_mode": "abs",
@@ -39,7 +60,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(summary["avg_multiplier"], "1.2")
         self.assertEqual(summary["avg_side"], "buy")
         self.assertEqual(summary["base_gap"], "0.05% (0.0005)")
-        self.assertEqual(summary["topup_gap"], "0.0006")
+        self.assertEqual(summary["topup_gap"], "buy 0.0005 / sell 0.0006")
         self.assertEqual(summary["base_size"], "buy 0.00016 / sell 0.00016")
         self.assertEqual(summary["topup_size"], "buy 0.00019 / sell 0.00016")
 
@@ -84,6 +105,8 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(plans[0]["grid_sell_size"], Decimal("0.101"))
         self.assertEqual(plans[0]["grid_topup_buy_size"], Decimal("0.121"))
         self.assertEqual(plans[0]["grid_topup_sell_size"], Decimal("0.101"))
+        self.assertEqual(plans[0]["grid_topup_buy_gap"], Decimal("0.005"))
+        self.assertEqual(plans[0]["grid_topup_sell_gap"], Decimal("0.00600"))
 
         statuses = [{"resting": {"oid": index + 1}} for index in range(len(plans))]
         row = build_grid_batch_row(
@@ -105,6 +128,8 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(row["sell_size"], "0.101")
         self.assertEqual(row["topup_buy_size"], "0.121")
         self.assertEqual(row["topup_sell_size"], "0.101")
+        self.assertEqual(row["topup_buy_gap"], "0.005")
+        self.assertEqual(row["topup_sell_gap"], "0.006")
 
     def test_only_far_side_topup_uses_dynamic_gap_and_size(self) -> None:
         row = {
@@ -116,6 +141,8 @@ class GridAvgTests(unittest.TestCase):
             "base_sell_size": "0.100",
             "topup_buy_size": "0.140",
             "topup_sell_size": "0.100",
+            "topup_buy_gap": "0.01",
+            "topup_sell_gap": "0.014",
             "levels": [
                 {
                     "side": "buy",
@@ -150,7 +177,22 @@ class GridAvgTests(unittest.TestCase):
         )
         self.assertIsNotNone(topup)
         self.assertEqual(topup["size"], "0.14")
-        self.assertEqual(topup["plan"]["grid_gap"], Decimal("0.014"))
+        self.assertEqual(topup["plan"]["grid_gap"], Decimal("0.01"))
+
+        sell_topup = next_depth_order(
+            row,
+            "BTC",
+            asset,
+            "sell",
+            Decimal("100"),
+            Decimal("-1"),
+            Decimal("100"),
+            Decimal("250"),
+            "abs",
+        )
+        self.assertIsNotNone(sell_topup)
+        self.assertEqual(sell_topup["size"], "0.1")
+        self.assertEqual(sell_topup["plan"]["grid_gap"], Decimal("0.014"))
 
         replacement = replacement_order_from_fill(
             row,

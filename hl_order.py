@@ -1646,7 +1646,7 @@ def grid_query_avg_summary(
     position_value: Decimal,
 ) -> list[tuple[str, str]]:
     avg_value = decimal_or_none(row.get("avg"))
-    effective_gap = Decimal(str(row.get("gap_rate") or "0"))
+    base_gap = Decimal(str(row.get("gap_rate") or "0"))
     base_buy_size = Decimal(str(row.get("base_buy_size") or row.get("buy_size") or "0"))
     base_sell_size = Decimal(str(row.get("base_sell_size") or row.get("sell_size") or "0"))
     topup_buy_size = base_buy_size
@@ -1665,25 +1665,28 @@ def grid_query_avg_summary(
             position_size,
             position_value,
         )
-        topup_buy_size, topup_sell_size = grid_avg_size_pair(
+        topup_buy_size, topup_sell_size, topup_buy_gap, topup_sell_gap = grid_avg_topup_params(
+            base_gap,
             base_buy_size,
             base_sell_size,
             avg_multiplier,
             avg_side,
             int(row.get("sz_decimals") or asset["szDecimals"]),
         )
-        effective_gap *= avg_multiplier
         avg_label = decimal_to_plain(avg_value)
         avg_position_label = decimal_to_plain(avg_position)
         avg_multiplier_label = decimal_to_plain(avg_multiplier)
         avg_side_label = avg_side or "balanced"
+    else:
+        topup_buy_gap = base_gap
+        topup_sell_gap = base_gap
     return [
         ("avg", avg_label),
         ("avg_position", avg_position_label),
         ("avg_multiplier", avg_multiplier_label),
         ("avg_side", avg_side_label),
         ("base_gap", f"{row.get('gap', '')} ({row.get('gap_rate', '')})"),
-        ("topup_gap", decimal_to_plain(effective_gap)),
+        ("topup_gap", f"buy {decimal_to_plain(topup_buy_gap)} / sell {decimal_to_plain(topup_sell_gap)}"),
         ("base_size", f"buy {decimal_to_plain(base_buy_size)} / sell {decimal_to_plain(base_sell_size)}"),
         ("topup_size", f"buy {decimal_to_plain(topup_buy_size)} / sell {decimal_to_plain(topup_sell_size)}"),
     ]
@@ -2441,6 +2444,30 @@ def grid_avg_size_pair(
     return buy_size, sell_size
 
 
+def grid_avg_topup_params(
+    base_gap: Decimal,
+    base_buy_size: Decimal,
+    base_sell_size: Decimal,
+    multiplier: Decimal,
+    favored_side: str | None,
+    sz_decimals: int,
+) -> tuple[Decimal, Decimal, Decimal, Decimal]:
+    buy_size, sell_size = grid_avg_size_pair(
+        base_buy_size,
+        base_sell_size,
+        multiplier,
+        favored_side,
+        sz_decimals,
+    )
+    buy_gap = base_gap
+    sell_gap = base_gap
+    if favored_side == "buy":
+        sell_gap *= multiplier
+    elif favored_side == "sell":
+        buy_gap *= multiplier
+    return buy_size, sell_size, buy_gap, sell_gap
+
+
 def grid_min_notional(args: argparse.Namespace) -> Decimal:
     value = getattr(args, "grid_min", None)
     if value is None:
@@ -2868,10 +2895,13 @@ def build_grid_orders(
         balanced_size = max(base_buy_size, base_sell_size)
         base_buy_size = balanced_size
         base_sell_size = balanced_size
-    topup_buy_size, topup_sell_size = (
-        grid_avg_size_pair(base_buy_size, base_sell_size, avg_multiplier, avg_favored_side, sz_decimals)
-        if avg_value is not None
-        else (base_buy_size, base_sell_size)
+    topup_buy_size, topup_sell_size, topup_buy_gap, topup_sell_gap = grid_avg_topup_params(
+        base_gap,
+        base_buy_size,
+        base_sell_size,
+        avg_multiplier,
+        avg_favored_side,
+        sz_decimals,
     )
     if topup_buy_size > topup_sell_size:
         args.resolved_grid_trend = format_signed_percent(topup_buy_size / topup_sell_size - Decimal("1"))
@@ -2916,6 +2946,8 @@ def build_grid_orders(
             plan["grid_base_sell_size"] = base_sell_size
             plan["grid_topup_buy_size"] = topup_buy_size
             plan["grid_topup_sell_size"] = topup_sell_size
+            plan["grid_topup_buy_gap"] = topup_buy_gap
+            plan["grid_topup_sell_gap"] = topup_sell_gap
             plan["grid_effective_gap"] = effective_gap
             plan["grid_avg_multiplier"] = avg_multiplier
             plan["grid_avg_favored_side"] = avg_favored_side
@@ -3020,6 +3052,8 @@ def build_grid_batch_row(
     base_sell_sizes = [Decimal(str(plan.get("grid_base_sell_size", plan.get("grid_sell_size", plan["size"])))) for plan in plans]
     topup_buy_sizes = [Decimal(str(plan.get("grid_topup_buy_size", plan.get("grid_buy_size", plan["size"])))) for plan in plans]
     topup_sell_sizes = [Decimal(str(plan.get("grid_topup_sell_size", plan.get("grid_sell_size", plan["size"])))) for plan in plans]
+    topup_buy_gaps = [Decimal(str(plan.get("grid_topup_buy_gap", gap_rate))) for plan in plans]
+    topup_sell_gaps = [Decimal(str(plan.get("grid_topup_sell_gap", gap_rate))) for plan in plans]
 
     return {
         "id": f"{now}-grid-{coin}",
@@ -3051,6 +3085,8 @@ def build_grid_batch_row(
         "base_sell_size": decimal_to_plain(base_sell_sizes[0]) if base_sell_sizes else "",
         "topup_buy_size": decimal_to_plain(topup_buy_sizes[0]) if topup_buy_sizes else "",
         "topup_sell_size": decimal_to_plain(topup_sell_sizes[0]) if topup_sell_sizes else "",
+        "topup_buy_gap": decimal_to_plain(topup_buy_gaps[0]) if topup_buy_gaps else decimal_to_plain(base_gap_rate),
+        "topup_sell_gap": decimal_to_plain(topup_sell_gaps[0]) if topup_sell_gaps else decimal_to_plain(base_gap_rate),
         "slippage": decimal_to_plain(slippage),
         "sz_decimals": int(asset["szDecimals"]),
         "created_at": now,
@@ -3726,6 +3762,8 @@ def modify_grid_batch_order(
         row["base_sell_size"] = new_row.get("base_sell_size", row.get("base_sell_size"))
         row["topup_buy_size"] = new_row.get("topup_buy_size", row.get("topup_buy_size"))
         row["topup_sell_size"] = new_row.get("topup_sell_size", row.get("topup_sell_size"))
+        row["topup_buy_gap"] = new_row.get("topup_buy_gap", row.get("topup_buy_gap"))
+        row["topup_sell_gap"] = new_row.get("topup_sell_gap", row.get("topup_sell_gap"))
         row["effective_gap_rate"] = new_row.get("effective_gap_rate", row.get("effective_gap_rate"))
         row["avg"] = new_row.get("avg")
         row["avg_multiplier"] = new_row.get("avg_multiplier", "1")
@@ -3882,6 +3920,8 @@ def build_recovered_grid_batch_row(
         "base_sell_size": decimal_to_plain(base_sell_size),
         "topup_buy_size": decimal_to_plain(base_buy_size),
         "topup_sell_size": decimal_to_plain(base_sell_size),
+        "topup_buy_gap": decimal_to_plain(gap_rate),
+        "topup_sell_gap": decimal_to_plain(gap_rate),
         "slippage": decimal_to_plain(slippage),
         "sz_decimals": int(asset["szDecimals"]),
         "created_at": now,
