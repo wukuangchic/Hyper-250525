@@ -3,6 +3,7 @@ from argparse import Namespace
 from decimal import Decimal
 
 from hl_order import build_grid_batch_row, build_grid_orders, grid_avg_bounds, grid_avg_multiplier, grid_avg_size_pair
+from trail_worker import near_grid_orders_if_stale, next_depth_order, replacement_order_from_fill
 
 
 class GridAvgTests(unittest.TestCase):
@@ -41,9 +42,12 @@ class GridAvgTests(unittest.TestCase):
         )
         self.assertEqual(plans[0]["grid_avg_multiplier"], Decimal("1.20"))
         self.assertEqual(plans[0]["grid_base_gap"], Decimal("0.005"))
-        self.assertEqual(plans[0]["grid_gap"], Decimal("0.00600"))
-        self.assertEqual(plans[0]["grid_buy_size"], Decimal("0.121"))
+        self.assertEqual(plans[0]["grid_gap"], Decimal("0.005"))
+        self.assertEqual(plans[0]["grid_effective_gap"], Decimal("0.00600"))
+        self.assertEqual(plans[0]["grid_buy_size"], Decimal("0.101"))
         self.assertEqual(plans[0]["grid_sell_size"], Decimal("0.101"))
+        self.assertEqual(plans[0]["grid_topup_buy_size"], Decimal("0.121"))
+        self.assertEqual(plans[0]["grid_topup_sell_size"], Decimal("0.101"))
 
         statuses = [{"resting": {"oid": index + 1}} for index in range(len(plans))]
         row = build_grid_batch_row(
@@ -61,8 +65,84 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(row["gap_rate"], "0.005")
         self.assertEqual(row["effective_gap_rate"], "0.006")
         self.assertEqual(row["base_buy_size"], "0.101")
-        self.assertEqual(row["buy_size"], "0.121")
+        self.assertEqual(row["buy_size"], "0.101")
         self.assertEqual(row["sell_size"], "0.101")
+        self.assertEqual(row["topup_buy_size"], "0.121")
+        self.assertEqual(row["topup_sell_size"], "0.101")
+
+    def test_only_far_side_topup_uses_dynamic_gap_and_size(self) -> None:
+        row = {
+            "gap_rate": "0.01",
+            "effective_gap_rate": "0.014",
+            "min_order_value": "1",
+            "sz_decimals": 3,
+            "base_buy_size": "0.100",
+            "base_sell_size": "0.100",
+            "topup_buy_size": "0.140",
+            "topup_sell_size": "0.100",
+            "levels": [
+                {
+                    "side": "buy",
+                    "status": "active",
+                    "oid": 1,
+                    "is_buy": True,
+                    "price": "90",
+                    "size": "0.100",
+                },
+                {
+                    "side": "sell",
+                    "status": "active",
+                    "oid": 2,
+                    "is_buy": False,
+                    "price": "110",
+                    "size": "0.100",
+                },
+            ],
+        }
+        asset = {"szDecimals": 3}
+
+        topup = next_depth_order(
+            row,
+            "BTC",
+            asset,
+            "buy",
+            Decimal("100"),
+            Decimal("-1"),
+            Decimal("100"),
+            Decimal("250"),
+            "abs",
+        )
+        self.assertIsNotNone(topup)
+        self.assertEqual(topup["size"], "0.14")
+        self.assertEqual(topup["plan"]["grid_gap"], Decimal("0.014"))
+
+        replacement = replacement_order_from_fill(
+            row,
+            "BTC",
+            asset,
+            Decimal("90"),
+            True,
+            Decimal("-1"),
+            Decimal("100"),
+            Decimal("250"),
+            "abs",
+        )
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement["size"], "0.1")
+        self.assertEqual(replacement["plan"]["grid_gap"], Decimal("0.01"))
+
+        near_orders = near_grid_orders_if_stale(
+            row,
+            "BTC",
+            asset,
+            "buy",
+            Decimal("100"),
+            Decimal("-1"),
+            "abs",
+        )
+        self.assertEqual(len(near_orders), 1)
+        self.assertEqual(near_orders[0]["size"], "0.1")
+        self.assertEqual(near_orders[0]["plan"]["grid_gap"], Decimal("0.01"))
 
     def test_long_multiplier_is_piecewise_linear_and_capped(self) -> None:
         cases = (

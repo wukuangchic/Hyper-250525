@@ -2806,9 +2806,9 @@ def build_grid_orders(
             position_size,
             position_value,
         )
-    gap = base_gap * avg_multiplier
-    first_buy_px = rounded_perp_price(anchor * (Decimal("1") - gap), sz_decimals)
-    first_sell_px = rounded_perp_price(anchor * (Decimal("1") + gap), sz_decimals)
+    effective_gap = base_gap * avg_multiplier
+    first_buy_px = rounded_perp_price(anchor * (Decimal("1") - base_gap), sz_decimals)
+    first_sell_px = rounded_perp_price(anchor * (Decimal("1") + base_gap), sz_decimals)
     if first_buy_px <= 0 or first_buy_px >= first_sell_px:
         raise ValueError("grid --gap is too small for this price precision")
 
@@ -2818,15 +2818,15 @@ def build_grid_orders(
         balanced_size = max(base_buy_size, base_sell_size)
         base_buy_size = balanced_size
         base_sell_size = balanced_size
-    buy_size, sell_size = (
+    topup_buy_size, topup_sell_size = (
         grid_avg_size_pair(base_buy_size, base_sell_size, avg_multiplier, avg_favored_side, sz_decimals)
         if avg_value is not None
         else (base_buy_size, base_sell_size)
     )
-    if buy_size > sell_size:
-        args.resolved_grid_trend = format_signed_percent(buy_size / sell_size - Decimal("1"))
-    elif sell_size > buy_size:
-        args.resolved_grid_trend = format_signed_percent(-(sell_size / buy_size - Decimal("1")))
+    if topup_buy_size > topup_sell_size:
+        args.resolved_grid_trend = format_signed_percent(topup_buy_size / topup_sell_size - Decimal("1"))
+    elif topup_sell_size > topup_buy_size:
+        args.resolved_grid_trend = format_signed_percent(-(topup_sell_size / topup_buy_size - Decimal("1")))
     else:
         args.resolved_grid_trend = "0%"
 
@@ -2834,8 +2834,8 @@ def build_grid_orders(
     plans: list[dict[str, Any]] = []
     for depth in range(1, GRID_TARGET_ORDERS_PER_SIDE + 1):
         for is_buy, base_size, label, multiplier in (
-            (True, buy_size, f"buy {depth}", Decimal("1") - gap * Decimal(depth)),
-            (False, sell_size, f"sell {depth}", Decimal("1") + gap * Decimal(depth)),
+            (True, base_buy_size, f"buy {depth}", Decimal("1") - base_gap * Decimal(depth)),
+            (False, base_sell_size, f"sell {depth}", Decimal("1") + base_gap * Decimal(depth)),
         ):
             price = rounded_perp_price(anchor * multiplier, sz_decimals)
             if price <= 0:
@@ -2857,13 +2857,16 @@ def build_grid_orders(
             reduce_only = grid_order_should_reduce_only(position_size, is_buy, policy)
             plan = build_grid_limit_order_plan(coin, is_buy, size, price, asset, reduce_only, label)
             plan["grid_anchor"] = anchor
-            plan["grid_gap"] = gap
+            plan["grid_gap"] = base_gap
             plan["grid_base_gap"] = base_gap
             plan["grid_depth"] = depth
-            plan["grid_buy_size"] = buy_size
-            plan["grid_sell_size"] = sell_size
+            plan["grid_buy_size"] = base_buy_size
+            plan["grid_sell_size"] = base_sell_size
             plan["grid_base_buy_size"] = base_buy_size
             plan["grid_base_sell_size"] = base_sell_size
+            plan["grid_topup_buy_size"] = topup_buy_size
+            plan["grid_topup_sell_size"] = topup_sell_size
+            plan["grid_effective_gap"] = effective_gap
             plan["grid_avg_multiplier"] = avg_multiplier
             plan["grid_avg_favored_side"] = avg_favored_side
             plan["grid_avg_current_value"] = avg_current_value
@@ -2960,10 +2963,13 @@ def build_grid_batch_row(
         row_status = "error"
     gap_rate = Decimal(str(plans[0].get("grid_gap", "0"))) if plans else Decimal("0")
     base_gap_rate = Decimal(str(plans[0].get("grid_base_gap", gap_rate))) if plans else Decimal("0")
+    effective_gap_rate = Decimal(str(plans[0].get("grid_effective_gap", gap_rate))) if plans else Decimal("0")
     buy_sizes = [Decimal(str(plan.get("grid_buy_size", plan["size"]))) for plan in plans]
     sell_sizes = [Decimal(str(plan.get("grid_sell_size", plan["size"]))) for plan in plans]
     base_buy_sizes = [Decimal(str(plan.get("grid_base_buy_size", plan.get("grid_buy_size", plan["size"])))) for plan in plans]
     base_sell_sizes = [Decimal(str(plan.get("grid_base_sell_size", plan.get("grid_sell_size", plan["size"])))) for plan in plans]
+    topup_buy_sizes = [Decimal(str(plan.get("grid_topup_buy_size", plan.get("grid_buy_size", plan["size"])))) for plan in plans]
+    topup_sell_sizes = [Decimal(str(plan.get("grid_topup_sell_size", plan.get("grid_sell_size", plan["size"])))) for plan in plans]
 
     return {
         "id": f"{now}-grid-{coin}",
@@ -2982,7 +2988,7 @@ def build_grid_batch_row(
         "min_order_value": decimal_to_plain(grid_min_notional(args)),
         "gap": " ".join(grid_gap_spec(args)),
         "gap_rate": decimal_to_plain(base_gap_rate),
-        "effective_gap_rate": decimal_to_plain(gap_rate),
+        "effective_gap_rate": decimal_to_plain(effective_gap_rate),
         "trend": args.trend or "0",
         "avg": str(args.grid_avg) if getattr(args, "grid_avg", None) is not None else None,
         "avg_multiplier": decimal_to_plain(Decimal(str(plans[0].get("grid_avg_multiplier", "1")))) if plans else "1",
@@ -2993,6 +2999,8 @@ def build_grid_batch_row(
         "sell_size": decimal_to_plain(sell_sizes[0]) if sell_sizes else "",
         "base_buy_size": decimal_to_plain(base_buy_sizes[0]) if base_buy_sizes else "",
         "base_sell_size": decimal_to_plain(base_sell_sizes[0]) if base_sell_sizes else "",
+        "topup_buy_size": decimal_to_plain(topup_buy_sizes[0]) if topup_buy_sizes else "",
+        "topup_sell_size": decimal_to_plain(topup_sell_sizes[0]) if topup_sell_sizes else "",
         "slippage": decimal_to_plain(slippage),
         "sz_decimals": int(asset["szDecimals"]),
         "created_at": now,
@@ -3666,6 +3674,8 @@ def modify_grid_batch_order(
         row["sell_size"] = new_row.get("sell_size", row.get("sell_size"))
         row["base_buy_size"] = new_row.get("base_buy_size", row.get("base_buy_size"))
         row["base_sell_size"] = new_row.get("base_sell_size", row.get("base_sell_size"))
+        row["topup_buy_size"] = new_row.get("topup_buy_size", row.get("topup_buy_size"))
+        row["topup_sell_size"] = new_row.get("topup_sell_size", row.get("topup_sell_size"))
         row["effective_gap_rate"] = new_row.get("effective_gap_rate", row.get("effective_gap_rate"))
         row["avg"] = new_row.get("avg")
         row["avg_multiplier"] = new_row.get("avg_multiplier", "1")
@@ -3820,6 +3830,8 @@ def build_recovered_grid_batch_row(
         "sell_size": decimal_to_plain(sell_size),
         "base_buy_size": decimal_to_plain(base_buy_size),
         "base_sell_size": decimal_to_plain(base_sell_size),
+        "topup_buy_size": decimal_to_plain(base_buy_size),
+        "topup_sell_size": decimal_to_plain(base_sell_size),
         "slippage": decimal_to_plain(slippage),
         "sz_decimals": int(asset["szDecimals"]),
         "created_at": now,

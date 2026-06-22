@@ -542,16 +542,26 @@ def effective_grid_gap(row: dict[str, Any]) -> Decimal:
     return Decimal(str(row.get("effective_gap_rate") or row["gap_rate"]))
 
 
-def grid_order_entry(row: dict[str, Any], coin: str, asset: dict[str, Any], is_buy: bool, price: Decimal, reduce_only: bool) -> dict[str, Any]:
-    size_key = "buy_size" if is_buy else "sell_size"
-    size = Decimal(str(row.get(size_key) or "0"))
+def grid_order_entry(
+    row: dict[str, Any],
+    coin: str,
+    asset: dict[str, Any],
+    is_buy: bool,
+    price: Decimal,
+    reduce_only: bool,
+    size: Decimal | None = None,
+    gap: Decimal | None = None,
+) -> dict[str, Any]:
+    size_key = "base_buy_size" if is_buy else "base_sell_size"
+    if size is None:
+        size = Decimal(str(row.get(size_key) or row.get("buy_size" if is_buy else "sell_size") or "0"))
     if size <= 0:
         raise ValueError(f"grid row is missing {size_key}")
     min_notional = Decimal(str(row.get("min_order_value") or "10"))
     size = grid_size_for_min_notional(size, price, int(asset["szDecimals"]), min_notional)
     side = "buy" if is_buy else "sell"
     plan = build_grid_limit_order_plan(coin, is_buy, size, price, asset, reduce_only, side)
-    plan["grid_gap"] = effective_grid_gap(row)
+    plan["grid_gap"] = gap if gap is not None else Decimal(str(row["gap_rate"]))
     return {
         "side": side,
         "status": "pending",
@@ -577,7 +587,7 @@ def replacement_order_from_fill(
     max_position_value: Decimal,
     policy: str,
 ) -> dict[str, Any] | None:
-    gap = effective_grid_gap(row)
+    gap = Decimal(str(row["gap_rate"]))
     sz_decimals = int(row.get("sz_decimals") or asset["szDecimals"])
     if submitted_limit_px <= 0:
         return None
@@ -688,7 +698,9 @@ def next_depth_order(
     if next_px <= 0:
         return None
     reduce_only = grid_order_should_reduce_only(position_size, is_buy, policy)
-    return grid_order_entry(row, coin, asset, is_buy, next_px, reduce_only)
+    size_key = "topup_buy_size" if is_buy else "topup_sell_size"
+    topup_size = Decimal(str(row.get(size_key) or row.get("base_buy_size" if is_buy else "base_sell_size") or "0"))
+    return grid_order_entry(row, coin, asset, is_buy, next_px, reduce_only, size=topup_size, gap=gap)
 
 
 def submit_grid_order_entry(
@@ -857,8 +869,8 @@ def grid_effectively_at_limit(
     price = rounded_perp_price(reference_px * (Decimal("1") - gap if is_buy else Decimal("1") + gap), sz_decimals)
     if price <= 0:
         return position_value >= max_position_value
-    size_key = "buy_size" if is_buy else "sell_size"
-    size = Decimal(str(row.get(size_key) or "0"))
+    size_key = "topup_buy_size" if is_buy else "topup_sell_size"
+    size = Decimal(str(row.get(size_key) or row.get("base_buy_size" if is_buy else "base_sell_size") or "0"))
     if size <= 0:
         return position_value >= max_position_value
     min_notional = Decimal(str(row.get("min_order_value") or "10"))
@@ -885,7 +897,7 @@ def near_grid_orders_if_stale(
     position_size: Decimal,
     policy: str,
 ) -> list[dict[str, Any]]:
-    gap = effective_grid_gap(row)
+    gap = Decimal(str(row["gap_rate"]))
     sz_decimals = int(row.get("sz_decimals") or asset["szDecimals"])
     is_buy = side == "buy"
 
@@ -936,8 +948,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     best_bid, best_ask = best_bid_ask(info, coin)
     position_size, position_value = current_position_size_value(info, account, coin, dex, current_mid)
     previous_avg_state = (
-        row.get("buy_size"),
-        row.get("sell_size"),
+        row.get("topup_buy_size"),
+        row.get("topup_sell_size"),
         row.get("avg_multiplier"),
         row.get("avg_favored_side"),
         row.get("avg_current_value"),
@@ -955,7 +967,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             position_size,
             position_value,
         )
-        buy_size, sell_size = grid_avg_size_pair(
+        topup_buy_size, topup_sell_size = grid_avg_size_pair(
             base_buy_size,
             base_sell_size,
             avg_multiplier,
@@ -964,12 +976,14 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         )
         row["base_buy_size"] = decimal_to_plain(base_buy_size)
         row["base_sell_size"] = decimal_to_plain(base_sell_size)
-        row["buy_size"] = decimal_to_plain(buy_size)
-        row["sell_size"] = decimal_to_plain(sell_size)
-        if buy_size > sell_size:
-            row["actual_trend"] = format_signed_percent(buy_size / sell_size - Decimal("1"))
-        elif sell_size > buy_size:
-            row["actual_trend"] = format_signed_percent(-(sell_size / buy_size - Decimal("1")))
+        row["buy_size"] = decimal_to_plain(base_buy_size)
+        row["sell_size"] = decimal_to_plain(base_sell_size)
+        row["topup_buy_size"] = decimal_to_plain(topup_buy_size)
+        row["topup_sell_size"] = decimal_to_plain(topup_sell_size)
+        if topup_buy_size > topup_sell_size:
+            row["actual_trend"] = format_signed_percent(topup_buy_size / topup_sell_size - Decimal("1"))
+        elif topup_sell_size > topup_buy_size:
+            row["actual_trend"] = format_signed_percent(-(topup_sell_size / topup_buy_size - Decimal("1")))
         else:
             row["actual_trend"] = "0%"
         row["avg_multiplier"] = decimal_to_plain(avg_multiplier)
@@ -977,10 +991,12 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         row["avg_current_value"] = decimal_to_plain(avg_current_value)
         row["effective_gap_rate"] = decimal_to_plain(Decimal(str(row["gap_rate"])) * avg_multiplier)
     else:
+        row["topup_buy_size"] = decimal_to_plain(Decimal(str(row.get("base_buy_size") or row.get("buy_size") or "0")))
+        row["topup_sell_size"] = decimal_to_plain(Decimal(str(row.get("base_sell_size") or row.get("sell_size") or "0")))
         row["effective_gap_rate"] = decimal_to_plain(Decimal(str(row["gap_rate"])))
     avg_state_changed = previous_avg_state != (
-        row.get("buy_size"),
-        row.get("sell_size"),
+        row.get("topup_buy_size"),
+        row.get("topup_sell_size"),
         row.get("avg_multiplier"),
         row.get("avg_favored_side"),
         row.get("avg_current_value"),
