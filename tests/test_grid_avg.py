@@ -2,11 +2,47 @@ import unittest
 from argparse import Namespace
 from decimal import Decimal
 
-from hl_order import build_grid_batch_row, build_grid_orders, grid_avg_bounds, grid_avg_multiplier, grid_avg_size_pair
+from hl_order import (
+    build_grid_batch_row,
+    build_grid_orders,
+    grid_avg_bounds,
+    grid_avg_multiplier,
+    grid_avg_size_pair,
+    grid_query_avg_summary,
+)
 from trail_worker import near_grid_orders_if_stale, next_depth_order, replacement_order_from_fill
 
 
 class GridAvgTests(unittest.TestCase):
+    def test_query_summary_displays_live_avg_values(self) -> None:
+        row = {
+            "position_limit_mode": "abs",
+            "min_position_value": "0",
+            "max_position_value": "250",
+            "avg": "0",
+            "gap": "0.05%",
+            "gap_rate": "0.0005",
+            "base_buy_size": "0.00016",
+            "base_sell_size": "0.00016",
+            "sz_decimals": 5,
+        }
+        summary = dict(
+            grid_query_avg_summary(
+                row,
+                {"szDecimals": 5},
+                Decimal("-0.002"),
+                Decimal("125"),
+            )
+        )
+        self.assertEqual(summary["avg"], "0")
+        self.assertEqual(summary["avg_position"], "-125")
+        self.assertEqual(summary["avg_multiplier"], "1.2")
+        self.assertEqual(summary["avg_side"], "buy")
+        self.assertEqual(summary["base_gap"], "0.05% (0.0005)")
+        self.assertEqual(summary["topup_gap"], "0.0006")
+        self.assertEqual(summary["base_size"], "buy 0.00016 / sell 0.00016")
+        self.assertEqual(summary["topup_size"], "buy 0.00019 / sell 0.00016")
+
     def test_grid_plan_persists_base_and_effective_values(self) -> None:
         class FakeInfo:
             def user_state(self, account: str, dex: str = "") -> dict:

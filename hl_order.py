@@ -1639,9 +1639,59 @@ def format_grid_detail_rows(row: dict[str, Any], open_oids: set[int]) -> list[di
     return rows
 
 
+def grid_query_avg_summary(
+    row: dict[str, Any],
+    asset: dict[str, Any],
+    position_size: Decimal,
+    position_value: Decimal,
+) -> list[tuple[str, str]]:
+    avg_value = decimal_or_none(row.get("avg"))
+    effective_gap = Decimal(str(row.get("gap_rate") or "0"))
+    base_buy_size = Decimal(str(row.get("base_buy_size") or row.get("buy_size") or "0"))
+    base_sell_size = Decimal(str(row.get("base_sell_size") or row.get("sell_size") or "0"))
+    topup_buy_size = base_buy_size
+    topup_sell_size = base_sell_size
+    avg_label = "-"
+    avg_position_label = "-"
+    avg_multiplier_label = "-"
+    avg_side_label = "-"
+    if avg_value is not None:
+        policy = grid_limit_policy_from_row(row)
+        avg_multiplier, avg_side, avg_position = grid_avg_multiplier(
+            policy,
+            Decimal(str(row.get("min_position_value") or "0")),
+            Decimal(str(row.get("max_position_value") or "0")),
+            avg_value,
+            position_size,
+            position_value,
+        )
+        topup_buy_size, topup_sell_size = grid_avg_size_pair(
+            base_buy_size,
+            base_sell_size,
+            avg_multiplier,
+            avg_side,
+            int(row.get("sz_decimals") or asset["szDecimals"]),
+        )
+        effective_gap *= avg_multiplier
+        avg_label = decimal_to_plain(avg_value)
+        avg_position_label = decimal_to_plain(avg_position)
+        avg_multiplier_label = decimal_to_plain(avg_multiplier)
+        avg_side_label = avg_side or "balanced"
+    return [
+        ("avg", avg_label),
+        ("avg_position", avg_position_label),
+        ("avg_multiplier", avg_multiplier_label),
+        ("avg_side", avg_side_label),
+        ("base_gap", f"{row.get('gap', '')} ({row.get('gap_rate', '')})"),
+        ("topup_gap", decimal_to_plain(effective_gap)),
+        ("base_size", f"buy {decimal_to_plain(base_buy_size)} / sell {decimal_to_plain(base_sell_size)}"),
+        ("topup_size", f"buy {decimal_to_plain(topup_buy_size)} / sell {decimal_to_plain(topup_sell_size)}"),
+    ]
+
+
 def query_grid(args: argparse.Namespace) -> None:
     info, _exchange, account, signer, role = build_clients(args.network, args.timeout, args.coin, need_exchange=False)
-    coin, _asset = resolve_perp_asset(info, args.coin)
+    coin, asset = resolve_perp_asset(info, args.coin)
     dex = coin_dex(coin)
     if args.verbose:
         print("network:", args.network)
@@ -1691,7 +1741,7 @@ def query_grid(args: argparse.Namespace) -> None:
             ("limit", grid_limit_display(row)),
             ("min", str(row.get("min_order_value", MIN_NOTIONAL))),
             ("position", f"{decimal_to_plain(position_size)} / {decimal_to_display(position_value)}"),
-            ("gap", f"{row.get('gap', '')} ({row.get('gap_rate', '')})"),
+            *grid_query_avg_summary(row, asset, position_size, position_value),
             ("trend", f"{row.get('trend', '0')} actual {row.get('actual_trend', '0%')}"),
             ("target_side", str(row.get("target_orders_per_side", GRID_TARGET_ORDERS_PER_SIDE))),
             ("active_buy", str(active_buy)),
