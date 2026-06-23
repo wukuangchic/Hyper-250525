@@ -42,7 +42,8 @@ query
 order query
 order --query
 
-# 持仓表里的 realPnl / result 会用历史成交、手续费、资金费和当前持仓浮盈亏重算真实盈亏
+# 持仓表里的 realPnl / result 按账户最近最多 2,000 笔成交计算：
+# 已实现盈亏 - 手续费 + 同期资金费 + 交易所当前持仓浮盈亏
 
 # 查询 BTC 行情、文本 K 线、当前持仓和近期成交
 BTC

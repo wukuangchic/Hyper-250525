@@ -113,9 +113,8 @@ CANCEL_AGE_UNIT_MS = {
     "day": 24 * 60 * 60 * 1000,
     "week": 7 * 24 * 60 * 60 * 1000,
 }
-HISTORY_PNL_LOOKBACK_DAYS = 365
-HISTORY_PNL_CHUNK_DAYS = 30
-HISTORY_PNL_MAX_FILLS = 5000
+HISTORY_PNL_MAX_FILLS = 2000
+HISTORY_PNL_FUNDING_PAGE_SIZE = 500
 INFO_RETRY_STATUS_CODES = {502, 503, 504}
 INFO_RETRY_DELAYS = (0.4, 1.0, 2.0)
 
@@ -307,76 +306,49 @@ def fetch_user_fills_window(info: Info, account: str, start_ms: int, end_ms: int
 
 
 def fetch_user_fills_for_history_pnl(info: Info, account: str, coin: str | None = None) -> list[dict[str, Any]]:
-    now_ms = int(time.time() * 1000)
-    chunk_ms = HISTORY_PNL_CHUNK_DAYS * 24 * 60 * 60 * 1000
-    earliest_ms = now_ms - HISTORY_PNL_LOOKBACK_DAYS * 24 * 60 * 60 * 1000
-    seen: set[tuple[str, int, int, str, str, str, str]] = set()
-    fills: list[dict[str, Any]] = []
-    end_ms = now_ms
+    try:
+        recent_fills = info.user_fills(account)
+    except Exception as exc:
+        log_event(
+            "history_pnl_fills_error",
+            {"coin": coin, "type": type(exc).__name__, "message": str(exc)},
+        )
+        recent_fills = []
 
-    while end_ms > earliest_ms and len(fills) < HISTORY_PNL_MAX_FILLS:
-        start_ms = max(earliest_ms, end_ms - chunk_ms)
-        try:
-            window_fills = fetch_user_fills_window(info, account, start_ms, end_ms)
-        except Exception as exc:
-            log_event(
-                "history_pnl_fills_error",
-                {"coin": coin, "startTime": start_ms, "endTime": end_ms, "type": type(exc).__name__, "message": str(exc)},
-            )
-            break
-
-        for fill in window_fills:
-            fill_coin = str(fill.get("coin", ""))
-            if coin is not None and not fill_matches_coin(fill_coin, coin):
-                continue
-            fill_time = int(fill.get("time", 0))
-            fill_key = (
-                str(fill.get("hash", "")),
-                int(fill.get("oid", -1)),
-                fill_time,
-                fill_coin,
-                str(fill.get("side", "")),
-                str(fill.get("px", "")),
-                str(fill.get("sz", "")),
-            )
-            if fill_key in seen:
-                continue
-            seen.add(fill_key)
-            fills.append(fill)
-            if len(fills) >= HISTORY_PNL_MAX_FILLS:
-                break
-
-        end_ms = start_ms - 1
-
+    fills = list(recent_fills[:HISTORY_PNL_MAX_FILLS])
     fills.sort(key=lambda item: int(item.get("time", 0)))
     log_event(
         "history_pnl_fills",
         {
             "coin": coin,
             "count": len(fills),
-            "lookbackDays": HISTORY_PNL_LOOKBACK_DAYS,
             "maxFills": HISTORY_PNL_MAX_FILLS,
         },
     )
     return fills
 
 
-def fetch_user_funding_for_history_pnl(info: Info, account: str, coin: str | None = None) -> list[dict[str, Any]]:
+def fetch_user_funding_for_history_pnl(
+    info: Info,
+    account: str,
+    coin: str | None = None,
+    start_ms: int | None = None,
+) -> list[dict[str, Any]]:
     now_ms = int(time.time() * 1000)
-    chunk_ms = HISTORY_PNL_CHUNK_DAYS * 24 * 60 * 60 * 1000
-    earliest_ms = now_ms - HISTORY_PNL_LOOKBACK_DAYS * 24 * 60 * 60 * 1000
+    if start_ms is None:
+        recent_fills = fetch_user_fills_for_history_pnl(info, account)
+        start_ms = min((int(fill.get("time", now_ms)) for fill in recent_fills), default=now_ms)
     seen: set[tuple[int, str, str, str]] = set()
     rows: list[dict[str, Any]] = []
-    end_ms = now_ms
+    cursor_ms = start_ms
 
-    while end_ms > earliest_ms:
-        start_ms = max(earliest_ms, end_ms - chunk_ms)
+    while cursor_ms <= now_ms:
         try:
-            window_rows = info.user_funding_history(account, start_ms, end_ms)
+            window_rows = info.user_funding_history(account, cursor_ms, now_ms)
         except Exception as exc:
             log_event(
                 "history_pnl_funding_error",
-                {"coin": coin, "startTime": start_ms, "endTime": end_ms, "type": type(exc).__name__, "message": str(exc)},
+                {"coin": coin, "startTime": cursor_ms, "endTime": now_ms, "type": type(exc).__name__, "message": str(exc)},
             )
             break
 
@@ -396,7 +368,13 @@ def fetch_user_funding_for_history_pnl(info: Info, account: str, coin: str | Non
             seen.add(row_key)
             rows.append(row)
 
-        end_ms = start_ms - 1
+        if len(window_rows) < HISTORY_PNL_FUNDING_PAGE_SIZE:
+            break
+        latest_time = max((int(row.get("time", 0)) for row in window_rows), default=cursor_ms)
+        next_cursor_ms = latest_time + 1
+        if next_cursor_ms <= cursor_ms:
+            break
+        cursor_ms = next_cursor_ms
 
     rows.sort(key=lambda item: int(item.get("time", 0)))
     log_event(
@@ -404,7 +382,7 @@ def fetch_user_funding_for_history_pnl(info: Info, account: str, coin: str | Non
         {
             "coin": coin,
             "count": len(rows),
-            "lookbackDays": HISTORY_PNL_LOOKBACK_DAYS,
+            "startTime": start_ms,
         },
     )
     return rows
@@ -1146,23 +1124,42 @@ def fill_signed_size(fill: dict[str, Any]) -> Decimal | None:
     return None
 
 
+def history_pnl_window_hours(fills: list[dict[str, Any]], now_ms: int | None = None) -> int | None:
+    if not fills:
+        return None
+    current_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    earliest_ms = min(int(fill.get("time", current_ms)) for fill in fills)
+    elapsed_ms = max(0, current_ms - earliest_ms)
+    hour_ms = 60 * 60 * 1000
+    return max(1, (elapsed_ms + hour_ms - 1) // hour_ms)
+
+
+def real_pnl_label(window_hours: int | None) -> str:
+    return f"realPnl({window_hours}H)" if window_hours is not None else "realPnl"
+
+
 def calculate_history_pnl(
     info: Info,
     account: str,
     coin: str,
     mark_px: Decimal | None = None,
+    unrealized_pnl: Decimal | None = None,
     fills: list[dict[str, Any]] | None = None,
     funding_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Decimal | int | bool | None]:
+    source_fills = fills if fills is not None else fetch_user_fills_for_history_pnl(info, account)
     fills = [
         fill
-        for fill in (fills if fills is not None else fetch_user_fills_for_history_pnl(info, account, coin))
+        for fill in source_fills
         if fill_matches_coin(str(fill.get("coin", "")), coin)
     ]
+    funding_start_ms = min((int(fill.get("time", 0)) for fill in source_fills), default=int(time.time() * 1000))
     funding_rows = [
         row
         for row in (
-            funding_rows if funding_rows is not None else fetch_user_funding_for_history_pnl(info, account, coin)
+            funding_rows
+            if funding_rows is not None
+            else fetch_user_funding_for_history_pnl(info, account, coin, start_ms=funding_start_ms)
         )
         if fill_matches_coin(str((row.get("delta") or {}).get("coin", "")), coin)
     ]
@@ -1214,8 +1211,8 @@ def calculate_history_pnl(
             funding += funding_usdc
 
     avg_px = cost_basis / position_size if position_size != 0 and has_cost_basis else None
-    open_pnl = None
-    if avg_px is not None and mark_px is not None:
+    open_pnl = unrealized_pnl
+    if open_pnl is None and avg_px is not None and mark_px is not None:
         open_pnl = (mark_px - avg_px) * position_size
 
     real_pnl = realized - fees + funding
@@ -1233,7 +1230,8 @@ def calculate_history_pnl(
         "openPnl": open_pnl,
         "realPnl": real_pnl,
         "netPnl": real_pnl,
-        "partial": len(fills) >= HISTORY_PNL_MAX_FILLS,
+        "windowHours": history_pnl_window_hours(source_fills),
+        "partial": len(source_fills) >= HISTORY_PNL_MAX_FILLS,
     }
 
 
@@ -1355,14 +1353,25 @@ def print_market_overview(
                 ("leverage", format_position_leverage(position)),
             ],
         )
-    history_pnl = calculate_history_pnl(info, account, coin, mark_px=latest_price)
+    current_unrealized_pnl = (
+        decimal_or_none(position.get("unrealizedPnl")) if position is not None else Decimal("0")
+    )
+    history_pnl = calculate_history_pnl(
+        info,
+        account,
+        coin,
+        mark_px=latest_price,
+        unrealized_pnl=current_unrealized_pnl,
+    )
     history_rows = [
         ("result", format_history_result(history_pnl.get("realPnl"))),
         ("realPnl", format_optional_decimal(history_pnl.get("realPnl"))),
     ]
     if history_pnl.get("partial"):
         history_rows.append(("note", f"limited to latest {HISTORY_PNL_MAX_FILLS} fills"))
-    print_box("Real PnL", history_rows)
+    window_hours = history_pnl.get("windowHours")
+    pnl_title = f"Real PnL ({window_hours}H)" if isinstance(window_hours, int) else "Real PnL"
+    print_box(pnl_title, history_rows)
     batch_rows = load_server_batch()
     open_orders = collect_open_orders_for_coin(info, account, network, coin, dex, batch_rows)
     if open_orders:
@@ -1398,7 +1407,11 @@ def collect_account_positions_and_orders(
     batch_rows = batch_rows if batch_rows is not None else load_server_batch()
     server_batch_oids = active_server_batch_oids(batch_rows, network, account)
     history_fills = fetch_user_fills_for_history_pnl(info, account)
-    history_funding = fetch_user_funding_for_history_pnl(info, account)
+    history_start_ms = min(
+        (int(fill.get("time", 0)) for fill in history_fills),
+        default=int(time.time() * 1000),
+    )
+    history_funding = fetch_user_funding_for_history_pnl(info, account, start_ms=history_start_ms)
     log_event("query_dex_names", dex_names)
 
     for dex in dex_names:
@@ -1417,6 +1430,7 @@ def collect_account_positions_and_orders(
                 account,
                 position_coin,
                 mark_px=mark_px,
+                unrealized_pnl=decimal_or_none(position.get("unrealizedPnl")),
                 fills=history_fills,
                 funding_rows=history_funding,
             )
@@ -1430,6 +1444,7 @@ def collect_account_positions_and_orders(
                     "value": format_optional_decimal(position.get("positionValue")),
                     "nPnl": format_optional_decimal(position.get("unrealizedPnl")),
                     "realPnl": format_optional_decimal(history_pnl.get("realPnl")),
+                    "pnlWindowHours": str(history_pnl.get("windowHours") or ""),
                     "result": format_history_result(history_pnl.get("realPnl")),
                     "roe": format_optional_percent(position.get("returnOnEquity")),
                     "liqPx": format_optional_decimal(position.get("liquidationPx")),
@@ -1796,6 +1811,9 @@ def query_account(args: argparse.Namespace) -> None:
     print_account_metrics(info, account)
     batch_rows = load_server_batch()
     positions, orders = collect_account_positions_and_orders(info, account, args.network, batch_rows)
+    pnl_window_hours = None
+    if positions and positions[0].get("pnlWindowHours"):
+        pnl_window_hours = int(positions[0]["pnlWindowHours"])
     print_table(
         "Positions",
         positions,
@@ -1806,7 +1824,7 @@ def query_account(args: argparse.Namespace) -> None:
             ("szi", "szi"),
             ("entryPx", "entryPx"),
             ("value", "value"),
-            ("realPnl", "realPnl"),
+            ("realPnl", real_pnl_label(pnl_window_hours)),
             ("result", "result"),
             ("roe", "ROE"),
             ("liqPx", "liqPx"),
