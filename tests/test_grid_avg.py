@@ -163,7 +163,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(row["topup_buy_gap"], "0.005")
         self.assertEqual(row["topup_sell_gap"], "0.00655")
 
-    def test_only_far_side_topup_uses_dynamic_gap_and_size(self) -> None:
+    def test_far_topup_and_reverting_replacement_use_avg_skew(self) -> None:
         row = {
             "gap_rate": "0.01",
             "effective_gap_rate": "0.014",
@@ -175,6 +175,7 @@ class GridAvgTests(unittest.TestCase):
             "topup_sell_size": "0.100",
             "topup_buy_gap": "0.01",
             "topup_sell_gap": "0.014",
+            "avg_favored_side": "buy",
             "levels": [
                 {
                     "side": "buy",
@@ -240,6 +241,21 @@ class GridAvgTests(unittest.TestCase):
         self.assertIsNotNone(replacement)
         self.assertEqual(replacement["size"], "0.1")
         self.assertEqual(replacement["plan"]["grid_gap"], Decimal("0.01"))
+
+        reverting_replacement = replacement_order_from_fill(
+            row,
+            "BTC",
+            asset,
+            Decimal("110"),
+            False,
+            Decimal("-1"),
+            Decimal("100"),
+            Decimal("250"),
+            "abs",
+        )
+        self.assertIsNotNone(reverting_replacement)
+        self.assertEqual(reverting_replacement["size"], "0.14")
+        self.assertEqual(reverting_replacement["plan"]["grid_gap"], Decimal("0.01"))
 
         near_orders = near_grid_orders_if_stale(
             row,
