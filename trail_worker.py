@@ -727,9 +727,11 @@ def submit_grid_order_entry(
     refresh_grid_order_tif(order)
     if account_margin_protected:
         if grid_order_would_add_risk(position_size, bool(order.get("is_buy"))):
-            order["status"] = "paused_account_margin"
+            # Account protection skips this price entirely. Once protection clears,
+            # the regular top-up pass builds a fresh level from the live market.
+            order["status"] = "skipped_account_margin"
             order["oid"] = None
-            order["paused_at"] = now
+            order["skipped_at"] = now
             return False
         order["reduce_only"] = True
         plan = order.get("plan")
@@ -1411,12 +1413,19 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
 
     restored = 0
     for entry in levels:
+        if isinstance(entry, dict) and str(entry.get("status")) == "paused_account_margin":
+            # Migrate levels saved by older workers so they are not restored at
+            # stale prices after account-margin protection ends.
+            entry["status"] = "skipped_account_margin"
+            entry["oid"] = None
+            entry["skipped_at"] = now
+            changed = True
+            continue
         if not isinstance(entry, dict) or entry.get("side") is None or str(entry.get("status")) not in {
             "paused_max",
             "paused_limit",
             "paused_margin",
             "paused_reduce_capacity",
-            "paused_account_margin",
         }:
             continue
         side = str(entry["side"])
@@ -1562,7 +1571,6 @@ def prune_grid_levels(row: dict[str, Any]) -> bool:
         "paused_limit",
         "paused_margin",
         "paused_reduce_capacity",
-        "paused_account_margin",
     }
     live_levels: list[dict[str, Any]] = []
     paused_levels: list[dict[str, Any]] = []
