@@ -105,7 +105,7 @@ DEFAULT_GRID_GAP_LABEL = ["auto-minTick", "auto-takerFee", "auto-makerFee"]
 DEFAULT_GRID_RANGE = ["auto", "auto"]
 GRID_TARGET_ORDERS_PER_SIDE = 10
 GRID_ACCOUNT_MARGIN_RATIO_THRESHOLD = Decimal("0.70")
-GRID_AVG_MAX_MULTIPLIER = Decimal("1.4")
+GRID_AVG_MAX_MULTIPLIER = Decimal("1.62")
 CANCEL_AGE_FILTERS = {"hour", "day", "week"}
 CANCEL_FILTERS = {"all", "up", "down", "buy", "sell", "tp", "sl", "trail", "grid"} | CANCEL_AGE_FILTERS
 CANCEL_AGE_UNIT_MS = {
@@ -5182,7 +5182,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--price", help="Limit price. Defaults to same-side book level 10.")
     parser.add_argument("--offset", dest="symmetric_offset", help="Symmetric order distance from base price, e.g. 2%% or 1500.")
     parser.add_argument("--trend", help="Grid quantity tilt. Default: 0. Positive makes buy size larger, negative makes sell size larger, e.g. 10%% or -10%%.")
-    parser.add_argument("--avg", dest="grid_avg", help="Grid target position value. Dynamically tilts size and gap up to 1.4x; mutually exclusive with --trend.")
+    parser.add_argument("--avg", dest="grid_avg", help="Grid target position value. Dynamically tilts far-side topup size or gap up to 1.62x; mutually exclusive with --trend.")
     parser.add_argument(
         "--gap",
         nargs="+",
