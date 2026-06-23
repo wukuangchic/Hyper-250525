@@ -3,6 +3,7 @@ from argparse import Namespace
 from decimal import Decimal
 
 from hl_order import (
+    asset_requires_isolated_margin,
     build_grid_batch_row,
     build_grid_orders,
     grid_avg_bounds,
@@ -12,10 +13,76 @@ from hl_order import (
     grid_query_avg_summary,
     refresh_grid_row_strategy_params,
 )
-from trail_worker import near_grid_orders_if_stale, next_depth_order, replacement_order_from_fill
+from trail_worker import (
+    grid_order_entry,
+    near_grid_orders_if_stale,
+    next_depth_order,
+    replacement_order_from_fill,
+    submit_grid_order_entry,
+)
 
 
 class GridAvgTests(unittest.TestCase):
+    def test_isolated_asset_detection(self) -> None:
+        self.assertTrue(asset_requires_isolated_margin({"onlyIsolated": True}))
+        self.assertTrue(asset_requires_isolated_margin({"marginMode": "noCross"}))
+        self.assertFalse(asset_requires_isolated_margin({"maxLeverage": 40}))
+
+    def test_flat_isolated_grid_sets_capped_leverage_once_before_orders(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.calls = []
+                self.next_oid = 1
+
+            def update_leverage(self, leverage: int, coin: str, is_cross: bool) -> dict:
+                self.calls.append(("leverage", leverage, coin, is_cross))
+                return {"status": "ok"}
+
+            def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
+                self.calls.append(("order", coin, is_buy, reduce_only))
+                oid = self.next_oid
+                self.next_oid += 1
+                return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": oid}}]}}}
+
+        exchange = FakeExchange()
+        asset = {
+            "szDecimals": 2,
+            "maxLeverage": 20,
+            "onlyIsolated": True,
+            "marginMode": "noCross",
+        }
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+            "levels": [],
+        }
+        ready = set()
+        buy = grid_order_entry(row, "xyz:SPCX", asset, True, Decimal("100"), False)
+        sell = grid_order_entry(row, "xyz:SPCX", asset, False, Decimal("101"), False)
+
+        for order in (buy, sell):
+            self.assertTrue(
+                submit_grid_order_entry(
+                    exchange,
+                    "xyz:SPCX",
+                    order,
+                    1,
+                    row,
+                    asset,
+                    Decimal("0"),
+                    Decimal("0"),
+                    "abs",
+                    False,
+                    ready,
+                )
+            )
+
+        self.assertEqual(exchange.calls[0], ("leverage", 5, "xyz:SPCX", False))
+        self.assertEqual(sum(call[0] == "leverage" for call in exchange.calls), 1)
+        self.assertEqual(sum(call[0] == "order" for call in exchange.calls), 2)
+
     def test_refresh_strategy_params_keeps_existing_levels(self) -> None:
         levels = [
             {"side": "buy", "status": "active", "oid": 1, "price": "90", "size": "0.1"},

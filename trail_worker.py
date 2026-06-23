@@ -19,6 +19,7 @@ from hl_order import (  # noqa: E402
     GRID_ACCOUNT_MARGIN_RATIO_THRESHOLD,
     GRID_TARGET_ORDERS_PER_SIDE,
     SERVER_BATCH_PATH,
+    asset_requires_isolated_margin,
     build_clients,
     build_grid_limit_order_plan,
     build_trigger_order_plan,
@@ -45,6 +46,7 @@ from hl_order import (  # noqa: E402
     save_server_batch,
     server_batch_lock,
     trail_stop_price,
+    update_isolated_opening_leverage,
 )
 
 
@@ -722,6 +724,7 @@ def submit_grid_order_entry(
     position_value: Decimal,
     policy: str,
     account_margin_protected: bool,
+    isolated_leverage_ready: set[str],
 ) -> bool:
     refresh_grid_order_reduce_only(order, position_size, policy)
     refresh_grid_order_tif(order)
@@ -743,6 +746,24 @@ def submit_grid_order_entry(
         order["oid"] = None
         order["paused_at"] = now
         return False
+    plan = order.get("plan")
+    reduce_only = bool(plan.get("reduce_only", False)) if isinstance(plan, dict) else bool(order.get("reduce_only", False))
+    if (
+        position_size == 0
+        and not reduce_only
+        and asset_requires_isolated_margin(asset)
+        and coin not in isolated_leverage_ready
+    ):
+        leverage, leverage_result = update_isolated_opening_leverage(
+            exchange,
+            int(asset["maxLeverage"]),
+            coin,
+        )
+        if leverage_result.get("status") != "ok":
+            raise RuntimeError(
+                f"Failed to set isolated opening leverage to {leverage}x for {coin}; order was not submitted."
+            )
+        isolated_leverage_ready.add(coin)
     try:
         oid, state, status = submit_grid_child_order(exchange, coin, order)
     except GridPostOnlyRejected as exc:
@@ -1051,6 +1072,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     submissions_by_side = {"buy": 0, "sell": 0}
     filled_submission_sides: set[str] = set()
     replacement_quota_sides: set[str] = set()
+    isolated_leverage_ready: set[str] = set()
 
     def side_submission_allowed(side: str) -> bool:
         return (
@@ -1074,6 +1096,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             position_value,
             policy,
             account_margin_protected,
+            isolated_leverage_ready,
         )
         if submitted:
             submissions_by_side[side] = submissions_by_side.get(side, 0) + 1
@@ -1094,6 +1117,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             position_value,
             policy,
             account_margin_protected,
+            isolated_leverage_ready,
         )
         if submitted:
             submissions_by_side[side] = submissions_by_side.get(side, 0) + 1

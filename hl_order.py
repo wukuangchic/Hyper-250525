@@ -1987,6 +1987,25 @@ def update_order_leverage(exchange: Exchange, max_leverage: int, coin: str) -> t
     return "isolated", result
 
 
+def asset_requires_isolated_margin(asset: dict[str, Any]) -> bool:
+    margin_mode = str(asset.get("marginMode") or "").strip().lower()
+    return bool(asset.get("onlyIsolated")) or margin_mode in {"nocross", "isolated"}
+
+
+def update_isolated_opening_leverage(
+    exchange: Exchange,
+    max_leverage: int,
+    coin: str,
+) -> tuple[int, dict[str, Any]]:
+    leverage = min(ISOLATED_FALLBACK_LEVERAGE, max_leverage)
+    result = exchange.update_leverage(leverage, coin, is_cross=False)
+    log_event(
+        "update_leverage_result",
+        {"mode": "isolated_opening", "leverage": leverage, "coin": coin, "result": result},
+    )
+    return leverage, result
+
+
 def build_limit_order_plan(
     coin: str,
     is_buy: bool,
