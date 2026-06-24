@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from decimal import Decimal
 from pathlib import Path
@@ -56,6 +57,7 @@ DONE_RETENTION_MAX = 500
 GRID_LEVEL_HISTORY_MAX = 120
 GRID_FILL_LOOKBACK_SECONDS = 24 * 60 * 60
 GRID_MARGIN_RETRY_SECONDS = 10 * 60
+GRID_ACCOUNT_MARGIN_RATIO_SOFT_THRESHOLD = Decimal("0.90")
 GRID_MAX_SUBMISSIONS_PER_SIDE_PER_RUN = 1
 GRID_ADD_RISK_BRAKE_STREAK = 2
 GRID_ALO_PRICE_ATTEMPT_LIMIT = 20
@@ -767,6 +769,18 @@ def dense_grid_entries(row: dict[str, Any]) -> list[dict[str, Any]]:
     return dense
 
 
+def grid_margin_gap_multiplier(margin_ratio: Decimal | None) -> Decimal:
+    if (
+        margin_ratio is None
+        or margin_ratio >= GRID_ACCOUNT_MARGIN_RATIO_SOFT_THRESHOLD
+        or margin_ratio <= GRID_ACCOUNT_MARGIN_RATIO_THRESHOLD
+    ):
+        return Decimal("1")
+    window = GRID_ACCOUNT_MARGIN_RATIO_SOFT_THRESHOLD - GRID_ACCOUNT_MARGIN_RATIO_THRESHOLD
+    distance_to_hard_stop = margin_ratio - GRID_ACCOUNT_MARGIN_RATIO_THRESHOLD
+    return Decimal("1") + Decimal(str(math.log(float(window / distance_to_hard_stop))))
+
+
 def next_depth_order(
     row: dict[str, Any],
     coin: str,
@@ -783,6 +797,8 @@ def next_depth_order(
     gap = Decimal(str(row.get(gap_key) or row["gap_rate"]))
     sz_decimals = int(row.get("sz_decimals") or asset["szDecimals"])
     is_buy = side == "buy"
+    if grid_order_would_add_risk(position_size, is_buy):
+        gap *= Decimal(str(row.get("margin_gap_multiplier") or "1"))
     base_px = farthest_active_price(row, side, reference_px or current_mid)
     multiplier = Decimal("1") - gap if is_buy else Decimal("1") + gap
     next_px = rounded_perp_price(base_px * multiplier, sz_decimals)
@@ -1331,6 +1347,11 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     )
     margin_ratio = account_margin_ratio(info, account, network, cache)
     account_margin_protected = margin_ratio is not None and margin_ratio < GRID_ACCOUNT_MARGIN_RATIO_THRESHOLD
+    margin_gap_multiplier = grid_margin_gap_multiplier(margin_ratio)
+    margin_gap_multiplier_text = decimal_to_plain(margin_gap_multiplier)
+    margin_state_changed = row.get("margin_gap_multiplier") != margin_gap_multiplier_text
+    row["margin_gap_multiplier"] = margin_gap_multiplier_text
+    row["margin_gap_soft_threshold"] = decimal_to_plain(GRID_ACCOUNT_MARGIN_RATIO_SOFT_THRESHOLD)
 
     open_orders_cache = cache.setdefault("open_orders", {})
     open_orders_key = (network, account, dex)
@@ -1345,7 +1366,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         fills_cache[fills_key] = info.user_fills_by_time(account, common_start_ms, now_ms)
         log_event("grid_user_fills_by_time", {"start_ms": common_start_ms, "end_ms": now_ms, "count": len(fills_cache[fills_key])})
     fills_by_oid = recent_fills_by_oid(info, account, coin, start_ms, now_ms, fills_cache[fills_key])
-    changed = avg_state_changed
+    changed = avg_state_changed or margin_state_changed
     missing_without_fill: list[int] = []
     recovered_missing = 0
     newly_filled: list[dict[str, Any]] = [
@@ -1793,6 +1814,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         f"submissions=buy:{submissions_by_side['buy']},sell:{submissions_by_side['sell']}; "
         f"filled_stop={','.join(sorted(filled_submission_sides)) or '-'}; "
         f"avg={row.get('avg') if row.get('avg') is not None else '-'}; avg_multiplier={row.get('avg_multiplier', '1')}; "
+        f"margin_gap_multiplier={decimal_to_plain(margin_gap_multiplier)}; "
         f"account_margin={margin_ratio_label}; account_protected={int(account_margin_protected)}"
     )
     return (

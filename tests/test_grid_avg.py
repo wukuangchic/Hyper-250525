@@ -15,6 +15,7 @@ from hl_order import (
 )
 from trail_worker import (
     apply_grid_add_risk_brake,
+    grid_margin_gap_multiplier,
     grid_order_entry,
     near_grid_orders_if_stale,
     next_depth_order,
@@ -76,6 +77,75 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(row["levels"][0]["status"], "active")
         self.assertEqual(row["add_risk_streak"]["side"], "buy")
         self.assertEqual(row["add_risk_streak"]["count"], 1)
+
+    def test_margin_gap_multiplier_starts_at_ninety_and_rises_toward_hard_stop(self) -> None:
+        self.assertEqual(grid_margin_gap_multiplier(None), Decimal("1"))
+        self.assertEqual(grid_margin_gap_multiplier(Decimal("0.90")), Decimal("1"))
+        self.assertEqual(grid_margin_gap_multiplier(Decimal("0.70")), Decimal("1"))
+        self.assertEqual(grid_margin_gap_multiplier(Decimal("0.80")).quantize(Decimal("0.001")), Decimal("1.693"))
+
+    def test_margin_gap_multiplier_only_widens_add_risk_far_topup(self) -> None:
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "1",
+            "sz_decimals": 3,
+            "base_buy_size": "0.100",
+            "base_sell_size": "0.100",
+            "topup_buy_size": "0.100",
+            "topup_sell_size": "0.100",
+            "topup_buy_gap": "0.01",
+            "topup_sell_gap": "0.01",
+            "margin_gap_multiplier": "2",
+            "levels": [
+                {
+                    "side": "buy",
+                    "status": "active",
+                    "oid": 1,
+                    "is_buy": True,
+                    "price": "89",
+                    "size": "0.100",
+                },
+                {
+                    "side": "sell",
+                    "status": "active",
+                    "oid": 2,
+                    "is_buy": False,
+                    "price": "110",
+                    "size": "0.100",
+                },
+            ],
+        }
+        asset = {"szDecimals": 3}
+
+        add_risk_topup = next_depth_order(
+            row,
+            "BTC",
+            asset,
+            "buy",
+            Decimal("100"),
+            Decimal("1"),
+            Decimal("100"),
+            Decimal("250"),
+            "abs",
+        )
+        self.assertIsNotNone(add_risk_topup)
+        self.assertEqual(add_risk_topup["price"], "87.22")
+        self.assertEqual(add_risk_topup["plan"]["grid_gap"], Decimal("0.02"))
+
+        reduce_risk_topup = next_depth_order(
+            row,
+            "BTC",
+            asset,
+            "sell",
+            Decimal("100"),
+            Decimal("1"),
+            Decimal("100"),
+            Decimal("250"),
+            "abs",
+        )
+        self.assertIsNotNone(reduce_risk_topup)
+        self.assertEqual(reduce_risk_topup["price"], "111.1")
+        self.assertEqual(reduce_risk_topup["plan"]["grid_gap"], Decimal("0.01"))
 
     def test_isolated_asset_detection(self) -> None:
         self.assertTrue(asset_requires_isolated_margin({"onlyIsolated": True}))
