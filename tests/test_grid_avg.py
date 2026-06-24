@@ -249,7 +249,7 @@ class GridAvgTests(unittest.TestCase):
                     "status": "active",
                     "oid": 1,
                     "is_buy": True,
-                    "price": "90",
+                    "price": "89",
                     "size": "0.100",
                 },
                 {
@@ -334,6 +334,7 @@ class GridAvgTests(unittest.TestCase):
             "abs",
         )
         self.assertEqual(len(near_orders), 1)
+        self.assertEqual(near_orders[0]["price"], "96")
         self.assertEqual(near_orders[0]["size"], "0.1")
         self.assertEqual(near_orders[0]["plan"]["grid_gap"], Decimal("0.01"))
 

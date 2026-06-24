@@ -936,7 +936,7 @@ def near_grid_orders_if_stale(
     nearest_px = nearest_active_price(row, side)
     if nearest_px is None:
         return []
-    stale_threshold = Decimal("1") - gap * Decimal("5") if is_buy else Decimal("1") + gap * Decimal("5")
+    stale_threshold = Decimal("1") - gap * Decimal("10") if is_buy else Decimal("1") + gap * Decimal("10")
     if is_buy and nearest_px >= reference_px * stale_threshold:
         return []
     if not is_buy and nearest_px <= reference_px * stale_threshold:
@@ -944,7 +944,7 @@ def near_grid_orders_if_stale(
 
     reduce_only = grid_order_should_reduce_only(position_size, is_buy, policy)
     entries: list[dict[str, Any]] = []
-    for gap_multiple in (Decimal("3"),):
+    for gap_multiple in (Decimal("4"),):
         multiplier = Decimal("1") - gap * gap_multiple if is_buy else Decimal("1") + gap * gap_multiple
         target_px = rounded_perp_price(reference_px * multiplier, sz_decimals)
         if target_px > 0:
