@@ -14,6 +14,7 @@ from hl_order import (
     refresh_grid_row_strategy_params,
 )
 from trail_worker import (
+    apply_grid_add_risk_brake,
     grid_order_entry,
     near_grid_orders_if_stale,
     next_depth_order,
@@ -23,6 +24,59 @@ from trail_worker import (
 
 
 class GridAvgTests(unittest.TestCase):
+    def test_add_risk_brake_cancels_nearest_same_side_after_two_open_fills(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.cancelled = []
+
+            def bulk_cancel(self, requests):
+                self.cancelled.extend(requests)
+                return {"status": "ok"}
+
+        row = {
+            "levels": [
+                {"side": "buy", "status": "active", "oid": 1, "price": "99", "size": "1", "is_buy": True},
+                {"side": "buy", "status": "active", "oid": 2, "price": "98", "size": "1", "is_buy": True},
+                {"side": "sell", "status": "active", "oid": 3, "price": "101", "size": "1", "is_buy": False},
+            ]
+        }
+        fills = [
+            {"side": "buy", "status": "filled", "oid": 10, "is_buy": True, "fill": {"time": 1000, "dir": "Open Long"}},
+            {"side": "buy", "status": "filled", "oid": 11, "is_buy": True, "fill": {"time": 2000, "dir": "Open Long"}},
+        ]
+
+        cancelled = apply_grid_add_risk_brake(FakeExchange(), "BTC", row, fills, Decimal("1"), 123)
+
+        self.assertEqual(cancelled, 1)
+        self.assertEqual(row["levels"][0]["status"], "brake_near_add_risk")
+        self.assertEqual(row["levels"][1]["status"], "active")
+        self.assertEqual(row["add_risk_streak"]["count"], 0)
+        self.assertEqual(row["add_risk_brakes"][-1]["cancelled_oid"], 1)
+        self.assertTrue(all(fill["add_risk_brake_counted"] for fill in fills))
+
+    def test_add_risk_brake_resets_on_reducing_fill(self) -> None:
+        class FakeExchange:
+            def bulk_cancel(self, requests):
+                raise AssertionError("should not cancel on interrupted streak")
+
+        row = {
+            "levels": [
+                {"side": "buy", "status": "active", "oid": 1, "price": "99", "size": "1", "is_buy": True},
+            ]
+        }
+        fills = [
+            {"side": "buy", "status": "filled", "oid": 10, "is_buy": True, "fill": {"time": 1000, "dir": "Open Long"}},
+            {"side": "sell", "status": "filled", "oid": 11, "is_buy": False, "fill": {"time": 2000, "dir": "Close Long"}},
+            {"side": "buy", "status": "filled", "oid": 12, "is_buy": True, "fill": {"time": 3000, "dir": "Open Long"}},
+        ]
+
+        cancelled = apply_grid_add_risk_brake(FakeExchange(), "BTC", row, fills, Decimal("1"), 123)
+
+        self.assertEqual(cancelled, 0)
+        self.assertEqual(row["levels"][0]["status"], "active")
+        self.assertEqual(row["add_risk_streak"]["side"], "buy")
+        self.assertEqual(row["add_risk_streak"]["count"], 1)
+
     def test_isolated_asset_detection(self) -> None:
         self.assertTrue(asset_requires_isolated_margin({"onlyIsolated": True}))
         self.assertTrue(asset_requires_isolated_margin({"marginMode": "noCross"}))

@@ -57,6 +57,7 @@ GRID_LEVEL_HISTORY_MAX = 120
 GRID_FILL_LOOKBACK_SECONDS = 24 * 60 * 60
 GRID_MARGIN_RETRY_SECONDS = 10 * 60
 GRID_MAX_SUBMISSIONS_PER_SIDE_PER_RUN = 1
+GRID_ADD_RISK_BRAKE_STREAK = 2
 GRID_ALO_PRICE_ATTEMPT_LIMIT = 20
 GRID_ALO_SPACING_MULTIPLIER = Decimal("0.95")
 TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -996,6 +997,123 @@ def cancel_grid_entries(exchange: Any, coin: str, entries: list[dict[str, Any]],
     return len(cancelled)
 
 
+def grid_fill_time(entry: dict[str, Any]) -> int:
+    fill = entry.get("fill")
+    if isinstance(fill, dict):
+        try:
+            return int(fill.get("time") or 0)
+        except (TypeError, ValueError):
+            pass
+    try:
+        return int(entry.get("filled_at") or 0) * 1000
+    except (TypeError, ValueError):
+        return 0
+
+
+def grid_fill_adds_risk(entry: dict[str, Any], position_size: Decimal) -> bool:
+    fill = entry.get("fill")
+    if isinstance(fill, dict):
+        direction = str(fill.get("dir") or "").lower()
+        if "open" in direction:
+            return True
+        if "close" in direction:
+            return False
+    return grid_order_would_add_risk(position_size, bool(entry.get("is_buy")))
+
+
+def nearest_add_risk_grid_entry(row: dict[str, Any], side: str, position_size: Decimal) -> dict[str, Any] | None:
+    entries = [
+        entry
+        for entry in active_grid_entries(row, side)
+        if grid_order_would_add_risk(position_size, bool(entry.get("is_buy")))
+    ]
+    if not entries:
+        return None
+    return sorted(
+        entries,
+        key=lambda entry: decimal_or_none(entry.get("price", entry.get("limit_px"))) or Decimal("0"),
+        reverse=side == "buy",
+    )[0]
+
+
+def append_add_risk_brake_history(row: dict[str, Any], event: dict[str, Any]) -> None:
+    history = row.setdefault("add_risk_brakes", [])
+    if not isinstance(history, list):
+        history = []
+        row["add_risk_brakes"] = history
+    history.append(event)
+    del history[:-GRID_LEVEL_HISTORY_MAX]
+
+
+def apply_grid_add_risk_brake(
+    exchange: Any,
+    coin: str,
+    row: dict[str, Any],
+    newly_filled: list[dict[str, Any]],
+    position_size: Decimal,
+    now: int,
+) -> int:
+    streak = row.setdefault("add_risk_streak", {})
+    if not isinstance(streak, dict):
+        streak = {}
+        row["add_risk_streak"] = streak
+
+    cancelled = 0
+    for entry in sorted(newly_filled, key=grid_fill_time):
+        if not isinstance(entry, dict) or entry.get("add_risk_brake_counted"):
+            continue
+        side = str(entry.get("side") or "")
+        if side not in {"buy", "sell"}:
+            entry["add_risk_brake_counted"] = True
+            continue
+
+        entry["add_risk_brake_counted"] = True
+        adds_risk = grid_fill_adds_risk(entry, position_size)
+        if not adds_risk:
+            streak.clear()
+            streak.update({"side": None, "count": 0, "updated_at": now})
+            continue
+
+        previous_side = streak.get("side")
+        count = int(streak.get("count") or 0) if previous_side == side else 0
+        count += 1
+        streak.update(
+            {
+                "side": side,
+                "count": count,
+                "updated_at": now,
+                "last_oid": entry.get("oid"),
+                "last_fill_time": grid_fill_time(entry),
+            }
+        )
+        if count < GRID_ADD_RISK_BRAKE_STREAK:
+            continue
+
+        target = nearest_add_risk_grid_entry(row, side, position_size)
+        event = {
+            "at": now,
+            "side": side,
+            "trigger_oid": entry.get("oid"),
+            "trigger_count": count,
+            "threshold": GRID_ADD_RISK_BRAKE_STREAK,
+        }
+        if target is None:
+            event["status"] = "skipped_no_active_add_risk_order"
+        else:
+            before = cancelled
+            cancelled += cancel_grid_entries(exchange, coin, [target], now, "brake_near_add_risk")
+            event.update(
+                {
+                    "status": "cancelled" if cancelled > before else "cancel_failed",
+                    "cancelled_oid": target.get("oid"),
+                    "cancelled_price": target.get("price", target.get("limit_px")),
+                }
+            )
+        append_add_risk_brake_history(row, event)
+        streak.update({"side": None, "count": 0, "updated_at": now})
+    return cancelled
+
+
 def trim_excess_grid_entries(exchange: Any, coin: str, row: dict[str, Any], target_per_side: int, now: int) -> int:
     trimmed = 0
     for side in ("buy", "sell"):
@@ -1356,6 +1474,10 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     }
     replacement_quota_sides.update(pending_replacement_sides)
 
+    add_risk_braked = apply_grid_add_risk_brake(exchange, coin, row, newly_filled, position_size, now)
+    if add_risk_braked:
+        changed = True
+
     paused = 0
     to_pause: list[dict[str, Any]] = []
     for side in ("buy", "sell"):
@@ -1666,6 +1788,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     row["note"] = (
         f"grid maintained; replacements={replacements}; topped_up={topped_up}; "
         f"paused={paused}; refreshed={refreshed}; deduped={deduped}; restored={restored}; trimmed={trimmed}; near_regrids={near_regrids}; "
+        f"add_risk_braked={add_risk_braked}; "
         f"recovered_missing={recovered_missing}; margin_cooldown={margin_cooldowns}; "
         f"submissions=buy:{submissions_by_side['buy']},sell:{submissions_by_side['sell']}; "
         f"filled_stop={','.join(sorted(filled_submission_sides)) or '-'}; "
@@ -1683,6 +1806,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         or restored > 0
         or trimmed > 0
         or near_regrids > 0
+        or add_risk_braked > 0
         or recovered_missing > 0,
     )
 
