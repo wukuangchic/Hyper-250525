@@ -805,6 +805,7 @@ def submit_grid_order_entry(
     policy: str,
     account_margin_protected: bool,
     isolated_leverage_ready: set[str],
+    retry_alo_reject: bool = False,
 ) -> bool:
     refresh_grid_order_reduce_only(order, position_size, policy)
     refresh_grid_order_tif(order)
@@ -843,79 +844,126 @@ def submit_grid_order_entry(
                 f"Failed to set isolated opening leverage to {leverage}x for {coin}; order was not submitted."
             )
         isolated_leverage_ready.add(coin)
-    oid: int | None = None
-    state = ""
-    status: dict[str, Any] | None = None
-    alo_rejects = 0
-    side = str(order.get("side") or "")
-    for attempt in range(GRID_ALO_PRICE_ATTEMPT_LIMIT):
-        price = decimal_or_none(order.get("price", order.get("limit_px")))
-        if price is None or price <= 0:
-            order["status"] = "skipped_alo_price_search"
+    ensure_grid_order_min_notional(row, asset, order)
+    try:
+        oid, state, status = submit_grid_child_order(exchange, coin, order)
+    except GridPostOnlyRejected as exc:
+        if not retry_alo_reject:
+            order["status"] = "skipped_post_only"
+            order["oid"] = None
+            order["last_error"] = str(exc)
+            order["skipped_at"] = now
+            return False
+        order["last_error"] = str(exc)
+        oid = None
+        state = ""
+        status = None
+        alo_rejects = 1
+        side = str(order.get("side") or "")
+        next_price = grid_insert_price_between_active_gap(row, asset, order) or next_outward_grid_price(row, asset, order)
+        if next_price is None or next_price <= 0:
+            order["status"] = "skipped_post_only"
             order["oid"] = None
             order["skipped_at"] = now
-            order["alo_price_attempts"] = attempt
+            order["alo_rejects"] = alo_rejects
             return False
-        if active_price_too_close(row, side, price, exclude=order, spacing_multiplier=GRID_ALO_SPACING_MULTIPLIER):
-            next_price = grid_insert_price_between_active_gap(row, asset, order) or next_outward_grid_price(row, asset, order)
-            if next_price is None or next_price <= 0 or next_price == price:
+        set_grid_order_price(order, next_price)
+        for attempt in range(1, GRID_ALO_PRICE_ATTEMPT_LIMIT):
+            price = decimal_or_none(order.get("price", order.get("limit_px")))
+            if price is None or price <= 0:
                 order["status"] = "skipped_alo_price_search"
                 order["oid"] = None
                 order["skipped_at"] = now
-                order["alo_price_attempts"] = attempt + 1
+                order["alo_price_attempts"] = attempt
                 return False
-            set_grid_order_price(order, next_price)
-            continue
-        ensure_grid_order_min_notional(row, asset, order)
+            if active_price_too_close(row, side, price, exclude=order, spacing_multiplier=GRID_ALO_SPACING_MULTIPLIER):
+                next_price = grid_insert_price_between_active_gap(row, asset, order) or next_outward_grid_price(row, asset, order)
+                if next_price is None or next_price <= 0 or next_price == price:
+                    order["status"] = "skipped_alo_price_search"
+                    order["oid"] = None
+                    order["skipped_at"] = now
+                    order["alo_price_attempts"] = attempt + 1
+                    return False
+                set_grid_order_price(order, next_price)
+                continue
+            ensure_grid_order_min_notional(row, asset, order)
+            try:
+                oid, state, status = submit_grid_child_order(exchange, coin, order)
+                break
+            except GridPostOnlyRejected as retry_exc:
+                alo_rejects += 1
+                order["last_error"] = str(retry_exc)
+                next_price = grid_insert_price_between_active_gap(row, asset, order) or next_outward_grid_price(row, asset, order)
+                if next_price is None or next_price <= 0:
+                    order["status"] = "skipped_post_only"
+                    order["oid"] = None
+                    order["skipped_at"] = now
+                    order["alo_rejects"] = alo_rejects
+                    return False
+                set_grid_order_price(order, next_price)
+                continue
+            except RuntimeError as exc:
+                error_text = str(exc)
+                if is_reduce_only_would_increase_text(error_text):
+                    order["status"] = "skipped_reduce_only"
+                    order["oid"] = None
+                    order["last_error"] = error_text
+                    order["skipped_at"] = now
+                    return False
+                if is_insufficient_margin_text(error_text):
+                    order["status"] = "paused_margin"
+                    order["oid"] = None
+                    order["last_error"] = error_text
+                    order["paused_at"] = now
+                    if grid_order_would_add_risk(position_size, bool(order.get("is_buy"))):
+                        pause_grid_margin_side(row, str(order.get("side")), now, position_value)
+                    return False
+                if not is_min_order_value_error_text(error_text) or order.get("resized_min_retry_at"):
+                    raise
+                bump_grid_order_size_one_step(asset, order)
+                order["resized_min_retry_at"] = now
+                oid, state, status = submit_grid_child_order(exchange, coin, order)
+                break
+        else:
+            order["status"] = "skipped_post_only"
+            order["oid"] = None
+            order["skipped_at"] = now
+            order["alo_rejects"] = alo_rejects
+            order["alo_price_attempts"] = GRID_ALO_PRICE_ATTEMPT_LIMIT
+            return False
+    except RuntimeError as exc:
+        error_text = str(exc)
+        if is_reduce_only_would_increase_text(error_text):
+            order["status"] = "skipped_reduce_only"
+            order["oid"] = None
+            order["last_error"] = error_text
+            order["skipped_at"] = now
+            return False
+        if is_insufficient_margin_text(error_text):
+            order["status"] = "paused_margin"
+            order["oid"] = None
+            order["last_error"] = error_text
+            order["paused_at"] = now
+            if grid_order_would_add_risk(position_size, bool(order.get("is_buy"))):
+                pause_grid_margin_side(row, str(order.get("side")), now, position_value)
+            return False
+        if not is_min_order_value_error_text(error_text) or order.get("resized_min_retry_at"):
+            raise
+        bump_grid_order_size_one_step(asset, order)
+        order["resized_min_retry_at"] = now
         try:
             oid, state, status = submit_grid_child_order(exchange, coin, order)
-            break
         except GridPostOnlyRejected as exc:
-            alo_rejects += 1
+            order["status"] = "skipped_post_only"
+            order["oid"] = None
             order["last_error"] = str(exc)
-            next_price = grid_insert_price_between_active_gap(row, asset, order) or next_outward_grid_price(row, asset, order)
-            if next_price is None or next_price <= 0:
-                order["status"] = "skipped_post_only"
-                order["oid"] = None
-                order["skipped_at"] = now
-                order["alo_rejects"] = alo_rejects
-                return False
-            set_grid_order_price(order, next_price)
-            continue
-        except RuntimeError as exc:
-            error_text = str(exc)
-            if is_reduce_only_would_increase_text(error_text):
-                order["status"] = "skipped_reduce_only"
-                order["oid"] = None
-                order["last_error"] = error_text
-                order["skipped_at"] = now
-                return False
-            if is_insufficient_margin_text(error_text):
-                order["status"] = "paused_margin"
-                order["oid"] = None
-                order["last_error"] = error_text
-                order["paused_at"] = now
-                if grid_order_would_add_risk(position_size, bool(order.get("is_buy"))):
-                    pause_grid_margin_side(row, str(order.get("side")), now, position_value)
-                return False
-            if not is_min_order_value_error_text(error_text) or order.get("resized_min_retry_at"):
-                raise
-            bump_grid_order_size_one_step(asset, order)
-            order["resized_min_retry_at"] = now
-            oid, state, status = submit_grid_child_order(exchange, coin, order)
-            break
-    else:
-        order["status"] = "skipped_post_only"
-        order["oid"] = None
-        order["skipped_at"] = now
-        order["alo_rejects"] = alo_rejects
-        order["alo_price_attempts"] = GRID_ALO_PRICE_ATTEMPT_LIMIT
-        return False
+            order["skipped_at"] = now
+            return False
     order["oid"] = oid
     order["status"] = state
     order["submitted_at"] = now
     order["last_submit_status"] = status
-    if alo_rejects:
+    if retry_alo_reject and "alo_rejects" in locals() and alo_rejects:
         order["alo_rejects"] = alo_rejects
     if state == "filled":
         order["filled_at"] = now
@@ -1238,6 +1286,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             policy,
             account_margin_protected,
             isolated_leverage_ready,
+            True,
         )
         if submitted:
             submissions_by_side[side] = submissions_by_side.get(side, 0) + 1
