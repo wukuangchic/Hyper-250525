@@ -1761,6 +1761,7 @@ def query_grid(args: argparse.Namespace) -> None:
             ("position", f"{decimal_to_plain(position_size)} / {decimal_to_display(position_value)}"),
             *grid_query_avg_summary(row, asset, position_size, position_value),
             ("trend", f"{row.get('trend', '0')} actual {row.get('actual_trend', '0%')}"),
+            ("margin_gap", format_optional_decimal(row.get("margin_gap_multiplier"))),
             ("target_side", str(row.get("target_orders_per_side", GRID_TARGET_ORDERS_PER_SIDE))),
             ("active_buy", str(active_buy)),
             ("active_sell", str(active_sell)),
@@ -3517,6 +3518,7 @@ def format_server_batch_rows(rows: list[dict[str, Any]], network: str, account: 
         is_grid = row.get("type") == "grid"
         limit = grid_limit_display(row) if is_grid else "-"
         trend = f"{row.get('trend', '0')} / {row.get('actual_trend', '0%')}" if is_grid else "-"
+        margin_gap = format_optional_decimal(row.get("margin_gap_multiplier")) if is_grid else "-"
         display_rows.append(
             {
                 "type": str(row.get("type", "")),
@@ -3525,6 +3527,7 @@ def format_server_batch_rows(rows: list[dict[str, Any]], network: str, account: 
                 "side": str(row.get("side", "grid" if is_grid else "")),
                 "limit": limit,
                 "trend": trend,
+                "mgap": margin_gap,
                 "trail": str(row.get("trail", row.get("gap", "-"))),
                 "bestPx": format_optional_decimal(row.get("best_px")),
                 "stopPx": format_optional_decimal(row.get("stop_px")),
@@ -3565,6 +3568,7 @@ def print_server_batch(rows: list[dict[str, Any]], network: str, account: str | 
             ("side", "side"),
             ("limit", "limit"),
             ("trend", "trend"),
+            ("mgap", "mgap"),
             ("trail", "trail"),
             ("bestPx", "bestPx"),
             ("stopPx", "stopPx"),
