@@ -57,6 +57,8 @@ GRID_LEVEL_HISTORY_MAX = 120
 GRID_FILL_LOOKBACK_SECONDS = 24 * 60 * 60
 GRID_MARGIN_RETRY_SECONDS = 10 * 60
 GRID_MAX_SUBMISSIONS_PER_SIDE_PER_RUN = 1
+GRID_ALO_PRICE_ATTEMPT_LIMIT = 20
+GRID_ALO_SPACING_MULTIPLIER = Decimal("0.95")
 TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
 TRANSIENT_ERROR_TEXTS = (
     "connection reset",
@@ -537,7 +539,77 @@ def refresh_grid_order_tif(order: dict[str, Any]) -> None:
     plan = order.get("plan")
     if not isinstance(plan, dict):
         return
-    plan["order_type"] = {"limit": {"tif": "Gtc"}}
+    plan["order_type"] = {"limit": {"tif": "Alo"}}
+
+
+def set_grid_order_price(order: dict[str, Any], price: Decimal) -> None:
+    price_text = decimal_to_plain(price)
+    order["limit_px"] = price_text
+    order["price"] = price_text
+    plan = order.get("plan")
+    if not isinstance(plan, dict):
+        return
+    plan["limit_px"] = price
+    plan["reference_price"] = price
+    plan["min_value_price"] = price
+    size = decimal_or_none(plan.get("size")) or decimal_or_none(order.get("size")) or Decimal("0")
+    notional = size * price
+    plan["notional"] = notional
+    plan["target_notional"] = notional
+    plan["worst_notional"] = notional
+
+
+def next_outward_grid_price(row: dict[str, Any], asset: dict[str, Any], order: dict[str, Any]) -> Decimal | None:
+    price = decimal_or_none(order.get("price", order.get("limit_px")))
+    if price is None or price <= 0:
+        return None
+    plan = order.get("plan")
+    gap = decimal_or_none(plan.get("grid_gap")) if isinstance(plan, dict) else None
+    if gap is None or gap <= 0:
+        gap = Decimal(str(row["gap_rate"]))
+    is_buy = bool(order.get("is_buy"))
+    multiplier = Decimal("1") - gap if is_buy else Decimal("1") + gap
+    return rounded_perp_price(price * multiplier, int(row.get("sz_decimals") or asset["szDecimals"]))
+
+
+def grid_insert_price_between_active_gap(
+    row: dict[str, Any],
+    asset: dict[str, Any],
+    order: dict[str, Any],
+) -> Decimal | None:
+    side = str(order.get("side") or "")
+    price = decimal_or_none(order.get("price", order.get("limit_px")))
+    if not side or price is None or price <= 0:
+        return None
+    prices = sorted(
+        {
+            existing
+            for entry in active_grid_entries(row, side)
+            if entry is not order
+            if (existing := decimal_or_none(entry.get("price", entry.get("limit_px")))) is not None and existing > 0
+        }
+    )
+    if len(prices) < 2:
+        return None
+    gap_rate = Decimal(str(row["gap_rate"]))
+    sz_decimals = int(row.get("sz_decimals") or asset["szDecimals"])
+    candidates: list[Decimal] = []
+    for lower, upper in zip(prices, prices[1:]):
+        midpoint = rounded_perp_price((lower + upper) / Decimal("2"), sz_decimals)
+        if midpoint <= 0:
+            continue
+        if (upper - lower) <= midpoint * gap_rate * Decimal("1.95"):
+            continue
+        if side == "buy" and midpoint > price:
+            continue
+        if side == "sell" and midpoint < price:
+            continue
+        if active_price_too_close(row, side, midpoint, exclude=order, spacing_multiplier=GRID_ALO_SPACING_MULTIPLIER):
+            continue
+        candidates.append(midpoint)
+    if not candidates:
+        return None
+    return max(candidates) if side == "buy" else min(candidates)
 
 
 def grid_order_entry(
@@ -656,12 +728,20 @@ def min_grid_spacing(row: dict[str, Any], price: Decimal) -> Decimal:
     return price * Decimal(str(row["gap_rate"])) * Decimal("0.75")
 
 
-def active_price_too_close(row: dict[str, Any], side: str, price: Decimal) -> bool:
+def active_price_too_close(
+    row: dict[str, Any],
+    side: str,
+    price: Decimal,
+    exclude: dict[str, Any] | None = None,
+    spacing_multiplier: Decimal = Decimal("0.75"),
+) -> bool:
     for entry in active_grid_entries(row, side):
+        if exclude is not None and entry is exclude:
+            continue
         existing = decimal_or_none(entry.get("price", entry.get("limit_px")))
         if existing is None or existing <= 0:
             continue
-        if abs(existing - price) < min_grid_spacing(row, price):
+        if abs(existing - price) <= price * Decimal(str(row["gap_rate"])) * spacing_multiplier:
             return True
     return False
 
@@ -740,7 +820,6 @@ def submit_grid_order_entry(
         plan = order.get("plan")
         if isinstance(plan, dict):
             plan["reduce_only"] = True
-    ensure_grid_order_min_notional(row, asset, order)
     if not grid_reduce_only_capacity_available(row, order, position_size, position_value):
         order["status"] = "paused_reduce_capacity"
         order["oid"] = None
@@ -764,39 +843,80 @@ def submit_grid_order_entry(
                 f"Failed to set isolated opening leverage to {leverage}x for {coin}; order was not submitted."
             )
         isolated_leverage_ready.add(coin)
-    try:
-        oid, state, status = submit_grid_child_order(exchange, coin, order)
-    except GridPostOnlyRejected as exc:
+    oid: int | None = None
+    state = ""
+    status: dict[str, Any] | None = None
+    alo_rejects = 0
+    side = str(order.get("side") or "")
+    for attempt in range(GRID_ALO_PRICE_ATTEMPT_LIMIT):
+        price = decimal_or_none(order.get("price", order.get("limit_px")))
+        if price is None or price <= 0:
+            order["status"] = "skipped_alo_price_search"
+            order["oid"] = None
+            order["skipped_at"] = now
+            order["alo_price_attempts"] = attempt
+            return False
+        if active_price_too_close(row, side, price, exclude=order, spacing_multiplier=GRID_ALO_SPACING_MULTIPLIER):
+            next_price = grid_insert_price_between_active_gap(row, asset, order) or next_outward_grid_price(row, asset, order)
+            if next_price is None or next_price <= 0 or next_price == price:
+                order["status"] = "skipped_alo_price_search"
+                order["oid"] = None
+                order["skipped_at"] = now
+                order["alo_price_attempts"] = attempt + 1
+                return False
+            set_grid_order_price(order, next_price)
+            continue
+        ensure_grid_order_min_notional(row, asset, order)
+        try:
+            oid, state, status = submit_grid_child_order(exchange, coin, order)
+            break
+        except GridPostOnlyRejected as exc:
+            alo_rejects += 1
+            order["last_error"] = str(exc)
+            next_price = grid_insert_price_between_active_gap(row, asset, order) or next_outward_grid_price(row, asset, order)
+            if next_price is None or next_price <= 0:
+                order["status"] = "skipped_post_only"
+                order["oid"] = None
+                order["skipped_at"] = now
+                order["alo_rejects"] = alo_rejects
+                return False
+            set_grid_order_price(order, next_price)
+            continue
+        except RuntimeError as exc:
+            error_text = str(exc)
+            if is_reduce_only_would_increase_text(error_text):
+                order["status"] = "skipped_reduce_only"
+                order["oid"] = None
+                order["last_error"] = error_text
+                order["skipped_at"] = now
+                return False
+            if is_insufficient_margin_text(error_text):
+                order["status"] = "paused_margin"
+                order["oid"] = None
+                order["last_error"] = error_text
+                order["paused_at"] = now
+                if grid_order_would_add_risk(position_size, bool(order.get("is_buy"))):
+                    pause_grid_margin_side(row, str(order.get("side")), now, position_value)
+                return False
+            if not is_min_order_value_error_text(error_text) or order.get("resized_min_retry_at"):
+                raise
+            bump_grid_order_size_one_step(asset, order)
+            order["resized_min_retry_at"] = now
+            oid, state, status = submit_grid_child_order(exchange, coin, order)
+            break
+    else:
         order["status"] = "skipped_post_only"
         order["oid"] = None
-        order["last_error"] = str(exc)
         order["skipped_at"] = now
+        order["alo_rejects"] = alo_rejects
+        order["alo_price_attempts"] = GRID_ALO_PRICE_ATTEMPT_LIMIT
         return False
-    except RuntimeError as exc:
-        error_text = str(exc)
-        if is_reduce_only_would_increase_text(error_text):
-            order["status"] = "skipped_reduce_only"
-            order["oid"] = None
-            order["last_error"] = error_text
-            order["skipped_at"] = now
-            return False
-        if is_insufficient_margin_text(error_text):
-            order["status"] = "paused_margin"
-            order["oid"] = None
-            order["last_error"] = error_text
-            order["paused_at"] = now
-            if grid_order_would_add_risk(position_size, bool(order.get("is_buy"))):
-                pause_grid_margin_side(row, str(order.get("side")), now, position_value)
-            return False
-        if not is_min_order_value_error_text(error_text) or order.get("resized_min_retry_at"):
-            raise
-        bump_grid_order_size_one_step(asset, order)
-        order["resized_min_retry_at"] = now
-        oid, state, status = submit_grid_child_order(exchange, coin, order)
     order["oid"] = oid
     order["status"] = state
     order["submitted_at"] = now
     order["last_submit_status"] = status
+    if alo_rejects:
+        order["alo_rejects"] = alo_rejects
     if state == "filled":
         order["filled_at"] = now
         order["replacement_pending"] = True
@@ -1279,8 +1399,6 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 break
             if submitted_near >= len(farthest_old):
                 break
-            if active_price_too_close(row, side, Decimal(str(near_order["price"]))):
-                continue
             old_entry = farthest_old[submitted_near]
             old_notional = Decimal(str(old_entry.get("size"))) * Decimal(str(old_entry.get("price", old_entry.get("limit_px"))))
             projected_after_old_cancel = projected_near_value
@@ -1302,6 +1420,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             submitted = submit_tracked(near_order)
             if submitted:
                 levels.append(near_order)
+                order_notional = Decimal(str(near_order["size"])) * Decimal(str(near_order["price"]))
                 if near_order.get("replacement_pending"):
                     newly_filled.append(near_order)
                 near_regrids += 1
@@ -1354,9 +1473,6 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         if grid_margin_pause_active(row, replacement_side, now, position_value, position_size):
             changed = True
             continue
-        if active_price_too_close(row, str(replacement["side"]), Decimal(str(replacement["price"]))):
-            changed = True
-            continue
         projected_position_value = projected_position_values[replacement_side]
         order_notional = Decimal(str(replacement["size"])) * Decimal(str(replacement["price"]))
         if not grid_order_allowed_by_max(
@@ -1378,6 +1494,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             changed = True
             continue
         levels.append(replacement)
+        order_notional = Decimal(str(replacement["size"])) * Decimal(str(replacement["price"]))
         if grid_order_would_add_risk(position_size, bool(replacement["is_buy"])):
             projected_position_values[replacement_side] += order_notional
         else:
@@ -1405,8 +1522,6 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             topup = next_depth_order(row, coin, asset, side, current_mid, position_size, position_value, max_position_value, policy, reference_px)
             if topup is None:
                 break
-            if active_price_too_close(row, side, Decimal(str(topup["price"]))):
-                break
             order_notional = Decimal(str(topup["size"])) * Decimal(str(topup["price"]))
             if not grid_order_allowed_by_max(
                 position_size,
@@ -1427,6 +1542,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 changed = True
                 break
             levels.append(topup)
+            order_notional = Decimal(str(topup["size"])) * Decimal(str(topup["price"]))
             remaining_topups -= 1
             if grid_order_would_add_risk(position_size, bool(topup["is_buy"])):
                 projected_position_values[side] += order_notional
@@ -1471,22 +1587,10 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             min_position_value,
         ):
             continue
-        if active_price_too_close(row, str(entry["side"]), Decimal(str(entry.get("price", entry.get("limit_px"))))):
-            continue
-        entry_price = Decimal(str(entry.get("price", entry.get("limit_px"))))
-        is_buy = bool(entry.get("is_buy"))
-        marketable = (is_buy and best_ask is not None and entry_price >= best_ask) or (
-            not is_buy and best_bid is not None and entry_price <= best_bid
-        )
-        if marketable:
-            entry["status"] = "skipped_marketable_restore"
-            entry["oid"] = None
-            entry["skipped_at"] = now
-            changed = True
-            continue
         if not submit_tracked(entry):
             changed = True
             continue
+        order_notional = Decimal(str(entry.get("size"))) * Decimal(str(entry.get("price", entry.get("limit_px"))))
         if grid_order_would_add_risk(position_size, bool(entry.get("is_buy"))):
             projected_position_values[side] += order_notional
         else:

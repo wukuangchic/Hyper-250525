@@ -83,6 +83,168 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(sum(call[0] == "leverage" for call in exchange.calls), 1)
         self.assertEqual(sum(call[0] == "order" for call in exchange.calls), 2)
 
+    def test_grid_submit_keeps_alo_order_at_one_gap_from_active_order(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.orders = []
+
+            def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
+                self.orders.append((coin, is_buy, Decimal(str(limit_px)), order_type, reduce_only))
+                return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 123}}]}}}
+
+        exchange = FakeExchange()
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+            "levels": [
+                {"side": "buy", "status": "active", "oid": 1, "price": "99", "size": "1"},
+            ],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        order = grid_order_entry(row, "BTC", asset, True, Decimal("100"), False)
+
+        submitted = submit_grid_order_entry(
+            exchange,
+            "BTC",
+            order,
+            1,
+            row,
+            asset,
+            Decimal("0"),
+            Decimal("0"),
+            "abs",
+            False,
+            set(),
+        )
+
+        self.assertTrue(submitted)
+        self.assertEqual(order["price"], "100")
+        self.assertEqual(exchange.orders[0][2], Decimal("100.0"))
+        self.assertEqual(order["plan"]["order_type"], {"limit": {"tif": "Alo"}})
+
+    def test_grid_submit_moves_alo_order_away_from_active_order_within_095_gap(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.orders = []
+
+            def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
+                self.orders.append((coin, is_buy, Decimal(str(limit_px)), order_type, reduce_only))
+                return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 123}}]}}}
+
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+            "levels": [
+                {"side": "buy", "status": "active", "oid": 1, "price": "99.1", "size": "1"},
+            ],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        order = grid_order_entry(row, "BTC", asset, True, Decimal("100"), False)
+
+        submitted = submit_grid_order_entry(
+            FakeExchange(),
+            "BTC",
+            order,
+            1,
+            row,
+            asset,
+            Decimal("0"),
+            Decimal("0"),
+            "abs",
+            False,
+            set(),
+        )
+
+        self.assertTrue(submitted)
+        self.assertEqual(order["price"], "98.01")
+        self.assertEqual(order["plan"]["order_type"], {"limit": {"tif": "Alo"}})
+
+    def test_grid_submit_inserts_between_wide_active_gap_before_moving_farther(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.orders = []
+
+            def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
+                self.orders.append((coin, is_buy, Decimal(str(limit_px)), order_type, reduce_only))
+                return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 124}}]}}}
+
+        exchange = FakeExchange()
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+            "levels": [
+                {"side": "buy", "status": "active", "oid": 1, "price": "99.1", "size": "1"},
+                {"side": "buy", "status": "active", "oid": 2, "price": "97", "size": "1"},
+            ],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        order = grid_order_entry(row, "BTC", asset, True, Decimal("100"), False)
+
+        submitted = submit_grid_order_entry(
+            exchange,
+            "BTC",
+            order,
+            1,
+            row,
+            asset,
+            Decimal("0"),
+            Decimal("0"),
+            "abs",
+            False,
+            set(),
+        )
+
+        self.assertTrue(submitted)
+        self.assertEqual(order["price"], "98.05")
+        self.assertEqual(exchange.orders[0][2], Decimal("98.05"))
+
+    def test_grid_submit_retries_alo_reject_one_gap_farther(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.prices = []
+
+            def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
+                self.prices.append(Decimal(str(limit_px)))
+                if len(self.prices) == 1:
+                    return {"status": "ok", "response": {"data": {"statuses": [{"error": "Post only would immediately match"}]}}}
+                return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 456}}]}}}
+
+        exchange = FakeExchange()
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+            "levels": [],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        order = grid_order_entry(row, "BTC", asset, False, Decimal("100"), False)
+
+        submitted = submit_grid_order_entry(
+            exchange,
+            "BTC",
+            order,
+            1,
+            row,
+            asset,
+            Decimal("0"),
+            Decimal("0"),
+            "abs",
+            False,
+            set(),
+        )
+
+        self.assertTrue(submitted)
+        self.assertEqual(exchange.prices, [Decimal("100.0"), Decimal("101.0")])
+        self.assertEqual(order["price"], "101")
+        self.assertEqual(order["alo_rejects"], 1)
+
     def test_refresh_strategy_params_keeps_existing_levels(self) -> None:
         levels = [
             {"side": "buy", "status": "active", "oid": 1, "price": "90", "size": "0.1"},
