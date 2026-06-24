@@ -1037,6 +1037,28 @@ def grid_fill_adds_risk(entry: dict[str, Any], position_size: Decimal) -> bool:
     return grid_order_would_add_risk(position_size, bool(entry.get("is_buy")))
 
 
+def grid_entry_oid_key(entry: dict[str, Any]) -> str:
+    fill = entry.get("fill")
+    if isinstance(fill, dict) and fill.get("oid") is not None:
+        return str(fill.get("oid"))
+    for key in ("confirmed_filled_oid", "oid"):
+        if entry.get(key) is not None:
+            return str(entry.get(key))
+    return ""
+
+
+def recent_grid_filled_entries(row: dict[str, Any]) -> list[dict[str, Any]]:
+    entries = [
+        entry
+        for entry in row.get("levels") or []
+        if isinstance(entry, dict)
+        and entry.get("side")
+        and str(entry.get("status")) == "filled"
+        and grid_entry_oid_key(entry)
+    ]
+    return sorted(entries, key=grid_fill_time)
+
+
 def nearest_add_risk_grid_entry(row: dict[str, Any], side: str, position_size: Decimal) -> dict[str, Any] | None:
     entries = [
         entry
@@ -1069,64 +1091,53 @@ def apply_grid_add_risk_brake(
     position_size: Decimal,
     now: int,
 ) -> int:
-    streak = row.setdefault("add_risk_streak", {})
-    if not isinstance(streak, dict):
-        streak = {}
-        row["add_risk_streak"] = streak
+    recent_filled = recent_grid_filled_entries(row)
+    if len(recent_filled) < GRID_ADD_RISK_BRAKE_STREAK:
+        return 0
 
+    latest_pair = recent_filled[-GRID_ADD_RISK_BRAKE_STREAK:]
+    latest_keys = [grid_entry_oid_key(entry) for entry in latest_pair]
+    new_keys = {
+        grid_entry_oid_key(entry)
+        for entry in newly_filled
+        if isinstance(entry, dict) and grid_entry_oid_key(entry)
+    }
+    if not any(key in new_keys for key in latest_keys):
+        return 0
+
+    pair_key = ":".join(latest_keys)
+    if pair_key == str(row.get("last_add_risk_brake_pair") or ""):
+        return 0
+
+    sides = [str(entry.get("side") or "") for entry in latest_pair]
+    adds_risk = [grid_fill_adds_risk(entry, position_size) for entry in latest_pair]
+    if len(set(sides)) != 1 or sides[0] not in {"buy", "sell"} or not all(adds_risk):
+        return 0
+
+    side = sides[0]
+    target = nearest_add_risk_grid_entry(row, side, position_size)
+    event = {
+        "at": now,
+        "side": side,
+        "trigger_oids": latest_keys,
+        "threshold": GRID_ADD_RISK_BRAKE_STREAK,
+        "mode": "latest_pair",
+    }
     cancelled = 0
-    for entry in sorted(newly_filled, key=grid_fill_time):
-        if not isinstance(entry, dict) or entry.get("add_risk_brake_counted"):
-            continue
-        side = str(entry.get("side") or "")
-        if side not in {"buy", "sell"}:
-            entry["add_risk_brake_counted"] = True
-            continue
-
-        entry["add_risk_brake_counted"] = True
-        adds_risk = grid_fill_adds_risk(entry, position_size)
-        if not adds_risk:
-            streak.clear()
-            streak.update({"side": None, "count": 0, "updated_at": now})
-            continue
-
-        previous_side = streak.get("side")
-        count = int(streak.get("count") or 0) if previous_side == side else 0
-        count += 1
-        streak.update(
+    if target is None:
+        event["status"] = "skipped_no_active_add_risk_order"
+    else:
+        cancelled = cancel_grid_entries(exchange, coin, [target], now, "brake_near_add_risk")
+        event.update(
             {
-                "side": side,
-                "count": count,
-                "updated_at": now,
-                "last_oid": entry.get("oid"),
-                "last_fill_time": grid_fill_time(entry),
+                "status": "cancelled" if cancelled else "cancel_failed",
+                "cancelled_oid": target.get("oid"),
+                "cancelled_price": target.get("price", target.get("limit_px")),
             }
         )
-        if count < GRID_ADD_RISK_BRAKE_STREAK:
-            continue
-
-        target = nearest_add_risk_grid_entry(row, side, position_size)
-        event = {
-            "at": now,
-            "side": side,
-            "trigger_oid": entry.get("oid"),
-            "trigger_count": count,
-            "threshold": GRID_ADD_RISK_BRAKE_STREAK,
-        }
-        if target is None:
-            event["status"] = "skipped_no_active_add_risk_order"
-        else:
-            before = cancelled
-            cancelled += cancel_grid_entries(exchange, coin, [target], now, "brake_near_add_risk")
-            event.update(
-                {
-                    "status": "cancelled" if cancelled > before else "cancel_failed",
-                    "cancelled_oid": target.get("oid"),
-                    "cancelled_price": target.get("price", target.get("limit_px")),
-                }
-            )
-        append_add_risk_brake_history(row, event)
-        streak.update({"side": None, "count": 0, "updated_at": now})
+    row["last_add_risk_brake_pair"] = pair_key
+    row["last_add_risk_brake_at"] = now
+    append_add_risk_brake_history(row, event)
     return cancelled
 
 

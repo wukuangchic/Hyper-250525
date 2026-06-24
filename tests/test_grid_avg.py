@@ -39,21 +39,43 @@ class GridAvgTests(unittest.TestCase):
                 {"side": "buy", "status": "active", "oid": 1, "price": "99", "size": "1", "is_buy": True},
                 {"side": "buy", "status": "active", "oid": 2, "price": "98", "size": "1", "is_buy": True},
                 {"side": "sell", "status": "active", "oid": 3, "price": "101", "size": "1", "is_buy": False},
+                {"side": "buy", "status": "filled", "oid": 10, "is_buy": True, "fill": {"time": 1000, "dir": "Open Long", "oid": 10}},
+                {"side": "buy", "status": "filled", "oid": 11, "is_buy": True, "fill": {"time": 2000, "dir": "Open Long", "oid": 11}},
             ]
         }
-        fills = [
-            {"side": "buy", "status": "filled", "oid": 10, "is_buy": True, "fill": {"time": 1000, "dir": "Open Long"}},
-            {"side": "buy", "status": "filled", "oid": 11, "is_buy": True, "fill": {"time": 2000, "dir": "Open Long"}},
-        ]
 
-        cancelled = apply_grid_add_risk_brake(FakeExchange(), "BTC", row, fills, Decimal("1"), 123)
+        cancelled = apply_grid_add_risk_brake(FakeExchange(), "BTC", row, row["levels"][-2:], Decimal("1"), 123)
 
         self.assertEqual(cancelled, 1)
         self.assertEqual(row["levels"][0]["status"], "brake_near_add_risk")
         self.assertEqual(row["levels"][1]["status"], "active")
-        self.assertEqual(row["add_risk_streak"]["count"], 0)
+        self.assertEqual(row["last_add_risk_brake_pair"], "10:11")
         self.assertEqual(row["add_risk_brakes"][-1]["cancelled_oid"], 1)
-        self.assertTrue(all(fill["add_risk_brake_counted"] for fill in fills))
+
+    def test_add_risk_brake_does_not_repeat_same_latest_pair(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.cancelled = []
+
+            def bulk_cancel(self, requests):
+                self.cancelled.extend(requests)
+                return {"status": "ok"}
+
+        row = {
+            "last_add_risk_brake_pair": "10:11",
+            "levels": [
+                {"side": "buy", "status": "active", "oid": 1, "price": "99", "size": "1", "is_buy": True},
+                {"side": "buy", "status": "filled", "oid": 10, "is_buy": True, "fill": {"time": 1000, "dir": "Open Long", "oid": 10}},
+                {"side": "buy", "status": "filled", "oid": 11, "is_buy": True, "fill": {"time": 2000, "dir": "Open Long", "oid": 11}},
+            ],
+        }
+        exchange = FakeExchange()
+
+        cancelled = apply_grid_add_risk_brake(exchange, "BTC", row, row["levels"][-1:], Decimal("1"), 123)
+
+        self.assertEqual(cancelled, 0)
+        self.assertEqual(exchange.cancelled, [])
+        self.assertEqual(row["levels"][0]["status"], "active")
 
     def test_add_risk_brake_resets_on_reducing_fill(self) -> None:
         class FakeExchange:
@@ -63,20 +85,17 @@ class GridAvgTests(unittest.TestCase):
         row = {
             "levels": [
                 {"side": "buy", "status": "active", "oid": 1, "price": "99", "size": "1", "is_buy": True},
+                {"side": "buy", "status": "filled", "oid": 10, "is_buy": True, "fill": {"time": 1000, "dir": "Open Long", "oid": 10}},
+                {"side": "sell", "status": "filled", "oid": 11, "is_buy": False, "fill": {"time": 2000, "dir": "Close Long", "oid": 11}},
+                {"side": "buy", "status": "filled", "oid": 12, "is_buy": True, "fill": {"time": 3000, "dir": "Open Long", "oid": 12}},
             ]
         }
-        fills = [
-            {"side": "buy", "status": "filled", "oid": 10, "is_buy": True, "fill": {"time": 1000, "dir": "Open Long"}},
-            {"side": "sell", "status": "filled", "oid": 11, "is_buy": False, "fill": {"time": 2000, "dir": "Close Long"}},
-            {"side": "buy", "status": "filled", "oid": 12, "is_buy": True, "fill": {"time": 3000, "dir": "Open Long"}},
-        ]
 
-        cancelled = apply_grid_add_risk_brake(FakeExchange(), "BTC", row, fills, Decimal("1"), 123)
+        cancelled = apply_grid_add_risk_brake(FakeExchange(), "BTC", row, row["levels"][-1:], Decimal("1"), 123)
 
         self.assertEqual(cancelled, 0)
         self.assertEqual(row["levels"][0]["status"], "active")
-        self.assertEqual(row["add_risk_streak"]["side"], "buy")
-        self.assertEqual(row["add_risk_streak"]["count"], 1)
+        self.assertNotIn("last_add_risk_brake_pair", row)
 
     def test_margin_gap_multiplier_starts_at_ninety_and_rises_toward_hard_stop(self) -> None:
         self.assertEqual(grid_margin_gap_multiplier(None), Decimal("1"))
