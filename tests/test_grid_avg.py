@@ -21,6 +21,7 @@ from trail_worker import (
     next_depth_order,
     prune_add_risk_brake_state,
     replacement_order_from_fill,
+    skip_stale_grid_recovery,
     submit_grid_order_entry,
 )
 
@@ -116,6 +117,64 @@ class GridAvgTests(unittest.TestCase):
         self.assertNotIn("last_add_risk_brake_at", row)
         self.assertNotIn("add_risk_streak", row)
         self.assertEqual(row["add_risk_brakes"], [{"at": 604900, "status": "cancelled"}])
+
+    def test_stale_recovery_skips_buy_that_would_cross_current_ask(self) -> None:
+        entry = {
+            "side": "buy",
+            "status": "recovery_deferred",
+            "oid": 123,
+            "price": "61639",
+            "limit_px": "61639",
+        }
+
+        skipped = skip_stale_grid_recovery(
+            entry,
+            123,
+            1000,
+            Decimal("60794.5"),
+            Decimal("60794"),
+            Decimal("60795"),
+        )
+
+        self.assertTrue(skipped)
+        self.assertEqual(entry["status"], "skipped_stale_recovery")
+        self.assertIsNone(entry["oid"])
+        self.assertEqual(entry["stale_recovery_oid"], 123)
+        self.assertEqual(entry["stale_recovery_price"], "61639")
+        self.assertEqual(entry["stale_recovery_best_ask"], "60795")
+
+    def test_stale_recovery_skips_sell_that_would_cross_current_bid(self) -> None:
+        entry = {"side": "sell", "status": "recovery_deferred", "oid": 456, "price": "99"}
+
+        skipped = skip_stale_grid_recovery(
+            entry,
+            456,
+            1000,
+            Decimal("100.5"),
+            Decimal("100"),
+            Decimal("101"),
+        )
+
+        self.assertTrue(skipped)
+        self.assertEqual(entry["status"], "skipped_stale_recovery")
+        self.assertIsNone(entry["oid"])
+        self.assertEqual(entry["stale_recovery_best_bid"], "100")
+
+    def test_stale_recovery_allows_resting_price(self) -> None:
+        entry = {"side": "buy", "status": "recovery_deferred", "oid": 789, "price": "99"}
+
+        skipped = skip_stale_grid_recovery(
+            entry,
+            789,
+            1000,
+            Decimal("100.5"),
+            Decimal("100"),
+            Decimal("101"),
+        )
+
+        self.assertFalse(skipped)
+        self.assertEqual(entry["status"], "recovery_deferred")
+        self.assertEqual(entry["oid"], 789)
 
     def test_margin_gap_multiplier_starts_at_ninety_and_rises_toward_hard_stop(self) -> None:
         self.assertEqual(grid_margin_gap_multiplier(None), Decimal("1"))

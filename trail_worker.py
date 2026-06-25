@@ -295,6 +295,51 @@ def grid_reference_price(side: str, current_mid: Decimal, best_bid: Decimal | No
     return current_mid
 
 
+def grid_recovery_price_would_cross_market(
+    entry: dict[str, Any],
+    current_mid: Decimal,
+    best_bid: Decimal | None,
+    best_ask: Decimal | None,
+) -> bool:
+    price = decimal_or_none(entry.get("price", entry.get("limit_px")))
+    if price is None or price <= 0:
+        return False
+    side = str(entry.get("side") or "")
+    if side == "buy":
+        reference = best_ask if best_ask is not None and best_ask > 0 else current_mid
+        return price >= reference
+    if side == "sell":
+        reference = best_bid if best_bid is not None and best_bid > 0 else current_mid
+        return price <= reference
+    return False
+
+
+def skip_stale_grid_recovery(
+    entry: dict[str, Any],
+    old_oid: int,
+    now: int,
+    current_mid: Decimal,
+    best_bid: Decimal | None,
+    best_ask: Decimal | None,
+) -> bool:
+    if not grid_recovery_price_would_cross_market(entry, current_mid, best_bid, best_ask):
+        return False
+    price = decimal_or_none(entry.get("price", entry.get("limit_px")))
+    entry["status"] = "skipped_stale_recovery"
+    entry["oid"] = None
+    entry["stale_recovery_oid"] = old_oid
+    entry["stale_recovery_at"] = now
+    entry["stale_recovery_mid"] = decimal_to_plain(current_mid)
+    if price is not None:
+        entry["stale_recovery_price"] = decimal_to_plain(price)
+    if best_bid is not None:
+        entry["stale_recovery_best_bid"] = decimal_to_plain(best_bid)
+    if best_ask is not None:
+        entry["stale_recovery_best_ask"] = decimal_to_plain(best_ask)
+    entry["last_error"] = "missing order recovery skipped because saved price would immediately match current market"
+    return True
+
+
 def find_open_order_by_oid(info: Any, account: str, dex: str, oid: int) -> dict[str, Any] | None:
     open_orders = collect_frontend_open_orders(info, account, dex)
     return next((order for order in open_orders if order.get("oid") is not None and int(order.get("oid", -1)) == oid), None)
@@ -1525,6 +1570,9 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 continue
             side = str(entry.get("side"))
             if grid_margin_pause_active(row, side, now, position_value, position_size):
+                changed = True
+                continue
+            if skip_stale_grid_recovery(entry, old_oid, now, current_mid, best_bid, best_ask):
                 changed = True
                 continue
             if submit_tracked(entry):
