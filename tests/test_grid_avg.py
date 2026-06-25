@@ -20,6 +20,8 @@ from trail_worker import (
     near_grid_orders_if_stale,
     next_depth_order,
     prune_add_risk_brake_state,
+    preserve_replacement_order,
+    prune_grid_levels,
     replacement_order_from_fill,
     skip_stale_grid_recovery,
     skip_unknown_oid_grid_recovery,
@@ -537,6 +539,72 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(order["status"], "skipped_post_only")
         self.assertEqual(order["price"], "100")
         self.assertEqual(len(exchange.orders), 1)
+
+    def test_failed_replacement_order_is_preserved_for_retry(self) -> None:
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+            "levels": [],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        order = replacement_order_from_fill(
+            row,
+            "BTC",
+            asset,
+            Decimal("100"),
+            True,
+            Decimal("1"),
+            Decimal("100"),
+            Decimal("200"),
+            "abs",
+        )
+        self.assertIsNotNone(order)
+        order["status"] = "skipped_account_margin"
+        order["skipped_at"] = 1
+
+        preserve_replacement_order(row["levels"], order, 2)
+
+        self.assertEqual(row["levels"], [order])
+        self.assertTrue(order["replacement_order"])
+        self.assertEqual(order["status"], "paused_replacement")
+        self.assertEqual(order["replacement_pause_reason"], "skipped_account_margin")
+        self.assertEqual(order["paused_at"], 2)
+
+    def test_paused_replacement_survives_prune_when_side_is_full(self) -> None:
+        row = {
+            "type": "grid",
+            "target_orders_per_side": 1,
+            "gap_rate": "0.01",
+            "levels": [
+                {"side": "buy", "status": "active", "oid": 1, "price": "99", "size": "1"},
+                {
+                    "side": "buy",
+                    "status": "paused_replacement",
+                    "oid": None,
+                    "price": "98",
+                    "size": "1",
+                    "reduce_only": True,
+                    "replacement_order": True,
+                    "paused_at": 1,
+                },
+                {
+                    "side": "buy",
+                    "status": "paused_limit",
+                    "oid": None,
+                    "price": "97",
+                    "size": "1",
+                    "reduce_only": True,
+                    "paused_at": 1,
+                },
+            ],
+        }
+
+        changed = prune_grid_levels(row)
+
+        self.assertTrue(changed)
+        self.assertEqual([entry["price"] for entry in row["levels"]], ["99", "98"])
 
     def test_replacement_alo_reject_inserts_between_wide_active_gap_before_moving_farther(self) -> None:
         class FakeExchange:

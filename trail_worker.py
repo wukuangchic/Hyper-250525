@@ -67,6 +67,14 @@ GRID_ALO_PRICE_ATTEMPT_LIMIT = 20
 GRID_ALO_SPACING_MULTIPLIER = Decimal("0.95")
 GRID_NEAR_REGRID_STALE_GAP_MULTIPLE = Decimal("30")
 GRID_NEAR_REGRID_TARGET_GAP_MULTIPLE = Decimal("15")
+GRID_REPLACEMENT_PAUSE_STATUS = "paused_replacement"
+GRID_PAUSED_STATUSES = {
+    "paused_max",
+    "paused_limit",
+    "paused_margin",
+    "paused_reduce_capacity",
+    GRID_REPLACEMENT_PAUSE_STATUS,
+}
 TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
 TRANSIENT_ERROR_TEXTS = (
     "connection reset",
@@ -792,7 +800,22 @@ def replacement_order_from_fill(
     multiplier = Decimal("1") - gap if next_is_buy else Decimal("1") + gap
     next_px = rounded_perp_price(submitted_limit_px * multiplier, sz_decimals)
     reduce_only = grid_order_should_reduce_only(position_size, next_is_buy, policy)
-    return grid_order_entry(row, coin, asset, next_is_buy, next_px, reduce_only, gap=gap)
+    order = grid_order_entry(row, coin, asset, next_is_buy, next_px, reduce_only, gap=gap)
+    order["replacement_order"] = True
+    return order
+
+
+def preserve_replacement_order(levels: list[Any], order: dict[str, Any], now: int, reason: str | None = None) -> None:
+    status = str(order.get("status") or "pending")
+    order["replacement_order"] = True
+    order["replacement_pause_reason"] = reason or status
+    if status not in GRID_PAUSED_STATUSES:
+        order["status"] = GRID_REPLACEMENT_PAUSE_STATUS
+    order["oid"] = None
+    order.pop("replacement_pending", None)
+    order.setdefault("paused_at", now)
+    if order not in levels:
+        levels.append(order)
 
 
 def active_grid_entries(row: dict[str, Any], side: str | None = None) -> list[dict[str, Any]]:
@@ -1878,6 +1901,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         entry["replacement_pending"] = False
         entry["replacement_processed_at"] = now
         if grid_margin_pause_active(row, replacement_side, now, position_value, position_size):
+            preserve_replacement_order(levels, replacement, now, "margin_pause_active")
             changed = True
             continue
         projected_position_value = projected_position_values[replacement_side]
@@ -1893,11 +1917,12 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         ):
             replacement["status"] = "paused_limit"
             replacement["paused_at"] = now
-            levels.append(replacement)
+            preserve_replacement_order(levels, replacement, now)
             changed = True
             continue
         submitted = submit_replacement(replacement)
         if not submitted:
+            preserve_replacement_order(levels, replacement, now)
             changed = True
             continue
         levels.append(replacement)
@@ -1961,6 +1986,10 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     restored = 0
     for entry in levels:
         if isinstance(entry, dict) and str(entry.get("status")) == "paused_account_margin":
+            if entry.get("replacement_order"):
+                preserve_replacement_order(levels, entry, now, "paused_account_margin")
+                changed = True
+                continue
             # Migrate levels saved by older workers so they are not restored at
             # stale prices after account-margin protection ends.
             entry["status"] = "skipped_account_margin"
@@ -1968,17 +1997,13 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             entry["skipped_at"] = now
             changed = True
             continue
-        if not isinstance(entry, dict) or entry.get("side") is None or str(entry.get("status")) not in {
-            "paused_max",
-            "paused_limit",
-            "paused_margin",
-            "paused_reduce_capacity",
-        }:
+        if not isinstance(entry, dict) or entry.get("side") is None or str(entry.get("status")) not in GRID_PAUSED_STATUSES:
             continue
         side = str(entry["side"])
+        is_replacement_order = bool(entry.get("replacement_order"))
         if not side_submission_allowed(side):
             continue
-        if len(active_grid_oids(row, side)) >= target_per_side:
+        if not is_replacement_order and len(active_grid_oids(row, side)) >= target_per_side:
             continue
         if grid_margin_pause_active(row, side, now, position_value, position_size):
             continue
@@ -1993,8 +2018,13 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             policy,
             min_position_value,
         ):
+            if is_replacement_order:
+                preserve_replacement_order(levels, entry, now, "limit_still_blocked")
             continue
-        if not submit_tracked(entry):
+        submitted = submit_replacement(entry) if is_replacement_order else submit_tracked(entry)
+        if not submitted:
+            if is_replacement_order:
+                preserve_replacement_order(levels, entry, now)
             changed = True
             continue
         order_notional = Decimal(str(entry.get("size"))) * Decimal(str(entry.get("price", entry.get("limit_px"))))
@@ -2104,12 +2134,6 @@ def prune_grid_levels(row: dict[str, Any]) -> bool:
         "pending",
         "recovery_deferred",
     }
-    paused_statuses = {
-        "paused_max",
-        "paused_limit",
-        "paused_margin",
-        "paused_reduce_capacity",
-    }
     live_levels: list[dict[str, Any]] = []
     paused_levels: list[dict[str, Any]] = []
     history_levels: list[dict[str, Any]] = []
@@ -2122,7 +2146,7 @@ def prune_grid_levels(row: dict[str, Any]) -> bool:
         status = str(entry.get("status", "active"))
         if status in live_statuses:
             live_levels.append(entry)
-        elif status in paused_statuses:
+        elif status in GRID_PAUSED_STATUSES:
             paused_levels.append(entry)
         else:
             history_levels.append(entry)
@@ -2132,13 +2156,21 @@ def prune_grid_levels(row: dict[str, Any]) -> bool:
         side: len(active_grid_oids(row, side))
         for side in ("buy", "sell")
     }
-    kept_paused: list[dict[str, Any]] = []
+    kept_paused: list[dict[str, Any]] = [
+        entry
+        for entry in paused_levels
+        if bool(entry.get("replacement_order"))
+    ]
     for side in ("buy", "sell"):
         keep_count = max(0, target_per_side - active_counts[side])
         if keep_count == 0:
             continue
         side_paused = sorted(
-            (entry for entry in paused_levels if str(entry.get("side")) == side),
+            (
+                entry
+                for entry in paused_levels
+                if str(entry.get("side")) == side and not bool(entry.get("replacement_order"))
+            ),
             key=grid_level_updated_at,
             reverse=True,
         )
