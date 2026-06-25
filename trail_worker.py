@@ -78,6 +78,12 @@ GRID_PAUSED_STATUSES = {
     GRID_REPLACEMENT_PAUSE_STATUS,
     GRID_RISK_DENSITY_PAUSE_STATUS,
 }
+GRID_PRICE_OCCUPANCY_STATUSES = {
+    "active",
+    "pending",
+    "recovery_deferred",
+    *GRID_PAUSED_STATUSES,
+}
 TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
 TRANSIENT_ERROR_TEXTS = (
     "connection reset",
@@ -721,7 +727,7 @@ def grid_insert_price_between_active_gap(
     prices = sorted(
         {
             existing
-            for entry in active_grid_entries(row, side)
+            for entry in grid_price_occupancy_entries(row, side)
             if entry is not order
             if (existing := decimal_or_none(entry.get("price", entry.get("limit_px")))) is not None and existing > 0
         }
@@ -871,6 +877,17 @@ def active_grid_entries(row: dict[str, Any], side: str | None = None) -> list[di
     return entries
 
 
+def grid_price_occupancy_entries(row: dict[str, Any], side: str | None = None) -> list[dict[str, Any]]:
+    return [
+        entry
+        for entry in row.get("levels") or []
+        if isinstance(entry, dict)
+        and entry.get("side")
+        and str(entry.get("status", "active")) in GRID_PRICE_OCCUPANCY_STATUSES
+        and (side is None or str(entry.get("side")) == side)
+    ]
+
+
 def active_grid_oids(row: dict[str, Any], side: str | None = None) -> set[int]:
     oids: set[int] = set()
     for entry in active_grid_entries(row, side):
@@ -927,7 +944,7 @@ def active_price_too_close(
     exclude: dict[str, Any] | None = None,
     spacing_multiplier: Decimal = Decimal("0.75"),
 ) -> bool:
-    for entry in active_grid_entries(row, side):
+    for entry in grid_price_occupancy_entries(row, side):
         if exclude is not None and entry is exclude:
             continue
         existing = decimal_or_none(entry.get("price", entry.get("limit_px")))

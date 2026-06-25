@@ -14,6 +14,7 @@ from hl_order import (
     refresh_grid_row_strategy_params,
 )
 from trail_worker import (
+    active_grid_oids,
     clear_grid_side_cap_entries,
     apply_grid_add_risk_brake,
     dense_grid_entries,
@@ -725,6 +726,23 @@ class GridAvgTests(unittest.TestCase):
         self.assertTrue(changed)
         self.assertEqual([entry["price"] for entry in row["levels"]], ["99", "98"])
 
+    def test_paused_replacement_does_not_count_as_active_oid(self) -> None:
+        row = {
+            "levels": [
+                {"side": "buy", "status": "active", "oid": 1, "price": "99", "size": "1"},
+                {
+                    "side": "buy",
+                    "status": "paused_replacement",
+                    "oid": 2,
+                    "price": "98",
+                    "size": "1",
+                    "replacement_order": True,
+                },
+            ]
+        }
+
+        self.assertEqual(active_grid_oids(row, "buy"), {1})
+
     def test_active_grid_orders_above_target_are_not_trimmed(self) -> None:
         class FakeExchange:
             def __init__(self) -> None:
@@ -793,6 +811,33 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertTrue(moved)
         self.assertEqual(order["price"], "98.05")
+
+    def test_grid_order_moves_away_from_paused_replacement_price(self) -> None:
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+            "levels": [
+                {"side": "buy", "status": "active", "oid": 1, "price": "99.1", "size": "1"},
+                {
+                    "side": "buy",
+                    "status": "paused_replacement",
+                    "oid": None,
+                    "price": "98.05",
+                    "size": "1",
+                    "replacement_order": True,
+                },
+                {"side": "buy", "status": "active", "oid": 2, "price": "97", "size": "1"},
+            ],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        order = grid_order_entry(row, "BTC", asset, True, Decimal("100"), False)
+
+        moved = move_grid_order_away_from_active(row, asset, order)
+
+        self.assertTrue(moved)
+        self.assertEqual(order["price"], "96.06")
 
     def test_replacement_alo_reject_inserts_between_wide_active_gap_before_moving_farther(self) -> None:
         class FakeExchange:
