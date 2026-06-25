@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import math
 import time
-from decimal import Decimal
+from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
@@ -68,12 +68,15 @@ GRID_ALO_SPACING_MULTIPLIER = Decimal("0.95")
 GRID_NEAR_REGRID_STALE_GAP_MULTIPLE = Decimal("30")
 GRID_NEAR_REGRID_TARGET_GAP_MULTIPLE = Decimal("15")
 GRID_REPLACEMENT_PAUSE_STATUS = "paused_replacement"
+GRID_RISK_DENSITY_PAUSE_STATUS = "paused_risk_density"
+GRID_MAX_LEVELS_PER_SIDE = 500
 GRID_PAUSED_STATUSES = {
     "paused_max",
     "paused_limit",
     "paused_margin",
     "paused_reduce_capacity",
     GRID_REPLACEMENT_PAUSE_STATUS,
+    GRID_RISK_DENSITY_PAUSE_STATUS,
 }
 TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
 TRANSIENT_ERROR_TEXTS = (
@@ -901,8 +904,20 @@ def nearest_active_price(row: dict[str, Any], side: str) -> Decimal | None:
     return max(prices) if side == "buy" else min(prices)
 
 
-def min_grid_spacing(row: dict[str, Any], price: Decimal) -> Decimal:
-    return price * Decimal(str(row["gap_rate"])) * Decimal("0.75")
+def grid_entry_gap_rate(row: dict[str, Any], entry: dict[str, Any]) -> Decimal:
+    plan = entry.get("plan")
+    if isinstance(plan, dict):
+        gap = decimal_or_none(plan.get("grid_gap"))
+        if gap is not None and gap > 0:
+            return gap
+    gap = decimal_or_none(entry.get("grid_gap"))
+    if gap is not None and gap > 0:
+        return gap
+    return Decimal(str(row["gap_rate"]))
+
+
+def min_grid_spacing(row: dict[str, Any], entry: dict[str, Any], price: Decimal) -> Decimal:
+    return price * grid_entry_gap_rate(row, entry) * Decimal("0.75")
 
 
 def active_price_too_close(
@@ -936,11 +951,91 @@ def dense_grid_entries(row: dict[str, Any]) -> list[dict[str, Any]]:
         kept_prices: list[Decimal] = []
         for entry in entries:
             price = decimal_or_none(entry.get("price", entry.get("limit_px"))) or Decimal("0")
-            if any(abs(price - kept) < min_grid_spacing(row, price) for kept in kept_prices):
+            if any(abs(price - kept) < min_grid_spacing(row, entry, price) for kept in kept_prices):
                 dense.append(entry)
                 continue
             kept_prices.append(price)
     return dense
+
+
+def grid_entry_near_to_far_key(entry: dict[str, Any], side: str) -> Decimal:
+    price = decimal_or_none(entry.get("price", entry.get("limit_px"))) or Decimal("0")
+    return -price if side == "buy" else price
+
+
+def grid_level_side_cap_clear_key(entry: dict[str, Any]) -> tuple[int, int, Decimal]:
+    status = str(entry.get("status") or "")
+    replacement_order = bool(entry.get("replacement_order"))
+    if replacement_order and status == "active":
+        priority = 5
+    elif replacement_order:
+        priority = 4
+    elif status == "active":
+        priority = 3
+    elif status in {"pending", "recovery_deferred"}:
+        priority = 2
+    elif status in GRID_PAUSED_STATUSES:
+        priority = 1
+    else:
+        priority = 0
+    price = decimal_or_none(entry.get("price", entry.get("limit_px"))) or Decimal("0")
+    return priority, grid_level_updated_at(entry), price
+
+
+def grid_side_cap_clear_candidates(row: dict[str, Any], max_per_side: int = GRID_MAX_LEVELS_PER_SIDE) -> list[dict[str, Any]]:
+    levels = row.get("levels")
+    if not isinstance(levels, list):
+        return []
+    capped_statuses = {"active", "pending", "recovery_deferred", *GRID_PAUSED_STATUSES}
+    clear: list[dict[str, Any]] = []
+    for side in ("buy", "sell"):
+        side_entries = [
+            entry
+            for entry in levels
+            if isinstance(entry, dict)
+            and str(entry.get("side") or "") == side
+            and str(entry.get("status") or "") in capped_statuses
+        ]
+        overflow = len(side_entries) - max_per_side
+        if overflow <= 0:
+            continue
+        side_entries.sort(key=grid_level_side_cap_clear_key)
+        clear.extend(side_entries[:overflow])
+    return clear
+
+
+def clear_grid_side_cap_entries(exchange: Any, coin: str, row: dict[str, Any], now: int) -> int:
+    levels = row.get("levels")
+    if not isinstance(levels, list):
+        return 0
+    to_clear = grid_side_cap_clear_candidates(row)
+    if not to_clear:
+        return 0
+    active_to_cancel = [
+        entry
+        for entry in to_clear
+        if str(entry.get("status") or "") == "active" and entry.get("oid") is not None
+    ]
+    if active_to_cancel:
+        cancel_grid_entries(exchange, coin, active_to_cancel, now, "cleared_side_cap")
+    clear_ids = {id(entry) for entry in to_clear}
+    row["levels"] = [entry for entry in levels if id(entry) not in clear_ids]
+    row["side_cap_cleared_at"] = now
+    row["side_cap_cleared_count"] = int(row.get("side_cap_cleared_count") or 0) + len(to_clear)
+    return len(to_clear)
+
+
+def evenly_spaced_keep_indexes(count: int, keep_count: int) -> set[int]:
+    if keep_count <= 0:
+        return set()
+    if keep_count >= count:
+        return set(range(count))
+    if keep_count == 1:
+        return {0}
+    return {
+        int((Decimal(i) * Decimal(count - 1) / Decimal(keep_count - 1)).to_integral_value(rounding=ROUND_HALF_UP))
+        for i in range(keep_count)
+    }
 
 
 def grid_margin_gap_multiplier(margin_ratio: Decimal | None) -> Decimal:
@@ -953,6 +1048,56 @@ def grid_margin_gap_multiplier(margin_ratio: Decimal | None) -> Decimal:
     window = GRID_ACCOUNT_MARGIN_RATIO_SOFT_THRESHOLD - GRID_ACCOUNT_MARGIN_RATIO_THRESHOLD
     distance_to_hard_stop = margin_ratio - GRID_ACCOUNT_MARGIN_RATIO_THRESHOLD
     return Decimal("1") + Decimal(str(math.log(float(window / distance_to_hard_stop))))
+
+
+def grid_risk_density_multiplier(row: dict[str, Any], side: str, margin_gap_multiplier: Decimal) -> Decimal:
+    multiplier = Decimal("1")
+    avg_multiplier = decimal_or_none(row.get("avg_multiplier"))
+    avg_favored_side = row.get("avg_favored_side")
+    if avg_multiplier is not None and avg_multiplier > multiplier and avg_favored_side in {"buy", "sell"}:
+        if side != str(avg_favored_side):
+            multiplier = avg_multiplier
+    if margin_gap_multiplier > multiplier:
+        multiplier = margin_gap_multiplier
+    return multiplier
+
+
+def grid_risk_density_allowed(target_per_side: int, multiplier: Decimal) -> int:
+    if target_per_side <= 0:
+        return 0
+    if multiplier <= 1:
+        return target_per_side
+    allowed = int((Decimal(target_per_side) / multiplier).to_integral_value(rounding=ROUND_FLOOR))
+    return max(1, min(target_per_side, allowed))
+
+
+def grid_risk_density_pause_candidates(
+    row: dict[str, Any],
+    side: str,
+    position_size: Decimal,
+    target_per_side: int,
+    margin_gap_multiplier: Decimal,
+) -> tuple[list[dict[str, Any]], int, Decimal]:
+    is_buy = side == "buy"
+    if not grid_order_would_add_risk(position_size, is_buy):
+        return [], target_per_side, Decimal("1")
+    active_add_risk = [
+        entry
+        for entry in active_grid_entries(row, side)
+        if grid_order_would_add_risk(position_size, bool(entry.get("is_buy")))
+    ]
+    multiplier = grid_risk_density_multiplier(row, side, margin_gap_multiplier)
+    allowed = grid_risk_density_allowed(target_per_side, multiplier)
+    if len(active_add_risk) <= allowed:
+        return [], allowed, multiplier
+    active_add_risk.sort(key=lambda entry: grid_entry_near_to_far_key(entry, side))
+    keep_indexes = evenly_spaced_keep_indexes(len(active_add_risk), allowed)
+    to_pause = [
+        entry
+        for index, entry in enumerate(active_add_risk)
+        if index not in keep_indexes and not bool(entry.get("replacement_order"))
+    ]
+    return to_pause, allowed, multiplier
 
 
 def next_depth_order(
@@ -1752,13 +1897,16 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         for entry in newly_filled
     }
     replacement_quota_sides.update(pending_replacement_sides)
-
-    add_risk_braked = apply_grid_add_risk_brake(exchange, coin, row, newly_filled, position_size, now)
-    if add_risk_braked:
+    saved_target_per_side = int(row.get("target_orders_per_side") or GRID_TARGET_ORDERS_PER_SIDE)
+    target_per_side = GRID_TARGET_ORDERS_PER_SIDE if saved_target_per_side == 5 else saved_target_per_side
+    if target_per_side != saved_target_per_side:
+        row["target_orders_per_side"] = target_per_side
         changed = True
 
+    add_risk_braked = 0
+
     paused = 0
-    to_pause: list[dict[str, Any]] = []
+    to_pause_limit: list[dict[str, Any]] = []
     for side in ("buy", "sell"):
         entries = active_grid_entries(row, side)
         entries.sort(
@@ -1778,14 +1926,38 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 policy,
                 min_position_value,
             ):
-                to_pause.append(entry)
+                to_pause_limit.append(entry)
                 continue
             if grid_order_would_add_risk(position_size, is_buy):
                 projected_side_value += order_notional
             else:
                 projected_side_value = max(Decimal("0"), projected_side_value - order_notional)
-    if to_pause:
-        paused = cancel_grid_entries(exchange, coin, to_pause, now, "paused_limit")
+    if to_pause_limit:
+        paused += cancel_grid_entries(exchange, coin, to_pause_limit, now, "paused_limit")
+    paused_limit_ids = {id(entry) for entry in to_pause_limit}
+    to_pause_density: list[dict[str, Any]] = []
+    risk_density_allowed: dict[str, int] = {}
+    risk_density_multiplier: dict[str, Decimal] = {}
+    for side in ("buy", "sell"):
+        candidates, allowed, multiplier = grid_risk_density_pause_candidates(
+            row,
+            side,
+            position_size,
+            target_per_side,
+            margin_gap_multiplier,
+        )
+        risk_density_allowed[side] = allowed
+        risk_density_multiplier[side] = multiplier
+        to_pause_density.extend(entry for entry in candidates if id(entry) not in paused_limit_ids)
+    if to_pause_density:
+        paused += cancel_grid_entries(exchange, coin, to_pause_density, now, GRID_RISK_DENSITY_PAUSE_STATUS)
+        for entry in to_pause_density:
+            entry["risk_density_allowed"] = risk_density_allowed.get(str(entry.get("side") or ""), target_per_side)
+            entry["risk_density_multiplier"] = decimal_to_plain(
+                risk_density_multiplier.get(str(entry.get("side") or ""), Decimal("1"))
+            )
+            entry["risk_density_paused_at"] = now
+    if paused:
         changed = True
 
     refreshed = 0
@@ -1809,72 +1981,6 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         changed = True
 
     near_regrids = 0
-    for side in ("buy", "sell"):
-        if side in pending_replacement_sides:
-            continue
-        if grid_margin_pause_active(row, side, now, position_value, position_size):
-            continue
-        reference_px = grid_reference_price(side, current_mid, best_bid, best_ask)
-        old_near_side_entries = active_grid_entries(row, side)
-        near_orders = near_grid_orders_if_stale(
-            row,
-            coin,
-            asset,
-            side,
-            reference_px,
-            position_size,
-            policy,
-        )
-        unique_old_entries: dict[int, dict[str, Any]] = {}
-        for entry in old_near_side_entries:
-            try:
-                unique_old_entries.setdefault(int(entry["oid"]), entry)
-            except (KeyError, TypeError, ValueError):
-                continue
-        farthest_old = sorted(
-            unique_old_entries.values(),
-            key=lambda entry: decimal_or_none(entry.get("price", entry.get("limit_px"))) or Decimal("0"),
-            reverse=side == "sell",
-        )
-        projected_near_value = position_value
-        for entry in farthest_old:
-            order_notional = Decimal(str(entry.get("size"))) * Decimal(str(entry.get("price", entry.get("limit_px"))))
-            if grid_order_would_add_risk(position_size, bool(entry.get("is_buy"))):
-                projected_near_value += order_notional
-            else:
-                projected_near_value = max(Decimal("0"), projected_near_value - order_notional)
-        submitted_near = 0
-        for near_order in near_orders:
-            if not side_submission_allowed(side):
-                break
-            if submitted_near >= len(farthest_old):
-                break
-            if not move_grid_order_away_from_active(row, asset, near_order):
-                continue
-            order_notional = Decimal(str(near_order["size"])) * Decimal(str(near_order["price"]))
-            if not grid_order_allowed_by_max(
-                position_size,
-                projected_near_value,
-                bool(near_order["is_buy"]),
-                order_notional,
-                max_position_value,
-                policy,
-                min_position_value,
-            ):
-                continue
-            submitted = submit_tracked(near_order)
-            if submitted:
-                levels.append(near_order)
-                order_notional = Decimal(str(near_order["size"])) * Decimal(str(near_order["price"]))
-                if near_order.get("replacement_pending"):
-                    newly_filled.append(near_order)
-                near_regrids += 1
-                submitted_near += 1
-                if grid_order_would_add_risk(position_size, bool(near_order["is_buy"])):
-                    projected_near_value += order_notional
-                else:
-                    projected_near_value = max(Decimal("0"), projected_near_value - order_notional)
-            changed = True
 
     projected_position_values: dict[str, Decimal] = {}
     for side in ("buy", "sell"):
@@ -1939,12 +2045,58 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         replacements += 1
         changed = True
 
-    topped_up = 0
-    saved_target_per_side = int(row.get("target_orders_per_side") or GRID_TARGET_ORDERS_PER_SIDE)
-    target_per_side = GRID_TARGET_ORDERS_PER_SIDE if saved_target_per_side == 5 else saved_target_per_side
-    if target_per_side != saved_target_per_side:
-        row["target_orders_per_side"] = target_per_side
+    restored = 0
+    for entry in levels:
+        if (
+            not isinstance(entry, dict)
+            or str(entry.get("status")) != GRID_RISK_DENSITY_PAUSE_STATUS
+            or bool(entry.get("replacement_order"))
+            or entry.get("side") is None
+        ):
+            continue
+        side = str(entry["side"])
+        if not side_submission_allowed(side):
+            continue
+        if grid_order_would_add_risk(position_size, bool(entry.get("is_buy"))):
+            _candidates, allowed, _multiplier = grid_risk_density_pause_candidates(
+                row,
+                side,
+                position_size,
+                target_per_side,
+                margin_gap_multiplier,
+            )
+            active_add_risk_count = sum(
+                1
+                for active in active_grid_entries(row, side)
+                if grid_order_would_add_risk(position_size, bool(active.get("is_buy")))
+            )
+            if active_add_risk_count >= allowed:
+                continue
+        if grid_margin_pause_active(row, side, now, position_value, position_size):
+            continue
+        projected_position_value = projected_position_values[side]
+        order_notional = Decimal(str(entry.get("size"))) * Decimal(str(entry.get("price", entry.get("limit_px"))))
+        if not grid_order_allowed_by_max(
+            position_size,
+            projected_position_value,
+            bool(entry.get("is_buy")),
+            order_notional,
+            max_position_value,
+            policy,
+            min_position_value,
+        ):
+            continue
+        if not submit_tracked(entry):
+            changed = True
+            continue
+        if grid_order_would_add_risk(position_size, bool(entry.get("is_buy"))):
+            projected_position_values[side] += order_notional
+        else:
+            projected_position_values[side] = max(Decimal("0"), projected_position_value - order_notional)
+        restored += 1
         changed = True
+
+    topped_up = 0
     for side in ("buy", "sell"):
         if not side_submission_allowed(side):
             continue
@@ -1988,7 +2140,6 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             topped_up += 1
             changed = True
 
-    restored = 0
     for entry in levels:
         if isinstance(entry, dict) and str(entry.get("status")) == "paused_account_margin":
             if entry.get("replacement_order"):
@@ -2006,10 +2157,27 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             continue
         side = str(entry["side"])
         is_replacement_order = bool(entry.get("replacement_order"))
+        status = str(entry.get("status"))
         if not side_submission_allowed(side):
             continue
-        if not is_replacement_order and len(active_grid_oids(row, side)) >= target_per_side:
-            continue
+        if not is_replacement_order:
+            if status == GRID_RISK_DENSITY_PAUSE_STATUS and grid_order_would_add_risk(position_size, bool(entry.get("is_buy"))):
+                _candidates, allowed, _multiplier = grid_risk_density_pause_candidates(
+                    row,
+                    side,
+                    position_size,
+                    target_per_side,
+                    margin_gap_multiplier,
+                )
+                active_add_risk_count = sum(
+                    1
+                    for active in active_grid_entries(row, side)
+                    if grid_order_would_add_risk(position_size, bool(active.get("is_buy")))
+                )
+                if active_add_risk_count >= allowed:
+                    continue
+            elif len(active_grid_oids(row, side)) >= target_per_side:
+                continue
         if grid_margin_pause_active(row, side, now, position_value, position_size):
             continue
         projected_position_value = projected_position_values[side]
@@ -2043,6 +2211,9 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     trimmed = trim_excess_grid_entries(exchange, coin, row, target_per_side, now)
     if trimmed:
         changed = True
+    side_cap_cleared = clear_grid_side_cap_entries(exchange, coin, row, now)
+    if side_cap_cleared:
+        changed = True
 
     row["status"] = "active"
     row.pop("error", None)
@@ -2059,7 +2230,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     row["note"] = (
         f"grid maintained; replacements={replacements}; topped_up={topped_up}; "
         f"paused={paused}; refreshed={refreshed}; deduped={deduped}; restored={restored}; trimmed={trimmed}; near_regrids={near_regrids}; "
-        f"add_risk_braked={add_risk_braked}; "
+        f"add_risk_braked={add_risk_braked}; side_cap_cleared={side_cap_cleared}; "
         f"recovered_missing={recovered_missing}; margin_cooldown={margin_cooldowns}; "
         f"submissions=buy:{submissions_by_side['buy']},sell:{submissions_by_side['sell']}; "
         f"filled_stop={','.join(sorted(filled_submission_sides)) or '-'}; "
@@ -2077,6 +2248,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         or deduped > 0
         or restored > 0
         or trimmed > 0
+        or side_cap_cleared > 0
         or near_regrids > 0
         or add_risk_braked > 0
         or recovered_missing > 0,

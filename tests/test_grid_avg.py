@@ -14,9 +14,12 @@ from hl_order import (
     refresh_grid_row_strategy_params,
 )
 from trail_worker import (
+    clear_grid_side_cap_entries,
     apply_grid_add_risk_brake,
+    dense_grid_entries,
     grid_margin_gap_multiplier,
     grid_order_entry,
+    grid_risk_density_pause_candidates,
     move_grid_order_away_from_active,
     near_grid_orders_if_stale,
     next_depth_order,
@@ -324,6 +327,120 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(reduce_risk_topup["price"], "111.1")
         self.assertEqual(reduce_risk_topup["plan"]["grid_gap"], Decimal("0.01"))
 
+    def test_risk_density_pauses_evenly_across_add_risk_orders(self) -> None:
+        row = {
+            "gap_rate": "0.01",
+            "avg_multiplier": "2",
+            "avg_favored_side": "sell",
+            "levels": [
+                {
+                    "side": "buy",
+                    "status": "active",
+                    "oid": oid,
+                    "is_buy": True,
+                    "price": str(100 - oid),
+                    "size": "1",
+                }
+                for oid in range(20)
+            ],
+        }
+
+        candidates, allowed, multiplier = grid_risk_density_pause_candidates(
+            row,
+            "buy",
+            Decimal("1"),
+            10,
+            Decimal("1"),
+        )
+
+        self.assertEqual(allowed, 5)
+        self.assertEqual(multiplier, Decimal("2"))
+        paused_oids = [entry["oid"] for entry in candidates]
+        self.assertEqual(paused_oids, [1, 2, 3, 4, 6, 7, 8, 9, 11, 12, 13, 15, 16, 17, 18])
+
+    def test_side_cap_clear_removes_paused_before_active(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.cancelled = []
+
+            def bulk_cancel(self, requests):
+                self.cancelled.extend(requests)
+                return {"status": "ok"}
+
+        row = {
+            "levels": [
+                {"side": "buy", "status": "active", "oid": oid, "price": str(100 - oid), "size": "1"}
+                for oid in range(500)
+            ]
+        }
+        row["levels"].append({"side": "buy", "status": "paused_risk_density", "oid": None, "price": "1", "size": "1"})
+        exchange = FakeExchange()
+
+        cleared = clear_grid_side_cap_entries(exchange, "BTC", row, 123)
+
+        self.assertEqual(cleared, 1)
+        self.assertEqual(len([entry for entry in row["levels"] if entry["side"] == "buy"]), 500)
+        self.assertEqual(exchange.cancelled, [])
+        self.assertNotIn("paused_risk_density", {entry["status"] for entry in row["levels"]})
+
+    def test_side_cap_clear_cancels_active_overflow(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.cancelled = []
+
+            def bulk_cancel(self, requests):
+                self.cancelled.extend(requests)
+                return {"status": "ok"}
+
+        row = {
+            "levels": [
+                {
+                    "side": "sell",
+                    "status": "active",
+                    "oid": oid,
+                    "price": str(100 + oid),
+                    "size": "1",
+                    "submitted_at": oid,
+                }
+                for oid in range(501)
+            ]
+        }
+        exchange = FakeExchange()
+
+        cleared = clear_grid_side_cap_entries(exchange, "BTC", row, 123)
+
+        self.assertEqual(cleared, 1)
+        self.assertEqual(exchange.cancelled, [{"coin": "BTC", "oid": 0}])
+        self.assertEqual(len([entry for entry in row["levels"] if entry["side"] == "sell"]), 500)
+        self.assertNotIn(0, {entry["oid"] for entry in row["levels"]})
+
+    def test_side_cap_clear_ignores_history_records(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.cancelled = []
+
+            def bulk_cancel(self, requests):
+                self.cancelled.extend(requests)
+                return {"status": "ok"}
+
+        row = {
+            "levels": [
+                {"side": "buy", "status": "active", "oid": oid, "price": str(100 - oid), "size": "1"}
+                for oid in range(500)
+            ]
+        }
+        row["levels"].extend(
+            {"side": "buy", "status": "filled", "oid": 1000 + oid, "price": str(50 - oid), "size": "1"}
+            for oid in range(20)
+        )
+        exchange = FakeExchange()
+
+        cleared = clear_grid_side_cap_entries(exchange, "BTC", row, 123)
+
+        self.assertEqual(cleared, 0)
+        self.assertEqual(len([entry for entry in row["levels"] if entry["side"] == "buy"]), 520)
+        self.assertEqual(exchange.cancelled, [])
+
     def test_far_topup_inserts_between_active_gap_using_target_gap(self) -> None:
         row = {
             "gap_rate": "0.01",
@@ -630,6 +747,33 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(trimmed, 0)
         self.assertEqual(exchange.cancel_requests, [])
         self.assertEqual([entry["status"] for entry in row["levels"]], ["active", "active"])
+
+    def test_dense_grid_uses_order_plan_gap_before_row_gap(self) -> None:
+        row = {
+            "gap_rate": "0.05",
+            "levels": [
+                {
+                    "side": "buy",
+                    "status": "active",
+                    "oid": 1,
+                    "price": "100",
+                    "size": "1",
+                    "plan": {"grid_gap": Decimal("0.01")},
+                },
+                {
+                    "side": "buy",
+                    "status": "active",
+                    "oid": 2,
+                    "price": "98",
+                    "size": "1",
+                    "plan": {"grid_gap": Decimal("0.01")},
+                },
+            ],
+        }
+
+        dense = dense_grid_entries(row)
+
+        self.assertEqual(dense, [])
 
     def test_grid_order_moves_away_from_near_active_price_before_submit(self) -> None:
         row = {
