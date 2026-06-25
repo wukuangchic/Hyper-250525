@@ -681,10 +681,25 @@ def next_outward_grid_price(row: dict[str, Any], asset: dict[str, Any], order: d
     return rounded_perp_price(price * multiplier, int(row.get("sz_decimals") or asset["szDecimals"]))
 
 
+def grid_order_target_gap(row: dict[str, Any], side: str, order: dict[str, Any] | None = None) -> Decimal:
+    plan = order.get("plan") if isinstance(order, dict) else None
+    gap = decimal_or_none(plan.get("grid_gap")) if isinstance(plan, dict) else None
+    if gap is not None and gap > 0:
+        return gap
+    gap_key = "topup_buy_gap" if side == "buy" else "topup_sell_gap"
+    gap = decimal_or_none(row.get(gap_key))
+    if gap is not None and gap > 0:
+        return gap
+    return Decimal(str(row["gap_rate"]))
+
+
 def grid_insert_price_between_active_gap(
     row: dict[str, Any],
     asset: dict[str, Any],
     order: dict[str, Any],
+    *,
+    target_gap: Decimal | None = None,
+    respect_order_boundary: bool = True,
 ) -> Decimal | None:
     side = str(order.get("side") or "")
     price = decimal_or_none(order.get("price", order.get("limit_px")))
@@ -700,7 +715,7 @@ def grid_insert_price_between_active_gap(
     )
     if len(prices) < 2:
         return None
-    gap_rate = Decimal(str(row["gap_rate"]))
+    gap_rate = target_gap if target_gap is not None and target_gap > 0 else grid_order_target_gap(row, side, order)
     sz_decimals = int(row.get("sz_decimals") or asset["szDecimals"])
     candidates: list[Decimal] = []
     for lower, upper in zip(prices, prices[1:]):
@@ -709,10 +724,11 @@ def grid_insert_price_between_active_gap(
             continue
         if (upper - lower) <= midpoint * gap_rate * Decimal("1.95"):
             continue
-        if side == "buy" and midpoint > price:
-            continue
-        if side == "sell" and midpoint < price:
-            continue
+        if respect_order_boundary:
+            if side == "buy" and midpoint > price:
+                continue
+            if side == "sell" and midpoint < price:
+                continue
         if active_price_too_close(row, side, midpoint, exclude=order, spacing_multiplier=GRID_ALO_SPACING_MULTIPLIER):
             continue
         candidates.append(midpoint)
@@ -892,16 +908,28 @@ def next_depth_order(
     gap = Decimal(str(row.get(gap_key) or row["gap_rate"]))
     sz_decimals = int(row.get("sz_decimals") or asset["szDecimals"])
     is_buy = side == "buy"
-    if grid_order_would_add_risk(position_size, is_buy):
+    adds_risk = grid_order_would_add_risk(position_size, is_buy)
+    if adds_risk:
         gap *= Decimal(str(row.get("margin_gap_multiplier") or "1"))
-    base_px = farthest_active_price(row, side, reference_px or current_mid)
-    multiplier = Decimal("1") - gap if is_buy else Decimal("1") + gap
-    next_px = rounded_perp_price(base_px * multiplier, sz_decimals)
+    gap_probe = {"side": side, "is_buy": is_buy, "price": decimal_to_plain(reference_px or current_mid)}
+    next_px = grid_insert_price_between_active_gap(
+        row,
+        asset,
+        gap_probe,
+        target_gap=gap,
+        respect_order_boundary=False,
+    )
+    if next_px is None:
+        base_px = farthest_active_price(row, side, reference_px or current_mid)
+        multiplier = Decimal("1") - gap if is_buy else Decimal("1") + gap
+        next_px = rounded_perp_price(base_px * multiplier, sz_decimals)
     if next_px <= 0:
         return None
     reduce_only = grid_order_should_reduce_only(position_size, is_buy, policy)
-    size_key = "topup_buy_size" if is_buy else "topup_sell_size"
-    topup_size = Decimal(str(row.get(size_key) or row.get("base_buy_size" if is_buy else "base_sell_size") or "0"))
+    base_size_key = "base_buy_size" if is_buy else "base_sell_size"
+    topup_size_key = "topup_buy_size" if is_buy else "topup_sell_size"
+    size_key = topup_size_key if adds_risk else base_size_key
+    topup_size = Decimal(str(row.get(size_key) or row.get(base_size_key) or "0"))
     return grid_order_entry(row, coin, asset, is_buy, next_px, reduce_only, size=topup_size, gap=gap)
 
 

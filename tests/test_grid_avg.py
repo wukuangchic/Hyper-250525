@@ -298,6 +298,40 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(reduce_risk_topup["price"], "111.1")
         self.assertEqual(reduce_risk_topup["plan"]["grid_gap"], Decimal("0.01"))
 
+    def test_far_topup_inserts_between_active_gap_using_target_gap(self) -> None:
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "1",
+            "sz_decimals": 3,
+            "base_buy_size": "0.100",
+            "base_sell_size": "0.100",
+            "topup_buy_size": "0.100",
+            "topup_sell_size": "0.100",
+            "topup_buy_gap": "0.01",
+            "topup_sell_gap": "0.02",
+            "levels": [
+                {"side": "sell", "status": "active", "oid": 1, "is_buy": False, "price": "101", "size": "0.100"},
+                {"side": "sell", "status": "active", "oid": 2, "is_buy": False, "price": "106", "size": "0.100"},
+            ],
+        }
+        asset = {"szDecimals": 3}
+
+        topup = next_depth_order(
+            row,
+            "BTC",
+            asset,
+            "sell",
+            Decimal("100"),
+            Decimal("-1"),
+            Decimal("100"),
+            Decimal("250"),
+            "abs",
+        )
+
+        self.assertIsNotNone(topup)
+        self.assertEqual(topup["price"], "103.5")
+        self.assertEqual(topup["plan"]["grid_gap"], Decimal("0.02"))
+
     def test_isolated_asset_detection(self) -> None:
         self.assertTrue(asset_requires_isolated_margin({"onlyIsolated": True}))
         self.assertTrue(asset_requires_isolated_margin({"marginMode": "noCross"}))
@@ -525,6 +559,51 @@ class GridAvgTests(unittest.TestCase):
         self.assertTrue(submitted)
         self.assertEqual(order["price"], "98.05")
         self.assertEqual([call[2] for call in exchange.orders], [Decimal("100.0"), Decimal("98.05")])
+        self.assertEqual(order["alo_rejects"], 1)
+
+    def test_replacement_alo_reject_uses_order_target_gap_for_wide_gap(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.orders = []
+
+            def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
+                self.orders.append((coin, is_buy, Decimal(str(limit_px)), order_type, reduce_only))
+                if len(self.orders) == 1:
+                    return {"status": "ok", "response": {"data": {"statuses": [{"error": "Post only would immediately match"}]}}}
+                return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 124}}]}}}
+
+        exchange = FakeExchange()
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+            "levels": [
+                {"side": "buy", "status": "active", "oid": 1, "price": "99.1", "size": "1"},
+                {"side": "buy", "status": "active", "oid": 2, "price": "97", "size": "1"},
+            ],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        order = grid_order_entry(row, "BTC", asset, True, Decimal("100"), False, gap=Decimal("0.02"))
+
+        submitted = submit_grid_order_entry(
+            exchange,
+            "BTC",
+            order,
+            1,
+            row,
+            asset,
+            Decimal("0"),
+            Decimal("0"),
+            "abs",
+            False,
+            set(),
+            True,
+        )
+
+        self.assertTrue(submitted)
+        self.assertEqual(order["price"], "98")
+        self.assertEqual([call[2] for call in exchange.orders], [Decimal("100.0"), Decimal("98")])
         self.assertEqual(order["alo_rejects"], 1)
 
     def test_replacement_alo_reject_retries_one_gap_farther(self) -> None:
