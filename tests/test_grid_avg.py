@@ -911,6 +911,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(reverting_replacement["size"], "0.1")
         self.assertEqual(reverting_replacement["plan"]["grid_gap"], Decimal("0.01"))
 
+        row["levels"][0]["price"] = "69"
         near_orders = near_grid_orders_if_stale(
             row,
             "BTC",
@@ -921,9 +922,21 @@ class GridAvgTests(unittest.TestCase):
             "abs",
         )
         self.assertEqual(len(near_orders), 1)
-        self.assertEqual(near_orders[0]["price"], "96")
+        self.assertEqual(near_orders[0]["price"], "85")
         self.assertEqual(near_orders[0]["size"], "0.1")
         self.assertEqual(near_orders[0]["plan"]["grid_gap"], Decimal("0.01"))
+
+        row["levels"][1]["price"] = "130"
+        add_risk_near_orders = near_grid_orders_if_stale(
+            row,
+            "BTC",
+            asset,
+            "sell",
+            Decimal("100"),
+            Decimal("-1"),
+            "abs",
+        )
+        self.assertEqual(add_risk_near_orders, [])
 
     def test_long_multiplier_is_asymptotic_to_position_bounds(self) -> None:
         cases = (

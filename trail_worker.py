@@ -65,6 +65,8 @@ GRID_ADD_RISK_BRAKE_HISTORY_RETENTION_SECONDS = 7 * 24 * 60 * 60
 GRID_UNKNOWN_OID_RECOVERY_MAX_AGE_SECONDS = 30 * 60
 GRID_ALO_PRICE_ATTEMPT_LIMIT = 20
 GRID_ALO_SPACING_MULTIPLIER = Decimal("0.95")
+GRID_NEAR_REGRID_STALE_GAP_MULTIPLE = Decimal("30")
+GRID_NEAR_REGRID_TARGET_GAP_MULTIPLE = Decimal("15")
 TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
 TRANSIENT_ERROR_TEXTS = (
     "connection reset",
@@ -1434,11 +1436,17 @@ def near_grid_orders_if_stale(
     gap = Decimal(str(row["gap_rate"]))
     sz_decimals = int(row.get("sz_decimals") or asset["szDecimals"])
     is_buy = side == "buy"
+    if grid_order_would_add_risk(position_size, is_buy):
+        return []
 
     nearest_px = nearest_active_price(row, side)
     if nearest_px is None:
         return []
-    stale_threshold = Decimal("1") - gap * Decimal("10") if is_buy else Decimal("1") + gap * Decimal("10")
+    stale_threshold = (
+        Decimal("1") - gap * GRID_NEAR_REGRID_STALE_GAP_MULTIPLE
+        if is_buy
+        else Decimal("1") + gap * GRID_NEAR_REGRID_STALE_GAP_MULTIPLE
+    )
     if is_buy and nearest_px >= reference_px * stale_threshold:
         return []
     if not is_buy and nearest_px <= reference_px * stale_threshold:
@@ -1446,7 +1454,7 @@ def near_grid_orders_if_stale(
 
     reduce_only = grid_order_should_reduce_only(position_size, is_buy, policy)
     entries: list[dict[str, Any]] = []
-    for gap_multiple in (Decimal("4"),):
+    for gap_multiple in (GRID_NEAR_REGRID_TARGET_GAP_MULTIPLE,):
         multiplier = Decimal("1") - gap * gap_multiple if is_buy else Decimal("1") + gap * gap_multiple
         target_px = rounded_perp_price(reference_px * multiplier, sz_decimals)
         if target_px > 0:
