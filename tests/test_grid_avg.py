@@ -19,6 +19,7 @@ from trail_worker import (
     grid_order_entry,
     near_grid_orders_if_stale,
     next_depth_order,
+    prune_add_risk_brake_state,
     replacement_order_from_fill,
     submit_grid_order_entry,
 )
@@ -96,6 +97,25 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(cancelled, 0)
         self.assertEqual(row["levels"][0]["status"], "active")
         self.assertNotIn("last_add_risk_brake_pair", row)
+
+    def test_add_risk_brake_state_prunes_old_pair_and_history(self) -> None:
+        row = {
+            "last_add_risk_brake_pair": "10:11",
+            "last_add_risk_brake_at": 100,
+            "add_risk_streak": {"side": "buy", "count": 1},
+            "add_risk_brakes": [
+                {"at": 100, "status": "cancelled"},
+                {"at": 604900, "status": "cancelled"},
+            ],
+        }
+
+        changed = prune_add_risk_brake_state(row, 604901)
+
+        self.assertTrue(changed)
+        self.assertNotIn("last_add_risk_brake_pair", row)
+        self.assertNotIn("last_add_risk_brake_at", row)
+        self.assertNotIn("add_risk_streak", row)
+        self.assertEqual(row["add_risk_brakes"], [{"at": 604900, "status": "cancelled"}])
 
     def test_margin_gap_multiplier_starts_at_ninety_and_rises_toward_hard_stop(self) -> None:
         self.assertEqual(grid_margin_gap_multiplier(None), Decimal("1"))

@@ -60,6 +60,8 @@ GRID_MARGIN_RETRY_SECONDS = 10 * 60
 GRID_ACCOUNT_MARGIN_RATIO_SOFT_THRESHOLD = Decimal("0.90")
 GRID_MAX_SUBMISSIONS_PER_SIDE_PER_RUN = 1
 GRID_ADD_RISK_BRAKE_STREAK = 2
+GRID_ADD_RISK_BRAKE_PAIR_RETENTION_SECONDS = 24 * 60 * 60
+GRID_ADD_RISK_BRAKE_HISTORY_RETENTION_SECONDS = 7 * 24 * 60 * 60
 GRID_ALO_PRICE_ATTEMPT_LIMIT = 20
 GRID_ALO_SPACING_MULTIPLIER = Decimal("0.95")
 TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -1083,6 +1085,52 @@ def append_add_risk_brake_history(row: dict[str, Any], event: dict[str, Any]) ->
     del history[:-GRID_LEVEL_HISTORY_MAX]
 
 
+def prune_add_risk_brake_state(row: dict[str, Any], now: int) -> bool:
+    changed = False
+    if "add_risk_streak" in row:
+        row.pop("add_risk_streak", None)
+        changed = True
+
+    try:
+        last_at = int(row.get("last_add_risk_brake_at") or 0)
+    except (TypeError, ValueError):
+        last_at = 0
+    if last_at and now - last_at > GRID_ADD_RISK_BRAKE_PAIR_RETENTION_SECONDS:
+        row.pop("last_add_risk_brake_pair", None)
+        row.pop("last_add_risk_brake_at", None)
+        changed = True
+
+    history = row.get("add_risk_brakes")
+    if history is None:
+        return changed
+    if not isinstance(history, list):
+        row.pop("add_risk_brakes", None)
+        return True
+
+    cutoff = now - GRID_ADD_RISK_BRAKE_HISTORY_RETENTION_SECONDS
+    kept: list[dict[str, Any]] = []
+    for event in history:
+        if not isinstance(event, dict):
+            changed = True
+            continue
+        try:
+            event_at = int(event.get("at") or 0)
+        except (TypeError, ValueError):
+            event_at = 0
+        if event_at >= cutoff:
+            kept.append(event)
+        else:
+            changed = True
+    kept = kept[-GRID_LEVEL_HISTORY_MAX:]
+    if len(kept) != len(history):
+        changed = True
+    if kept:
+        row["add_risk_brakes"] = kept
+    else:
+        row.pop("add_risk_brakes", None)
+    return changed
+
+
 def apply_grid_add_risk_brake(
     exchange: Any,
     coin: str,
@@ -1363,6 +1411,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     margin_state_changed = row.get("margin_gap_multiplier") != margin_gap_multiplier_text
     row["margin_gap_multiplier"] = margin_gap_multiplier_text
     row["margin_gap_soft_threshold"] = decimal_to_plain(GRID_ACCOUNT_MARGIN_RATIO_SOFT_THRESHOLD)
+    brake_state_pruned = prune_add_risk_brake_state(row, now)
 
     open_orders_cache = cache.setdefault("open_orders", {})
     open_orders_key = (network, account, dex)
@@ -1377,7 +1426,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         fills_cache[fills_key] = info.user_fills_by_time(account, common_start_ms, now_ms)
         log_event("grid_user_fills_by_time", {"start_ms": common_start_ms, "end_ms": now_ms, "count": len(fills_cache[fills_key])})
     fills_by_oid = recent_fills_by_oid(info, account, coin, start_ms, now_ms, fills_cache[fills_key])
-    changed = avg_state_changed or margin_state_changed
+    changed = avg_state_changed or margin_state_changed or brake_state_pruned
     missing_without_fill: list[int] = []
     recovered_missing = 0
     newly_filled: list[dict[str, Any]] = [
