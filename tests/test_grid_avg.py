@@ -22,6 +22,7 @@ from trail_worker import (
     prune_add_risk_brake_state,
     replacement_order_from_fill,
     skip_stale_grid_recovery,
+    skip_unknown_oid_grid_recovery,
     submit_grid_order_entry,
 )
 
@@ -175,6 +176,58 @@ class GridAvgTests(unittest.TestCase):
         self.assertFalse(skipped)
         self.assertEqual(entry["status"], "recovery_deferred")
         self.assertEqual(entry["oid"], 789)
+
+    def test_unknown_oid_recovery_skips_old_missing_order(self) -> None:
+        entry = {
+            "side": "buy",
+            "status": "recovery_deferred",
+            "oid": 123,
+            "price": "99",
+            "submitted_at": 1000,
+        }
+
+        skipped = skip_unknown_oid_grid_recovery(entry, 123, 1000 + 31 * 60, {"status": "unknownOid"})
+
+        self.assertTrue(skipped)
+        self.assertEqual(entry["status"], "skipped_unknown_oid")
+        self.assertIsNone(entry["oid"])
+        self.assertEqual(entry["unknown_oid"], 123)
+        self.assertEqual(entry["unknown_oid_age_seconds"], 31 * 60)
+
+    def test_unknown_oid_recovery_allows_fresh_missing_order(self) -> None:
+        entry = {
+            "side": "buy",
+            "status": "recovery_deferred",
+            "oid": 123,
+            "price": "99",
+            "submitted_at": 1000,
+        }
+
+        skipped = skip_unknown_oid_grid_recovery(entry, 123, 1000 + 5 * 60, {"status": "unknownOid"})
+
+        self.assertFalse(skipped)
+        self.assertEqual(entry["status"], "recovery_deferred")
+        self.assertEqual(entry["oid"], 123)
+
+    def test_unknown_oid_recovery_ignores_known_exchange_status(self) -> None:
+        entry = {
+            "side": "buy",
+            "status": "recovery_deferred",
+            "oid": 123,
+            "price": "99",
+            "submitted_at": 1000,
+        }
+
+        skipped = skip_unknown_oid_grid_recovery(
+            entry,
+            123,
+            1000 + 31 * 60,
+            {"order": {"status": "open"}},
+        )
+
+        self.assertFalse(skipped)
+        self.assertEqual(entry["status"], "recovery_deferred")
+        self.assertEqual(entry["oid"], 123)
 
     def test_margin_gap_multiplier_starts_at_ninety_and_rises_toward_hard_stop(self) -> None:
         self.assertEqual(grid_margin_gap_multiplier(None), Decimal("1"))

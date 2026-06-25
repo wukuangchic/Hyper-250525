@@ -62,6 +62,7 @@ GRID_MAX_SUBMISSIONS_PER_SIDE_PER_RUN = 1
 GRID_ADD_RISK_BRAKE_STREAK = 2
 GRID_ADD_RISK_BRAKE_PAIR_RETENTION_SECONDS = 24 * 60 * 60
 GRID_ADD_RISK_BRAKE_HISTORY_RETENTION_SECONDS = 7 * 24 * 60 * 60
+GRID_UNKNOWN_OID_RECOVERY_MAX_AGE_SECONDS = 30 * 60
 GRID_ALO_PRICE_ATTEMPT_LIMIT = 20
 GRID_ALO_SPACING_MULTIPLIER = Decimal("0.95")
 TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -337,6 +338,50 @@ def skip_stale_grid_recovery(
     if best_ask is not None:
         entry["stale_recovery_best_ask"] = decimal_to_plain(best_ask)
     entry["last_error"] = "missing order recovery skipped because saved price would immediately match current market"
+    return True
+
+
+def grid_order_status_name(order_status: Any) -> str:
+    if not isinstance(order_status, dict):
+        return ""
+    order = order_status.get("order")
+    if isinstance(order, dict) and order.get("status") is not None:
+        return str(order.get("status") or "")
+    if order_status.get("status") is not None:
+        return str(order_status.get("status") or "")
+    return ""
+
+
+def grid_entry_age_seconds(entry: dict[str, Any], now: int) -> int:
+    for key in ("submitted_at", "recovered_at", "filled_at", "cancelled_at", "skipped_at", "paused_at"):
+        try:
+            value = int(entry.get(key) or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            return max(0, now - value)
+    return 0
+
+
+def skip_unknown_oid_grid_recovery(
+    entry: dict[str, Any],
+    old_oid: int,
+    now: int,
+    order_status: Any,
+) -> bool:
+    status_name = grid_order_status_name(order_status)
+    if status_name != "unknownOid":
+        return False
+    age_seconds = grid_entry_age_seconds(entry, now)
+    if age_seconds < GRID_UNKNOWN_OID_RECOVERY_MAX_AGE_SECONDS:
+        return False
+    entry["status"] = "skipped_unknown_oid"
+    entry["oid"] = None
+    entry["unknown_oid"] = old_oid
+    entry["unknown_oid_at"] = now
+    entry["unknown_oid_age_seconds"] = age_seconds
+    entry["unknown_oid_status"] = status_name
+    entry["last_error"] = "missing order recovery skipped because exchange returned unknownOid with no fill"
     return True
 
 
@@ -1552,7 +1597,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         if fill is None:
             old_oid = oid
             order_status = info.query_order_by_oid(account, old_oid)
-            status_name = str(order_status.get("order", {}).get("status") or "")
+            status_name = grid_order_status_name(order_status)
             if status_name == "filled":
                 entry["status"] = "filled"
                 entry["filled_at"] = now
@@ -1566,6 +1611,9 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 entry["oid"] = None
                 entry["last_error"] = "exchange canceled excess reduce-only order"
                 entry["skipped_at"] = now
+                changed = True
+                continue
+            if skip_unknown_oid_grid_recovery(entry, old_oid, now, order_status):
                 changed = True
                 continue
             side = str(entry.get("side"))
