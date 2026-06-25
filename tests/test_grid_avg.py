@@ -18,6 +18,7 @@ from trail_worker import (
     clear_grid_side_cap_entries,
     apply_grid_add_risk_brake,
     dense_grid_entries,
+    defer_paused_grid_restore_if_crossing,
     grid_margin_gap_multiplier,
     grid_order_entry,
     grid_risk_density_pause_candidates,
@@ -206,6 +207,37 @@ class GridAvgTests(unittest.TestCase):
         self.assertFalse(skipped)
         self.assertEqual(entry["status"], "recovery_deferred")
         self.assertEqual(entry["oid"], 789)
+
+    def test_paused_restore_deferred_when_price_would_cross_market(self) -> None:
+        entry = {"side": "buy", "status": "paused_replacement", "oid": None, "price": "101"}
+
+        deferred = defer_paused_grid_restore_if_crossing(
+            entry,
+            123,
+            Decimal("100"),
+            Decimal("99"),
+            Decimal("100.5"),
+        )
+
+        self.assertTrue(deferred)
+        self.assertEqual(entry["status"], "paused_replacement")
+        self.assertEqual(entry["restore_deferred_reason"], "would_cross_market")
+        self.assertEqual(entry["restore_deferred_price"], "101")
+        self.assertEqual(entry["restore_deferred_best_ask"], "100.5")
+
+    def test_paused_restore_not_deferred_when_price_would_rest(self) -> None:
+        entry = {"side": "buy", "status": "paused_replacement", "oid": None, "price": "99"}
+
+        deferred = defer_paused_grid_restore_if_crossing(
+            entry,
+            123,
+            Decimal("100"),
+            Decimal("99"),
+            Decimal("100.5"),
+        )
+
+        self.assertFalse(deferred)
+        self.assertNotIn("restore_deferred_reason", entry)
 
     def test_unknown_oid_recovery_skips_old_missing_order(self) -> None:
         entry = {

@@ -374,6 +374,28 @@ def skip_stale_grid_recovery(
     return True
 
 
+def defer_paused_grid_restore_if_crossing(
+    entry: dict[str, Any],
+    now: int,
+    current_mid: Decimal,
+    best_bid: Decimal | None,
+    best_ask: Decimal | None,
+) -> bool:
+    if not grid_recovery_price_would_cross_market(entry, current_mid, best_bid, best_ask):
+        return False
+    price = decimal_or_none(entry.get("price", entry.get("limit_px")))
+    entry["restore_deferred_at"] = now
+    entry["restore_deferred_reason"] = "would_cross_market"
+    entry["restore_deferred_mid"] = decimal_to_plain(current_mid)
+    if price is not None:
+        entry["restore_deferred_price"] = decimal_to_plain(price)
+    if best_bid is not None:
+        entry["restore_deferred_best_bid"] = decimal_to_plain(best_bid)
+    if best_ask is not None:
+        entry["restore_deferred_best_ask"] = decimal_to_plain(best_ask)
+    return True
+
+
 def grid_order_status_name(order_status: Any) -> str:
     if not isinstance(order_status, dict):
         return ""
@@ -2091,6 +2113,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 continue
         if grid_margin_pause_active(row, side, now, position_value, position_size):
             continue
+        if defer_paused_grid_restore_if_crossing(entry, now, current_mid, best_bid, best_ask):
+            continue
         projected_position_value = projected_position_values[side]
         order_notional = Decimal(str(entry.get("size"))) * Decimal(str(entry.get("price", entry.get("limit_px"))))
         if not grid_order_allowed_by_max(
@@ -2196,6 +2220,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             elif len(active_grid_oids(row, side)) >= target_per_side:
                 continue
         if grid_margin_pause_active(row, side, now, position_value, position_size):
+            continue
+        if defer_paused_grid_restore_if_crossing(entry, now, current_mid, best_bid, best_ask):
             continue
         projected_position_value = projected_position_values[side]
         order_notional = Decimal(str(entry.get("size"))) * Decimal(str(entry.get("price", entry.get("limit_px"))))
