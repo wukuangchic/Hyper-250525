@@ -17,6 +17,7 @@ from trail_worker import (
     apply_grid_add_risk_brake,
     grid_margin_gap_multiplier,
     grid_order_entry,
+    move_grid_order_away_from_active,
     near_grid_orders_if_stale,
     next_depth_order,
     prune_add_risk_brake_state,
@@ -26,6 +27,7 @@ from trail_worker import (
     skip_stale_grid_recovery,
     skip_unknown_oid_grid_recovery,
     submit_grid_order_entry,
+    trim_excess_grid_entries,
 )
 
 
@@ -606,6 +608,48 @@ class GridAvgTests(unittest.TestCase):
         self.assertTrue(changed)
         self.assertEqual([entry["price"] for entry in row["levels"]], ["99", "98"])
 
+    def test_active_grid_orders_above_target_are_not_trimmed(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.cancel_requests = []
+
+            def bulk_cancel(self, requests):
+                self.cancel_requests.extend(requests)
+                return {"status": "ok"}
+
+        row = {
+            "levels": [
+                {"side": "buy", "status": "active", "oid": 1, "price": "99", "size": "1"},
+                {"side": "buy", "status": "active", "oid": 2, "price": "98", "size": "1"},
+            ],
+        }
+        exchange = FakeExchange()
+
+        trimmed = trim_excess_grid_entries(exchange, "BTC", row, 1, 123)
+
+        self.assertEqual(trimmed, 0)
+        self.assertEqual(exchange.cancel_requests, [])
+        self.assertEqual([entry["status"] for entry in row["levels"]], ["active", "active"])
+
+    def test_grid_order_moves_away_from_near_active_price_before_submit(self) -> None:
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+            "levels": [
+                {"side": "buy", "status": "active", "oid": 1, "price": "99.1", "size": "1"},
+                {"side": "buy", "status": "active", "oid": 2, "price": "97", "size": "1"},
+            ],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        order = grid_order_entry(row, "BTC", asset, True, Decimal("100"), False)
+
+        moved = move_grid_order_away_from_active(row, asset, order)
+
+        self.assertTrue(moved)
+        self.assertEqual(order["price"], "98.05")
+
     def test_replacement_alo_reject_inserts_between_wide_active_gap_before_moving_farther(self) -> None:
         class FakeExchange:
             def __init__(self) -> None:
@@ -647,8 +691,8 @@ class GridAvgTests(unittest.TestCase):
         )
 
         self.assertTrue(submitted)
-        self.assertEqual(order["price"], "98.05")
-        self.assertEqual([call[2] for call in exchange.orders], [Decimal("100.0"), Decimal("98.05")])
+        self.assertEqual(order["price"], "95.138")
+        self.assertEqual([call[2] for call in exchange.orders], [Decimal("98.05"), Decimal("95.138")])
         self.assertEqual(order["alo_rejects"], 1)
 
     def test_replacement_alo_reject_uses_order_target_gap_for_wide_gap(self) -> None:
@@ -692,8 +736,8 @@ class GridAvgTests(unittest.TestCase):
         )
 
         self.assertTrue(submitted)
-        self.assertEqual(order["price"], "98")
-        self.assertEqual([call[2] for call in exchange.orders], [Decimal("100.0"), Decimal("98")])
+        self.assertEqual(order["price"], "96.04")
+        self.assertEqual([call[2] for call in exchange.orders], [Decimal("98.0"), Decimal("96.04")])
         self.assertEqual(order["alo_rejects"], 1)
 
     def test_replacement_alo_reject_retries_one_gap_farther(self) -> None:
