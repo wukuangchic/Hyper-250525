@@ -30,6 +30,7 @@ import contextlib
 import fcntl
 import io
 import json
+import math
 import os
 import sys
 import time
@@ -105,7 +106,9 @@ DEFAULT_GRID_GAP_LABEL = ["auto-minTick", "auto-takerFee", "auto-makerFee"]
 DEFAULT_GRID_RANGE = ["auto", "auto"]
 GRID_TARGET_ORDERS_PER_SIDE = 10
 GRID_ACCOUNT_MARGIN_RATIO_THRESHOLD = Decimal("0.70")
-GRID_AVG_MAX_MULTIPLIER = Decimal("1.62")
+GRID_AVG_ASYMPTOTIC_SCALE = Decimal("0.33719298245614043")
+GRID_AVG_ASYMPTOTIC_POWER = Decimal("0.1213062962221336")
+GRID_AVG_BOUNDARY_MULTIPLIER = Decimal("1E+9")
 CANCEL_AGE_FILTERS = {"hour", "day", "week"}
 CANCEL_FILTERS = {"all", "up", "down", "buy", "sell", "tp", "sl", "trail", "grid"} | CANCEL_AGE_FILTERS
 CANCEL_AGE_UNIT_MS = {
@@ -2457,7 +2460,19 @@ def grid_avg_multiplier(
         deviation = Decimal("1") if span <= 0 else (current - avg_position_value) / span
         favored_side = "buy" if policy == "short" else "sell"
     deviation = max(Decimal("0"), min(Decimal("1"), deviation))
-    multiplier = Decimal("1") + (GRID_AVG_MAX_MULTIPLIER - Decimal("1")) * deviation
+    if deviation >= Decimal("1"):
+        multiplier = GRID_AVG_BOUNDARY_MULTIPLIER
+    elif deviation <= 0:
+        multiplier = Decimal("1")
+    else:
+        multiplier = Decimal(
+            str(
+                Decimal("1")
+                + GRID_AVG_ASYMPTOTIC_SCALE
+                * Decimal(str(math.pow(float(deviation), float(GRID_AVG_ASYMPTOTIC_POWER))))
+                / (Decimal("1") - deviation)
+            )
+        ).quantize(Decimal("0.00000001")).normalize()
     return multiplier, favored_side, current
 
 
@@ -2473,13 +2488,7 @@ def grid_avg_size_pair(
     favored_side: str | None,
     sz_decimals: int,
 ) -> tuple[Decimal, Decimal]:
-    buy_size = base_buy_size
-    sell_size = base_sell_size
-    if favored_side == "buy":
-        buy_size = round_grid_size_nearest(base_buy_size * multiplier, sz_decimals)
-    elif favored_side == "sell":
-        sell_size = round_grid_size_nearest(base_sell_size * multiplier, sz_decimals)
-    return buy_size, sell_size
+    return base_buy_size, base_sell_size
 
 
 def grid_avg_topup_params(
@@ -5223,7 +5232,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--price", help="Limit price. Defaults to same-side book level 10.")
     parser.add_argument("--offset", dest="symmetric_offset", help="Symmetric order distance from base price, e.g. 2%% or 1500.")
     parser.add_argument("--trend", help="Grid quantity tilt. Default: 0. Positive makes buy size larger, negative makes sell size larger, e.g. 10%% or -10%%.")
-    parser.add_argument("--avg", dest="grid_avg", help="Grid target position value. Dynamically tilts far-side topup size or gap up to 1.62x; mutually exclusive with --trend.")
+    parser.add_argument("--avg", dest="grid_avg", help="Grid target position value. Dynamically widens risk-side far topup gaps; mutually exclusive with --trend.")
     parser.add_argument(
         "--gap",
         nargs="+",

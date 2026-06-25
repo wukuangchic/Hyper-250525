@@ -159,6 +159,20 @@ def is_insufficient_margin_text(text: str) -> bool:
     return "insufficient margin" in text.lower()
 
 
+def is_grid_child_order_reject_text(text: str) -> bool:
+    return "failed to submit grid child order:" in text.lower()
+
+
+def skip_grid_exchange_reject(order: dict[str, Any], error_text: str, now: int) -> bool:
+    if not is_grid_child_order_reject_text(error_text):
+        return False
+    order["status"] = "skipped_exchange_reject"
+    order["oid"] = None
+    order["last_error"] = error_text
+    order["skipped_at"] = now
+    return True
+
+
 def grid_margin_pause_active(
     row: dict[str, Any],
     side: str,
@@ -760,18 +774,7 @@ def replacement_order_from_fill(
     multiplier = Decimal("1") - gap if next_is_buy else Decimal("1") + gap
     next_px = rounded_perp_price(submitted_limit_px * multiplier, sz_decimals)
     reduce_only = grid_order_should_reduce_only(position_size, next_is_buy, policy)
-    next_side = "buy" if next_is_buy else "sell"
-    size = None
-    if str(row.get("avg_favored_side") or "") == next_side:
-        size_key = "topup_buy_size" if next_is_buy else "topup_sell_size"
-        size = Decimal(
-            str(
-                row.get(size_key)
-                or row.get("base_buy_size" if next_is_buy else "base_sell_size")
-                or "0"
-            )
-        )
-    return grid_order_entry(row, coin, asset, next_is_buy, next_px, reduce_only, size=size, gap=gap)
+    return grid_order_entry(row, coin, asset, next_is_buy, next_px, reduce_only, gap=gap)
 
 
 def active_grid_entries(row: dict[str, Any], side: str | None = None) -> list[dict[str, Any]]:
@@ -1027,6 +1030,8 @@ def submit_grid_order_entry(
                     if grid_order_would_add_risk(position_size, bool(order.get("is_buy"))):
                         pause_grid_margin_side(row, str(order.get("side")), now, position_value)
                     return False
+                if skip_grid_exchange_reject(order, error_text, now):
+                    return False
                 if not is_min_order_value_error_text(error_text) or order.get("resized_min_retry_at"):
                     raise
                 bump_grid_order_size_one_step(asset, order)
@@ -1055,6 +1060,8 @@ def submit_grid_order_entry(
             order["paused_at"] = now
             if grid_order_would_add_risk(position_size, bool(order.get("is_buy"))):
                 pause_grid_margin_side(row, str(order.get("side")), now, position_value)
+            return False
+        if skip_grid_exchange_reject(order, error_text, now):
             return False
         if not is_min_order_value_error_text(error_text) or order.get("resized_min_retry_at"):
             raise
