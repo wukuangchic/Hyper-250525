@@ -1300,7 +1300,23 @@ def apply_grid_add_risk_brake(
     if target is None:
         event["status"] = "skipped_no_active_add_risk_order"
     else:
-        cancelled = cancel_grid_entries(exchange, coin, [target], now, "brake_near_add_risk")
+        try:
+            cancelled = cancel_grid_entries(exchange, coin, [target], now, "brake_near_add_risk")
+        except RuntimeError as exc:
+            target["brake_cancel_failed_at"] = now
+            target["brake_cancel_error"] = str(exc)
+            event.update(
+                {
+                    "status": "cancel_failed",
+                    "cancelled_oid": target.get("oid"),
+                    "cancelled_price": target.get("price", target.get("limit_px")),
+                    "error": str(exc),
+                }
+            )
+            row["last_add_risk_brake_pair"] = pair_key
+            row["last_add_risk_brake_at"] = now
+            append_add_risk_brake_history(row, event)
+            return 0
         event.update(
             {
                 "status": "cancelled" if cancelled else "cancel_failed",

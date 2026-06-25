@@ -100,6 +100,28 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(row["levels"][0]["status"], "active")
         self.assertNotIn("last_add_risk_brake_pair", row)
 
+    def test_add_risk_brake_cancel_failure_does_not_raise(self) -> None:
+        class FakeExchange:
+            def bulk_cancel(self, requests):
+                return {"status": "err", "response": "order was already filled"}
+
+        row = {
+            "levels": [
+                {"side": "buy", "status": "active", "oid": 1, "price": "99", "size": "1", "is_buy": True},
+                {"side": "buy", "status": "filled", "oid": 10, "is_buy": True, "fill": {"time": 1000, "dir": "Open Long", "oid": 10}},
+                {"side": "buy", "status": "filled", "oid": 11, "is_buy": True, "fill": {"time": 2000, "dir": "Open Long", "oid": 11}},
+            ]
+        }
+
+        cancelled = apply_grid_add_risk_brake(FakeExchange(), "BTC", row, row["levels"][-1:], Decimal("1"), 123)
+
+        self.assertEqual(cancelled, 0)
+        self.assertEqual(row["levels"][0]["status"], "active")
+        self.assertEqual(row["levels"][0]["brake_cancel_failed_at"], 123)
+        self.assertEqual(row["last_add_risk_brake_pair"], "10:11")
+        self.assertEqual(row["add_risk_brakes"][-1]["status"], "cancel_failed")
+        self.assertIn("order was already filled", row["add_risk_brakes"][-1]["error"])
+
     def test_add_risk_brake_state_prunes_old_pair_and_history(self) -> None:
         row = {
             "last_add_risk_brake_pair": "10:11",
