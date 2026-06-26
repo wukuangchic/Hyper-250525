@@ -246,7 +246,8 @@ BTC --cancel grid
 - 到达持仓上限后，worker 会撤销继续加仓方向的 grid 单，只保留/恢复减仓方向。
 - 仓位降到能容纳下一张加仓单后，worker 再把加仓方向补回到最多 10 张。
 - 补缺失子单时优先参考盘口 best bid/ask，而不是只参考 mid；盘口读取失败时才退回 mid。
-- 加风险方向 active 单超过当前风险密度预算时，worker 会按 `avg_multiplier` / `margin_gap_multiplier` 把允许数量压缩为 `floor(10 / multiplier)`，最低保留 1 张；超过部分按价格近远等距抽稀暂停为 `paused_risk_density`，而不是集中暂停近侧或远侧。系数下降后，`paused_risk_density` 会优先于常规补档恢复。
+- 加风险方向 active 单超过当前风险密度预算时，worker 会按 `avg_multiplier` / `margin_gap_multiplier` 把允许数量压缩为 `floor(10 / multiplier)`，最低保留 1 张；超过部分按价格近远用等比/自然对数分布抽稀暂停为 `paused_risk_density`，近侧保留更密、远侧更疏。系数下降后，`paused_risk_density` 会优先于常规补档恢复。
+- 为避免 1 分钟内盘口被打穿，每侧 active grid 单最多保留 32 张；成交反向单优先提交，提交后若超过 32 张，再按近密远疏的等比/自然对数分布优先保留成交反向单并暂停其他旧 active 为 `paused_active_cap`，之后在 active 少于 32 张时按保存顺序逐步恢复。
 - 为避免异常循环无限堆积可恢复记录，`levels` 内同侧 active、pending、recovery_deferred 和 paused 合计最多保留 500 张；历史记录不占这个名额，仍由独立历史裁剪控制。超过时会优先清理普通 paused，必要时先撤交易所 active 挂单再从本地清除，`replacement_order` 最后才会被清。
 - 全仓或逐仓的加仓方向若被交易所以保证金不足拒绝，worker 会对该方向冷却 10 分钟，本轮不再继续试单；减仓方向照常维护。仓位缩小会提前解除冷却，否则到期后探测一次。
 - reduce-only 子单的活动数量总和不会超过当前可减仓数量；交易所因可减仓数量不足自动取消的 `reduceOnlyCanceled` 不会被当作手动撤单反复补回。

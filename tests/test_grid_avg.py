@@ -19,6 +19,7 @@ from trail_worker import (
     apply_grid_add_risk_brake,
     dense_grid_entries,
     defer_paused_grid_restore_if_crossing,
+    grid_active_cap_pause_candidates,
     grid_margin_gap_multiplier,
     grid_order_entry,
     grid_risk_density_pause_candidates,
@@ -360,7 +361,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(reduce_risk_topup["price"], "111.1")
         self.assertEqual(reduce_risk_topup["plan"]["grid_gap"], Decimal("0.01"))
 
-    def test_risk_density_pauses_evenly_across_add_risk_orders(self) -> None:
+    def test_risk_density_pauses_logarithmically_across_add_risk_orders(self) -> None:
         row = {
             "gap_rate": "0.01",
             "avg_multiplier": "2",
@@ -389,7 +390,58 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(allowed, 5)
         self.assertEqual(multiplier, Decimal("2"))
         paused_oids = [entry["oid"] for entry in candidates]
-        self.assertEqual(paused_oids, [1, 2, 3, 4, 6, 7, 8, 9, 11, 12, 13, 15, 16, 17, 18])
+        self.assertEqual(paused_oids, [2, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18])
+
+    def test_active_cap_pauses_logarithmically_beyond_thirty_two_active_orders(self) -> None:
+        row = {
+            "levels": [
+                {
+                    "side": "sell",
+                    "status": "active",
+                    "oid": oid,
+                    "is_buy": False,
+                    "price": str(100 + oid),
+                    "size": "1",
+                }
+                for oid in range(40)
+            ],
+        }
+
+        candidates, allowed = grid_active_cap_pause_candidates(row, "sell")
+
+        self.assertEqual(allowed, 32)
+        self.assertEqual([entry["oid"] for entry in candidates], [29, 30, 32, 33, 34, 36, 37, 38])
+
+    def test_active_cap_keeps_replacement_before_regular_orders(self) -> None:
+        row = {
+            "levels": [
+                {
+                    "side": "sell",
+                    "status": "active",
+                    "oid": oid,
+                    "is_buy": False,
+                    "price": str(100 + oid),
+                    "size": "1",
+                }
+                for oid in range(32)
+            ]
+        }
+        row["levels"].append(
+            {
+                "side": "sell",
+                "status": "active",
+                "oid": 999,
+                "is_buy": False,
+                "price": "200",
+                "size": "1",
+                "replacement_order": True,
+            }
+        )
+
+        candidates, allowed = grid_active_cap_pause_candidates(row, "sell")
+
+        self.assertEqual(allowed, 32)
+        self.assertEqual([entry["oid"] for entry in candidates], [30])
 
     def test_side_cap_clear_removes_paused_before_active(self) -> None:
         class FakeExchange:

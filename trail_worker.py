@@ -69,7 +69,9 @@ GRID_NEAR_REGRID_STALE_GAP_MULTIPLE = Decimal("30")
 GRID_NEAR_REGRID_TARGET_GAP_MULTIPLE = Decimal("15")
 GRID_REPLACEMENT_PAUSE_STATUS = "paused_replacement"
 GRID_RISK_DENSITY_PAUSE_STATUS = "paused_risk_density"
+GRID_ACTIVE_CAP_PAUSE_STATUS = "paused_active_cap"
 GRID_MAX_LEVELS_PER_SIDE = 500
+GRID_MAX_ACTIVE_ORDERS_PER_SIDE = 32
 GRID_PAUSED_STATUSES = {
     "paused_max",
     "paused_limit",
@@ -77,6 +79,7 @@ GRID_PAUSED_STATUSES = {
     "paused_reduce_capacity",
     GRID_REPLACEMENT_PAUSE_STATUS,
     GRID_RISK_DENSITY_PAUSE_STATUS,
+    GRID_ACTIVE_CAP_PAUSE_STATUS,
 }
 GRID_PRICE_OCCUPANCY_STATUSES = {
     "active",
@@ -1064,17 +1067,25 @@ def clear_grid_side_cap_entries(exchange: Any, coin: str, row: dict[str, Any], n
     return len(to_clear)
 
 
-def evenly_spaced_keep_indexes(count: int, keep_count: int) -> set[int]:
+def logarithmic_keep_indexes(count: int, keep_count: int) -> set[int]:
     if keep_count <= 0:
         return set()
     if keep_count >= count:
         return set(range(count))
     if keep_count == 1:
         return {0}
-    return {
-        int((Decimal(i) * Decimal(count - 1) / Decimal(keep_count - 1)).to_integral_value(rounding=ROUND_HALF_UP))
-        for i in range(keep_count)
-    }
+    log_count = Decimal(str(math.log(count)))
+    keep: set[int] = set()
+    for index in range(keep_count):
+        exponent = log_count * Decimal(index) / Decimal(keep_count - 1)
+        raw = Decimal(str(math.exp(float(exponent)))) - Decimal("1")
+        keep.add(max(0, min(count - 1, int(raw.to_integral_value(rounding=ROUND_HALF_UP)))))
+    if len(keep) < keep_count:
+        for index in range(count):
+            keep.add(index)
+            if len(keep) >= keep_count:
+                break
+    return keep
 
 
 def grid_margin_gap_multiplier(margin_ratio: Decimal | None) -> Decimal:
@@ -1130,13 +1141,36 @@ def grid_risk_density_pause_candidates(
     if len(active_add_risk) <= allowed:
         return [], allowed, multiplier
     active_add_risk.sort(key=lambda entry: grid_entry_near_to_far_key(entry, side))
-    keep_indexes = evenly_spaced_keep_indexes(len(active_add_risk), allowed)
+    keep_indexes = logarithmic_keep_indexes(len(active_add_risk), allowed)
     to_pause = [
         entry
         for index, entry in enumerate(active_add_risk)
         if index not in keep_indexes and not bool(entry.get("replacement_order"))
     ]
     return to_pause, allowed, multiplier
+
+
+def grid_active_cap_pause_candidates(
+    row: dict[str, Any],
+    side: str,
+    max_active_per_side: int = GRID_MAX_ACTIVE_ORDERS_PER_SIDE,
+) -> tuple[list[dict[str, Any]], int]:
+    active = active_grid_entries(row, side)
+    if len(active) <= max_active_per_side:
+        return [], max_active_per_side
+    replacements = [entry for entry in active if bool(entry.get("replacement_order"))]
+    regular = [entry for entry in active if not bool(entry.get("replacement_order"))]
+    replacements.sort(key=lambda entry: grid_entry_near_to_far_key(entry, side))
+    regular.sort(key=lambda entry: grid_entry_near_to_far_key(entry, side))
+    if len(replacements) >= max_active_per_side:
+        keep_indexes = logarithmic_keep_indexes(len(replacements), max_active_per_side)
+        keep_ids = {id(entry) for index, entry in enumerate(replacements) if index in keep_indexes}
+        return [entry for entry in active if id(entry) not in keep_ids], max_active_per_side
+    regular_keep_count = max_active_per_side - len(replacements)
+    keep_indexes = logarithmic_keep_indexes(len(regular), regular_keep_count)
+    keep_ids = {id(entry) for entry in replacements}
+    keep_ids.update(id(entry) for index, entry in enumerate(regular) if index in keep_indexes)
+    return [entry for entry in active if id(entry) not in keep_ids], max_active_per_side
 
 
 def next_depth_order(
@@ -1996,6 +2030,20 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 risk_density_multiplier.get(str(entry.get("side") or ""), Decimal("1"))
             )
             entry["risk_density_paused_at"] = now
+    paused_density_ids = {id(entry) for entry in to_pause_density}
+    to_pause_active_cap: list[dict[str, Any]] = []
+    for side in ("buy", "sell"):
+        candidates, allowed = grid_active_cap_pause_candidates(row, side)
+        to_pause_active_cap.extend(
+            entry
+            for entry in candidates
+            if id(entry) not in paused_limit_ids and id(entry) not in paused_density_ids
+        )
+    if to_pause_active_cap:
+        paused += cancel_grid_entries(exchange, coin, to_pause_active_cap, now, GRID_ACTIVE_CAP_PAUSE_STATUS)
+        for entry in to_pause_active_cap:
+            entry["active_cap_allowed"] = GRID_MAX_ACTIVE_ORDERS_PER_SIDE
+            entry["active_cap_paused_at"] = now
     if paused:
         changed = True
 
@@ -2084,6 +2132,17 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         replacements += 1
         changed = True
 
+    to_pause_post_replacement_cap: list[dict[str, Any]] = []
+    for side in ("buy", "sell"):
+        candidates, _allowed = grid_active_cap_pause_candidates(row, side)
+        to_pause_post_replacement_cap.extend(candidates)
+    if to_pause_post_replacement_cap:
+        paused += cancel_grid_entries(exchange, coin, to_pause_post_replacement_cap, now, GRID_ACTIVE_CAP_PAUSE_STATUS)
+        for entry in to_pause_post_replacement_cap:
+            entry["active_cap_allowed"] = GRID_MAX_ACTIVE_ORDERS_PER_SIDE
+            entry["active_cap_paused_at"] = now
+        changed = True
+
     restored = 0
     for entry in levels:
         if (
@@ -2095,6 +2154,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             continue
         side = str(entry["side"])
         if not side_submission_allowed(side):
+            continue
+        if len(active_grid_oids(row, side)) >= GRID_MAX_ACTIVE_ORDERS_PER_SIDE:
             continue
         if grid_order_would_add_risk(position_size, bool(entry.get("is_buy"))):
             _candidates, allowed, _multiplier = grid_risk_density_pause_candidates(
@@ -2201,6 +2262,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         status = str(entry.get("status"))
         if not side_submission_allowed(side):
             continue
+        if status == GRID_ACTIVE_CAP_PAUSE_STATUS and len(active_grid_oids(row, side)) >= GRID_MAX_ACTIVE_ORDERS_PER_SIDE:
+            continue
         if not is_replacement_order:
             if status == GRID_RISK_DENSITY_PAUSE_STATUS and grid_order_would_add_risk(position_size, bool(entry.get("is_buy"))):
                 _candidates, allowed, _multiplier = grid_risk_density_pause_candidates(
@@ -2217,6 +2280,22 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 )
                 if active_add_risk_count >= allowed:
                     continue
+            elif status == GRID_ACTIVE_CAP_PAUSE_STATUS:
+                if grid_order_would_add_risk(position_size, bool(entry.get("is_buy"))):
+                    _candidates, allowed, _multiplier = grid_risk_density_pause_candidates(
+                        row,
+                        side,
+                        position_size,
+                        target_per_side,
+                        margin_gap_multiplier,
+                    )
+                    active_add_risk_count = sum(
+                        1
+                        for active in active_grid_entries(row, side)
+                        if grid_order_would_add_risk(position_size, bool(active.get("is_buy")))
+                    )
+                    if active_add_risk_count >= allowed:
+                        continue
             elif len(active_grid_oids(row, side)) >= target_per_side:
                 continue
         if grid_margin_pause_active(row, side, now, position_value, position_size):
