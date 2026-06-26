@@ -10,6 +10,7 @@ from hl_order import (
     grid_avg_multiplier,
     grid_avg_size_pair,
     grid_avg_topup_params,
+    format_grid_detail_rows,
     grid_query_avg_summary,
     refresh_grid_row_strategy_params,
 )
@@ -42,6 +43,20 @@ from trail_worker import (
 
 
 class GridAvgTests(unittest.TestCase):
+    def test_grid_detail_rows_sort_all_sides_by_price_desc(self) -> None:
+        row = {
+            "levels": [
+                {"side": "buy", "status": "active", "oid": 1, "price": "99", "size": "1"},
+                {"side": "sell", "status": "active", "oid": 2, "price": "105", "size": "1"},
+                {"side": "sell", "status": "active", "oid": 3, "price": "103", "size": "1"},
+                {"side": "buy", "status": "active", "oid": 4, "price": "101", "size": "1"},
+            ]
+        }
+
+        rows = format_grid_detail_rows(row, {1, 2, 3, 4})
+
+        self.assertEqual([item["price"] for item in rows], ["105.00", "103.00", "101.00", "99.00"])
+
     def test_panic_ratio_short_uses_liq_above_mid_and_buy_below_mid(self) -> None:
         row = {
             "levels": [

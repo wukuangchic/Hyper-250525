@@ -1604,16 +1604,14 @@ def print_recent_history(
     )
 
 
-def grid_entry_sort_key(entry: dict[str, Any]) -> tuple[int, Decimal, int]:
+def grid_entry_sort_key(entry: dict[str, Any]) -> tuple[Decimal, int, int]:
     side_rank = 0 if str(entry.get("side")) == "buy" else 1
     price = decimal_or_none(entry.get("price", entry.get("limit_px"))) or Decimal("0")
-    if side_rank == 0:
-        price = -price
     try:
         oid = int(entry.get("oid") or 0)
     except (TypeError, ValueError):
         oid = 0
-    return side_rank, price, oid
+    return -price, side_rank, oid
 
 
 def format_grid_detail_rows(row: dict[str, Any], open_oids: set[int]) -> list[dict[str, str]]:
