@@ -807,12 +807,18 @@ def move_grid_order_away_from_active(
 
 
 def advance_grid_order_away_from_active(row: dict[str, Any], asset: dict[str, Any], order: dict[str, Any]) -> bool:
+    side = str(order.get("side") or "")
     price = decimal_or_none(order.get("price", order.get("limit_px")))
-    if price is None or price <= 0:
+    if not side or price is None or price <= 0:
         return False
-    next_price = grid_insert_price_between_active_gap(row, asset, order)
-    if next_price is None or next_price <= 0 or next_price == price:
+    if active_price_too_close(row, side, price, exclude=order, spacing_multiplier=GRID_ALO_SPACING_MULTIPLIER):
+        next_price = grid_insert_price_between_active_gap(row, asset, order)
+        if next_price is None or next_price <= 0 or next_price == price:
+            next_price = next_outward_grid_price(row, asset, order)
+    else:
         next_price = next_outward_grid_price(row, asset, order)
+        if next_price is None or next_price <= 0 or next_price == price:
+            next_price = grid_insert_price_between_active_gap(row, asset, order)
     if next_price is None or next_price <= 0 or next_price == price:
         return False
     set_grid_order_price(order, next_price)

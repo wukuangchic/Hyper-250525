@@ -1105,6 +1105,51 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(order["price"], "101")
         self.assertEqual(order["alo_rejects"], 1)
 
+    def test_replacement_alo_reject_moves_outward_before_inserting_when_not_too_close(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.prices = []
+
+            def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
+                self.prices.append(Decimal(str(limit_px)))
+                if len(self.prices) == 1:
+                    return {"status": "ok", "response": {"data": {"statuses": [{"error": "Post only would immediately match"}]}}}
+                return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 789}}]}}}
+
+        exchange = FakeExchange()
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+            "levels": [
+                {"side": "buy", "status": "active", "oid": 1, "price": "98", "size": "1"},
+                {"side": "buy", "status": "active", "oid": 2, "price": "95", "size": "1"},
+            ],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        order = grid_order_entry(row, "BTC", asset, True, Decimal("100"), False)
+
+        submitted = submit_grid_order_entry(
+            exchange,
+            "BTC",
+            order,
+            1,
+            row,
+            asset,
+            Decimal("0"),
+            Decimal("0"),
+            "abs",
+            False,
+            set(),
+            True,
+        )
+
+        self.assertTrue(submitted)
+        self.assertEqual(exchange.prices, [Decimal("100.0"), Decimal("99.0")])
+        self.assertEqual(order["price"], "99")
+        self.assertEqual(order["alo_rejects"], 1)
+
     def test_refresh_strategy_params_keeps_existing_levels(self) -> None:
         levels = [
             {"side": "buy", "status": "active", "oid": 1, "price": "90", "size": "0.1"},
