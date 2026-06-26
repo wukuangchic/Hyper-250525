@@ -15,10 +15,12 @@ from hl_order import (
 )
 from trail_worker import (
     active_grid_oids,
+    build_grid_panic_reduce_order,
     clear_grid_side_cap_entries,
     apply_grid_add_risk_brake,
     dense_grid_entries,
     defer_paused_grid_restore_if_crossing,
+    grid_panic_ratio,
     grid_active_cap_restore_allowed,
     grid_active_cap_pause_candidates,
     grid_margin_gap_multiplier,
@@ -40,6 +42,66 @@ from trail_worker import (
 
 
 class GridAvgTests(unittest.TestCase):
+    def test_panic_ratio_short_uses_liq_above_mid_and_buy_below_mid(self) -> None:
+        row = {
+            "levels": [
+                {"side": "buy", "status": "active", "oid": 1, "price": "63", "size": "1"},
+                {"side": "buy", "status": "active", "oid": 2, "price": "60", "size": "1"},
+            ]
+        }
+
+        ratio = grid_panic_ratio(row, Decimal("-4"), Decimal("64"), Decimal("72"))
+
+        self.assertEqual(ratio, Decimal("8"))
+
+    def test_panic_ratio_long_uses_liq_below_mid_and_sell_above_mid(self) -> None:
+        row = {
+            "levels": [
+                {"side": "sell", "status": "active", "oid": 1, "price": "105", "size": "1"},
+                {"side": "sell", "status": "active", "oid": 2, "price": "110", "size": "1"},
+            ]
+        }
+
+        ratio = grid_panic_ratio(row, Decimal("4"), Decimal("100"), Decimal("60"))
+
+        self.assertEqual(ratio, Decimal("8"))
+
+    def test_panic_ratio_ignores_inverted_price_geometry(self) -> None:
+        short_row = {"levels": [{"side": "buy", "status": "active", "oid": 1, "price": "65", "size": "1"}]}
+        long_row = {"levels": [{"side": "sell", "status": "active", "oid": 1, "price": "99", "size": "1"}]}
+
+        self.assertIsNone(grid_panic_ratio(short_row, Decimal("-4"), Decimal("64"), Decimal("72")))
+        self.assertIsNone(grid_panic_ratio(long_row, Decimal("4"), Decimal("100"), Decimal("60")))
+
+    def test_panic_reduce_order_uses_base_size_ioc_and_reduce_only(self) -> None:
+        class FakeExchange:
+            def _slippage_price(self, coin, is_buy, slippage, reference_price):
+                self.args = (coin, is_buy, Decimal(str(slippage)), Decimal(str(reference_price)))
+                return reference_price * (1.001 if is_buy else 0.999)
+
+        row = {
+            "base_buy_size": "0.16",
+            "base_sell_size": "0.16",
+            "slippage": "0.001",
+            "sz_decimals": 2,
+        }
+
+        order = build_grid_panic_reduce_order(
+            FakeExchange(),
+            row,
+            "HYPE",
+            {"szDecimals": 2},
+            Decimal("64"),
+            Decimal("-4.28"),
+        )
+
+        self.assertIsNotNone(order)
+        self.assertEqual(order["side"], "buy")
+        self.assertEqual(order["size"], "0.16")
+        self.assertTrue(order["reduce_only"])
+        self.assertEqual(order["plan"]["order_type"], {"limit": {"tif": "Ioc"}})
+        self.assertTrue(order["plan"]["reduce_only"])
+
     def test_add_risk_brake_cancels_nearest_same_side_after_two_open_fills(self) -> None:
         class FakeExchange:
             def __init__(self) -> None:
@@ -505,7 +567,7 @@ class GridAvgTests(unittest.TestCase):
         row = {
             "levels": [
                 {"side": "buy", "status": "active", "oid": oid, "price": str(100 - oid), "size": "1"}
-                for oid in range(500)
+                for oid in range(1024)
             ]
         }
         row["levels"].append({"side": "buy", "status": "paused_risk_density", "oid": None, "price": "1", "size": "1"})
@@ -514,7 +576,7 @@ class GridAvgTests(unittest.TestCase):
         cleared = clear_grid_side_cap_entries(exchange, "BTC", row, 123)
 
         self.assertEqual(cleared, 1)
-        self.assertEqual(len([entry for entry in row["levels"] if entry["side"] == "buy"]), 500)
+        self.assertEqual(len([entry for entry in row["levels"] if entry["side"] == "buy"]), 1024)
         self.assertEqual(exchange.cancelled, [])
         self.assertNotIn("paused_risk_density", {entry["status"] for entry in row["levels"]})
 
@@ -537,7 +599,7 @@ class GridAvgTests(unittest.TestCase):
                     "size": "1",
                     "submitted_at": oid,
                 }
-                for oid in range(501)
+                for oid in range(1025)
             ]
         }
         exchange = FakeExchange()
@@ -546,7 +608,7 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertEqual(cleared, 1)
         self.assertEqual(exchange.cancelled, [{"coin": "BTC", "oid": 0}])
-        self.assertEqual(len([entry for entry in row["levels"] if entry["side"] == "sell"]), 500)
+        self.assertEqual(len([entry for entry in row["levels"] if entry["side"] == "sell"]), 1024)
         self.assertNotIn(0, {entry["oid"] for entry in row["levels"]})
 
     def test_side_cap_clear_ignores_history_records(self) -> None:
@@ -561,7 +623,7 @@ class GridAvgTests(unittest.TestCase):
         row = {
             "levels": [
                 {"side": "buy", "status": "active", "oid": oid, "price": str(100 - oid), "size": "1"}
-                for oid in range(500)
+                for oid in range(1024)
             ]
         }
         row["levels"].extend(
@@ -573,7 +635,7 @@ class GridAvgTests(unittest.TestCase):
         cleared = clear_grid_side_cap_entries(exchange, "BTC", row, 123)
 
         self.assertEqual(cleared, 0)
-        self.assertEqual(len([entry for entry in row["levels"] if entry["side"] == "buy"]), 520)
+        self.assertEqual(len([entry for entry in row["levels"] if entry["side"] == "buy"]), 1044)
         self.assertEqual(exchange.cancelled, [])
 
     def test_far_topup_inserts_between_active_gap_using_target_gap(self) -> None:

@@ -25,10 +25,10 @@ from hl_order import (  # noqa: E402
     build_grid_limit_order_plan,
     build_trigger_order_plan,
     collect_frontend_open_orders,
-    current_position_size_value,
     decimal_or_none,
     decimal_to_plain,
     fill_matches_coin,
+    find_current_position,
     format_signed_percent,
     grid_avg_multiplier,
     grid_avg_topup_params,
@@ -49,6 +49,7 @@ from hl_order import (  # noqa: E402
     trail_stop_price,
     update_isolated_opening_leverage,
 )
+from simple_hyper.order_specs import MIN_NOTIONAL
 
 
 RATE_LIMIT_LOG_PATH = Path(__file__).resolve().parent / "logs" / "trail-rate-limit.jsonl"
@@ -67,10 +68,11 @@ GRID_ALO_PRICE_ATTEMPT_LIMIT = 20
 GRID_ALO_SPACING_MULTIPLIER = Decimal("0.95")
 GRID_NEAR_REGRID_STALE_GAP_MULTIPLE = Decimal("30")
 GRID_NEAR_REGRID_TARGET_GAP_MULTIPLE = Decimal("15")
+GRID_PANIC_RATIO_THRESHOLD = Decimal("10")
 GRID_REPLACEMENT_PAUSE_STATUS = "paused_replacement"
 GRID_RISK_DENSITY_PAUSE_STATUS = "paused_risk_density"
 GRID_ACTIVE_CAP_PAUSE_STATUS = "paused_active_cap"
-GRID_MAX_LEVELS_PER_SIDE = 500
+GRID_MAX_LEVELS_PER_SIDE = 1024
 GRID_MAX_ACTIVE_ORDERS_PER_SIDE = 32
 GRID_PAUSED_STATUSES = {
     "paused_max",
@@ -978,6 +980,42 @@ def nearest_active_price(row: dict[str, Any], side: str) -> Decimal | None:
     return max(prices) if side == "buy" else min(prices)
 
 
+def grid_panic_ratio_threshold(row: dict[str, Any]) -> Decimal:
+    threshold = decimal_or_none(row.get("panic_ratio_threshold"))
+    if threshold is None or threshold <= 0:
+        return GRID_PANIC_RATIO_THRESHOLD
+    return threshold
+
+
+def grid_panic_ratio(
+    row: dict[str, Any],
+    position_size: Decimal,
+    current_mid: Decimal,
+    liquidation_px: Decimal | None,
+) -> Decimal | None:
+    if position_size == 0 or current_mid <= 0 or liquidation_px is None or liquidation_px <= 0:
+        return None
+    reduce_side = reduce_side_for_position(position_size)
+    if reduce_side is None:
+        return None
+    nearest_reduce_px = nearest_active_price(row, reduce_side)
+    if nearest_reduce_px is None or nearest_reduce_px <= 0:
+        return None
+    if position_size < 0:
+        if liquidation_px <= current_mid or nearest_reduce_px >= current_mid:
+            return None
+        liquidation_distance = liquidation_px - current_mid
+        reduce_distance = current_mid - nearest_reduce_px
+    else:
+        if liquidation_px >= current_mid or nearest_reduce_px <= current_mid:
+            return None
+        liquidation_distance = current_mid - liquidation_px
+        reduce_distance = nearest_reduce_px - current_mid
+    if liquidation_distance <= 0 or reduce_distance <= 0:
+        return None
+    return liquidation_distance / reduce_distance
+
+
 def grid_entry_gap_rate(row: dict[str, Any], entry: dict[str, Any]) -> Decimal:
     plan = entry.get("plan")
     if isinstance(plan, dict):
@@ -1496,6 +1534,118 @@ def submit_grid_order_entry(
     return True
 
 
+def build_grid_panic_reduce_order(
+    exchange: Any,
+    row: dict[str, Any],
+    coin: str,
+    asset: dict[str, Any],
+    current_mid: Decimal,
+    position_size: Decimal,
+) -> dict[str, Any] | None:
+    if position_size == 0 or current_mid <= 0:
+        return None
+    is_buy = position_size < 0
+    side = "buy" if is_buy else "sell"
+    size_key = "base_buy_size" if is_buy else "base_sell_size"
+    size = decimal_or_none(row.get(size_key))
+    if size is None or size <= 0:
+        return None
+    max_size = abs(position_size)
+    if max_size <= 0:
+        return None
+    size = min(size, max_size)
+    sz_decimals = int(row.get("sz_decimals") or asset["szDecimals"])
+    step = Decimal(1).scaleb(-sz_decimals)
+    size = (size / step).to_integral_value(rounding=ROUND_FLOOR) * step
+    if size <= 0:
+        return None
+    slippage = Decimal(str(row.get("slippage") or DEFAULT_SLIPPAGE))
+    limit_px = Decimal(str(exchange._slippage_price(coin, is_buy, float(slippage), float(current_mid))))
+    limit_px = rounded_perp_price(limit_px, sz_decimals)
+    if limit_px <= 0:
+        return None
+    if size * limit_px < MIN_NOTIONAL:
+        size = grid_size_for_min_notional(size, limit_px, sz_decimals, MIN_NOTIONAL)
+        size = min(size, max_size)
+        size = (size / step).to_integral_value(rounding=ROUND_FLOOR) * step
+        if size <= 0:
+            return None
+        if size * limit_px < MIN_NOTIONAL:
+            return None
+    notional = size * limit_px
+    return {
+        "side": side,
+        "is_buy": is_buy,
+        "size": decimal_to_plain(size),
+        "price": decimal_to_plain(limit_px),
+        "limit_px": decimal_to_plain(limit_px),
+        "reduce_only": True,
+        "plan": {
+            "label": "grid-panic-reduce",
+            "coin": coin,
+            "is_buy": is_buy,
+            "size": size,
+            "limit_px": limit_px,
+            "order_type": {"limit": {"tif": "Ioc"}},
+            "reduce_only": True,
+            "mode": "market",
+            "notional": notional,
+            "target_notional": notional,
+            "worst_notional": notional,
+            "reference_price": current_mid,
+            "price_source": f"mid with {slippage} slippage protection",
+        },
+    }
+
+
+def submit_grid_panic_reduce(
+    exchange: Any,
+    coin: str,
+    order: dict[str, Any],
+    now: int,
+    row: dict[str, Any],
+) -> bool:
+    plan = order.get("plan")
+    if not isinstance(plan, dict):
+        return False
+    result = exchange.order(
+        coin,
+        bool(plan["is_buy"]),
+        float(plan["size"]),
+        float(plan["limit_px"]),
+        plan["order_type"],
+        reduce_only=True,
+    )
+    log_event("grid_panic_reduce_order", {"coin": coin, "side": order.get("side"), "result": result})
+    if result.get("status") != "ok":
+        row["panic_reduce_error"] = str(result)
+        row["panic_reduce_error_at"] = now
+        return False
+    statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+    for status in statuses:
+        if not isinstance(status, dict):
+            continue
+        if status.get("error"):
+            row["panic_reduce_error"] = str(status["error"])
+            row["panic_reduce_error_at"] = now
+            return False
+        if isinstance(status.get("filled"), dict):
+            order["oid"] = int(status["filled"].get("oid", 0))
+            order["status"] = "filled"
+            order["filled_at"] = now
+            order["last_submit_status"] = status
+            return True
+        if isinstance(status.get("resting"), dict):
+            order["oid"] = int(status["resting"].get("oid", 0))
+            order["status"] = "active"
+            order["submitted_at"] = now
+            order["last_submit_status"] = status
+            return True
+    row["panic_reduce_error"] = f"panic reduce response did not include an order id: {result}"
+    row["panic_reduce_error_at"] = now
+    return False
+
+
 def cancel_grid_entries(exchange: Any, coin: str, entries: list[dict[str, Any]], now: int, note: str) -> int:
     requests = []
     for entry in entries:
@@ -1848,7 +1998,19 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     mids = mids_cache[mids_key]
     current_mid = Decimal(str(mids[coin]))
     best_bid, best_ask = best_bid_ask(info, coin)
-    position_size, position_value = current_position_size_value(info, account, coin, dex, current_mid)
+    current_position = find_current_position(info, account, coin, dex)
+    if current_position is None:
+        position_size = Decimal("0")
+        position_value = Decimal("0")
+        liquidation_px = None
+    else:
+        position_size = Decimal(str(current_position.get("szi", "0")))
+        position_value = decimal_or_none(current_position.get("positionValue"))
+        if position_value is None:
+            position_value = abs(position_size * current_mid)
+        else:
+            position_value = abs(position_value)
+        liquidation_px = decimal_or_none(current_position.get("liquidationPx"))
     previous_avg_state = (
         row.get("topup_buy_size"),
         row.get("topup_sell_size"),
@@ -2178,6 +2340,40 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             else:
                 projected = max(Decimal("0"), projected - order_notional)
         projected_position_values[side] = projected
+    previous_panic_state = (
+        row.get("panic_ratio"),
+        row.get("panic_ratio_threshold"),
+        row.get("panic_liquidation_px"),
+    )
+    panic_ratio = grid_panic_ratio(row, position_size, current_mid, liquidation_px)
+    panic_threshold = grid_panic_ratio_threshold(row)
+    panic_reduced = 0
+    row["panic_ratio_threshold"] = decimal_to_plain(panic_threshold)
+    row["panic_ratio"] = decimal_to_plain(panic_ratio) if panic_ratio is not None else None
+    row["panic_liquidation_px"] = decimal_to_plain(liquidation_px) if liquidation_px is not None else None
+    if previous_panic_state != (
+        row.get("panic_ratio"),
+        row.get("panic_ratio_threshold"),
+        row.get("panic_liquidation_px"),
+    ):
+        changed = True
+    if panic_ratio is not None and panic_ratio < panic_threshold:
+        panic_order = build_grid_panic_reduce_order(exchange, row, coin, asset, current_mid, position_size)
+        if panic_order is not None:
+            panic_order["panic_ratio"] = decimal_to_plain(panic_ratio)
+            panic_order["panic_ratio_threshold"] = decimal_to_plain(panic_threshold)
+            submitted = submit_grid_panic_reduce(exchange, coin, panic_order, now, row)
+            if submitted:
+                panic_reduced = 1
+                row["panic_reduce_at"] = now
+                row["panic_reduce_count"] = int(row.get("panic_reduce_count") or 0) + 1
+                row["panic_reduce_side"] = panic_order.get("side")
+                row["panic_reduce_size"] = panic_order.get("size")
+                row["panic_reduce_price"] = panic_order.get("price")
+                row["panic_reduce_ratio"] = decimal_to_plain(panic_ratio)
+                row.pop("panic_reduce_error", None)
+                row.pop("panic_reduce_error_at", None)
+                changed = True
     replacements = 0
     for entry in newly_filled:
         submitted_limit_px = decimal_or_none(entry.get("price", entry.get("limit_px"))) or Decimal("0")
@@ -2252,6 +2448,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         ):
             continue
         side = str(entry["side"])
+        if panic_reduced and grid_order_would_add_risk(position_size, side == "buy"):
+            continue
         if not side_submission_allowed(side):
             continue
         if len(active_grid_oids(row, side)) >= GRID_MAX_ACTIVE_ORDERS_PER_SIDE:
@@ -2293,6 +2491,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
 
     topped_up = 0
     for side in ("buy", "sell"):
+        if panic_reduced and grid_order_would_add_risk(position_size, side == "buy"):
+            continue
         if not side_submission_allowed(side):
             continue
         if grid_margin_pause_active(row, side, now, position_value, position_size):
@@ -2353,6 +2553,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         side = str(entry["side"])
         is_replacement_order = bool(entry.get("replacement_order"))
         status = str(entry.get("status"))
+        if panic_reduced and not is_replacement_order and grid_order_would_add_risk(position_size, side == "buy"):
+            continue
         if not side_submission_allowed(side):
             continue
         if status == GRID_ACTIVE_CAP_PAUSE_STATUS and not grid_active_cap_restore_allowed(row, entry, side):
@@ -2441,7 +2643,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         f"filled_stop={','.join(sorted(filled_submission_sides)) or '-'}; "
         f"avg={row.get('avg') if row.get('avg') is not None else '-'}; avg_multiplier={row.get('avg_multiplier', '1')}; "
         f"margin_gap_multiplier={decimal_to_plain(margin_gap_multiplier)}; "
-        f"account_margin={margin_ratio_label}; account_protected={int(account_margin_protected)}"
+        f"account_margin={margin_ratio_label}; account_protected={int(account_margin_protected)}; "
+        f"panic_ratio={row.get('panic_ratio') or '-'}; panic_reduced={panic_reduced}"
     )
     return (
         row,
@@ -2456,7 +2659,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         or side_cap_cleared > 0
         or near_regrids > 0
         or add_risk_braked > 0
-        or recovered_missing > 0,
+        or recovered_missing > 0
+        or panic_reduced > 0,
     )
 
 
