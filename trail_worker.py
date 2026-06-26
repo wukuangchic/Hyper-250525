@@ -690,11 +690,15 @@ def refresh_grid_order_reduce_only(order: dict[str, Any], position_size: Decimal
         plan["reduce_only"] = reduce_only
 
 
-def refresh_grid_order_tif(order: dict[str, Any]) -> None:
+def set_grid_order_tif(order: dict[str, Any], tif: str) -> None:
     plan = order.get("plan")
     if not isinstance(plan, dict):
         return
-    plan["order_type"] = {"limit": {"tif": "Alo"}}
+    plan["order_type"] = {"limit": {"tif": tif}}
+
+
+def refresh_grid_order_tif(order: dict[str, Any]) -> None:
+    set_grid_order_tif(order, "Alo")
 
 
 def set_grid_order_price(order: dict[str, Any], price: Decimal) -> None:
@@ -1429,6 +1433,7 @@ def submit_grid_order_entry(
             order["skipped_at"] = now
             order["alo_rejects"] = alo_rejects
             return False
+        set_grid_order_tif(order, "Gtc")
         for attempt in range(1, GRID_ALO_PRICE_ATTEMPT_LIMIT):
             price = decimal_or_none(order.get("price", order.get("limit_px")))
             if price is None or price <= 0:

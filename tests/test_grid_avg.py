@@ -1110,6 +1110,8 @@ class GridAvgTests(unittest.TestCase):
         self.assertTrue(submitted)
         self.assertEqual(order["price"], "95.138")
         self.assertEqual([call[2] for call in exchange.orders], [Decimal("98.05"), Decimal("95.138")])
+        self.assertEqual([call[3] for call in exchange.orders], [{"limit": {"tif": "Alo"}}, {"limit": {"tif": "Gtc"}}])
+        self.assertEqual(order["plan"]["order_type"], {"limit": {"tif": "Gtc"}})
         self.assertEqual(order["alo_rejects"], 1)
 
     def test_replacement_alo_reject_uses_order_target_gap_for_wide_gap(self) -> None:
@@ -1155,6 +1157,8 @@ class GridAvgTests(unittest.TestCase):
         self.assertTrue(submitted)
         self.assertEqual(order["price"], "96.04")
         self.assertEqual([call[2] for call in exchange.orders], [Decimal("98.0"), Decimal("96.04")])
+        self.assertEqual([call[3] for call in exchange.orders], [{"limit": {"tif": "Alo"}}, {"limit": {"tif": "Gtc"}}])
+        self.assertEqual(order["plan"]["order_type"], {"limit": {"tif": "Gtc"}})
         self.assertEqual(order["alo_rejects"], 1)
 
     def test_replacement_alo_reject_retries_one_gap_farther(self) -> None:
@@ -1197,6 +1201,57 @@ class GridAvgTests(unittest.TestCase):
         self.assertTrue(submitted)
         self.assertEqual(exchange.prices, [Decimal("100.0"), Decimal("101.0")])
         self.assertEqual(order["price"], "101")
+        self.assertEqual(order["alo_rejects"], 1)
+
+    def test_replacement_gtc_retry_keeps_spacing_from_paused_orders(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.orders = []
+
+            def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
+                self.orders.append((Decimal(str(limit_px)), order_type))
+                if len(self.orders) == 1:
+                    return {"status": "ok", "response": {"data": {"statuses": [{"error": "Post only would immediately match"}]}}}
+                return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 456}}]}}}
+
+        exchange = FakeExchange()
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+            "levels": [
+                {
+                    "side": "buy",
+                    "status": "paused_replacement",
+                    "oid": None,
+                    "price": "99",
+                    "size": "1",
+                    "replacement_order": True,
+                },
+            ],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        order = grid_order_entry(row, "BTC", asset, True, Decimal("100"), False)
+
+        submitted = submit_grid_order_entry(
+            exchange,
+            "BTC",
+            order,
+            1,
+            row,
+            asset,
+            Decimal("0"),
+            Decimal("0"),
+            "abs",
+            False,
+            set(),
+            True,
+        )
+
+        self.assertTrue(submitted)
+        self.assertEqual(exchange.orders, [(Decimal("100.0"), {"limit": {"tif": "Alo"}}), (Decimal("98.01"), {"limit": {"tif": "Gtc"}})])
+        self.assertEqual(order["price"], "98.01")
         self.assertEqual(order["alo_rejects"], 1)
 
     def test_replacement_alo_reject_moves_outward_before_inserting_when_not_too_close(self) -> None:
