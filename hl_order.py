@@ -1614,6 +1614,16 @@ def grid_entry_sort_key(entry: dict[str, Any]) -> tuple[Decimal, int, int]:
     return -price, side_rank, oid
 
 
+def format_grid_entry_status(entry: dict[str, Any]) -> str:
+    status = str(entry.get("status", ""))
+    if status == "filled":
+        if bool(entry.get("replacement_pending")):
+            return "filled_pending"
+        if entry.get("replacement_processed_at"):
+            return "filled_replaced"
+    return status
+
+
 def format_grid_detail_rows(row: dict[str, Any], open_oids: set[int]) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     entries = [item for item in row.get("levels") or [] if isinstance(item, dict) and item.get("side")]
@@ -1635,12 +1645,13 @@ def format_grid_detail_rows(row: dict[str, Any], open_oids: set[int]) -> list[di
         except (TypeError, ValueError):
             oid = 0
         status = str(entry.get("status", ""))
+        display_status = format_grid_entry_status(entry)
         live = "1" if status == "active" and oid in open_oids else "0"
         fill = entry.get("fill") if isinstance(entry.get("fill"), dict) else {}
         rows.append(
             {
                 "side": str(entry.get("side", "")),
-                "status": status,
+                "status": display_status,
                 "live": live,
                 "price": format_optional_decimal(entry.get("price", entry.get("limit_px"))),
                 "size": format_optional_quantity(entry.get("size")),
