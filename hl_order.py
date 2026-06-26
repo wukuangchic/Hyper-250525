@@ -1765,6 +1765,14 @@ def query_grid(args: argparse.Namespace) -> None:
             *grid_query_avg_summary(row, asset, position_size, position_value),
             ("trend", f"{row.get('trend', '0')} actual {row.get('actual_trend', '0%')}"),
             ("margin_gap", format_optional_decimal(row.get("margin_gap_multiplier"))),
+            ("panic_ratio", format_optional_decimal(row.get("panic_ratio"))),
+            ("panic_threshold", format_optional_decimal(row.get("panic_ratio_threshold"))),
+            ("panic_reduced", str(row.get("panic_reduce_count", "0"))),
+            ("panic_last", (
+                f"{row.get('panic_reduce_side')} {row.get('panic_reduce_size')} @ {row.get('panic_reduce_price')}"
+                if row.get("panic_reduce_at")
+                else "-"
+            )),
             ("target_side", str(row.get("target_orders_per_side", GRID_TARGET_ORDERS_PER_SIDE))),
             ("active_buy", str(active_buy)),
             ("active_sell", str(active_sell)),
