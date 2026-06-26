@@ -1632,7 +1632,26 @@ def show_grid_entry_in_detail(entry: dict[str, Any]) -> bool:
     return not bool(entry.get("replacement_processed_at"))
 
 
-def format_grid_detail_rows(row: dict[str, Any], open_oids: set[int]) -> list[dict[str, str]]:
+def grid_mid_marker_row(current_mid: Decimal) -> dict[str, str]:
+    marker = "----"
+    return {
+        "side": marker,
+        "status": "mid",
+        "live": "-",
+        "price": f"--- {format_optional_decimal(current_mid)} ---",
+        "size": marker,
+        "value": marker,
+        "oid": marker,
+        "updated": marker,
+        "fillPx": marker,
+    }
+
+
+def format_grid_detail_rows(
+    row: dict[str, Any],
+    open_oids: set[int],
+    current_mid: Decimal | None = None,
+) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     entries = [
         item
@@ -1651,7 +1670,12 @@ def format_grid_detail_rows(row: dict[str, Any], open_oids: set[int]) -> list[di
     live_entries = [entry for entry in entries if str(entry.get("status", "active")) in live_statuses]
     history_entries = [entry for entry in entries if str(entry.get("status", "active")) not in live_statuses]
     history_entries = sorted(history_entries, key=lambda entry: int(entry.get("submitted_at") or entry.get("recovered_at") or entry.get("filled_at") or entry.get("cancelled_at") or entry.get("skipped_at") or entry.get("paused_at") or 0))[-120:]
+    mid_marker_inserted = current_mid is None
     for entry in sorted(live_entries + history_entries, key=grid_entry_sort_key):
+        price = decimal_or_none(entry.get("price", entry.get("limit_px")))
+        if not mid_marker_inserted and price is not None and price < current_mid:
+            rows.append(grid_mid_marker_row(current_mid))
+            mid_marker_inserted = True
         try:
             oid = int(entry.get("oid") or 0)
         except (TypeError, ValueError):
@@ -1675,6 +1699,8 @@ def format_grid_detail_rows(row: dict[str, Any], open_oids: set[int]) -> list[di
                 "fillPx": format_optional_decimal(fill.get("px")) if fill else "-",
             }
         )
+    if not mid_marker_inserted and current_mid is not None:
+        rows.append(grid_mid_marker_row(current_mid))
     return rows
 
 
@@ -1802,7 +1828,7 @@ def query_grid(args: argparse.Namespace) -> None:
             ("note", str(row.get("note", ""))),
         ]
         print_box("Grid", summary)
-        detail_rows = format_grid_detail_rows(row, open_oids)
+        detail_rows = format_grid_detail_rows(row, open_oids, current_mid)
         print_table(
             "Grid Orders",
             detail_rows,

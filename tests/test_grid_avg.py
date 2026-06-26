@@ -57,6 +57,27 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertEqual([item["price"] for item in rows], ["105.00", "103.00", "101.00", "99.00"])
 
+    def test_grid_detail_rows_insert_mid_marker_by_price(self) -> None:
+        row = {
+            "levels": [
+                {"side": "buy", "status": "active", "oid": 1, "price": "99", "size": "1"},
+                {"side": "sell", "status": "active", "oid": 2, "price": "105", "size": "1"},
+                {"side": "sell", "status": "active", "oid": 3, "price": "101", "size": "1"},
+            ]
+        }
+
+        rows = format_grid_detail_rows(row, {1, 2, 3}, Decimal("100"))
+
+        self.assertEqual(
+            [(item["status"], item["price"]) for item in rows],
+            [
+                ("active", "105.00"),
+                ("active", "101.00"),
+                ("mid", "--- 100.00 ---"),
+                ("active", "99.00"),
+            ],
+        )
+
     def test_grid_detail_rows_show_only_pending_filled_replacement_state(self) -> None:
         row = {
             "levels": [
