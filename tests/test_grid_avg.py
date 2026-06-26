@@ -19,10 +19,12 @@ from trail_worker import (
     apply_grid_add_risk_brake,
     dense_grid_entries,
     defer_paused_grid_restore_if_crossing,
+    grid_active_cap_restore_allowed,
     grid_active_cap_pause_candidates,
     grid_margin_gap_multiplier,
     grid_order_entry,
     grid_risk_density_pause_candidates,
+    grid_risk_density_restore_allowed,
     move_grid_order_away_from_active,
     near_grid_orders_if_stale,
     next_depth_order,
@@ -442,6 +444,54 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertEqual(allowed, 32)
         self.assertEqual([entry["oid"] for entry in candidates], [30])
+
+    def test_risk_density_restore_uses_logarithmic_distribution(self) -> None:
+        row = {
+            "gap_rate": "0.01",
+            "avg_multiplier": "2",
+            "avg_favored_side": "sell",
+            "levels": [
+                {
+                    "side": "buy",
+                    "status": "active" if oid in {0, 1, 3} else "paused_risk_density",
+                    "oid": oid if oid in {0, 1, 3} else None,
+                    "is_buy": True,
+                    "price": str(100 - oid),
+                    "size": "1",
+                }
+                for oid in range(20)
+            ],
+        }
+        should_wait = row["levels"][2]
+        should_restore = row["levels"][8]
+
+        self.assertFalse(
+            grid_risk_density_restore_allowed(row, should_wait, "buy", Decimal("1"), 10, Decimal("1"))
+        )
+        self.assertTrue(
+            grid_risk_density_restore_allowed(row, should_restore, "buy", Decimal("1"), 10, Decimal("1"))
+        )
+
+    def test_active_cap_restore_uses_logarithmic_distribution(self) -> None:
+        keep_active = set(range(29)) | {31, 35}
+        row = {
+            "levels": [
+                {
+                    "side": "sell",
+                    "status": "active" if oid in keep_active else "paused_active_cap",
+                    "oid": oid if oid in keep_active else None,
+                    "is_buy": False,
+                    "price": str(100 + oid),
+                    "size": "1",
+                }
+                for oid in range(40)
+            ],
+        }
+        should_wait = row["levels"][29]
+        should_restore = row["levels"][39]
+
+        self.assertFalse(grid_active_cap_restore_allowed(row, should_wait, "sell"))
+        self.assertTrue(grid_active_cap_restore_allowed(row, should_restore, "sell"))
 
     def test_side_cap_clear_removes_paused_before_active(self) -> None:
         class FakeExchange:
