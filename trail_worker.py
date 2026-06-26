@@ -825,6 +825,31 @@ def advance_grid_order_away_from_active(row: dict[str, Any], asset: dict[str, An
     return move_grid_order_away_from_active(row, asset, order)
 
 
+def ensure_grid_base_sizes(row: dict[str, Any]) -> bool:
+    changed = False
+    for side in ("buy", "sell"):
+        base_key = f"base_{side}_size"
+        legacy_key = f"{side}_size"
+        if decimal_or_none(row.get(base_key)) is not None:
+            continue
+        legacy_size = decimal_or_none(row.get(legacy_key))
+        if legacy_size is None or legacy_size <= 0:
+            sizes = [
+                decimal_or_none(entry.get("size"))
+                for entry in row.get("levels") or []
+                if isinstance(entry, dict) and str(entry.get("side") or "") == side
+            ]
+            sizes = [size for size in sizes if size is not None and size > 0]
+            legacy_size = sizes[-1] if sizes else None
+        if legacy_size is None or legacy_size <= 0:
+            continue
+        row[base_key] = decimal_to_plain(legacy_size)
+        if decimal_or_none(row.get(legacy_key)) is None:
+            row[legacy_key] = decimal_to_plain(legacy_size)
+        changed = True
+    return changed
+
+
 def grid_order_entry(
     row: dict[str, Any],
     coin: str,
@@ -835,6 +860,7 @@ def grid_order_entry(
     size: Decimal | None = None,
     gap: Decimal | None = None,
 ) -> dict[str, Any]:
+    ensure_grid_base_sizes(row)
     size_key = "base_buy_size" if is_buy else "base_sell_size"
     if size is None:
         size = Decimal(str(row.get(size_key) or row.get("buy_size" if is_buy else "sell_size") or "0"))
@@ -1797,6 +1823,7 @@ def near_grid_orders_if_stale(
 
 def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> tuple[dict[str, Any], bool]:
     cache = cache if cache is not None else {}
+    changed = ensure_grid_base_sizes(row)
     network = str(row.get("network") or "mainnet")
     timeout = float(row.get("timeout") or 20)
     raw_coin = str(row.get("raw_coin") or row["coin"])

@@ -711,6 +711,38 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(exchange.orders[0][2], Decimal("100.0"))
         self.assertEqual(order["plan"]["order_type"], {"limit": {"tif": "Alo"}})
 
+    def test_grid_order_entry_backfills_base_size_for_legacy_row(self) -> None:
+        row = {
+            "gap_rate": "0.0002",
+            "buy_size": "0.07",
+            "sell_size": "0.07",
+            "min_order_value": "10",
+        }
+
+        order = grid_order_entry(row, "xyz:JPY", {"szDecimals": 2}, True, Decimal("161.05"), False)
+
+        self.assertEqual(row["base_buy_size"], "0.07")
+        self.assertEqual(row["base_sell_size"], "0.07")
+        self.assertEqual(order["size"], "0.07")
+
+    def test_grid_order_entry_infers_legacy_base_size_from_levels(self) -> None:
+        row = {
+            "gap_rate": "0.0002",
+            "min_order_value": "10",
+            "levels": [
+                {"side": "buy", "size": "0.07"},
+                {"side": "sell", "size": "0.08"},
+            ],
+        }
+
+        order = grid_order_entry(row, "xyz:JPY", {"szDecimals": 2}, False, Decimal("161.05"), False)
+
+        self.assertEqual(row["base_buy_size"], "0.07")
+        self.assertEqual(row["base_sell_size"], "0.08")
+        self.assertEqual(row["buy_size"], "0.07")
+        self.assertEqual(row["sell_size"], "0.08")
+        self.assertEqual(order["size"], "0.08")
+
     def test_grid_submit_does_not_move_non_replacement_before_alo_reject(self) -> None:
         class FakeExchange:
             def __init__(self) -> None:
