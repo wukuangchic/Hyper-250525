@@ -1624,9 +1624,21 @@ def format_grid_entry_status(entry: dict[str, Any]) -> str:
     return status
 
 
+def show_grid_entry_in_detail(entry: dict[str, Any]) -> bool:
+    if str(entry.get("status", "")) != "filled":
+        return True
+    if bool(entry.get("replacement_pending")):
+        return True
+    return not bool(entry.get("replacement_processed_at"))
+
+
 def format_grid_detail_rows(row: dict[str, Any], open_oids: set[int]) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
-    entries = [item for item in row.get("levels") or [] if isinstance(item, dict) and item.get("side")]
+    entries = [
+        item
+        for item in row.get("levels") or []
+        if isinstance(item, dict) and item.get("side") and show_grid_entry_in_detail(item)
+    ]
     live_statuses = {
         "active",
         "pending",

@@ -57,7 +57,7 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertEqual([item["price"] for item in rows], ["105.00", "103.00", "101.00", "99.00"])
 
-    def test_grid_detail_rows_show_filled_replacement_state(self) -> None:
+    def test_grid_detail_rows_show_only_pending_filled_replacement_state(self) -> None:
         row = {
             "levels": [
                 {
@@ -82,7 +82,7 @@ class GridAvgTests(unittest.TestCase):
 
         rows = format_grid_detail_rows(row, set())
 
-        self.assertEqual([item["status"] for item in rows], ["filled_replaced", "filled_pending"])
+        self.assertEqual([item["status"] for item in rows], ["filled_pending"])
 
     def test_panic_ratio_short_uses_liq_above_mid_and_buy_below_mid(self) -> None:
         row = {
