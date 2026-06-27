@@ -978,6 +978,89 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(row["sell_size"], "0.08")
         self.assertEqual(order["size"], "0.08")
 
+    def test_account_margin_protected_replacement_pauses_for_restore(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.orders = []
+
+            def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
+                self.orders.append((coin, is_buy, Decimal(str(limit_px)), order_type, reduce_only))
+                return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 123}}]}}}
+
+        exchange = FakeExchange()
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+            "levels": [],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        order = grid_order_entry(row, "BTC", asset, True, Decimal("100"), False)
+        order["replacement_order"] = True
+
+        submitted = submit_grid_order_entry(
+            exchange,
+            "BTC",
+            order,
+            7,
+            row,
+            asset,
+            Decimal("1"),
+            Decimal("100"),
+            "abs",
+            True,
+            set(),
+        )
+
+        self.assertFalse(submitted)
+        self.assertEqual(exchange.orders, [])
+        self.assertEqual(order["status"], "paused_account_margin")
+        self.assertIsNone(order["oid"])
+        self.assertEqual(order["paused_at"], 7)
+        self.assertNotIn("skipped_at", order)
+
+    def test_account_margin_protected_regular_add_risk_is_skipped(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.orders = []
+
+            def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
+                self.orders.append((coin, is_buy, Decimal(str(limit_px)), order_type, reduce_only))
+                return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 123}}]}}}
+
+        exchange = FakeExchange()
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+            "levels": [],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        order = grid_order_entry(row, "BTC", asset, True, Decimal("100"), False)
+
+        submitted = submit_grid_order_entry(
+            exchange,
+            "BTC",
+            order,
+            7,
+            row,
+            asset,
+            Decimal("1"),
+            Decimal("100"),
+            "abs",
+            True,
+            set(),
+        )
+
+        self.assertFalse(submitted)
+        self.assertEqual(exchange.orders, [])
+        self.assertEqual(order["status"], "skipped_account_margin")
+        self.assertIsNone(order["oid"])
+        self.assertEqual(order["skipped_at"], 7)
+        self.assertNotIn("paused_at", order)
+
     def test_grid_submit_does_not_move_non_replacement_before_alo_reject(self) -> None:
         class FakeExchange:
             def __init__(self) -> None:

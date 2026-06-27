@@ -1491,6 +1491,11 @@ def submit_grid_order_entry(
     refresh_grid_order_tif(order)
     if account_margin_protected:
         if grid_order_would_add_risk(position_size, bool(order.get("is_buy"))):
+            if bool(order.get("replacement_order")):
+                order["status"] = "paused_account_margin"
+                order["oid"] = None
+                order["paused_at"] = now
+                return False
             # Account protection skips this price entirely. Once protection clears,
             # the regular top-up pass builds a fresh level from the live market.
             order["status"] = "skipped_account_margin"
