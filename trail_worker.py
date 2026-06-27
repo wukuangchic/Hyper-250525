@@ -691,6 +691,29 @@ def refresh_grid_order_reduce_only(order: dict[str, Any], position_size: Decimal
         plan["reduce_only"] = reduce_only
 
 
+def set_grid_order_reduce_only(order: dict[str, Any], reduce_only: bool) -> None:
+    order["reduce_only"] = reduce_only
+    plan = order.get("plan")
+    if isinstance(plan, dict):
+        plan["reduce_only"] = reduce_only
+
+
+def pause_refreshed_reduce_only_entries(entries: list[dict[str, Any]], now: int) -> int:
+    paused = 0
+    for entry in entries:
+        if str(entry.get("status")) != "refresh_reduce_only" or entry.get("cancelled_at") != now:
+            continue
+        entry["status"] = GRID_REPLACEMENT_PAUSE_STATUS
+        entry["oid"] = None
+        entry["replacement_order"] = True
+        entry["replacement_pause_reason"] = "refresh_reduce_only"
+        entry["refresh_reduce_only_paused_at"] = now
+        entry.setdefault("paused_at", now)
+        set_grid_order_reduce_only(entry, False)
+        paused += 1
+    return paused
+
+
 def set_grid_order_tif(order: dict[str, Any], tif: str) -> None:
     plan = order.get("plan")
     if not isinstance(plan, dict):
@@ -1456,10 +1479,7 @@ def submit_grid_order_entry(
             order["oid"] = None
             order["skipped_at"] = now
             return False
-        order["reduce_only"] = True
-        plan = order.get("plan")
-        if isinstance(plan, dict):
-            plan["reduce_only"] = True
+        set_grid_order_reduce_only(order, True)
     if not grid_reduce_only_capacity_available(row, order, position_size, position_value):
         order["status"] = "paused_reduce_capacity"
         order["oid"] = None
@@ -2403,6 +2423,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             to_refresh.append(entry)
     if to_refresh:
         refreshed = cancel_grid_entries(exchange, coin, to_refresh, now, "refresh_reduce_only")
+        if refreshed:
+            pause_refreshed_reduce_only_entries(to_refresh, now)
         changed = True
 
     dense_regridded = regrid_dense_entries(

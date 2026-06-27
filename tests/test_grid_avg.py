@@ -31,6 +31,7 @@ from trail_worker import (
     move_grid_order_away_from_active,
     near_grid_orders_if_stale,
     next_depth_order,
+    pause_refreshed_reduce_only_entries,
     prune_add_risk_brake_state,
     preserve_replacement_order,
     prune_grid_levels,
@@ -165,6 +166,68 @@ class GridAvgTests(unittest.TestCase):
         self.assertTrue(order["reduce_only"])
         self.assertEqual(order["plan"]["order_type"], {"limit": {"tif": "Ioc"}})
         self.assertTrue(order["plan"]["reduce_only"])
+
+    def test_refresh_reduce_only_cancel_becomes_non_reduce_paused_replacement(self) -> None:
+        entry = {
+            "side": "buy",
+            "status": "refresh_reduce_only",
+            "oid": 123,
+            "is_buy": True,
+            "price": "64.214",
+            "size": "0.16",
+            "reduce_only": True,
+            "cancelled_at": 10,
+            "plan": {"reduce_only": True},
+        }
+
+        paused = pause_refreshed_reduce_only_entries([entry], 10)
+
+        self.assertEqual(paused, 1)
+        self.assertEqual(entry["status"], "paused_replacement")
+        self.assertIsNone(entry["oid"])
+        self.assertTrue(entry["replacement_order"])
+        self.assertEqual(entry["replacement_pause_reason"], "refresh_reduce_only")
+        self.assertFalse(entry["reduce_only"])
+        self.assertFalse(entry["plan"]["reduce_only"])
+
+    def test_paused_replacement_restore_recomputes_reduce_only_from_current_position(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.orders = []
+
+            def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
+                self.orders.append((coin, is_buy, Decimal(str(limit_px)), order_type, reduce_only))
+                return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 456}}]}}}
+
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+            "levels": [],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        order = grid_order_entry(row, "BTC", asset, True, Decimal("100"), False)
+        exchange = FakeExchange()
+
+        submitted = submit_grid_order_entry(
+            exchange,
+            "BTC",
+            order,
+            1,
+            row,
+            asset,
+            Decimal("-1"),
+            Decimal("100"),
+            "abs",
+            True,
+            set(),
+        )
+
+        self.assertTrue(submitted)
+        self.assertTrue(order["reduce_only"])
+        self.assertTrue(order["plan"]["reduce_only"])
+        self.assertTrue(exchange.orders[0][4])
 
     def test_add_risk_brake_cancels_nearest_same_side_after_two_open_fills(self) -> None:
         class FakeExchange:
