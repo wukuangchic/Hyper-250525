@@ -31,6 +31,7 @@ from trail_worker import (
     move_grid_order_away_from_active,
     near_grid_orders_if_stale,
     next_depth_order,
+    pause_refresh_reduce_only_replacement,
     pause_refreshed_reduce_only_entries,
     pause_skipped_account_margin_replacement,
     prune_add_risk_brake_state,
@@ -190,6 +191,44 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(entry["replacement_pause_reason"], "refresh_reduce_only")
         self.assertFalse(entry["reduce_only"])
         self.assertFalse(entry["plan"]["reduce_only"])
+
+    def test_old_refresh_reduce_only_replacement_is_migrated_to_paused_replacement(self) -> None:
+        entry = {
+            "side": "buy",
+            "status": "refresh_reduce_only",
+            "oid": 123,
+            "is_buy": True,
+            "price": "64.214",
+            "size": "0.16",
+            "reduce_only": True,
+            "replacement_order": True,
+            "plan": {"reduce_only": True},
+        }
+
+        migrated = pause_refresh_reduce_only_replacement(entry, 10)
+
+        self.assertTrue(migrated)
+        self.assertEqual(entry["status"], "paused_replacement")
+        self.assertIsNone(entry["oid"])
+        self.assertEqual(entry["replacement_pause_reason"], "refresh_reduce_only")
+        self.assertFalse(entry["reduce_only"])
+        self.assertFalse(entry["plan"]["reduce_only"])
+
+    def test_regular_refresh_reduce_only_is_not_migrated_to_replacement(self) -> None:
+        entry = {
+            "side": "buy",
+            "status": "refresh_reduce_only",
+            "oid": 123,
+            "is_buy": True,
+            "price": "64.214",
+            "size": "0.16",
+        }
+
+        migrated = pause_refresh_reduce_only_replacement(entry, 10)
+
+        self.assertFalse(migrated)
+        self.assertEqual(entry["status"], "refresh_reduce_only")
+        self.assertEqual(entry["oid"], 123)
 
     def test_paused_replacement_restore_recomputes_reduce_only_from_current_position(self) -> None:
         class FakeExchange:

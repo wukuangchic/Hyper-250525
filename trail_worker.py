@@ -703,15 +703,23 @@ def pause_refreshed_reduce_only_entries(entries: list[dict[str, Any]], now: int)
     for entry in entries:
         if str(entry.get("status")) != "refresh_reduce_only" or entry.get("cancelled_at") != now:
             continue
-        entry["status"] = GRID_REPLACEMENT_PAUSE_STATUS
-        entry["oid"] = None
         entry["replacement_order"] = True
-        entry["replacement_pause_reason"] = "refresh_reduce_only"
-        entry["refresh_reduce_only_paused_at"] = now
-        entry.setdefault("paused_at", now)
-        set_grid_order_reduce_only(entry, False)
-        paused += 1
+        if pause_refresh_reduce_only_replacement(entry, now):
+            paused += 1
     return paused
+
+
+def pause_refresh_reduce_only_replacement(entry: dict[str, Any], now: int) -> bool:
+    if str(entry.get("status")) != "refresh_reduce_only" or not bool(entry.get("replacement_order")):
+        return False
+    entry["status"] = GRID_REPLACEMENT_PAUSE_STATUS
+    entry["oid"] = None
+    entry["replacement_order"] = True
+    entry["replacement_pause_reason"] = "refresh_reduce_only"
+    entry["refresh_reduce_only_paused_at"] = now
+    entry.setdefault("paused_at", now)
+    set_grid_order_reduce_only(entry, False)
+    return True
 
 
 def set_grid_order_tif(order: dict[str, Any], tif: str) -> None:
@@ -2657,6 +2665,9 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             changed = True
 
     for entry in levels:
+        if isinstance(entry, dict) and pause_refresh_reduce_only_replacement(entry, now):
+            changed = True
+            continue
         if isinstance(entry, dict) and pause_skipped_account_margin_replacement(levels, entry, now):
             changed = True
             continue
