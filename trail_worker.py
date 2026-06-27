@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import math
 import time
+from copy import deepcopy
 from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
@@ -1072,6 +1073,83 @@ def dense_grid_entries(row: dict[str, Any]) -> list[dict[str, Any]]:
                 continue
             kept_prices.append(price)
     return dense
+
+
+def regrid_dense_entries(
+    exchange: Any,
+    coin: str,
+    row: dict[str, Any],
+    asset: dict[str, Any],
+    now: int,
+    position_size: Decimal,
+    position_value: Decimal,
+    policy: str,
+    account_margin_protected: bool,
+    isolated_leverage_ready: set[str],
+) -> int:
+    if account_margin_protected:
+        return 0
+    regridded = 0
+    for entry in dense_grid_entries(row):
+        if str(entry.get("status", "active")) != "active":
+            continue
+        try:
+            old_oid = int(entry["oid"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        old_snapshot = deepcopy(entry)
+        old_price = decimal_or_none(entry.get("price", entry.get("limit_px")))
+        if not advance_grid_order_away_from_active(row, asset, entry):
+            entry.clear()
+            entry.update(old_snapshot)
+            entry["dense_regrid_deferred_at"] = now
+            entry["dense_regrid_deferred_reason"] = "no_farther_price"
+            continue
+        new_price = decimal_or_none(entry.get("price", entry.get("limit_px")))
+        if new_price is None or new_price <= 0 or new_price == old_price:
+            entry.clear()
+            entry.update(old_snapshot)
+            entry["dense_regrid_deferred_at"] = now
+            entry["dense_regrid_deferred_reason"] = "unchanged_price"
+            continue
+        cancel_request = {"coin": coin, "oid": old_oid}
+        cancel_result = exchange.bulk_cancel([cancel_request])
+        log_event(
+            "grid_dense_regrid_cancel",
+            {
+                "coin": coin,
+                "old_oid": old_oid,
+                "old_price": decimal_to_plain(old_price) if old_price is not None else None,
+                "new_price": decimal_to_plain(new_price),
+                "result": cancel_result,
+            },
+        )
+        if cancel_result.get("status") != "ok":
+            entry.clear()
+            entry.update(old_snapshot)
+            raise RuntimeError(f"Failed to cancel dense grid order before regrid: {cancel_result}")
+        entry["oid"] = None
+        entry["dense_regrid_from_oid"] = old_oid
+        if old_price is not None:
+            entry["dense_regrid_from_price"] = decimal_to_plain(old_price)
+        entry["dense_regrid_at"] = now
+        submitted = submit_grid_order_entry(
+            exchange,
+            coin,
+            entry,
+            now,
+            row,
+            asset,
+            position_size,
+            position_value,
+            policy,
+            False,
+            isolated_leverage_ready,
+            retry_alo_reject=True,
+        )
+        if submitted:
+            regridded += 1
+    return regridded
 
 
 def grid_entry_near_to_far_key(entry: dict[str, Any], side: str) -> Decimal:
@@ -2327,10 +2405,19 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         refreshed = cancel_grid_entries(exchange, coin, to_refresh, now, "refresh_reduce_only")
         changed = True
 
-    deduped = 0
-    to_dedup = dense_grid_entries(row)
-    if to_dedup:
-        deduped = cancel_grid_entries(exchange, coin, to_dedup, now, "dedup_dense")
+    dense_regridded = regrid_dense_entries(
+        exchange,
+        coin,
+        row,
+        asset,
+        now,
+        position_size,
+        position_value,
+        policy,
+        account_margin_protected,
+        isolated_leverage_ready,
+    )
+    if dense_regridded:
         changed = True
 
     near_regrids = 0
@@ -2641,7 +2728,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     margin_ratio_label = f"{margin_ratio * Decimal('100'):.2f}%" if margin_ratio is not None else "unknown"
     row["note"] = (
         f"grid maintained; replacements={replacements}; topped_up={topped_up}; "
-        f"paused={paused}; refreshed={refreshed}; deduped={deduped}; restored={restored}; trimmed={trimmed}; near_regrids={near_regrids}; "
+        f"paused={paused}; refreshed={refreshed}; dense_regridded={dense_regridded}; restored={restored}; trimmed={trimmed}; near_regrids={near_regrids}; "
         f"add_risk_braked={add_risk_braked}; side_cap_cleared={side_cap_cleared}; "
         f"recovered_missing={recovered_missing}; margin_cooldown={margin_cooldowns}; "
         f"submissions=buy:{submissions_by_side['buy']},sell:{submissions_by_side['sell']}; "
@@ -2658,7 +2745,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         or topped_up > 0
         or paused > 0
         or refreshed > 0
-        or deduped > 0
+        or dense_regridded > 0
         or restored > 0
         or trimmed > 0
         or side_cap_cleared > 0

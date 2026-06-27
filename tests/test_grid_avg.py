@@ -34,6 +34,7 @@ from trail_worker import (
     prune_add_risk_brake_state,
     preserve_replacement_order,
     prune_grid_levels,
+    regrid_dense_entries,
     replacement_order_from_fill,
     skip_stale_grid_recovery,
     skip_unknown_oid_grid_recovery,
@@ -1083,6 +1084,59 @@ class GridAvgTests(unittest.TestCase):
         dense = dense_grid_entries(row)
 
         self.assertEqual(dense, [])
+
+    def test_dense_grid_regrids_farther_instead_of_dedup_cancel(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.cancel_requests = []
+                self.orders = []
+
+            def bulk_cancel(self, requests):
+                self.cancel_requests.extend(requests)
+                return {"status": "ok"}
+
+            def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
+                self.orders.append((coin, is_buy, Decimal(str(limit_px)), order_type, reduce_only))
+                return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 22}}]}}}
+
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+            "levels": [],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        keep = grid_order_entry(row, "BTC", asset, True, Decimal("100"), False)
+        keep["status"] = "active"
+        keep["oid"] = 1
+        dense = grid_order_entry(row, "BTC", asset, True, Decimal("99.5"), False)
+        dense["status"] = "active"
+        dense["oid"] = 2
+        row["levels"] = [keep, dense]
+        exchange = FakeExchange()
+
+        regridded = regrid_dense_entries(
+            exchange,
+            "BTC",
+            row,
+            asset,
+            123,
+            Decimal("0"),
+            Decimal("0"),
+            "abs",
+            False,
+            set(),
+        )
+
+        self.assertEqual(regridded, 1)
+        self.assertEqual(exchange.cancel_requests, [{"coin": "BTC", "oid": 2}])
+        self.assertEqual(dense["status"], "active")
+        self.assertEqual(dense["oid"], 22)
+        self.assertEqual(dense["dense_regrid_from_oid"], 2)
+        self.assertEqual(dense["dense_regrid_from_price"], "99.5")
+        self.assertLess(Decimal(dense["price"]), Decimal("99.5"))
+        self.assertNotIn("dedup_dense", {entry["status"] for entry in row["levels"]})
 
     def test_grid_order_moves_away_from_near_active_price_before_submit(self) -> None:
         row = {
