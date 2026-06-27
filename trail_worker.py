@@ -952,6 +952,13 @@ def preserve_replacement_order(levels: list[Any], order: dict[str, Any], now: in
         levels.append(order)
 
 
+def pause_skipped_account_margin_replacement(levels: list[Any], entry: dict[str, Any], now: int) -> bool:
+    if str(entry.get("status")) != "skipped_account_margin" or not bool(entry.get("replacement_order")):
+        return False
+    preserve_replacement_order(levels, entry, now, "skipped_account_margin")
+    return True
+
+
 def active_grid_entries(row: dict[str, Any], side: str | None = None) -> list[dict[str, Any]]:
     entries = [
         entry
@@ -2650,6 +2657,9 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             changed = True
 
     for entry in levels:
+        if isinstance(entry, dict) and pause_skipped_account_margin_replacement(levels, entry, now):
+            changed = True
+            continue
         if isinstance(entry, dict) and str(entry.get("status")) == "paused_account_margin":
             if entry.get("replacement_order"):
                 preserve_replacement_order(levels, entry, now, "paused_account_margin")

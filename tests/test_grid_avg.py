@@ -32,6 +32,7 @@ from trail_worker import (
     near_grid_orders_if_stale,
     next_depth_order,
     pause_refreshed_reduce_only_entries,
+    pause_skipped_account_margin_replacement,
     prune_add_risk_brake_state,
     preserve_replacement_order,
     prune_grid_levels,
@@ -1046,6 +1047,43 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(order["status"], "paused_replacement")
         self.assertEqual(order["replacement_pause_reason"], "skipped_account_margin")
         self.assertEqual(order["paused_at"], 2)
+
+    def test_skipped_account_margin_replacement_is_migrated_to_paused_replacement(self) -> None:
+        levels = [
+            {
+                "side": "sell",
+                "status": "skipped_account_margin",
+                "oid": None,
+                "price": "101",
+                "size": "1",
+                "replacement_order": True,
+                "skipped_at": 1,
+            }
+        ]
+
+        migrated = pause_skipped_account_margin_replacement(levels, levels[0], 2)
+
+        self.assertTrue(migrated)
+        self.assertEqual(levels[0]["status"], "paused_replacement")
+        self.assertTrue(levels[0]["replacement_order"])
+        self.assertEqual(levels[0]["replacement_pause_reason"], "skipped_account_margin")
+        self.assertEqual(levels[0]["paused_at"], 2)
+
+    def test_regular_skipped_account_margin_is_not_migrated_to_replacement(self) -> None:
+        entry = {
+            "side": "sell",
+            "status": "skipped_account_margin",
+            "oid": None,
+            "price": "101",
+            "size": "1",
+            "skipped_at": 1,
+        }
+
+        migrated = pause_skipped_account_margin_replacement([entry], entry, 2)
+
+        self.assertFalse(migrated)
+        self.assertEqual(entry["status"], "skipped_account_margin")
+        self.assertNotIn("replacement_order", entry)
 
     def test_paused_replacement_survives_prune_when_side_is_full(self) -> None:
         row = {
