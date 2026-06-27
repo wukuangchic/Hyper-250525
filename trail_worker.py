@@ -70,6 +70,7 @@ GRID_ALO_SPACING_MULTIPLIER = Decimal("0.95")
 GRID_NEAR_REGRID_STALE_GAP_MULTIPLE = Decimal("30")
 GRID_NEAR_REGRID_TARGET_GAP_MULTIPLE = Decimal("15")
 GRID_PANIC_RATIO_THRESHOLD = Decimal("20")
+GRID_PANIC_RATIO_LEGACY_DEFAULT_THRESHOLD = Decimal("10")
 GRID_REPLACEMENT_PAUSE_STATUS = "paused_replacement"
 GRID_RISK_DENSITY_PAUSE_STATUS = "paused_risk_density"
 GRID_ACTIVE_CAP_PAUSE_STATUS = "paused_active_cap"
@@ -1026,6 +1027,8 @@ def nearest_active_price(row: dict[str, Any], side: str) -> Decimal | None:
 def grid_panic_ratio_threshold(row: dict[str, Any]) -> Decimal:
     threshold = decimal_or_none(row.get("panic_ratio_threshold"))
     if threshold is None or threshold <= 0:
+        return GRID_PANIC_RATIO_THRESHOLD
+    if threshold == GRID_PANIC_RATIO_LEGACY_DEFAULT_THRESHOLD:
         return GRID_PANIC_RATIO_THRESHOLD
     return threshold
 

@@ -22,6 +22,7 @@ from trail_worker import (
     dense_grid_entries,
     defer_paused_grid_restore_if_crossing,
     grid_panic_ratio,
+    grid_panic_ratio_threshold,
     grid_active_cap_restore_allowed,
     grid_active_cap_pause_candidates,
     grid_margin_gap_multiplier,
@@ -139,6 +140,11 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertIsNone(grid_panic_ratio(short_row, Decimal("-4"), Decimal("64"), Decimal("72")))
         self.assertIsNone(grid_panic_ratio(long_row, Decimal("4"), Decimal("100"), Decimal("60")))
+
+    def test_panic_threshold_migrates_legacy_default_only(self) -> None:
+        self.assertEqual(grid_panic_ratio_threshold({}), Decimal("20"))
+        self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "10"}), Decimal("20"))
+        self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "15"}), Decimal("15"))
 
     def test_panic_reduce_order_uses_base_size_ioc_and_reduce_only(self) -> None:
         class FakeExchange:
