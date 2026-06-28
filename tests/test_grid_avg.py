@@ -1,6 +1,7 @@
 import unittest
 from argparse import Namespace
 from decimal import Decimal
+from unittest.mock import patch
 
 from hl_order import (
     asset_requires_isolated_margin,
@@ -13,7 +14,9 @@ from hl_order import (
     grid_avg_topup_params,
     format_grid_detail_rows,
     grid_query_avg_summary,
+    is_auto_grid_gap,
     refresh_grid_row_strategy_params,
+    resolve_grid_spacing,
 )
 from trail_worker import (
     active_grid_oids,
@@ -51,6 +54,34 @@ from trail_worker import (
 
 
 class GridAvgTests(unittest.TestCase):
+    def test_grid_gap_zero_requests_default_spacing(self) -> None:
+        for value in (["0"], ["0%"], ["0.0%"]):
+            args = Namespace(gap=value, resolved_grid_gap_spec=None)
+            with patch(
+                "hl_order.effective_perp_fee_rates",
+                return_value={
+                    "taker_effective": Decimal("0.0004"),
+                    "maker_effective": Decimal("0.0001"),
+                },
+            ):
+                spacing = resolve_grid_spacing(args, object(), "account", {"szDecimals": 3}, "", Decimal("400"))
+
+            self.assertTrue(is_auto_grid_gap(value))
+            self.assertEqual(spacing, Decimal("0.000550"))
+            self.assertEqual(
+                args.resolved_grid_gap_spec,
+                ["0.0550% (minTick 0.0050% + taker 0.0400% + maker 0.0100%)"],
+            )
+
+    def test_grid_gap_positive_still_uses_explicit_spacing(self) -> None:
+        args = Namespace(gap=["0.3%"], resolved_grid_gap_spec=None)
+
+        spacing = resolve_grid_spacing(args, object(), "account", {"szDecimals": 3}, "", Decimal("400"))
+
+        self.assertFalse(is_auto_grid_gap(args.gap))
+        self.assertEqual(spacing, Decimal("0.003"))
+        self.assertIsNone(args.resolved_grid_gap_spec)
+
     def test_duplicate_grid_batch_guard_blocks_active_same_coin(self) -> None:
         rows = [
             {

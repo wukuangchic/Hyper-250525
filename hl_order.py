@@ -2388,6 +2388,22 @@ def parse_percent_decimal(value: str, label: str, allow_signed: bool = True) -> 
     return value_decimal
 
 
+def is_auto_grid_gap(value: str | list[str] | None) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, list):
+        if len(value) != 1:
+            return False
+        value = value[0]
+    text = value.strip().replace(" ", "")
+    if not text:
+        return False
+    try:
+        return parse_percent_decimal(text, "--gap", allow_signed=False) == 0
+    except ValueError:
+        return False
+
+
 def parse_grid_gap(value: str | list[str]) -> tuple[Decimal, Decimal | None]:
     if isinstance(value, list):
         if len(value) not in {1, 2}:
@@ -2694,7 +2710,7 @@ def resolve_grid_gap(
     start_px: Decimal,
     end_px: Decimal,
 ) -> tuple[Decimal, Decimal | None]:
-    if getattr(args, "gap", None):
+    if getattr(args, "gap", None) and not is_auto_grid_gap(args.gap):
         return parse_grid_gap(args.gap)
 
     sz_decimals = int(asset["szDecimals"])
@@ -2723,7 +2739,7 @@ def resolve_grid_spacing(
     dex: str,
     anchor_px: Decimal,
 ) -> Decimal:
-    if getattr(args, "gap", None):
+    if getattr(args, "gap", None) and not is_auto_grid_gap(args.gap):
         gap, _offset = parse_grid_gap(args.gap)
         return gap
 
@@ -5299,7 +5315,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gap",
         nargs="+",
-        help="Grid spacing. Default: min price tick percent + effective taker fee + effective maker fee. E.g. 0.15%%.",
+        help="Grid spacing. Default, or 0: min price tick percent + effective taker fee + effective maker fee. E.g. 0.15%%.",
     )
     parser.add_argument("--market", action="store_true", help="Submit as a market order using IOC with slippage protection.")
     parser.add_argument("--slippage", default=DEFAULT_SLIPPAGE, help="Market slippage protection. Default: 0.05. Also accepts 5%%.")
@@ -5599,7 +5615,7 @@ def parse_args() -> argparse.Namespace:
         if args.grid_recover and not selected_grid_limits:
             parser.error("grid --recover requires one of --long, --short, or --abs")
         try:
-            if args.gap:
+            if args.gap and not is_auto_grid_gap(args.gap):
                 parse_grid_gap(args.gap)
             parse_percent_decimal(args.trend or "0", "--trend", allow_signed=True)
             policy, min_limit_value, limit_value = grid_limit_arg(args)

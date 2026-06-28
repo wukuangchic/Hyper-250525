@@ -194,7 +194,7 @@ BTC grid --short 300
 参数：
 
 - `--gap`：每个买卖格子的间距。初始买价从 `mid * (1 - gap)` 到 `mid * (1 - 5 * gap)`，卖价从 `mid * (1 + gap)` 到 `mid * (1 + 5 * gap)`。
-- 不写 `--gap` 时，默认使用 `最小价格变动百分比 + 折扣后 takerFee + 折扣后 makerFee`。
+- 不写 `--gap`，或写 `--gap 0` / `--gap 0%` 时，默认使用 `最小价格变动百分比 + 折扣后 takerFee + 折扣后 makerFee`。
 - `--trend`：数量倾向，默认 `0`；正数让买入数量大于卖出数量，负数让卖出数量大于买入数量。取消趋势用 `--modify --trend 0`。
 - `--avg 200`：把 200 设为目标持仓价值，并与 `--trend` 互斥。`avg` 只调整补档间距，不调整单量；回归侧保持基础 `gap`，偏离目标的一侧按偏离度指数放大补档 `gap`。偏离 25% 时约 `1.46` 倍，50% 时约 `1.74` 倍，接近上下限时倍率趋向无限大。
 - `--long` / `--short` 的 `avg` 使用该方向的绝对持仓价值；`--abs` 的 `avg` 可以是负数，例如 `--abs 300 --avg -100` 表示目标为空仓 100。
@@ -218,6 +218,7 @@ BTC grid --modify --abs 500
 BTC grid --modify --short 300
 BTC grid --modify --long 200 500
 BTC grid --modify --gap 0.3%
+BTC grid --modify --gap 0
 BTC grid --modify --trend 0
 BTC grid --modify --avg 200
 BTC grid --modify --min 20
@@ -226,7 +227,7 @@ BTC grid --modify --min 20
 - 所有 `--modify` 都只更新策略配置，不会主动撤销或重铺现有 grid 子单；新参数从以后生成的新单开始生效。
 - 模式、仓位范围或最低下单额变化后，如果现有订单违反新的方向、仓位上下限、保证金保护或 reduce-only 要求，Worker 仍会按安全规则单独撤销相关订单。
 - 从 `avg` 模式切回无方向的普通网格可使用 `--modify --trend 0`。
-- `--modify` 只改变命令中明确提供的参数；例如只传 `--trend` 时会沿用原来的 gap，只传 `--gap` 时也会沿用原来的 trend。
+- `--modify` 只改变命令中明确提供的参数；例如只传 `--trend` 时会沿用原来的 gap，只传 `--gap` 时也会沿用原来的 trend。`--modify --gap 0` 会按当前价格和费率重算默认 gap。
 - 修改 `--long` / `--short` 的下限后，Worker 会按新仓位范围维护后续订单；账户安全余量率低于 70% 时，账户保护仍优先，Worker 不会为了达到下限而新增风险。
 
 ### 查询、恢复、取消
