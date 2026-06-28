@@ -1782,9 +1782,9 @@ class GridAvgTests(unittest.TestCase):
         )
         self.assertIs(row["levels"], levels)
         self.assertEqual(row["levels"][0]["oid"], 1)
-        self.assertEqual(row["avg_multiplier"], "1.62")
+        self.assertEqual(row["avg_multiplier"], "1.744")
         self.assertEqual(row["topup_buy_gap"], "0.01")
-        self.assertEqual(row["topup_sell_gap"], "0.0162")
+        self.assertEqual(row["topup_sell_gap"], "0.01744")
         self.assertEqual(row["topup_buy_size"], row["base_buy_size"])
         self.assertEqual(row["topup_sell_size"], row["base_sell_size"])
 
@@ -1830,10 +1830,10 @@ class GridAvgTests(unittest.TestCase):
         )
         self.assertEqual(summary["avg"], "0")
         self.assertEqual(summary["avg_position"], "-125")
-        self.assertEqual(summary["avg_multiplier"], "1.62")
+        self.assertEqual(summary["avg_multiplier"], "1.744")
         self.assertEqual(summary["avg_side"], "buy")
         self.assertEqual(summary["base_gap"], "0.05% (0.0005)")
-        self.assertEqual(summary["topup_gap"], "buy 0.0005 / sell 0.00081")
+        self.assertEqual(summary["topup_gap"], "buy 0.0005 / sell 0.000872")
         self.assertEqual(summary["base_size"], "buy 0.00016 / sell 0.00016")
         self.assertEqual(summary["topup_size"], "buy 0.00016 / sell 0.00016")
 
@@ -1870,16 +1870,16 @@ class GridAvgTests(unittest.TestCase):
             Decimal("100"),
             Decimal("0.05"),
         )
-        self.assertEqual(plans[0]["grid_avg_multiplier"], Decimal("1.62"))
+        self.assertEqual(plans[0]["grid_avg_multiplier"], Decimal("1.744"))
         self.assertEqual(plans[0]["grid_base_gap"], Decimal("0.005"))
         self.assertEqual(plans[0]["grid_gap"], Decimal("0.005"))
-        self.assertEqual(plans[0]["grid_effective_gap"], Decimal("0.00810"))
+        self.assertEqual(plans[0]["grid_effective_gap"], Decimal("0.008720"))
         self.assertEqual(plans[0]["grid_buy_size"], Decimal("0.101"))
         self.assertEqual(plans[0]["grid_sell_size"], Decimal("0.101"))
         self.assertEqual(plans[0]["grid_topup_buy_size"], Decimal("0.101"))
         self.assertEqual(plans[0]["grid_topup_sell_size"], Decimal("0.101"))
         self.assertEqual(plans[0]["grid_topup_buy_gap"], Decimal("0.005"))
-        self.assertEqual(plans[0]["grid_topup_sell_gap"], Decimal("0.00810"))
+        self.assertEqual(plans[0]["grid_topup_sell_gap"], Decimal("0.008720"))
 
         statuses = [{"resting": {"oid": index + 1}} for index in range(len(plans))]
         row = build_grid_batch_row(
@@ -1895,14 +1895,14 @@ class GridAvgTests(unittest.TestCase):
         )
         self.assertEqual(row["avg"], "200")
         self.assertEqual(row["gap_rate"], "0.005")
-        self.assertEqual(row["effective_gap_rate"], "0.0081")
+        self.assertEqual(row["effective_gap_rate"], "0.00872")
         self.assertEqual(row["base_buy_size"], "0.101")
         self.assertEqual(row["buy_size"], "0.101")
         self.assertEqual(row["sell_size"], "0.101")
         self.assertEqual(row["topup_buy_size"], "0.101")
         self.assertEqual(row["topup_sell_size"], "0.101")
         self.assertEqual(row["topup_buy_gap"], "0.005")
-        self.assertEqual(row["topup_sell_gap"], "0.0081")
+        self.assertEqual(row["topup_sell_gap"], "0.00872")
 
     def test_far_topup_and_reverting_replacement_use_avg_skew(self) -> None:
         row = {
@@ -2029,11 +2029,11 @@ class GridAvgTests(unittest.TestCase):
         cases = (
             ("50", "1E+9", "buy"),
             ("100", "1E+9", "buy"),
-            ("150", "1.62", "buy"),
-            ("175", "1.38", "buy"),
+            ("150", "1.744", "buy"),
+            ("175", "1.456", "buy"),
             ("200", "1", None),
-            ("250", "1.38", "sell"),
-            ("300", "1.62", "sell"),
+            ("250", "1.456", "sell"),
+            ("300", "1.744", "sell"),
             ("400", "1E+9", "sell"),
             ("500", "1E+9", "sell"),
         )
