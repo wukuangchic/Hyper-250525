@@ -717,6 +717,10 @@ def set_grid_order_reduce_only(order: dict[str, Any], reduce_only: bool) -> None
         plan["reduce_only"] = reduce_only
 
 
+def grid_reduce_only_canceled_restore_without_reduce_only(order: dict[str, Any]) -> bool:
+    return str(order.get("status")) == "paused_reduce_capacity" and order.get("reduce_only_canceled_oid") is not None
+
+
 def pause_refreshed_reduce_only_entries(entries: list[dict[str, Any]], now: int) -> int:
     paused = 0
     for entry in entries:
@@ -1520,6 +1524,7 @@ def submit_grid_order_entry(
     retry_alo_reject: bool = False,
     margin_blocked_sides: set[tuple[str, str]] | None = None,
 ) -> bool:
+    restore_without_reduce_only = grid_reduce_only_canceled_restore_without_reduce_only(order)
     refresh_grid_order_reduce_only(order, position_size, policy)
     refresh_grid_order_tif(order)
     side = str(order.get("side") or "")
@@ -1544,6 +1549,9 @@ def submit_grid_order_entry(
             order["skipped_at"] = now
             return False
         set_grid_order_reduce_only(order, True)
+    elif restore_without_reduce_only:
+        set_grid_order_reduce_only(order, False)
+        order["reduce_only_canceled_restore_without_reduce_only_at"] = now
     if not grid_reduce_only_capacity_available(row, order, position_size, position_value):
         order["status"] = "paused_reduce_capacity"
         order["oid"] = None
@@ -1576,6 +1584,8 @@ def submit_grid_order_entry(
     ensure_grid_order_min_notional(row, asset, order)
 
     def try_reduce_only_after_margin_reject(error_text: str) -> dict[str, Any] | None:
+        if restore_without_reduce_only:
+            return None
         if grid_order_would_add_risk(position_size, bool(order.get("is_buy"))):
             return None
         plan = order.get("plan")

@@ -27,6 +27,7 @@ from trail_worker import (
     grid_active_cap_pause_candidates,
     grid_margin_gap_multiplier,
     grid_order_entry,
+    grid_reduce_only_canceled_restore_without_reduce_only,
     grid_risk_density_pause_candidates,
     grid_risk_density_restore_allowed,
     move_grid_order_away_from_active,
@@ -510,6 +511,95 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(entry["reduce_only_canceled_at"], 456)
         self.assertEqual(entry["paused_at"], 456)
         self.assertNotIn("skipped_at", entry)
+
+    def test_reduce_only_canceled_restore_submits_without_reduce_only(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.orders = []
+
+            def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
+                self.orders.append((coin, is_buy, Decimal(str(limit_px)), order_type, reduce_only))
+                return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 456}}]}}}
+
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+            "levels": [],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        order = grid_order_entry(row, "BTC", asset, True, Decimal("99"), True)
+        order["status"] = "paused_reduce_capacity"
+        order["oid"] = None
+        order["reduce_only_canceled_oid"] = 123
+        exchange = FakeExchange()
+
+        self.assertTrue(grid_reduce_only_canceled_restore_without_reduce_only(order))
+        submitted = submit_grid_order_entry(
+            exchange,
+            "BTC",
+            order,
+            789,
+            row,
+            asset,
+            Decimal("-1"),
+            Decimal("100"),
+            "abs",
+            False,
+            set(),
+        )
+
+        self.assertTrue(submitted)
+        self.assertEqual(order["status"], "active")
+        self.assertFalse(order["reduce_only"])
+        self.assertFalse(order["plan"]["reduce_only"])
+        self.assertFalse(exchange.orders[0][4])
+        self.assertEqual(order["reduce_only_canceled_restore_without_reduce_only_at"], 789)
+
+    def test_reduce_only_canceled_restore_margin_reject_does_not_retry_reduce_only(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.orders = []
+
+            def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
+                self.orders.append((coin, is_buy, Decimal(str(limit_px)), order_type, reduce_only))
+                return {"status": "ok", "response": {"data": {"statuses": [{"error": "Insufficient margin"}]}}}
+
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+            "levels": [],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        order = grid_order_entry(row, "BTC", asset, True, Decimal("99"), True)
+        order["status"] = "paused_reduce_capacity"
+        order["oid"] = None
+        order["reduce_only_canceled_oid"] = 123
+        exchange = FakeExchange()
+
+        submitted = submit_grid_order_entry(
+            exchange,
+            "BTC",
+            order,
+            789,
+            row,
+            asset,
+            Decimal("-1"),
+            Decimal("100"),
+            "abs",
+            False,
+            set(),
+        )
+
+        self.assertFalse(submitted)
+        self.assertEqual(len(exchange.orders), 1)
+        self.assertFalse(exchange.orders[0][4])
+        self.assertEqual(order["status"], "paused_margin")
+        self.assertFalse(order["reduce_only"])
+        self.assertFalse(order["plan"]["reduce_only"])
 
     def test_unknown_oid_recovery_skips_old_missing_order(self) -> None:
         entry = {
