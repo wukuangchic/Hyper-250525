@@ -390,6 +390,15 @@ def skip_stale_grid_recovery(
     return True
 
 
+def pause_reduce_only_canceled_entry(entry: dict[str, Any], old_oid: int, now: int) -> None:
+    entry["status"] = "paused_reduce_capacity"
+    entry["oid"] = None
+    entry["reduce_only_canceled_oid"] = old_oid
+    entry["reduce_only_canceled_at"] = now
+    entry["last_error"] = "exchange canceled reduce-only order; waiting for restore when reduce capacity is available"
+    entry["paused_at"] = now
+
+
 def defer_paused_grid_restore_if_crossing(
     entry: dict[str, Any],
     now: int,
@@ -2420,10 +2429,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 changed = True
                 continue
             if status_name == "reduceOnlyCanceled":
-                entry["status"] = "skipped_reduce_only"
-                entry["oid"] = None
-                entry["last_error"] = "exchange canceled excess reduce-only order"
-                entry["skipped_at"] = now
+                pause_reduce_only_canceled_entry(entry, old_oid, now)
                 changed = True
                 continue
             if skip_unknown_oid_grid_recovery(entry, old_oid, now, order_status):

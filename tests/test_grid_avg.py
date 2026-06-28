@@ -33,6 +33,7 @@ from trail_worker import (
     near_grid_orders_if_stale,
     next_depth_order,
     pause_refresh_reduce_only_replacement,
+    pause_reduce_only_canceled_entry,
     pause_refreshed_reduce_only_entries,
     pause_skipped_account_margin_replacement,
     prune_add_risk_brake_state,
@@ -490,6 +491,25 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertFalse(deferred)
         self.assertNotIn("restore_deferred_reason", entry)
+
+    def test_reduce_only_canceled_pauses_for_restore(self) -> None:
+        entry = {
+            "side": "buy",
+            "status": "active",
+            "oid": 123,
+            "price": "99",
+            "size": "1",
+            "reduce_only": True,
+        }
+
+        pause_reduce_only_canceled_entry(entry, 123, 456)
+
+        self.assertEqual(entry["status"], "paused_reduce_capacity")
+        self.assertIsNone(entry["oid"])
+        self.assertEqual(entry["reduce_only_canceled_oid"], 123)
+        self.assertEqual(entry["reduce_only_canceled_at"], 456)
+        self.assertEqual(entry["paused_at"], 456)
+        self.assertNotIn("skipped_at", entry)
 
     def test_unknown_oid_recovery_skips_old_missing_order(self) -> None:
         entry = {
