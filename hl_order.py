@@ -3551,6 +3551,12 @@ def grid_batch_indexes(
     ]
 
 
+def ensure_no_duplicate_grid_batch(rows: list[dict[str, Any]], network: str, account: str | None, coin: str) -> None:
+    matching_indexes = grid_batch_indexes(rows, network, account, coin, {"active", "error"})
+    if matching_indexes:
+        raise ValueError(f"active grid batch already exists for {coin}; use --modify or --cancel grid first")
+
+
 def cancellable_grid_batch_indexes(rows: list[dict[str, Any]], network: str, account: str | None, coin: str | None = None) -> list[int]:
     return grid_batch_indexes(rows, network, account, coin, {"active", "error"})
 
@@ -4074,9 +4080,7 @@ def recover_grid_batch_order(
 ) -> None:
     if current_mid is None:
         raise ValueError(f"No mid price found for {coin}, cannot recover grid")
-    existing = grid_batch_indexes(load_server_batch(), args.network, account, coin, {"active", "error"})
-    if existing:
-        raise ValueError(f"active grid batch already exists for {coin}; use --modify or --cancel grid first")
+    ensure_no_duplicate_grid_batch(load_server_batch(), args.network, account, coin)
     max_position_value = Decimal(str(args.grid_position_limit_value))
     gap_rate = resolve_grid_spacing(args, info, account, asset, dex, current_mid)
     orders = select_grid_recovery_orders(
@@ -4884,6 +4888,7 @@ def place_order(args: argparse.Namespace) -> None:
                 price_rate,
             )
             return
+        ensure_no_duplicate_grid_batch(load_server_batch(), args.network, account, coin)
         plans = build_grid_orders(args, info, account, dex, exchange, coin, asset, amount, current_mid, slippage)
         if args.verbose:
             print("dex:", dex or "default")

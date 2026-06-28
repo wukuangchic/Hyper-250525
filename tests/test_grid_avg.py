@@ -6,6 +6,7 @@ from hl_order import (
     asset_requires_isolated_margin,
     build_grid_batch_row,
     build_grid_orders,
+    ensure_no_duplicate_grid_batch,
     grid_avg_bounds,
     grid_avg_multiplier,
     grid_avg_size_pair,
@@ -50,6 +51,40 @@ from trail_worker import (
 
 
 class GridAvgTests(unittest.TestCase):
+    def test_duplicate_grid_batch_guard_blocks_active_same_coin(self) -> None:
+        rows = [
+            {
+                "type": "grid",
+                "status": "active",
+                "network": "mainnet",
+                "account": "0xabc",
+                "coin": "xyz:SP500",
+            },
+            {
+                "type": "grid",
+                "status": "cancelled",
+                "network": "mainnet",
+                "account": "0xabc",
+                "coin": "xyz:SP500",
+            },
+        ]
+
+        with self.assertRaisesRegex(ValueError, "active grid batch already exists for xyz:SP500"):
+            ensure_no_duplicate_grid_batch(rows, "mainnet", "0xabc", "xyz:SP500")
+
+    def test_duplicate_grid_batch_guard_allows_cancelled_same_coin(self) -> None:
+        rows = [
+            {
+                "type": "grid",
+                "status": "cancelled",
+                "network": "mainnet",
+                "account": "0xabc",
+                "coin": "xyz:SP500",
+            }
+        ]
+
+        ensure_no_duplicate_grid_batch(rows, "mainnet", "0xabc", "xyz:SP500")
+
     def test_grid_detail_rows_sort_all_sides_by_price_desc(self) -> None:
         row = {
             "levels": [
