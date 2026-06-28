@@ -859,6 +859,42 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(topup["price"], "103.5")
         self.assertEqual(topup["plan"]["grid_gap"], Decimal("0.02"))
 
+    def test_topup_ignores_paused_gap_that_would_cross_market(self) -> None:
+        row = {
+            "gap_rate": "0.0002",
+            "min_order_value": "1",
+            "sz_decimals": 3,
+            "base_buy_size": "0.002",
+            "topup_buy_size": "0.002",
+            "topup_buy_gap": "0.0002",
+            "levels": [
+                {"side": "buy", "status": "paused_replacement", "is_buy": True, "price": "7370.6", "size": "0.002"},
+                {"side": "buy", "status": "paused_replacement", "is_buy": True, "price": "7360.2", "size": "0.002"},
+                {"side": "buy", "status": "active", "oid": 1, "is_buy": True, "price": "7316.7", "size": "0.002"},
+                {"side": "buy", "status": "active", "oid": 2, "is_buy": True, "price": "7274.8", "size": "0.002"},
+            ],
+        }
+        asset = {"szDecimals": 3}
+
+        topup = next_depth_order(
+            row,
+            "xyz:SP500",
+            asset,
+            "buy",
+            Decimal("7332.0"),
+            Decimal("0.008"),
+            Decimal("58.6"),
+            Decimal("250"),
+            "abs",
+            Decimal("7331.8"),
+            Decimal("7331.8"),
+            Decimal("7332.2"),
+        )
+
+        self.assertIsNotNone(topup)
+        self.assertLess(Decimal(str(topup["price"])), Decimal("7332.2"))
+        self.assertNotEqual(topup["price"], "7365.4")
+
     def test_isolated_asset_detection(self) -> None:
         self.assertTrue(asset_requires_isolated_margin({"onlyIsolated": True}))
         self.assertTrue(asset_requires_isolated_margin({"marginMode": "noCross"}))

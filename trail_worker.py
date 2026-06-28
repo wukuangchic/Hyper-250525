@@ -345,7 +345,16 @@ def grid_recovery_price_would_cross_market(
     price = decimal_or_none(entry.get("price", entry.get("limit_px")))
     if price is None or price <= 0:
         return False
-    side = str(entry.get("side") or "")
+    return grid_price_would_cross_market(str(entry.get("side") or ""), price, current_mid, best_bid, best_ask)
+
+
+def grid_price_would_cross_market(
+    side: str,
+    price: Decimal,
+    current_mid: Decimal,
+    best_bid: Decimal | None,
+    best_ask: Decimal | None,
+) -> bool:
     if side == "buy":
         reference = best_ask if best_ask is not None and best_ask > 0 else current_mid
         return price >= reference
@@ -1445,6 +1454,8 @@ def next_depth_order(
     max_position_value: Decimal,
     policy: str,
     reference_px: Decimal | None = None,
+    best_bid: Decimal | None = None,
+    best_ask: Decimal | None = None,
 ) -> dict[str, Any] | None:
     gap_key = "topup_buy_gap" if side == "buy" else "topup_sell_gap"
     gap = Decimal(str(row.get(gap_key) or row["gap_rate"]))
@@ -1461,11 +1472,13 @@ def next_depth_order(
         target_gap=gap,
         respect_order_boundary=False,
     )
+    if next_px is not None and grid_price_would_cross_market(side, next_px, current_mid, best_bid, best_ask):
+        next_px = None
     if next_px is None:
         base_px = farthest_active_price(row, side, reference_px or current_mid)
         multiplier = Decimal("1") - gap if is_buy else Decimal("1") + gap
         next_px = rounded_perp_price(base_px * multiplier, sz_decimals)
-    if next_px <= 0:
+    if next_px <= 0 or grid_price_would_cross_market(side, next_px, current_mid, best_bid, best_ask):
         return None
     reduce_only = grid_order_should_reduce_only(position_size, is_buy, policy)
     base_size_key = "base_buy_size" if is_buy else "base_sell_size"
@@ -2659,7 +2672,20 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 break
             projected_position_value = projected_position_values[side]
             reference_px = grid_reference_price(side, current_mid, best_bid, best_ask)
-            topup = next_depth_order(row, coin, asset, side, current_mid, position_size, position_value, max_position_value, policy, reference_px)
+            topup = next_depth_order(
+                row,
+                coin,
+                asset,
+                side,
+                current_mid,
+                position_size,
+                position_value,
+                max_position_value,
+                policy,
+                reference_px,
+                best_bid,
+                best_ask,
+            )
             if topup is None:
                 break
             order_notional = Decimal(str(topup["size"])) * Decimal(str(topup["price"]))
