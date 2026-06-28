@@ -1625,7 +1625,10 @@ def format_grid_entry_status(entry: dict[str, Any]) -> str:
 
 
 def show_grid_entry_in_detail(entry: dict[str, Any]) -> bool:
-    if str(entry.get("status", "")) != "filled":
+    status = str(entry.get("status", ""))
+    if status == "skipped_account_margin":
+        return False
+    if status != "filled":
         return True
     if bool(entry.get("replacement_pending")):
         return True

@@ -110,6 +110,20 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertEqual([item["status"] for item in rows], ["filled_pending"])
 
+    def test_grid_detail_rows_hide_skipped_account_margin_history(self) -> None:
+        row = {
+            "levels": [
+                {"side": "buy", "status": "skipped_account_margin", "price": "99", "size": "1", "skipped_at": 1},
+                {"side": "buy", "status": "paused_account_margin", "price": "98", "size": "1", "paused_at": 2},
+                {"side": "sell", "status": "active", "oid": 3, "price": "101", "size": "1"},
+            ]
+        }
+
+        rows = format_grid_detail_rows(row, {3})
+
+        self.assertEqual([item["status"] for item in rows], ["active", "paused_account_margin"])
+        self.assertNotIn("skipped_account_margin", [item["status"] for item in rows])
+
     def test_panic_ratio_short_uses_liq_above_mid_and_buy_below_mid(self) -> None:
         row = {
             "levels": [
