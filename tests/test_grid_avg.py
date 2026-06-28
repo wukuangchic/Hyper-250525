@@ -1173,6 +1173,90 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(second["last_error"], "same-run insufficient margin pause")
         self.assertEqual(second["paused_at"], 7)
 
+    def test_reduce_risk_margin_reject_retries_as_reduce_only(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.orders = []
+
+            def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
+                self.orders.append((coin, is_buy, Decimal(str(limit_px)), order_type, reduce_only))
+                if len(self.orders) == 1:
+                    return {"status": "ok", "response": {"data": {"statuses": [{"error": "Insufficient margin"}]}}}
+                return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 456}}]}}}
+
+        exchange = FakeExchange()
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+            "levels": [],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        order = grid_order_entry(row, "BTC", asset, False, Decimal("99"), False)
+
+        submitted = submit_grid_order_entry(
+            exchange,
+            "BTC",
+            order,
+            7,
+            row,
+            asset,
+            Decimal("1"),
+            Decimal("100"),
+            "abs",
+            False,
+            set(),
+        )
+
+        self.assertTrue(submitted)
+        self.assertEqual([call[4] for call in exchange.orders], [False, True])
+        self.assertEqual(order["status"], "active")
+        self.assertEqual(order["oid"], 456)
+        self.assertTrue(order["reduce_only"])
+        self.assertTrue(order["plan"]["reduce_only"])
+        self.assertEqual(order["margin_reduce_only_retry_at"], 7)
+
+    def test_add_risk_margin_reject_does_not_retry_reduce_only(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.orders = []
+
+            def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
+                self.orders.append((coin, is_buy, Decimal(str(limit_px)), order_type, reduce_only))
+                return {"status": "ok", "response": {"data": {"statuses": [{"error": "Insufficient margin"}]}}}
+
+        exchange = FakeExchange()
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+            "levels": [],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        order = grid_order_entry(row, "BTC", asset, True, Decimal("99"), False)
+
+        submitted = submit_grid_order_entry(
+            exchange,
+            "BTC",
+            order,
+            7,
+            row,
+            asset,
+            Decimal("1"),
+            Decimal("100"),
+            "abs",
+            False,
+            set(),
+        )
+
+        self.assertFalse(submitted)
+        self.assertEqual(len(exchange.orders), 1)
+        self.assertEqual(exchange.orders[0][4], False)
+        self.assertEqual(order["status"], "paused_margin")
+        self.assertFalse(order["reduce_only"])
+
     def test_grid_submit_does_not_move_non_replacement_before_alo_reject(self) -> None:
         class FakeExchange:
             def __init__(self) -> None:

@@ -1565,6 +1565,46 @@ def submit_grid_order_entry(
         order["alo_price_attempts"] = GRID_ALO_PRICE_ATTEMPT_LIMIT
         return False
     ensure_grid_order_min_notional(row, asset, order)
+
+    def try_reduce_only_after_margin_reject(error_text: str) -> dict[str, Any] | None:
+        if grid_order_would_add_risk(position_size, bool(order.get("is_buy"))):
+            return None
+        plan = order.get("plan")
+        already_reduce_only = bool(order.get("reduce_only", False)) or (
+            isinstance(plan, dict) and bool(plan.get("reduce_only", False))
+        )
+        if already_reduce_only:
+            return None
+        set_grid_order_reduce_only(order, True)
+        order["margin_reduce_only_retry_at"] = now
+        order["margin_reduce_only_retry_error"] = error_text
+        if not grid_reduce_only_capacity_available(row, order, position_size, position_value):
+            order["status"] = "paused_reduce_capacity"
+            order["oid"] = None
+            order["last_error"] = error_text
+            order["paused_at"] = now
+            return {"handled": True}
+        try:
+            retry_oid, retry_state, retry_status = submit_grid_child_order(exchange, coin, order)
+            return {"submitted": True, "oid": retry_oid, "state": retry_state, "status": retry_status}
+        except GridPostOnlyRejected as retry_exc:
+            order["status"] = "skipped_post_only"
+            order["oid"] = None
+            order["last_error"] = str(retry_exc)
+            order["skipped_at"] = now
+            return {"handled": True}
+        except RuntimeError as retry_exc:
+            retry_error_text = str(retry_exc)
+            if is_reduce_only_would_increase_text(retry_error_text):
+                order["status"] = "skipped_reduce_only"
+                order["oid"] = None
+                order["last_error"] = retry_error_text
+                order["skipped_at"] = now
+                return {"handled": True}
+            if is_insufficient_margin_text(retry_error_text):
+                return {"error_text": retry_error_text}
+            raise
+
     try:
         oid, state, status = submit_grid_child_order(exchange, coin, order)
     except GridPostOnlyRejected as exc:
@@ -1628,6 +1668,16 @@ def submit_grid_order_entry(
                     order["skipped_at"] = now
                     return False
                 if is_insufficient_margin_text(error_text):
+                    retry_result = try_reduce_only_after_margin_reject(error_text)
+                    if retry_result is not None:
+                        if retry_result.get("submitted"):
+                            oid = retry_result["oid"]
+                            state = retry_result["state"]
+                            status = retry_result["status"]
+                            break
+                        if retry_result.get("handled"):
+                            return False
+                        error_text = str(retry_result.get("error_text") or error_text)
                     order["status"] = "paused_margin"
                     order["oid"] = None
                     order["last_error"] = error_text
@@ -1661,6 +1711,23 @@ def submit_grid_order_entry(
             order["skipped_at"] = now
             return False
         if is_insufficient_margin_text(error_text):
+            retry_result = try_reduce_only_after_margin_reject(error_text)
+            if retry_result is not None:
+                if retry_result.get("submitted"):
+                    oid = retry_result["oid"]
+                    state = retry_result["state"]
+                    status = retry_result["status"]
+                    order["oid"] = oid
+                    order["status"] = state
+                    order["submitted_at"] = now
+                    order["last_submit_status"] = status
+                    if state == "filled":
+                        order["filled_at"] = now
+                        order["replacement_pending"] = True
+                    return True
+                if retry_result.get("handled"):
+                    return False
+                error_text = str(retry_result.get("error_text") or error_text)
             order["status"] = "paused_margin"
             order["oid"] = None
             order["last_error"] = error_text
