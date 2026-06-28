@@ -1075,6 +1075,67 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(order["skipped_at"], 7)
         self.assertNotIn("paused_at", order)
 
+    def test_same_run_insufficient_margin_pauses_later_same_side_without_submit(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.orders = []
+
+            def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
+                self.orders.append((coin, is_buy, Decimal(str(limit_px)), order_type, reduce_only))
+                return {"status": "ok", "response": {"data": {"statuses": [{"error": "Insufficient margin"}]}}}
+
+        exchange = FakeExchange()
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+            "levels": [],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        first = grid_order_entry(row, "BTC", asset, True, Decimal("100"), False)
+        second = grid_order_entry(row, "BTC", asset, True, Decimal("99"), False)
+        margin_blocked_sides: set[tuple[str, str]] = set()
+
+        first_submitted = submit_grid_order_entry(
+            exchange,
+            "BTC",
+            first,
+            7,
+            row,
+            asset,
+            Decimal("1"),
+            Decimal("100"),
+            "abs",
+            False,
+            set(),
+            margin_blocked_sides=margin_blocked_sides,
+        )
+        second_submitted = submit_grid_order_entry(
+            exchange,
+            "BTC",
+            second,
+            7,
+            row,
+            asset,
+            Decimal("1"),
+            Decimal("100"),
+            "abs",
+            False,
+            set(),
+            margin_blocked_sides=margin_blocked_sides,
+        )
+
+        self.assertFalse(first_submitted)
+        self.assertFalse(second_submitted)
+        self.assertEqual(len(exchange.orders), 1)
+        self.assertEqual(margin_blocked_sides, {("BTC", "buy")})
+        self.assertEqual(first["status"], "paused_margin")
+        self.assertIn("Insufficient margin", first["last_error"])
+        self.assertEqual(second["status"], "paused_margin")
+        self.assertEqual(second["last_error"], "same-run insufficient margin pause")
+        self.assertEqual(second["paused_at"], 7)
+
     def test_grid_submit_does_not_move_non_replacement_before_alo_reject(self) -> None:
         class FakeExchange:
             def __init__(self) -> None:

@@ -1127,6 +1127,7 @@ def regrid_dense_entries(
     policy: str,
     account_margin_protected: bool,
     isolated_leverage_ready: set[str],
+    margin_blocked_sides: set[tuple[str, str]] | None = None,
 ) -> int:
     if account_margin_protected:
         return 0
@@ -1187,6 +1188,7 @@ def regrid_dense_entries(
             False,
             isolated_leverage_ready,
             retry_alo_reject=True,
+            margin_blocked_sides=margin_blocked_sides,
         )
         if submitted:
             regridded += 1
@@ -1486,9 +1488,18 @@ def submit_grid_order_entry(
     account_margin_protected: bool,
     isolated_leverage_ready: set[str],
     retry_alo_reject: bool = False,
+    margin_blocked_sides: set[tuple[str, str]] | None = None,
 ) -> bool:
     refresh_grid_order_reduce_only(order, position_size, policy)
     refresh_grid_order_tif(order)
+    side = str(order.get("side") or "")
+    margin_side_key = (coin, side)
+    if side and margin_blocked_sides is not None and margin_side_key in margin_blocked_sides:
+        order["status"] = "paused_margin"
+        order["oid"] = None
+        order["last_error"] = "same-run insufficient margin pause"
+        order["paused_at"] = now
+        return False
     if account_margin_protected:
         if grid_order_would_add_risk(position_size, bool(order.get("is_buy"))):
             if bool(order.get("replacement_order")):
@@ -1600,6 +1611,8 @@ def submit_grid_order_entry(
                     order["oid"] = None
                     order["last_error"] = error_text
                     order["paused_at"] = now
+                    if side and margin_blocked_sides is not None:
+                        margin_blocked_sides.add(margin_side_key)
                     if grid_order_would_add_risk(position_size, bool(order.get("is_buy"))):
                         pause_grid_margin_side(row, str(order.get("side")), now, position_value)
                     return False
@@ -1631,6 +1644,8 @@ def submit_grid_order_entry(
             order["oid"] = None
             order["last_error"] = error_text
             order["paused_at"] = now
+            if side and margin_blocked_sides is not None:
+                margin_blocked_sides.add(margin_side_key)
             if grid_order_would_add_risk(position_size, bool(order.get("is_buy"))):
                 pause_grid_margin_side(row, str(order.get("side")), now, position_value)
             return False
@@ -2237,6 +2252,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     filled_submission_sides: set[str] = set()
     replacement_quota_sides: set[str] = set()
     isolated_leverage_ready: set[str] = set()
+    margin_blocked_sides: set[tuple[str, str]] = set()
 
     def side_submission_allowed(side: str) -> bool:
         return (
@@ -2261,6 +2277,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             policy,
             account_margin_protected,
             isolated_leverage_ready,
+            margin_blocked_sides=margin_blocked_sides,
         )
         if submitted:
             submissions_by_side[side] = submissions_by_side.get(side, 0) + 1
@@ -2283,6 +2300,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             account_margin_protected,
             isolated_leverage_ready,
             True,
+            margin_blocked_sides=margin_blocked_sides,
         )
         if submitted:
             submissions_by_side[side] = submissions_by_side.get(side, 0) + 1
@@ -2461,6 +2479,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         policy,
         account_margin_protected,
         isolated_leverage_ready,
+        margin_blocked_sides,
     )
     if dense_regridded:
         changed = True
