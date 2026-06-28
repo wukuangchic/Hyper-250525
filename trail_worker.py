@@ -792,19 +792,21 @@ def grid_insert_price_between_active_gap(
     *,
     target_gap: Decimal | None = None,
     respect_order_boundary: bool = True,
+    boundary_price: Decimal | None = None,
 ) -> Decimal | None:
     side = str(order.get("side") or "")
     price = decimal_or_none(order.get("price", order.get("limit_px")))
     if not side or price is None or price <= 0:
         return None
-    prices = sorted(
-        {
-            existing
-            for entry in grid_price_occupancy_entries(row, side)
-            if entry is not order
-            if (existing := decimal_or_none(entry.get("price", entry.get("limit_px")))) is not None and existing > 0
-        }
-    )
+    prices = {
+        existing
+        for entry in grid_price_occupancy_entries(row, side)
+        if entry is not order
+        if (existing := decimal_or_none(entry.get("price", entry.get("limit_px")))) is not None and existing > 0
+    }
+    if boundary_price is not None and boundary_price > 0:
+        prices.add(boundary_price)
+    prices = sorted(prices)
     if len(prices) < 2:
         return None
     gap_rate = target_gap if target_gap is not None and target_gap > 0 else grid_order_target_gap(row, side, order)
@@ -1465,12 +1467,18 @@ def next_depth_order(
     if adds_risk:
         gap *= Decimal(str(row.get("margin_gap_multiplier") or "1"))
     gap_probe = {"side": side, "is_buy": is_buy, "price": decimal_to_plain(reference_px or current_mid)}
+    boundary_needed = any(
+        grid_price_would_cross_market(side, existing, current_mid, None, None)
+        for entry in grid_price_occupancy_entries(row, side)
+        if (existing := decimal_or_none(entry.get("price", entry.get("limit_px")))) is not None and existing > 0
+    )
     next_px = grid_insert_price_between_active_gap(
         row,
         asset,
         gap_probe,
         target_gap=gap,
-        respect_order_boundary=False,
+        respect_order_boundary=boundary_needed,
+        boundary_price=current_mid if boundary_needed else None,
     )
     if next_px is not None and grid_price_would_cross_market(side, next_px, current_mid, best_bid, best_ask):
         next_px = None

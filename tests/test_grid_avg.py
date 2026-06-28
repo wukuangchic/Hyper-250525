@@ -892,6 +892,7 @@ class GridAvgTests(unittest.TestCase):
         )
 
         self.assertIsNotNone(topup)
+        self.assertEqual(topup["price"], "7324.4")
         self.assertLess(Decimal(str(topup["price"])), Decimal("7332.2"))
         self.assertNotEqual(topup["price"], "7365.4")
 
