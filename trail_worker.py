@@ -1045,6 +1045,13 @@ def preserve_replacement_order(
         levels.append(order)
 
 
+def normalize_margin_paused_replacement(entry: dict[str, Any], now: int) -> bool:
+    if not bool(entry.get("replacement_order")) or str(entry.get("status")) != "paused_margin":
+        return False
+    preserve_replacement_order([], entry, now, "paused_margin", normalize_margin=True)
+    return True
+
+
 def pause_skipped_account_margin_replacement(levels: list[Any], entry: dict[str, Any], now: int) -> bool:
     if str(entry.get("status")) != "skipped_account_margin" or not bool(entry.get("replacement_order")):
         return False
@@ -2930,6 +2937,9 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         side = str(entry["side"])
         is_replacement_order = bool(entry.get("replacement_order"))
         status = str(entry.get("status"))
+        if normalize_margin_paused_replacement(entry, now):
+            status = str(entry.get("status"))
+            changed = True
         if panic_reduced and not is_replacement_order and grid_order_would_add_risk(position_size, side == "buy"):
             continue
         if not side_submission_allowed(side):

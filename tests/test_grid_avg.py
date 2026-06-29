@@ -41,6 +41,7 @@ from trail_worker import (
     move_grid_order_away_from_active,
     near_grid_orders_if_stale,
     next_depth_order,
+    normalize_margin_paused_replacement,
     pause_refresh_reduce_only_replacement,
     pause_reduce_only_canceled_entry,
     pause_refreshed_reduce_only_entries,
@@ -1719,6 +1720,23 @@ class GridAvgTests(unittest.TestCase):
 
         preserve_replacement_order(levels, order, 3, normalize_margin=True)
 
+        self.assertEqual(order["status"], "paused_replacement")
+        self.assertEqual(order["replacement_pause_reason"], "paused_margin")
+        self.assertEqual(order["last_error"], "Insufficient margin")
+
+    def test_restore_loop_normalizes_margin_paused_replacement_before_submit_quota(self) -> None:
+        order = {
+            "side": "sell",
+            "status": "paused_margin",
+            "oid": None,
+            "price": "101",
+            "size": "1",
+            "replacement_order": True,
+            "last_error": "Insufficient margin",
+            "paused_at": 1,
+        }
+
+        self.assertTrue(normalize_margin_paused_replacement(order, 3))
         self.assertEqual(order["status"], "paused_replacement")
         self.assertEqual(order["replacement_pause_reason"], "paused_margin")
         self.assertEqual(order["last_error"], "Insufficient margin")
