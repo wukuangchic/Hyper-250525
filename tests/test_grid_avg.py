@@ -364,6 +364,106 @@ class GridAvgTests(unittest.TestCase):
         self.assertTrue(order["plan"]["reduce_only"])
         self.assertTrue(exchange.orders[0][4])
 
+    def test_grid_submit_adopts_matching_exchange_open_order(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.orders = []
+
+            def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
+                self.orders.append((coin, is_buy, size, limit_px, order_type, reduce_only))
+                raise AssertionError("duplicate exchange order should not be submitted")
+
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+            "levels": [],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        order = grid_order_entry(row, "BTC", asset, False, Decimal("101"), False)
+        open_orders = [
+            {
+                "coin": "BTC",
+                "side": "A",
+                "limitPx": "101",
+                "sz": "1",
+                "oid": 789,
+                "reduceOnly": False,
+                "timestamp": 123000,
+            }
+        ]
+
+        submitted = submit_grid_order_entry(
+            FakeExchange(),
+            "BTC",
+            order,
+            2,
+            row,
+            asset,
+            Decimal("0"),
+            Decimal("0"),
+            "abs",
+            False,
+            set(),
+            open_orders=open_orders,
+        )
+
+        self.assertTrue(submitted)
+        self.assertEqual(order["status"], "active")
+        self.assertEqual(order["oid"], 789)
+        self.assertEqual(order["submitted_at"], 2)
+        self.assertEqual(order["last_submit_status"]["adopted_open_order"]["oid"], 789)
+
+    def test_grid_submit_does_not_adopt_oid_already_tracked_locally(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.orders = []
+
+            def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
+                self.orders.append((coin, is_buy, size, limit_px, order_type, reduce_only))
+                return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 790}}]}}}
+
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+            "levels": [{"side": "sell", "status": "active", "oid": 789, "price": "101"}],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        order = grid_order_entry(row, "BTC", asset, False, Decimal("101"), False)
+        open_orders = [
+            {
+                "coin": "BTC",
+                "side": "A",
+                "limitPx": "101",
+                "sz": "1",
+                "oid": 789,
+                "reduceOnly": False,
+            }
+        ]
+        exchange = FakeExchange()
+
+        submitted = submit_grid_order_entry(
+            exchange,
+            "BTC",
+            order,
+            2,
+            row,
+            asset,
+            Decimal("0"),
+            Decimal("0"),
+            "abs",
+            False,
+            set(),
+            open_orders=open_orders,
+        )
+
+        self.assertTrue(submitted)
+        self.assertEqual(order["oid"], 790)
+        self.assertEqual(len(exchange.orders), 1)
+
     def test_add_risk_brake_cancels_nearest_same_side_after_two_open_fills(self) -> None:
         class FakeExchange:
             def __init__(self) -> None:

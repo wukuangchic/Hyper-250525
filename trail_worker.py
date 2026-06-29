@@ -713,6 +713,116 @@ def submit_grid_child_order(exchange: Any, coin: str, order: dict[str, Any]) -> 
     raise RuntimeError(f"Grid child order response did not include an order id: {result}")
 
 
+def matching_open_grid_order(
+    open_orders: list[dict[str, Any]] | None,
+    coin: str,
+    order: dict[str, Any],
+    row: dict[str, Any],
+) -> dict[str, Any] | None:
+    if not open_orders:
+        return None
+    plan = order.get("plan")
+    if not isinstance(plan, dict):
+        return None
+    desired_side = "B" if bool(plan.get("is_buy")) else "A"
+    desired_price = decimal_or_none(plan.get("limit_px"))
+    desired_size = decimal_or_none(plan.get("size"))
+    desired_reduce_only = bool(plan.get("reduce_only", False))
+    if desired_price is None or desired_size is None:
+        return None
+    tracked_oids = grid_batch_open_oids(row)
+    try:
+        current_oid = int(order.get("oid") or 0)
+    except (TypeError, ValueError):
+        current_oid = 0
+    if current_oid:
+        tracked_oids.discard(current_oid)
+    for open_order in open_orders:
+        if not isinstance(open_order, dict):
+            continue
+        if not position_matches_coin(str(open_order.get("coin", "")), coin):
+            continue
+        if str(open_order.get("side") or "") != desired_side:
+            continue
+        oid = open_order.get("oid")
+        try:
+            oid_int = int(oid)
+        except (TypeError, ValueError):
+            continue
+        if oid_int in tracked_oids:
+            continue
+        open_price = decimal_or_none(open_order.get("limitPx"))
+        open_size = decimal_or_none(open_order.get("sz"))
+        if open_price != desired_price or open_size != desired_size:
+            continue
+        if bool(open_order.get("reduceOnly", False)) != desired_reduce_only:
+            continue
+        return open_order
+    return None
+
+
+def adopt_matching_open_grid_order(
+    open_orders: list[dict[str, Any]] | None,
+    coin: str,
+    order: dict[str, Any],
+    now: int,
+    row: dict[str, Any],
+) -> bool:
+    open_order = matching_open_grid_order(open_orders, coin, order, row)
+    if open_order is None:
+        return False
+    oid = int(open_order["oid"])
+    order["oid"] = oid
+    order["status"] = "active"
+    order["submitted_at"] = now
+    order["adopted_open_order_at"] = now
+    order["last_submit_status"] = {
+        "adopted_open_order": {
+            "oid": oid,
+            "limitPx": open_order.get("limitPx"),
+            "sz": open_order.get("sz"),
+            "side": open_order.get("side"),
+            "timestamp": open_order.get("timestamp"),
+        }
+    }
+    log_event(
+        "grid_child_order_adopted",
+        {
+            "coin": coin,
+            "side": order.get("side"),
+            "oid": oid,
+            "price": order.get("price", order.get("limit_px")),
+            "size": order.get("size"),
+        },
+    )
+    return True
+
+
+def record_submitted_open_grid_order(
+    open_orders: list[dict[str, Any]] | None,
+    coin: str,
+    order: dict[str, Any],
+    oid: int | None,
+    now: int,
+) -> None:
+    if open_orders is None or oid is None or oid <= 0:
+        return
+    plan = order.get("plan")
+    if not isinstance(plan, dict):
+        return
+    open_orders.append(
+        {
+            "coin": coin,
+            "side": "B" if bool(plan.get("is_buy")) else "A",
+            "limitPx": str(plan.get("limit_px")),
+            "sz": str(plan.get("size")),
+            "oid": oid,
+            "timestamp": now * 1000,
+            "reduceOnly": bool(plan.get("reduce_only", False)),
+        }
+    )
+
+
 def ensure_grid_order_min_notional(row: dict[str, Any], asset: dict[str, Any], order: dict[str, Any]) -> None:
     plan = order.get("plan")
     if not isinstance(plan, dict):
@@ -1590,6 +1700,7 @@ def submit_grid_order_entry(
     isolated_leverage_ready: set[str],
     retry_alo_reject: bool = False,
     margin_blocked_sides: set[tuple[str, str]] | None = None,
+    open_orders: list[dict[str, Any]] | None = None,
 ) -> bool:
     restore_without_reduce_only = grid_reduce_only_canceled_restore_without_reduce_only(order)
     refresh_grid_order_reduce_only(order, position_size, policy)
@@ -1651,6 +1762,8 @@ def submit_grid_order_entry(
         order["alo_price_attempts"] = GRID_ALO_PRICE_ATTEMPT_LIMIT
         return False
     ensure_grid_order_min_notional(row, asset, order)
+    if adopt_matching_open_grid_order(open_orders, coin, order, now, row):
+        return True
 
     def try_reduce_only_after_margin_reject(error_text: str) -> dict[str, Any] | None:
         if restore_without_reduce_only:
@@ -1673,6 +1786,8 @@ def submit_grid_order_entry(
             order["paused_at"] = now
             return {"handled": True}
         try:
+            if adopt_matching_open_grid_order(open_orders, coin, order, now, row):
+                return {"adopted": True}
             retry_oid, retry_state, retry_status = submit_grid_child_order(exchange, coin, order)
             return {"submitted": True, "oid": retry_oid, "state": retry_state, "status": retry_status}
         except GridPostOnlyRejected as retry_exc:
@@ -1734,6 +1849,8 @@ def submit_grid_order_entry(
                 set_grid_order_price(order, next_price)
                 continue
             ensure_grid_order_min_notional(row, asset, order)
+            if adopt_matching_open_grid_order(open_orders, coin, order, now, row):
+                return True
             try:
                 oid, state, status = submit_grid_child_order(exchange, coin, order)
                 break
@@ -1763,6 +1880,8 @@ def submit_grid_order_entry(
                             state = retry_result["state"]
                             status = retry_result["status"]
                             break
+                        if retry_result.get("adopted"):
+                            return True
                         if retry_result.get("handled"):
                             return False
                         error_text = str(retry_result.get("error_text") or error_text)
@@ -1810,9 +1929,13 @@ def submit_grid_order_entry(
                     order["status"] = state
                     order["submitted_at"] = now
                     order["last_submit_status"] = status
+                    if state == "active":
+                        record_submitted_open_grid_order(open_orders, coin, order, oid, now)
                     if state == "filled":
                         order["filled_at"] = now
                         order["replacement_pending"] = True
+                    return True
+                if retry_result.get("adopted"):
                     return True
                 if retry_result.get("handled"):
                     return False
@@ -1845,6 +1968,8 @@ def submit_grid_order_entry(
     order["status"] = state
     order["submitted_at"] = now
     order["last_submit_status"] = status
+    if state == "active":
+        record_submitted_open_grid_order(open_orders, coin, order, oid, now)
     if retry_alo_reject and "alo_rejects" in locals() and alo_rejects:
         order["alo_rejects"] = alo_rejects
     if state == "filled":
@@ -2430,7 +2555,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     open_orders_key = (network, account, dex)
     if open_orders_key not in open_orders_cache:
         open_orders_cache[open_orders_key] = collect_frontend_open_orders(info, account, dex)
-    open_oids = open_order_oids(info, account, dex, coin, open_orders_cache[open_orders_key])
+    current_open_orders = open_orders_cache[open_orders_key]
+    open_oids = open_order_oids(info, account, dex, coin, current_open_orders)
     mark_phase("open_orders")
 
     fills_cache = cache.setdefault("fills", {})
@@ -2481,6 +2607,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             account_margin_protected,
             isolated_leverage_ready,
             margin_blocked_sides=margin_blocked_sides,
+            open_orders=current_open_orders,
         )
         if submitted:
             submissions_by_side[side] = submissions_by_side.get(side, 0) + 1
@@ -2504,6 +2631,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             isolated_leverage_ready,
             True,
             margin_blocked_sides=margin_blocked_sides,
+            open_orders=current_open_orders,
         )
         if submitted:
             submissions_by_side[side] = submissions_by_side.get(side, 0) + 1
