@@ -58,7 +58,6 @@ DONE_RETENTION_DAYS = 7
 DONE_RETENTION_MAX = 500
 GRID_LEVEL_HISTORY_MAX = 120
 GRID_FILL_LOOKBACK_SECONDS = 24 * 60 * 60
-GRID_MARGIN_RETRY_SECONDS = 10 * 60
 GRID_ACCOUNT_MARGIN_RATIO_SOFT_THRESHOLD = Decimal("0.90")
 GRID_MAX_SUBMISSIONS_PER_SIDE_PER_RUN = 1
 GRID_ADD_RISK_BRAKE_STREAK = 2
@@ -213,10 +212,11 @@ def grid_margin_pause_active(
     if not isinstance(pause, dict):
         return False
 
+    paused_at = int(pause.get("paused_at") or 0)
     paused_position_value = decimal_or_none(pause.get("position_value"))
-    expired = now >= int(pause.get("retry_at") or 0)
+    stale_run = paused_at != now
     position_reduced = paused_position_value is not None and position_value < paused_position_value
-    if expired or position_reduced:
+    if stale_run or position_reduced:
         pauses.pop(side, None)
         if not pauses:
             row.pop("margin_pauses", None)
@@ -304,9 +304,24 @@ def pause_grid_margin_side(
     pauses = row.setdefault("margin_pauses", {})
     pauses[side] = {
         "paused_at": now,
-        "retry_at": now + GRID_MARGIN_RETRY_SECONDS,
         "position_value": decimal_to_plain(position_value),
     }
+
+
+def clear_stale_grid_margin_pauses(row: dict[str, Any], now: int) -> bool:
+    pauses = row.get("margin_pauses")
+    if not isinstance(pauses, dict):
+        return False
+    stale_sides = [
+        side
+        for side, pause in pauses.items()
+        if not isinstance(pause, dict) or int(pause.get("paused_at") or 0) != now
+    ]
+    for side in stale_sides:
+        pauses.pop(side, None)
+    if not pauses:
+        row.pop("margin_pauses", None)
+    return bool(stale_sides)
 
 
 def pause_grid_margin_side_entries(row: dict[str, Any], side: str, now: int, error_text: str) -> int:
@@ -333,28 +348,6 @@ def pause_grid_margin_side_entries(row: dict[str, Any], side: str, now: int, err
         entry["paused_at"] = now
         paused += 1
     return paused
-
-
-def migrate_insufficient_margin_side_pauses(row: dict[str, Any], now: int, position_value: Decimal) -> bool:
-    changed = False
-    paused_sides: set[str] = set()
-    for entry in row.get("levels") or []:
-        if not isinstance(entry, dict) or entry.get("side") is None:
-            continue
-        if not is_insufficient_margin_text(str(entry.get("last_error") or "")):
-            continue
-        status = str(entry.get("status", "active"))
-        if status not in GRID_PAUSED_STATUSES and status not in {"pending", "recovery_deferred"}:
-            continue
-        side = str(entry["side"])
-        if side in paused_sides:
-            continue
-        error_text = str(entry.get("last_error") or "Insufficient margin")
-        pause_grid_margin_side(row, side, now, position_value)
-        pause_grid_margin_side_entries(row, side, now, error_text)
-        paused_sides.add(side)
-        changed = True
-    return changed
 
 
 def find_current_position_from_state(state: dict[str, Any], coin: str) -> dict[str, Any] | None:
@@ -1762,9 +1755,9 @@ def submit_grid_order_entry(
                     order["oid"] = None
                     order["last_error"] = error_text
                     order["paused_at"] = now
-                    if side and margin_blocked_sides is not None:
-                        margin_blocked_sides.add(margin_side_key)
-                    if side:
+                    if side and grid_order_would_add_risk(position_size, bool(order.get("is_buy"))):
+                        if margin_blocked_sides is not None:
+                            margin_blocked_sides.add(margin_side_key)
                         pause_grid_margin_side(row, side, now, position_value)
                         pause_grid_margin_side_entries(row, side, now, error_text)
                     return False
@@ -1813,9 +1806,9 @@ def submit_grid_order_entry(
             order["oid"] = None
             order["last_error"] = error_text
             order["paused_at"] = now
-            if side and margin_blocked_sides is not None:
-                margin_blocked_sides.add(margin_side_key)
-            if side:
+            if side and grid_order_would_add_risk(position_size, bool(order.get("is_buy"))):
+                if margin_blocked_sides is not None:
+                    margin_blocked_sides.add(margin_side_key)
                 pause_grid_margin_side(row, side, now, position_value)
                 pause_grid_margin_side_entries(row, side, now, error_text)
             return False
@@ -2309,6 +2302,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     mark_phase("asset")
     now = int(cache.setdefault("now", int(time.time())))
     now_ms = now * 1000
+    stale_margin_pauses_cleared = clear_stale_grid_margin_pauses(row, now)
     start_ms = int(row.get("last_fill_check_ms") or (now - 24 * 60 * 60) * 1000)
     start_ms = max(0, min(start_ms - 5 * 60 * 1000, (now - GRID_FILL_LOOKBACK_SECONDS) * 1000))
     max_position_value = Decimal(str(row["max_position_value"]))
@@ -2432,8 +2426,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         log_event("grid_user_fills_by_time", {"start_ms": common_start_ms, "end_ms": now_ms, "count": len(fills_cache[fills_key])})
     fills_by_oid = recent_fills_by_oid(info, account, coin, start_ms, now_ms, fills_cache[fills_key])
     mark_phase("fills")
-    margin_history_paused = migrate_insufficient_margin_side_pauses(row, now, position_value)
-    changed = avg_state_changed or margin_state_changed or brake_state_pruned or margin_history_paused
+    changed = avg_state_changed or margin_state_changed or brake_state_pruned or stale_margin_pauses_cleared
     missing_without_fill: list[int] = []
     recovered_missing = 0
     newly_filled: list[dict[str, Any]] = [

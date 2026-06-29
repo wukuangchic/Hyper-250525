@@ -21,6 +21,7 @@ from hl_order import (
 from trail_worker import (
     active_grid_oids,
     build_grid_panic_reduce_order,
+    clear_stale_grid_margin_pauses,
     clear_grid_side_cap_entries,
     apply_grid_add_risk_brake,
     dense_grid_entries,
@@ -32,7 +33,6 @@ from trail_worker import (
     grid_margin_gap_multiplier,
     grid_margin_pause_active,
     find_current_position_from_state,
-    migrate_insufficient_margin_side_pauses,
     grid_order_entry,
     grid_reduce_only_canceled_restore_without_reduce_only,
     grid_risk_density_pause_candidates,
@@ -1381,13 +1381,14 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(row["levels"][5]["status"], "recovery_deferred")
         self.assertEqual(row["levels"][6]["status"], "filled")
 
-    def test_margin_pause_stays_active_for_reduce_risk_side_until_retry_or_position_reduces(self) -> None:
+    def test_margin_pause_is_current_run_only(self) -> None:
         row = {}
 
         pause_grid_margin_side(row, "sell", 7, Decimal("100"))
 
-        self.assertTrue(grid_margin_pause_active(row, "sell", 8, Decimal("100"), Decimal("1")))
-        self.assertFalse(grid_margin_pause_active(row, "sell", 8, Decimal("99"), Decimal("1")))
+        self.assertTrue(grid_margin_pause_active(row, "sell", 7, Decimal("100"), Decimal("1")))
+        self.assertFalse(grid_margin_pause_active(row, "sell", 8, Decimal("100"), Decimal("1")))
+        self.assertNotIn("margin_pauses", row)
 
     def test_find_current_position_from_cached_state_matches_coin(self) -> None:
         state = {
@@ -1403,31 +1404,39 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(position["positionValue"], "10")
         self.assertIsNone(find_current_position_from_state(state, "BTC"))
 
-    def test_historical_insufficient_margin_pauses_whole_side(self) -> None:
+    def test_historical_insufficient_margin_does_not_create_new_margin_pause(self) -> None:
         row = {
+            "margin_pauses": {"sell": {"paused_at": 6, "position_value": "100"}},
             "levels": [
                 {
                     "side": "sell",
+                    "is_buy": False,
                     "status": "paused_replacement",
                     "oid": None,
                     "price": "101",
                     "last_error": "Failed to submit grid child order: Insufficient margin",
                 },
-                {"side": "sell", "status": "paused_reduce_capacity", "oid": None, "price": "102"},
-                {"side": "sell", "status": "active", "oid": 1, "price": "103"},
-                {"side": "buy", "status": "paused_replacement", "oid": None, "price": "99"},
+                {"side": "sell", "is_buy": False, "status": "paused_reduce_capacity", "oid": None, "price": "102"},
             ]
         }
 
-        changed = migrate_insufficient_margin_side_pauses(row, 7, Decimal("100"))
+        self.assertFalse(grid_margin_pause_active(row, "sell", 7, Decimal("100"), Decimal("-1")))
+        self.assertNotIn("margin_pauses", row)
+        self.assertEqual(row["levels"][0]["status"], "paused_replacement")
+        self.assertEqual(row["levels"][1]["status"], "paused_reduce_capacity")
+
+    def test_stale_margin_pauses_clear_at_next_worker_run(self) -> None:
+        row = {
+            "margin_pauses": {
+                "buy": {"paused_at": 7, "position_value": "100"},
+                "sell": {"paused_at": 8, "position_value": "100"},
+            }
+        }
+
+        changed = clear_stale_grid_margin_pauses(row, 8)
 
         self.assertTrue(changed)
-        self.assertIn("sell", row["margin_pauses"])
-        self.assertEqual(row["levels"][0]["status"], "paused_margin")
-        self.assertEqual(row["levels"][1]["status"], "paused_margin")
-        self.assertEqual(row["levels"][2]["status"], "active")
-        self.assertEqual(row["levels"][2]["oid"], 1)
-        self.assertEqual(row["levels"][3]["status"], "paused_replacement")
+        self.assertEqual(row["margin_pauses"], {"sell": {"paused_at": 8, "position_value": "100"}})
 
     def test_reduce_risk_margin_reject_retries_as_reduce_only(self) -> None:
         class FakeExchange:
@@ -1472,6 +1481,67 @@ class GridAvgTests(unittest.TestCase):
         self.assertTrue(order["reduce_only"])
         self.assertTrue(order["plan"]["reduce_only"])
         self.assertEqual(order["margin_reduce_only_retry_at"], 7)
+
+    def test_reduce_risk_margin_reject_does_not_block_same_side(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.orders = []
+
+            def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
+                self.orders.append((coin, is_buy, Decimal(str(limit_px)), order_type, reduce_only))
+                return {"status": "ok", "response": {"data": {"statuses": [{"error": "Insufficient margin"}]}}}
+
+        exchange = FakeExchange()
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+            "levels": [],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        first = grid_order_entry(row, "BTC", asset, False, Decimal("101"), False)
+        second = grid_order_entry(row, "BTC", asset, False, Decimal("102"), False)
+        margin_blocked_sides: set[tuple[str, str]] = set()
+
+        first_submitted = submit_grid_order_entry(
+            exchange,
+            "BTC",
+            first,
+            7,
+            row,
+            asset,
+            Decimal("1"),
+            Decimal("200"),
+            "abs",
+            False,
+            set(),
+            margin_blocked_sides=margin_blocked_sides,
+        )
+        second_submitted = submit_grid_order_entry(
+            exchange,
+            "BTC",
+            second,
+            7,
+            row,
+            asset,
+            Decimal("1"),
+            Decimal("200"),
+            "abs",
+            False,
+            set(),
+            margin_blocked_sides=margin_blocked_sides,
+        )
+
+        self.assertFalse(first_submitted)
+        self.assertFalse(second_submitted)
+        self.assertEqual(len(exchange.orders), 4)
+        self.assertEqual([call[4] for call in exchange.orders], [False, True, False, True])
+        self.assertEqual(margin_blocked_sides, set())
+        self.assertNotIn("margin_pauses", row)
+        self.assertEqual(first["status"], "paused_margin")
+        self.assertEqual(second["status"], "paused_margin")
+        self.assertNotEqual(second["last_error"], "same-run insufficient margin pause")
 
     def test_add_risk_margin_reject_does_not_retry_reduce_only(self) -> None:
         class FakeExchange:
