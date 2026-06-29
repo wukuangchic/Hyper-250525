@@ -29,7 +29,6 @@ from hl_order import (  # noqa: E402
     decimal_or_none,
     decimal_to_plain,
     fill_matches_coin,
-    find_current_position,
     format_signed_percent,
     grid_avg_multiplier,
     grid_avg_topup_params,
@@ -43,6 +42,7 @@ from hl_order import (  # noqa: E402
     load_server_batch,
     log_event,
     mask,
+    position_matches_coin,
     resolve_perp_asset,
     rounded_perp_price,
     save_server_batch,
@@ -213,12 +213,10 @@ def grid_margin_pause_active(
     if not isinstance(pause, dict):
         return False
 
-    is_buy = side == "buy"
     paused_position_value = decimal_or_none(pause.get("position_value"))
     expired = now >= int(pause.get("retry_at") or 0)
     position_reduced = paused_position_value is not None and position_value < paused_position_value
-    no_longer_adds_risk = not grid_order_would_add_risk(position_size, is_buy)
-    if expired or position_reduced or no_longer_adds_risk:
+    if expired or position_reduced:
         pauses.pop(side, None)
         if not pauses:
             row.pop("margin_pauses", None)
@@ -309,6 +307,67 @@ def pause_grid_margin_side(
         "retry_at": now + GRID_MARGIN_RETRY_SECONDS,
         "position_value": decimal_to_plain(position_value),
     }
+
+
+def pause_grid_margin_side_entries(row: dict[str, Any], side: str, now: int, error_text: str) -> int:
+    paused = 0
+    for entry in row.get("levels") or []:
+        if not isinstance(entry, dict) or str(entry.get("side") or "") != side:
+            continue
+        status = str(entry.get("status", "active"))
+        has_oid = entry.get("oid") is not None
+        if status == "active" and has_oid:
+            continue
+        if status not in {
+            "active",
+            "pending",
+            "recovery_deferred",
+            "paused_margin",
+            "paused_reduce_capacity",
+            GRID_REPLACEMENT_PAUSE_STATUS,
+        }:
+            continue
+        entry["status"] = "paused_margin"
+        entry["oid"] = None
+        entry["last_error"] = error_text
+        entry["paused_at"] = now
+        paused += 1
+    return paused
+
+
+def migrate_insufficient_margin_side_pauses(row: dict[str, Any], now: int, position_value: Decimal) -> bool:
+    changed = False
+    paused_sides: set[str] = set()
+    for entry in row.get("levels") or []:
+        if not isinstance(entry, dict) or entry.get("side") is None:
+            continue
+        if not is_insufficient_margin_text(str(entry.get("last_error") or "")):
+            continue
+        status = str(entry.get("status", "active"))
+        if status not in GRID_PAUSED_STATUSES and status not in {"pending", "recovery_deferred"}:
+            continue
+        side = str(entry["side"])
+        if side in paused_sides:
+            continue
+        error_text = str(entry.get("last_error") or "Insufficient margin")
+        pause_grid_margin_side(row, side, now, position_value)
+        pause_grid_margin_side_entries(row, side, now, error_text)
+        paused_sides.add(side)
+        changed = True
+    return changed
+
+
+def find_current_position_from_state(state: dict[str, Any], coin: str) -> dict[str, Any] | None:
+    for item in state.get("assetPositions", []):
+        if not isinstance(item, dict):
+            continue
+        position = item.get("position", {})
+        if not isinstance(position, dict) or not position_matches_coin(str(position.get("coin", "")), coin):
+            continue
+        size = decimal_or_none(position.get("szi")) or Decimal("0")
+        if size != 0:
+            return position
+    return None
 
 
 def best_bid_ask(info: Any, coin: str) -> tuple[Decimal | None, Decimal | None]:
@@ -1530,10 +1589,12 @@ def submit_grid_order_entry(
     side = str(order.get("side") or "")
     margin_side_key = (coin, side)
     if side and margin_blocked_sides is not None and margin_side_key in margin_blocked_sides:
+        error_text = "same-run insufficient margin pause"
         order["status"] = "paused_margin"
         order["oid"] = None
-        order["last_error"] = "same-run insufficient margin pause"
+        order["last_error"] = error_text
         order["paused_at"] = now
+        pause_grid_margin_side_entries(row, side, now, error_text)
         return False
     if account_margin_protected:
         if grid_order_would_add_risk(position_size, bool(order.get("is_buy"))):
@@ -1703,8 +1764,9 @@ def submit_grid_order_entry(
                     order["paused_at"] = now
                     if side and margin_blocked_sides is not None:
                         margin_blocked_sides.add(margin_side_key)
-                    if grid_order_would_add_risk(position_size, bool(order.get("is_buy"))):
-                        pause_grid_margin_side(row, str(order.get("side")), now, position_value)
+                    if side:
+                        pause_grid_margin_side(row, side, now, position_value)
+                        pause_grid_margin_side_entries(row, side, now, error_text)
                     return False
                 if skip_grid_exchange_reject(order, error_text, now):
                     return False
@@ -1753,8 +1815,9 @@ def submit_grid_order_entry(
             order["paused_at"] = now
             if side and margin_blocked_sides is not None:
                 margin_blocked_sides.add(margin_side_key)
-            if grid_order_would_add_risk(position_size, bool(order.get("is_buy"))):
-                pause_grid_margin_side(row, str(order.get("side")), now, position_value)
+            if side:
+                pause_grid_margin_side(row, side, now, position_value)
+                pause_grid_margin_side_entries(row, side, now, error_text)
             return False
         if skip_grid_exchange_reject(order, error_text, now):
             return False
@@ -2220,6 +2283,16 @@ def near_grid_orders_if_stale(
 
 
 def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> tuple[dict[str, Any], bool]:
+    phase_started_at = time.monotonic()
+    last_phase_at = phase_started_at
+    phase_timings: list[tuple[str, float]] = []
+
+    def mark_phase(name: str) -> None:
+        nonlocal last_phase_at
+        now_phase = time.monotonic()
+        phase_timings.append((name, now_phase - last_phase_at))
+        last_phase_at = now_phase
+
     cache = cache if cache is not None else {}
     changed = ensure_grid_base_sizes(row)
     network = str(row.get("network") or "mainnet")
@@ -2231,7 +2304,9 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     if client_key not in client_cache:
         client_cache[client_key] = build_clients(network, timeout, raw_coin)
     info, exchange, account, _signer, _role = client_cache[client_key]
+    mark_phase("clients")
     coin, asset = resolve_perp_asset(info, str(row.get("raw_coin") or row["coin"]))
+    mark_phase("asset")
     now = int(cache.setdefault("now", int(time.time())))
     now_ms = now * 1000
     start_ms = int(row.get("last_fill_check_ms") or (now - 24 * 60 * 60) * 1000)
@@ -2245,8 +2320,16 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         mids_cache[mids_key] = info.all_mids(dex)
     mids = mids_cache[mids_key]
     current_mid = Decimal(str(mids[coin]))
+    mark_phase("mids")
     best_bid, best_ask = best_bid_ask(info, coin)
-    current_position = find_current_position(info, account, coin, dex)
+    mark_phase("book")
+    user_state_cache = cache.setdefault("user_states", {})
+    user_state_key = (network, account, dex)
+    if user_state_key not in user_state_cache:
+        user_state_cache[user_state_key] = info.user_state(account, dex=dex)
+        log_event(f"worker_user_state:{dex or 'default'}", user_state_cache[user_state_key])
+    current_position = find_current_position_from_state(user_state_cache[user_state_key], coin)
+    mark_phase("position")
     if current_position is None:
         position_size = Decimal("0")
         position_value = Decimal("0")
@@ -2313,6 +2396,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         row["topup_buy_gap"] = decimal_to_plain(Decimal(str(row["gap_rate"])))
         row["topup_sell_gap"] = decimal_to_plain(Decimal(str(row["gap_rate"])))
         row["effective_gap_rate"] = decimal_to_plain(Decimal(str(row["gap_rate"])))
+    mark_phase("avg")
     avg_state_changed = previous_avg_state != (
         row.get("topup_buy_size"),
         row.get("topup_sell_size"),
@@ -2331,12 +2415,14 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     row["margin_gap_multiplier"] = margin_gap_multiplier_text
     row["margin_gap_soft_threshold"] = decimal_to_plain(GRID_ACCOUNT_MARGIN_RATIO_SOFT_THRESHOLD)
     brake_state_pruned = prune_add_risk_brake_state(row, now)
+    mark_phase("margin")
 
     open_orders_cache = cache.setdefault("open_orders", {})
     open_orders_key = (network, account, dex)
     if open_orders_key not in open_orders_cache:
         open_orders_cache[open_orders_key] = collect_frontend_open_orders(info, account, dex)
     open_oids = open_order_oids(info, account, dex, coin, open_orders_cache[open_orders_key])
+    mark_phase("open_orders")
 
     fills_cache = cache.setdefault("fills", {})
     common_start_ms = (now - GRID_FILL_LOOKBACK_SECONDS) * 1000
@@ -2345,7 +2431,9 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         fills_cache[fills_key] = info.user_fills_by_time(account, common_start_ms, now_ms)
         log_event("grid_user_fills_by_time", {"start_ms": common_start_ms, "end_ms": now_ms, "count": len(fills_cache[fills_key])})
     fills_by_oid = recent_fills_by_oid(info, account, coin, start_ms, now_ms, fills_cache[fills_key])
-    changed = avg_state_changed or margin_state_changed or brake_state_pruned
+    mark_phase("fills")
+    margin_history_paused = migrate_insufficient_margin_side_pauses(row, now, position_value)
+    changed = avg_state_changed or margin_state_changed or brake_state_pruned or margin_history_paused
     missing_without_fill: list[int] = []
     recovered_missing = 0
     newly_filled: list[dict[str, Any]] = [
@@ -2473,6 +2561,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         entry["replacement_pending"] = True
         newly_filled.append(entry)
         changed = True
+    mark_phase("missing_scan")
 
     pending_replacement_sides = {
         "sell" if bool(entry.get("is_buy")) else "buy"
@@ -2555,6 +2644,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             entry["active_cap_paused_at"] = now
     if paused:
         changed = True
+    mark_phase("pause_caps")
 
     refreshed = 0
     to_refresh: list[dict[str, Any]] = []
@@ -2571,6 +2661,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         if refreshed:
             pause_refreshed_reduce_only_entries(to_refresh, now)
         changed = True
+    mark_phase("refresh")
 
     dense_regridded = regrid_dense_entries(
         exchange,
@@ -2587,6 +2678,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     )
     if dense_regridded:
         changed = True
+    mark_phase("dense")
 
     near_regrids = 0
 
@@ -2634,6 +2726,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 row.pop("panic_reduce_error", None)
                 row.pop("panic_reduce_error_at", None)
                 changed = True
+    mark_phase("panic")
     replacements = 0
     for entry in newly_filled:
         submitted_limit_px = decimal_or_none(entry.get("price", entry.get("limit_px"))) or Decimal("0")
@@ -2686,6 +2779,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             projected_position_values[replacement_side] = max(Decimal("0"), projected_position_value - order_notional)
         replacements += 1
         changed = True
+    mark_phase("replacements")
 
     to_pause_post_replacement_cap: list[dict[str, Any]] = []
     for side in ("buy", "sell"):
@@ -2697,6 +2791,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             entry["active_cap_allowed"] = GRID_MAX_ACTIVE_ORDERS_PER_SIDE
             entry["active_cap_paused_at"] = now
         changed = True
+    mark_phase("post_cap")
 
     restored = 0
     for entry in levels:
@@ -2748,6 +2843,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             projected_position_values[side] = max(Decimal("0"), projected_position_value - order_notional)
         restored += 1
         changed = True
+    mark_phase("risk_restore")
 
     topped_up = 0
     for side in ("buy", "sell"):
@@ -2807,6 +2903,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 projected_position_values[side] = max(Decimal("0"), projected_position_value - order_notional)
             topped_up += 1
             changed = True
+    mark_phase("topups")
 
     for entry in levels:
         if isinstance(entry, dict) and pause_refresh_reduce_only_replacement(entry, now):
@@ -2893,6 +2990,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             projected_position_values[side] = max(Decimal("0"), projected_position_value - order_notional)
         restored += 1
         changed = True
+    mark_phase("paused_restore")
 
     trimmed = trim_excess_grid_entries(exchange, coin, row, target_per_side, now)
     if trimmed:
@@ -2900,6 +2998,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     side_cap_cleared = clear_grid_side_cap_entries(exchange, coin, row, now)
     if side_cap_cleared:
         changed = True
+    mark_phase("trim")
 
     row["status"] = "active"
     row.pop("error", None)
@@ -2925,6 +3024,10 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         f"account_margin={margin_ratio_label}; account_protected={int(account_margin_protected)}; "
         f"panic_ratio={row.get('panic_ratio') or '-'}; panic_reduced={panic_reduced}"
     )
+    total_elapsed = time.monotonic() - phase_started_at
+    if total_elapsed >= 30:
+        phase_text = ",".join(f"{name}:{elapsed:.2f}s" for name, elapsed in phase_timings if elapsed >= 0.01)
+        print(f"trail_worker: grid phases {network}:{coin} total={total_elapsed:.2f}s {phase_text}")
     return (
         row,
         changed
@@ -3072,6 +3175,12 @@ def prune_grid_level_history(rows: list[dict[str, Any]]) -> bool:
     return changed
 
 
+def save_worker_progress(rows: list[dict[str, Any]], changed: bool) -> bool:
+    if changed:
+        save_server_batch(rows)
+    return False
+
+
 def run_once() -> None:
     rows = load_server_batch()
     active_trail_indexes = [
@@ -3105,6 +3214,7 @@ def run_once() -> None:
             mid_px = Decimal(str(mids_cache[cache_key][row["coin"]]))
             rows[index], row_changed = modify_trail_stop(row, mid_px)
             changed = changed or row_changed
+            changed = save_worker_progress(rows, changed)
         except Exception as exc:
             transient_status = transient_error_status(exc)
             if transient_status is None:
@@ -3118,6 +3228,7 @@ def run_once() -> None:
             row["updated_at"] = int(time.time())
             rows[index] = row
             changed = True
+            changed = save_worker_progress(rows, changed)
 
     for index in active_grid_indexes:
         row = rows[index]
@@ -3130,6 +3241,7 @@ def run_once() -> None:
                 f"trail_worker: grid maintained {row.get('network', 'mainnet')}:{row.get('coin')} "
                 f"open={len(grid_batch_open_oids(rows[index]))} elapsed={elapsed:.2f}s"
             )
+            changed = save_worker_progress(rows, changed)
         except Exception as exc:
             transient_status = transient_error_status(exc)
             if transient_status is None:
@@ -3143,6 +3255,7 @@ def run_once() -> None:
             row["updated_at"] = int(time.time())
             rows[index] = row
             changed = True
+            changed = save_worker_progress(rows, changed)
 
     rows, pruned = prune_done_rows(rows)
     grid_history_pruned = prune_grid_level_history(rows)

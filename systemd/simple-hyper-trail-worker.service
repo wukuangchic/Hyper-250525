@@ -9,4 +9,4 @@ User=simplehyper
 Group=simplehyper
 WorkingDirectory=/opt/simple-hyper
 ExecStart=/opt/simple-hyper/.venv/bin/python /opt/simple-hyper/trail_worker.py
-TimeoutStartSec=3min
+TimeoutStartSec=10min

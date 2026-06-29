@@ -4,8 +4,10 @@ import time
 import unittest
 from argparse import Namespace
 from pathlib import Path
+from unittest.mock import patch
 
 from hl_order import args_need_server_batch_lock, server_batch_lock
+from trail_worker import save_worker_progress
 
 
 def hold_batch_lock(path_text: str, ready) -> None:
@@ -45,6 +47,15 @@ class ServerBatchLockTests(unittest.TestCase):
         )
         for args, expected in cases:
             self.assertEqual(args_need_server_batch_lock(args), expected)
+
+    def test_worker_progress_saves_only_when_changed(self) -> None:
+        rows = [{"type": "grid", "status": "active"}]
+        with patch("trail_worker.save_server_batch") as save_server_batch:
+            self.assertFalse(save_worker_progress(rows, False))
+            save_server_batch.assert_not_called()
+
+            self.assertFalse(save_worker_progress(rows, True))
+            save_server_batch.assert_called_once_with(rows)
 
 
 if __name__ == "__main__":
