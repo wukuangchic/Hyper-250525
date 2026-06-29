@@ -1760,6 +1760,21 @@ def grid_query_avg_summary(
     ]
 
 
+def grid_query_rows(
+    batch_rows: list[dict[str, Any]],
+    network: str,
+    account: str | None,
+    coin: str,
+) -> list[dict[str, Any]]:
+    return [
+        row
+        for row in batch_rows
+        if row.get("type") == "grid"
+        and str(row.get("status", "")) != "cancelled"
+        and batch_row_matches_context(row, network, account, coin)
+    ]
+
+
 def query_grid(args: argparse.Namespace) -> None:
     info, _exchange, account, signer, role = build_clients(args.network, args.timeout, args.coin, need_exchange=False)
     coin, asset = resolve_perp_asset(info, args.coin)
@@ -1772,11 +1787,7 @@ def query_grid(args: argparse.Namespace) -> None:
 
     print_account_metrics(info, account)
     batch_rows = load_server_batch()
-    rows = [
-        row
-        for row in batch_rows
-        if row.get("type") == "grid" and batch_row_matches_context(row, args.network, account, coin)
-    ]
+    rows = grid_query_rows(batch_rows, args.network, account, coin)
     if not rows:
         print_box("Grid", [("coin", coin), ("status", "not found")])
         return

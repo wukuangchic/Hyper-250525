@@ -14,6 +14,7 @@ from hl_order import (
     grid_avg_topup_params,
     format_grid_detail_rows,
     grid_query_avg_summary,
+    grid_query_rows,
     is_auto_grid_gap,
     refresh_grid_row_strategy_params,
     resolve_grid_spacing,
@@ -2246,6 +2247,18 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(summary["topup_gap"], "buy 0.0005 / sell 0.000872")
         self.assertEqual(summary["base_size"], "buy 0.00016 / sell 0.00016")
         self.assertEqual(summary["topup_size"], "buy 0.00016 / sell 0.00016")
+
+    def test_grid_query_rows_hide_cancelled_grid_batches(self) -> None:
+        rows = [
+            {"type": "grid", "status": "cancelled", "network": "mainnet", "account": "0xabc", "coin": "BTC"},
+            {"type": "grid", "status": "active", "network": "mainnet", "account": "0xabc", "coin": "BTC"},
+            {"type": "trail", "status": "active", "network": "mainnet", "account": "0xabc", "coin": "BTC"},
+        ]
+
+        self.assertEqual(
+            grid_query_rows(rows, "mainnet", "0xabc", "BTC"),
+            [rows[1]],
+        )
 
     def test_grid_plan_persists_base_and_effective_values(self) -> None:
         class FakeInfo:
