@@ -1699,6 +1699,30 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(order["replacement_pause_reason"], "skipped_account_margin")
         self.assertEqual(order["paused_at"], 2)
 
+    def test_margin_rejected_replacement_normalizes_after_restore_attempt(self) -> None:
+        levels = []
+        order = {
+            "side": "sell",
+            "status": "paused_margin",
+            "oid": None,
+            "price": "101",
+            "size": "1",
+            "replacement_order": True,
+            "last_error": "Insufficient margin",
+            "paused_at": 1,
+        }
+
+        preserve_replacement_order(levels, order, 2)
+
+        self.assertEqual(order["status"], "paused_margin")
+        self.assertEqual(order["replacement_pause_reason"], "paused_margin")
+
+        preserve_replacement_order(levels, order, 3, normalize_margin=True)
+
+        self.assertEqual(order["status"], "paused_replacement")
+        self.assertEqual(order["replacement_pause_reason"], "paused_margin")
+        self.assertEqual(order["last_error"], "Insufficient margin")
+
     def test_skipped_account_margin_replacement_is_migrated_to_paused_replacement(self) -> None:
         levels = [
             {

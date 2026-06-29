@@ -1024,11 +1024,19 @@ def replacement_order_from_fill(
     return order
 
 
-def preserve_replacement_order(levels: list[Any], order: dict[str, Any], now: int, reason: str | None = None) -> None:
+def preserve_replacement_order(
+    levels: list[Any],
+    order: dict[str, Any],
+    now: int,
+    reason: str | None = None,
+    normalize_margin: bool = False,
+) -> None:
     status = str(order.get("status") or "pending")
     order["replacement_order"] = True
     order["replacement_pause_reason"] = reason or status
-    if status not in GRID_PAUSED_STATUSES:
+    if normalize_margin and status == "paused_margin":
+        order["status"] = GRID_REPLACEMENT_PAUSE_STATUS
+    elif status not in GRID_PAUSED_STATUSES:
         order["status"] = GRID_REPLACEMENT_PAUSE_STATUS
     order["oid"] = None
     order.pop("replacement_pending", None)
@@ -2968,12 +2976,12 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             min_position_value,
         ):
             if is_replacement_order:
-                preserve_replacement_order(levels, entry, now, "limit_still_blocked")
+                preserve_replacement_order(levels, entry, now, "limit_still_blocked", normalize_margin=True)
             continue
         submitted = submit_replacement(entry) if is_replacement_order else submit_tracked(entry)
         if not submitted:
             if is_replacement_order:
-                preserve_replacement_order(levels, entry, now)
+                preserve_replacement_order(levels, entry, now, normalize_margin=True)
             changed = True
             continue
         order_notional = Decimal(str(entry.get("size"))) * Decimal(str(entry.get("price", entry.get("limit_px"))))
