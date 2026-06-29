@@ -229,8 +229,8 @@ class GridAvgTests(unittest.TestCase):
         self.assertIsNone(grid_panic_ratio(long_row, Decimal("4"), Decimal("100"), Decimal("60")))
 
     def test_panic_threshold_migrates_legacy_default_only(self) -> None:
-        self.assertEqual(grid_panic_ratio_threshold({}), Decimal("20"))
-        self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "10"}), Decimal("20"))
+        self.assertEqual(grid_panic_ratio_threshold({}), Decimal("30"))
+        self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "10"}), Decimal("30"))
         self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "15"}), Decimal("15"))
 
     def test_panic_reduce_order_uses_base_size_ioc_and_reduce_only(self) -> None:
