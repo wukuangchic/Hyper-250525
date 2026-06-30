@@ -1578,6 +1578,164 @@ def grid_active_cap_keep_ids(entries: list[dict[str, Any]], side: str, max_activ
     return keep_ids
 
 
+def grid_entry_notional(entry: dict[str, Any]) -> Decimal:
+    return Decimal(str(entry.get("size"))) * Decimal(str(entry.get("price", entry.get("limit_px"))))
+
+
+def grid_entries_fit_within_max(
+    entries: list[dict[str, Any]],
+    side: str,
+    position_size: Decimal,
+    position_value: Decimal,
+    max_position_value: Decimal,
+    policy: str,
+    min_position_value: Decimal,
+) -> Decimal | None:
+    projected_position_value = position_value
+    ordered = sorted(
+        entries,
+        key=lambda entry: decimal_or_none(entry.get("price", entry.get("limit_px"))) or Decimal("0"),
+        reverse=side == "buy",
+    )
+    for entry in ordered:
+        order_notional = grid_entry_notional(entry)
+        if not grid_order_allowed_by_max(
+            position_size,
+            projected_position_value,
+            bool(entry.get("is_buy")),
+            order_notional,
+            max_position_value,
+            policy,
+            min_position_value,
+        ):
+            return None
+        if grid_order_would_add_risk(position_size, bool(entry.get("is_buy"))):
+            projected_position_value += order_notional
+        else:
+            projected_position_value = max(Decimal("0"), projected_position_value - order_notional)
+    return projected_position_value
+
+
+def grid_replacement_rebalance_keep_ids(
+    row: dict[str, Any],
+    side: str,
+    position_size: Decimal,
+    position_value: Decimal,
+    max_position_value: Decimal,
+    policy: str,
+    min_position_value: Decimal = Decimal("0"),
+) -> set[int]:
+    active = [
+        entry
+        for entry in active_grid_entries(row, side)
+        if bool(entry.get("replacement_order"))
+    ]
+    paused = [
+        entry
+        for entry in row.get("levels") or []
+        if isinstance(entry, dict)
+        and str(entry.get("side") or "") == side
+        and str(entry.get("status")) == GRID_REPLACEMENT_PAUSE_STATUS
+        and bool(entry.get("replacement_order"))
+    ]
+    if not active or not paused:
+        return set()
+    regular_active = [
+        entry
+        for entry in active_grid_entries(row, side)
+        if not bool(entry.get("replacement_order"))
+    ]
+    regular_projected_position_value = grid_entries_fit_within_max(
+        regular_active,
+        side,
+        position_size,
+        position_value,
+        max_position_value,
+        policy,
+        min_position_value,
+    )
+    if regular_projected_position_value is None:
+        return set()
+    combined = active + paused
+    combined.sort(key=lambda entry: grid_entry_near_to_far_key(entry, side))
+    keep_count = min(len(active), len(combined))
+    while keep_count > 0:
+        keep_indexes = logarithmic_keep_indexes(len(combined), keep_count)
+        keep_entries = [entry for index, entry in enumerate(combined) if index in keep_indexes]
+        if (
+            grid_entries_fit_within_max(
+                keep_entries,
+                side,
+                position_size,
+                regular_projected_position_value,
+                max_position_value,
+                policy,
+                min_position_value,
+            )
+            is not None
+        ):
+            return {id(entry) for entry in keep_entries}
+        keep_count -= 1
+    return set()
+
+
+def grid_replacement_rebalance_pair(
+    row: dict[str, Any],
+    side: str,
+    position_size: Decimal,
+    position_value: Decimal,
+    max_position_value: Decimal,
+    policy: str,
+    min_position_value: Decimal = Decimal("0"),
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    keep_ids = grid_replacement_rebalance_keep_ids(
+        row,
+        side,
+        position_size,
+        position_value,
+        max_position_value,
+        policy,
+        min_position_value,
+    )
+    if not keep_ids:
+        return None, None
+    active = [
+        entry
+        for entry in active_grid_entries(row, side)
+        if bool(entry.get("replacement_order"))
+    ]
+    paused = [
+        entry
+        for entry in row.get("levels") or []
+        if isinstance(entry, dict)
+        and str(entry.get("side") or "") == side
+        and str(entry.get("status")) == GRID_REPLACEMENT_PAUSE_STATUS
+        and bool(entry.get("replacement_order"))
+    ]
+    if not active or not paused:
+        return None, None
+    active_ids = {id(entry) for entry in active}
+    combined = active + paused
+    combined.sort(key=lambda entry: grid_entry_near_to_far_key(entry, side))
+    restore_entry = next(
+        (
+            entry
+            for entry in combined
+            if id(entry) in keep_ids and str(entry.get("status")) == GRID_REPLACEMENT_PAUSE_STATUS
+        ),
+        None,
+    )
+    pause_entry = next(
+        (
+            entry
+            for entry in reversed(combined)
+            if id(entry) in active_ids and id(entry) not in keep_ids
+        ),
+        None,
+    )
+    return pause_entry, restore_entry
+
+
 def grid_risk_density_restore_allowed(
     row: dict[str, Any],
     entry: dict[str, Any],
@@ -2336,6 +2494,17 @@ def trim_excess_grid_entries(exchange: Any, coin: str, row: dict[str, Any], targ
     return trimmed
 
 
+def prioritize_grid_entry_for_restore(levels: list[dict[str, Any]], entry: dict[str, Any]) -> bool:
+    for index, candidate in enumerate(levels):
+        if id(candidate) != id(entry):
+            continue
+        if index == 0:
+            return False
+        levels.insert(0, levels.pop(index))
+        return True
+    return False
+
+
 def reduce_side_for_position(position_size: Decimal) -> str | None:
     if position_size > 0:
         return "sell"
@@ -2932,6 +3101,34 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         changed = True
     mark_phase("post_cap")
 
+    replacement_rebalanced = 0
+    if isinstance(levels, list):
+        for side in ("buy", "sell"):
+            if not side_submission_allowed(side):
+                continue
+            pause_entry, restore_entry = grid_replacement_rebalance_pair(
+                row,
+                side,
+                position_size,
+                position_value,
+                max_position_value,
+                policy,
+                min_position_value,
+            )
+            if pause_entry is None or restore_entry is None:
+                continue
+            cancelled = cancel_grid_entries(exchange, coin, [pause_entry], now, GRID_REPLACEMENT_PAUSE_STATUS)
+            if not cancelled:
+                continue
+            pause_entry["paused_at"] = now
+            pause_entry["replacement_rebalanced_at"] = now
+            restore_entry["replacement_rebalance_target_at"] = now
+            prioritize_grid_entry_for_restore(levels, restore_entry)
+            paused += cancelled
+            replacement_rebalanced += 1
+            changed = True
+    mark_phase("replacement_rebalance")
+
     restored = 0
     for entry in levels:
         if (
@@ -3155,7 +3352,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     margin_cooldowns = ",".join(sorted((row.get("margin_pauses") or {}).keys())) or "-"
     margin_ratio_label = f"{margin_ratio * Decimal('100'):.2f}%" if margin_ratio is not None else "unknown"
     row["note"] = (
-        f"grid maintained; replacements={replacements}; topped_up={topped_up}; "
+        f"grid maintained; replacements={replacements}; replacement_rebalanced={replacement_rebalanced}; topped_up={topped_up}; "
         f"paused={paused}; refreshed={refreshed}; dense_regridded={dense_regridded}; restored={restored}; trimmed={trimmed}; near_regrids={near_regrids}; "
         f"add_risk_braked={add_risk_braked}; side_cap_cleared={side_cap_cleared}; "
         f"recovered_missing={recovered_missing}; margin_cooldown={margin_cooldowns}; "

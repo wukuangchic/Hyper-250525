@@ -35,6 +35,7 @@ from trail_worker import (
     grid_margin_pause_active,
     find_current_position_from_state,
     grid_order_entry,
+    grid_replacement_rebalance_pair,
     grid_reduce_only_canceled_restore_without_reduce_only,
     grid_risk_density_pause_candidates,
     grid_risk_density_restore_allowed,
@@ -1025,6 +1026,46 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertFalse(grid_active_cap_restore_allowed(row, should_wait, "sell"))
         self.assertTrue(grid_active_cap_restore_allowed(row, should_restore, "sell"))
+
+    def test_replacement_rebalance_swaps_toward_logarithmic_distribution(self) -> None:
+        row = {
+            "levels": [
+                {
+                    "side": "buy",
+                    "status": "paused_replacement",
+                    "oid": None,
+                    "is_buy": True,
+                    "price": price,
+                    "size": "1",
+                    "replacement_order": True,
+                }
+                for price in ("106", "105", "101")
+            ]
+            + [
+                {
+                    "side": "buy",
+                    "status": "active",
+                    "oid": oid,
+                    "is_buy": True,
+                    "price": price,
+                    "size": "1",
+                    "replacement_order": True,
+                }
+                for oid, price in ((1, "104"), (2, "103"), (3, "102"))
+            ]
+        }
+
+        pause_entry, restore_entry = grid_replacement_rebalance_pair(
+            row,
+            "buy",
+            Decimal("0"),
+            Decimal("0"),
+            Decimal("400"),
+            "abs",
+        )
+
+        self.assertEqual(pause_entry["price"], "102")
+        self.assertEqual(restore_entry["price"], "106")
 
     def test_side_cap_clear_removes_paused_before_active(self) -> None:
         class FakeExchange:
