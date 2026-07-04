@@ -46,6 +46,7 @@ from trail_worker import (
     near_grid_orders_if_stale,
     next_depth_order,
     normalize_margin_paused_replacement,
+    panic_reversal_order_from_reduce,
     pause_refresh_reduce_only_replacement,
     pause_reduce_only_canceled_entry,
     pause_refreshed_reduce_only_entries,
@@ -237,9 +238,10 @@ class GridAvgTests(unittest.TestCase):
         self.assertIsNone(grid_panic_ratio(long_row, Decimal("4"), Decimal("100"), Decimal("60")))
 
     def test_panic_threshold_migrates_legacy_defaults_only(self) -> None:
-        self.assertEqual(grid_panic_ratio_threshold({}), Decimal("30"))
-        self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "10"}), Decimal("30"))
-        self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "20"}), Decimal("30"))
+        self.assertEqual(grid_panic_ratio_threshold({}), Decimal("50"))
+        self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "10"}), Decimal("50"))
+        self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "20"}), Decimal("50"))
+        self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "30"}), Decimal("50"))
         self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "15"}), Decimal("15"))
 
     def test_panic_reduce_order_uses_base_size_ioc_and_reduce_only(self) -> None:
@@ -270,6 +272,62 @@ class GridAvgTests(unittest.TestCase):
         self.assertTrue(order["reduce_only"])
         self.assertEqual(order["plan"]["order_type"], {"limit": {"tif": "Ioc"}})
         self.assertTrue(order["plan"]["reduce_only"])
+
+    def test_panic_reversal_after_short_reduce_is_far_sell_with_normal_gap(self) -> None:
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+
+        order = panic_reversal_order_from_reduce(
+            row,
+            "BTC",
+            asset,
+            Decimal("100"),
+            True,
+            Decimal("-4"),
+            "abs",
+        )
+
+        self.assertIsNotNone(order)
+        self.assertEqual(order["side"], "sell")
+        self.assertEqual(order["price"], "110")
+        self.assertFalse(order["reduce_only"])
+        self.assertTrue(order["replacement_order"])
+        self.assertTrue(order["panic_reversal_order"])
+        self.assertEqual(order["plan"]["label"], "grid-panic-reversal")
+        self.assertEqual(order["plan"]["grid_gap"], Decimal("0.01"))
+
+    def test_panic_reversal_after_long_reduce_is_far_buy_with_normal_gap(self) -> None:
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+
+        order = panic_reversal_order_from_reduce(
+            row,
+            "BTC",
+            asset,
+            Decimal("100"),
+            False,
+            Decimal("4"),
+            "abs",
+        )
+
+        self.assertIsNotNone(order)
+        self.assertEqual(order["side"], "buy")
+        self.assertEqual(order["price"], "90")
+        self.assertFalse(order["reduce_only"])
+        self.assertTrue(order["replacement_order"])
+        self.assertTrue(order["panic_reversal_order"])
+        self.assertEqual(order["plan"]["label"], "grid-panic-reversal")
+        self.assertEqual(order["plan"]["grid_gap"], Decimal("0.01"))
 
     def test_refresh_reduce_only_cancel_becomes_non_reduce_paused_replacement(self) -> None:
         entry = {

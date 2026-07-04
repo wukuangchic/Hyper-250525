@@ -68,12 +68,14 @@ GRID_ALO_PRICE_ATTEMPT_LIMIT = 20
 GRID_ALO_SPACING_MULTIPLIER = Decimal("0.95")
 GRID_NEAR_REGRID_STALE_GAP_MULTIPLE = Decimal("30")
 GRID_NEAR_REGRID_TARGET_GAP_MULTIPLE = Decimal("15")
-GRID_PANIC_RATIO_THRESHOLD = Decimal("30")
+GRID_PANIC_RATIO_THRESHOLD = Decimal("50")
+GRID_PANIC_REVERSAL_GAP_MULTIPLIER = Decimal("10")
 GRID_ROE_DENSITY_THRESHOLD = Decimal("-0.10")
 GRID_ROE_STOP_THRESHOLD = Decimal("-0.40")
 GRID_PANIC_RATIO_LEGACY_DEFAULT_THRESHOLDS = {
     Decimal("10"),
     Decimal("20"),
+    Decimal("30"),
 }
 GRID_REPLACEMENT_PAUSE_STATUS = "paused_replacement"
 GRID_RISK_DENSITY_PAUSE_STATUS = "paused_risk_density"
@@ -1138,6 +1140,36 @@ def replacement_order_from_fill(
     reduce_only = grid_order_should_reduce_only(position_size, next_is_buy, policy)
     order = grid_order_entry(row, coin, asset, next_is_buy, next_px, reduce_only, gap=gap)
     order["replacement_order"] = True
+    return order
+
+
+def panic_reversal_order_from_reduce(
+    row: dict[str, Any],
+    coin: str,
+    asset: dict[str, Any],
+    current_mid: Decimal,
+    reduced_is_buy: bool,
+    position_size: Decimal,
+    policy: str,
+) -> dict[str, Any] | None:
+    gap = Decimal(str(row["gap_rate"]))
+    if current_mid <= 0 or gap <= 0:
+        return None
+    next_is_buy = not reduced_is_buy
+    sz_decimals = int(row.get("sz_decimals") or asset["szDecimals"])
+    panic_gap = gap * GRID_PANIC_REVERSAL_GAP_MULTIPLIER
+    multiplier = Decimal("1") - panic_gap if next_is_buy else Decimal("1") + panic_gap
+    next_px = rounded_perp_price(current_mid * multiplier, sz_decimals)
+    if next_px <= 0:
+        return None
+    reduce_only = grid_order_should_reduce_only(position_size, next_is_buy, policy)
+    order = grid_order_entry(row, coin, asset, next_is_buy, next_px, reduce_only, gap=gap)
+    order["replacement_order"] = True
+    order["panic_reversal_order"] = True
+    plan = order.get("plan")
+    if isinstance(plan, dict):
+        plan["label"] = "grid-panic-reversal"
+        plan["panic_reversal_gap_multiplier"] = GRID_PANIC_REVERSAL_GAP_MULTIPLIER
     return order
 
 
@@ -3157,6 +3189,58 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 row.pop("panic_reduce_error", None)
                 row.pop("panic_reduce_error_at", None)
                 changed = True
+                panic_reversal = panic_reversal_order_from_reduce(
+                    row,
+                    coin,
+                    asset,
+                    current_mid,
+                    bool(panic_order.get("is_buy")),
+                    position_size,
+                    policy,
+                )
+                if panic_reversal is not None:
+                    reversal_side = str(panic_reversal["side"])
+                    if grid_margin_pause_active(row, reversal_side, now, position_value, position_size):
+                        preserve_replacement_order(levels, panic_reversal, now, "margin_pause_active")
+                    elif not grid_roe_restore_allowed(
+                        row,
+                        panic_reversal,
+                        reversal_side,
+                        position_size,
+                        target_per_side,
+                        position_roe,
+                    ):
+                        panic_reversal["status"] = GRID_ROE_PAUSE_STATUS
+                        panic_reversal["paused_at"] = now
+                        panic_reversal["roe_allowed"] = grid_roe_add_risk_allowed(target_per_side, position_roe)
+                        preserve_replacement_order(levels, panic_reversal, now, GRID_ROE_PAUSE_STATUS)
+                    else:
+                        projected_position_value = projected_position_values[reversal_side]
+                        order_notional = Decimal(str(panic_reversal["size"])) * Decimal(str(panic_reversal["price"]))
+                        if not grid_order_allowed_by_max(
+                            position_size,
+                            projected_position_value,
+                            bool(panic_reversal["is_buy"]),
+                            order_notional,
+                            max_position_value,
+                            policy,
+                            min_position_value,
+                        ):
+                            panic_reversal["status"] = "paused_limit"
+                            panic_reversal["paused_at"] = now
+                            preserve_replacement_order(levels, panic_reversal, now)
+                        elif not submit_replacement(panic_reversal):
+                            preserve_replacement_order(levels, panic_reversal, now)
+                        else:
+                            levels.append(panic_reversal)
+                            if grid_order_would_add_risk(position_size, bool(panic_reversal["is_buy"])):
+                                projected_position_values[reversal_side] += order_notional
+                            else:
+                                projected_position_values[reversal_side] = max(
+                                    Decimal("0"),
+                                    projected_position_value - order_notional,
+                                )
+                    changed = True
     mark_phase("panic")
     replacements = 0
     for entry in newly_filled:
