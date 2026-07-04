@@ -37,6 +37,9 @@ from trail_worker import (
     grid_order_entry,
     grid_replacement_rebalance_pair,
     grid_reduce_only_canceled_restore_without_reduce_only,
+    grid_roe_add_risk_allowed,
+    grid_roe_pause_candidates,
+    grid_roe_restore_allowed,
     grid_risk_density_pause_candidates,
     grid_risk_density_restore_allowed,
     move_grid_order_away_from_active,
@@ -58,6 +61,7 @@ from trail_worker import (
     skip_unknown_oid_grid_recovery,
     submit_grid_order_entry,
     trim_excess_grid_entries,
+    GRID_ROE_PAUSE_STATUS,
 )
 
 
@@ -191,13 +195,14 @@ class GridAvgTests(unittest.TestCase):
             "levels": [
                 {"side": "buy", "status": "skipped_account_margin", "price": "99", "size": "1", "skipped_at": 1},
                 {"side": "buy", "status": "paused_account_margin", "price": "98", "size": "1", "paused_at": 2},
+                {"side": "buy", "status": "paused_roe", "price": "97", "size": "1", "paused_at": 3},
                 {"side": "sell", "status": "active", "oid": 3, "price": "101", "size": "1"},
             ]
         }
 
         rows = format_grid_detail_rows(row, {3})
 
-        self.assertEqual([item["status"] for item in rows], ["active", "paused_account_margin"])
+        self.assertEqual([item["status"] for item in rows], ["active", "paused_account_margin", "paused_roe"])
         self.assertNotIn("skipped_account_margin", [item["status"] for item in rows])
 
     def test_panic_ratio_short_uses_liq_above_mid_and_buy_below_mid(self) -> None:
@@ -833,6 +838,55 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(grid_margin_gap_multiplier(Decimal("0.90")), Decimal("1"))
         self.assertEqual(grid_margin_gap_multiplier(Decimal("0.70")), Decimal("1"))
         self.assertEqual(grid_margin_gap_multiplier(Decimal("0.80")).quantize(Decimal("0.001")), Decimal("1.693"))
+
+    def test_roe_allowed_linearly_compresses_add_risk_active_count(self) -> None:
+        self.assertEqual(grid_roe_add_risk_allowed(10, None), 10)
+        self.assertEqual(grid_roe_add_risk_allowed(10, Decimal("-0.10")), 10)
+        self.assertEqual(grid_roe_add_risk_allowed(10, Decimal("-0.25")), 5)
+        self.assertEqual(grid_roe_add_risk_allowed(10, Decimal("-0.399")), 1)
+        self.assertEqual(grid_roe_add_risk_allowed(10, Decimal("-0.40")), 0)
+
+    def test_roe_pause_candidates_limit_only_add_risk_side(self) -> None:
+        row = {
+            "levels": [
+                {
+                    "side": "buy",
+                    "status": "active",
+                    "oid": oid,
+                    "is_buy": True,
+                    "price": str(price),
+                    "size": "1",
+                }
+                for oid, price in enumerate(range(100, 90, -1), start=1)
+            ]
+        }
+
+        buy_candidates, buy_allowed = grid_roe_pause_candidates(row, "buy", Decimal("2"), 10, Decimal("-0.25"))
+        sell_candidates, sell_allowed = grid_roe_pause_candidates(row, "sell", Decimal("2"), 10, Decimal("-0.25"))
+
+        self.assertEqual(buy_allowed, 5)
+        self.assertEqual(len(buy_candidates), 5)
+        self.assertEqual(sell_allowed, 10)
+        self.assertEqual(sell_candidates, [])
+
+    def test_roe_restore_respects_stop_and_keep_distribution(self) -> None:
+        row = {
+            "levels": [
+                {"side": "buy", "status": "active", "oid": 1, "is_buy": True, "price": "100", "size": "1"},
+                {"side": "buy", "status": GRID_ROE_PAUSE_STATUS, "is_buy": True, "price": "99", "size": "1"},
+            ]
+        }
+
+        paused = row["levels"][1]
+        open_slot_row = {
+            "levels": [
+                {"side": "buy", "status": GRID_ROE_PAUSE_STATUS, "is_buy": True, "price": "99", "size": "1"},
+            ]
+        }
+
+        self.assertFalse(grid_roe_restore_allowed(row, paused, "buy", Decimal("2"), 10, Decimal("-0.40")))
+        self.assertFalse(grid_roe_restore_allowed(row, paused, "buy", Decimal("2"), 10, Decimal("-0.37")))
+        self.assertTrue(grid_roe_restore_allowed(open_slot_row, open_slot_row["levels"][0], "buy", Decimal("2"), 10, Decimal("-0.37")))
 
     def test_margin_gap_multiplier_only_widens_add_risk_far_topup(self) -> None:
         row = {

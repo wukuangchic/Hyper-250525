@@ -248,6 +248,7 @@ BTC --cancel grid
 - 仓位降到能容纳下一张加仓单后，worker 再把加仓方向补回到最多 10 张。
 - 补缺失子单时优先参考盘口 best bid/ask，而不是只参考 mid；盘口读取失败时才退回 mid。
 - 加风险方向 active 单超过当前风险密度预算时，worker 会按 `avg_multiplier` / `margin_gap_multiplier` 把允许数量压缩为 `floor(10 / multiplier)`，最低保留 1 张；超过部分按价格近远用等比/自然对数分布抽稀暂停为 `paused_risk_density`，近侧保留更密、远侧更疏。系数下降后，`paused_risk_density` 会优先于常规补档恢复。
+- 持仓 ROE 由 Hyperliquid `position.returnOnEquity` 直接返回；低于 -10% 时，worker 会按 -10% 到 -40% 的线性区间压缩加仓侧 active 数量，超出部分暂停为 `paused_roe`；低于 -40% 时，加仓侧允许 active 数归零。强制减仓仍只由 `panic_ratio` 触发。
 - 为避免 1 分钟内盘口被打穿，每侧 active grid 单最多保留 32 张；成交反向单优先提交，提交后若超过 32 张，再按近密远疏的等比/自然对数分布优先保留成交反向单并暂停其他旧 active 为 `paused_active_cap`，之后在 active 少于 32 张时也按同一分布逐步恢复。
 - 如果同侧反向单受 `limit abs` 等上限约束，worker 会每轮每侧最多做一组 `active <-> paused_replacement` 渐进式互换，把应当保留的近密远疏档位逐步换回 active，而不是一直沿用历史先恢复成功的那批单。
 - 为避免异常循环无限堆积可恢复记录，`levels` 内同侧 active、pending、recovery_deferred 和 paused 合计最多保留 1024 张；历史记录不占这个名额，仍由独立历史裁剪控制。超过时会优先清理普通 paused，必要时先撤交易所 active 挂单再从本地清除，`replacement_order` 最后才会被清。

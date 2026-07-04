@@ -1669,6 +1669,7 @@ def format_grid_detail_rows(
         "paused_margin",
         "paused_reduce_capacity",
         "paused_account_margin",
+        "paused_roe",
     }
     live_entries = [entry for entry in entries if str(entry.get("status", "active")) in live_statuses]
     history_entries = [entry for entry in entries if str(entry.get("status", "active")) not in live_statuses]
@@ -1826,6 +1827,12 @@ def query_grid(args: argparse.Namespace) -> None:
             *grid_query_avg_summary(row, asset, position_size, position_value),
             ("trend", f"{row.get('trend', '0')} actual {row.get('actual_trend', '0%')}"),
             ("margin_gap", format_optional_decimal(row.get("margin_gap_multiplier"))),
+            ("roe", format_optional_percent(row.get("roe"))),
+            ("roe_limit", (
+                f"active<{format_optional_percent(row.get('roe_density_threshold'))} "
+                f"stop<{format_optional_percent(row.get('roe_stop_threshold'))}"
+            )),
+            ("roe_allowed", f"buy:{row.get('roe_add_risk_allowed_buy', '-')} sell:{row.get('roe_add_risk_allowed_sell', '-')}"),
             ("panic_ratio", format_optional_decimal(row.get("panic_ratio"))),
             ("panic_threshold", format_optional_decimal(row.get("panic_ratio_threshold"))),
             ("panic_reduced", str(row.get("panic_reduce_count", "0"))),
