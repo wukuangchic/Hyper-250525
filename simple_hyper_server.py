@@ -191,6 +191,15 @@ INDEX_HTML = r"""<!doctype html>
       box-shadow: 0 0 0 3px rgba(36, 95, 115, 0.14);
     }
 
+    .credential-proxy {
+      position: absolute;
+      left: -9999px;
+      width: 1px;
+      height: 1px;
+      opacity: 0;
+      pointer-events: none;
+    }
+
     .buttons {
       display: flex;
       gap: 10px;
@@ -389,10 +398,11 @@ INDEX_HTML = r"""<!doctype html>
       <div id="status" class="status">Not verified</div>
     </header>
 
-    <form id="authPanel" class="panel auth-block" autocomplete="on">
+    <form id="authPanel" class="panel auth-block" method="post" action="/api/run" autocomplete="off">
+      <input id="credentialUsername" class="credential-proxy" name="username" type="text" autocomplete="username" tabindex="-1" aria-hidden="true">
       <div class="field">
-        <label for="account">Account</label>
-        <input id="account" name="username" autocomplete="username" autocapitalize="off" spellcheck="false" placeholder="0x...">
+        <label for="walletInput">Wallet</label>
+        <input id="walletInput" name="hyper_wallet" type="search" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="0x..." data-form-type="other" data-lpignore="true">
       </div>
       <div class="field">
         <label for="secret">Private Key or Agent Key</label>
@@ -571,10 +581,22 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function credentials() {
+      syncCredentialUsername();
       return {
-        account_address: state.verified ? state.account_address : $("account").value.trim(),
+        account_address: state.verified ? state.account_address : $("walletInput").value.trim(),
         secret_key: state.verified ? state.secret_key : $("secret").value.trim(),
       };
+    }
+
+    function syncCredentialUsername() {
+      $("credentialUsername").value = $("walletInput").value.trim();
+    }
+
+    function syncWalletFromCredential() {
+      const credentialUsername = $("credentialUsername").value.trim();
+      if (credentialUsername && !$("walletInput").value.trim()) {
+        $("walletInput").value = credentialUsername;
+      }
     }
 
     function setBusy(busy) {
@@ -649,7 +671,8 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     async function verify() {
-      state.account_address = $("account").value.trim();
+      syncWalletFromCredential();
+      state.account_address = $("walletInput").value.trim();
       state.secret_key = $("secret").value.trim();
       try {
         setBusy(true);
@@ -674,7 +697,8 @@ INDEX_HTML = r"""<!doctype html>
       state.verified = false;
       state.account_address = "";
       state.secret_key = "";
-      $("account").value = "";
+      $("walletInput").value = "";
+      $("credentialUsername").value = "";
       $("secret").value = "";
       syncAuth();
       setHistoryScope(COMMAND_HISTORY_SHARED_SCOPE);
@@ -694,6 +718,9 @@ INDEX_HTML = r"""<!doctype html>
       event.preventDefault();
       verify();
     });
+    $("walletInput").addEventListener("input", syncCredentialUsername);
+    $("credentialUsername").addEventListener("input", syncWalletFromCredential);
+    $("credentialUsername").addEventListener("change", syncWalletFromCredential);
     $("reverify").addEventListener("click", reverify);
     $("clear").addEventListener("click", clearCommand);
     $("history").addEventListener("click", (event) => {
@@ -728,6 +755,8 @@ INDEX_HTML = r"""<!doctype html>
     syncAuth();
     state.command_history = loadHistory();
     renderHistory();
+    const autofillSync = window.setInterval(syncWalletFromCredential, 250);
+    window.setTimeout(() => window.clearInterval(autofillSync), 5000);
   </script>
 </body>
 </html>
