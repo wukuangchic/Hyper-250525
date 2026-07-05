@@ -90,7 +90,8 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     button,
-    input {
+    input,
+    select {
       font: inherit;
     }
 
@@ -194,7 +195,8 @@ INDEX_HTML = r"""<!doctype html>
       font-weight: 660;
     }
 
-    input {
+    input,
+    select {
       width: 100%;
       min-height: 44px;
       border: 1px solid var(--line);
@@ -937,7 +939,8 @@ GRID_HTML = r"""<!doctype html>
       outline: none;
     }
 
-    input:focus {
+    input:focus,
+    select:focus {
       border-color: var(--accent);
       box-shadow: 0 0 0 3px rgba(35, 92, 103, 0.13);
     }
@@ -974,6 +977,10 @@ GRID_HTML = r"""<!doctype html>
       background: #fff;
     }
 
+    button.full {
+      width: 100%;
+    }
+
     button:disabled {
       opacity: 0.52;
     }
@@ -986,6 +993,70 @@ GRID_HTML = r"""<!doctype html>
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
       gap: 8px;
+    }
+
+    .active-list {
+      display: grid;
+      gap: 8px;
+    }
+
+    .grid-card {
+      width: 100%;
+      min-height: 0;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      color: var(--ink);
+      background: #fff;
+      text-align: left;
+      white-space: normal;
+    }
+
+    .grid-card.selected {
+      border-color: rgba(35, 92, 103, 0.54);
+      box-shadow: 0 0 0 3px rgba(35, 92, 103, 0.11);
+    }
+
+    .grid-card-main {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      align-items: baseline;
+      font-weight: 780;
+    }
+
+    .grid-card-meta {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 5px 10px;
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.25;
+    }
+
+    .modify-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 9px;
+    }
+
+    .modify-grid .wide {
+      grid-column: 1 / -1;
+    }
+
+    .command-preview {
+      margin: 0;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 9px;
+      background: #fff;
+      color: var(--muted);
+      font-family: "SF Mono", Menlo, Consolas, monospace;
+      font-size: 11px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
     }
 
     .metric {
@@ -1095,12 +1166,21 @@ GRID_HTML = r"""<!doctype html>
       .grid-layout {
         grid-template-columns: minmax(320px, 0.8fr) minmax(560px, 1.2fr);
         grid-template-areas:
-          "controls summary"
+          "controls active"
+          "modify summary"
           "raw orders";
       }
 
       .controls-panel {
         grid-area: controls;
+      }
+
+      .active-panel {
+        grid-area: active;
+      }
+
+      .modify-panel {
+        grid-area: modify;
       }
 
       .summary-panel {
@@ -1162,9 +1242,64 @@ GRID_HTML = r"""<!doctype html>
             <input id="coin" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="BTC" value="BTC">
           </div>
           <div class="actions">
-            <button id="refresh" type="submit">Refresh</button>
+            <button id="refresh" type="submit">Load Active</button>
+            <button id="detailRefresh" type="button" class="secondary">Detail</button>
             <button id="clear" type="button" class="secondary">Clear</button>
           </div>
+        </form>
+      </section>
+
+      <section class="panel active-panel">
+        <h2 class="section-title">Active Grids</h2>
+        <div id="activeGrids" class="active-list">
+          <div class="empty">Load active grids to pick a coin.</div>
+        </div>
+      </section>
+
+      <section class="panel modify-panel">
+        <h2 class="section-title">Quick Modify</h2>
+        <form id="modifyForm" class="modify-grid" autocomplete="off">
+          <div class="field">
+            <label for="limitMode">Limit</label>
+            <select id="limitMode">
+              <option value="abs">abs</option>
+              <option value="long">long</option>
+              <option value="short">short</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="maxPosition">Max</label>
+            <input id="maxPosition" inputmode="decimal" autocomplete="off" placeholder="300">
+          </div>
+          <div class="field">
+            <label for="minPosition">Min</label>
+            <input id="minPosition" inputmode="decimal" autocomplete="off" placeholder="0">
+          </div>
+          <div class="field">
+            <label for="gap">Gap</label>
+            <input id="gap" autocomplete="off" placeholder="0.5%">
+          </div>
+          <div class="field">
+            <label for="minOrder">Min Order</label>
+            <input id="minOrder" inputmode="decimal" autocomplete="off" placeholder="20">
+          </div>
+          <div class="field">
+            <label for="strategyMode">Strategy</label>
+            <select id="strategyMode">
+              <option value="keep">keep</option>
+              <option value="avg">avg</option>
+              <option value="trend">trend</option>
+            </select>
+          </div>
+          <div class="field wide">
+            <label for="strategyValue">Strategy Value</label>
+            <input id="strategyValue" autocomplete="off" placeholder="200 or 10%">
+          </div>
+          <div class="field wide">
+            <label>Command</label>
+            <pre id="modifyCommand" class="command-preview">Pick an active grid.</pre>
+          </div>
+          <button id="applyModify" type="submit" class="full wide" disabled>Apply Modify</button>
         </form>
       </section>
 
@@ -1193,7 +1328,12 @@ GRID_HTML = r"""<!doctype html>
 
   <script>
     const $ = (id) => document.getElementById(id);
-    const state = { account_address: "", secret_key: "" };
+    const state = {
+      account_address: "",
+      secret_key: "",
+      active_grids: [],
+      selected_grid: null,
+    };
 
     function setStatus(text, ready = false) {
       $("status").textContent = text;
@@ -1234,7 +1374,9 @@ GRID_HTML = r"""<!doctype html>
 
     function setBusy(busy) {
       $("refresh").disabled = busy;
+      $("detailRefresh").disabled = busy;
       $("clear").disabled = busy;
+      $("applyModify").disabled = busy || !state.selected_grid;
       setStatus(busy ? "Loading" : "Ready", !busy);
     }
 
@@ -1247,6 +1389,32 @@ GRID_HTML = r"""<!doctype html>
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ...credentials(), coin: normalizeCoin($("coin").value) }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || data.ok === false) {
+        throw new Error(data.error || `HTTP ${response.status}`);
+      }
+      return data;
+    }
+
+    async function apiGrids() {
+      const response = await fetch("/api/grids", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(credentials()),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || data.ok === false) {
+        throw new Error(data.error || `HTTP ${response.status}`);
+      }
+      return data;
+    }
+
+    async function apiRun(command) {
+      const response = await fetch("/api/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...credentials(), command }),
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok || data.ok === false) {
@@ -1375,6 +1543,109 @@ GRID_HTML = r"""<!doctype html>
       mount.appendChild(table);
     }
 
+    function renderActiveGrids(grids) {
+      const mount = $("activeGrids");
+      mount.replaceChildren();
+      if (!grids.length) {
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        empty.textContent = "No active grid batches found for this wallet.";
+        mount.appendChild(empty);
+        return;
+      }
+      for (const grid of grids) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "grid-card";
+        if (state.selected_grid && state.selected_grid.id === grid.id) button.classList.add("selected");
+        button.dataset.gridId = grid.id;
+        const title = document.createElement("div");
+        title.className = "grid-card-main";
+        const coin = document.createElement("span");
+        coin.textContent = grid.coin || "-";
+        const status = document.createElement("span");
+        status.textContent = grid.status || "-";
+        title.append(coin, status);
+        const meta = document.createElement("div");
+        meta.className = "grid-card-meta";
+        const items = [
+          ["limit", `${grid.limit_mode} ${grid.min_position_value || "0"}..${grid.max_position_value || "-"}`],
+          ["gap", grid.gap || "-"],
+          ["avg", grid.avg || "-"],
+          ["trend", grid.trend || "0"],
+          ["active", `B${grid.active_buy} / S${grid.active_sell}`],
+          ["min", grid.min_order_value || "-"],
+        ];
+        for (const [key, value] of items) {
+          const item = document.createElement("div");
+          item.textContent = `${key}: ${value}`;
+          meta.appendChild(item);
+        }
+        button.append(title, meta);
+        mount.appendChild(button);
+      }
+    }
+
+    function populateModifyForm(grid) {
+      $("limitMode").value = grid.limit_mode || "abs";
+      $("minPosition").value = grid.min_position_value || "0";
+      $("maxPosition").value = grid.max_position_value || "";
+      $("gap").value = grid.gap || "";
+      $("minOrder").value = grid.min_order_value || "";
+      if (grid.avg) {
+        $("strategyMode").value = "avg";
+        $("strategyValue").value = grid.avg;
+      } else if (grid.trend && grid.trend !== "0") {
+        $("strategyMode").value = "trend";
+        $("strategyValue").value = grid.trend;
+      } else {
+        $("strategyMode").value = "keep";
+        $("strategyValue").value = "";
+      }
+      updateModifyPreview();
+    }
+
+    function shellQuote(value) {
+      const text = String(value || "");
+      if (/^[A-Za-z0-9_:%+.,=-]+$/.test(text)) return text;
+      return `'${text.replace(/'/g, "'\\''")}'`;
+    }
+
+    function buildModifyCommand() {
+      const coin = normalizeCoin($("coin").value);
+      if (!coin) return "";
+      const args = [coin, "grid", "--modify"];
+      const maxPosition = $("maxPosition").value.trim();
+      const minPosition = $("minPosition").value.trim();
+      if (maxPosition) {
+        args.push(`--${$("limitMode").value}`);
+        if (minPosition && minPosition !== "0") args.push(minPosition);
+        args.push(maxPosition);
+      }
+      const gap = $("gap").value.trim();
+      if (gap) args.push("--gap", gap);
+      const minOrder = $("minOrder").value.trim();
+      if (minOrder) args.push("--min", minOrder);
+      const strategyMode = $("strategyMode").value;
+      const strategyValue = $("strategyValue").value.trim();
+      if (strategyMode === "avg" && strategyValue) args.push("--avg", strategyValue);
+      if (strategyMode === "trend" && strategyValue) args.push("--trend", strategyValue);
+      return args.map(shellQuote).join(" ");
+    }
+
+    function updateModifyPreview() {
+      $("modifyCommand").textContent = buildModifyCommand() || "Pick an active grid.";
+      $("applyModify").disabled = !state.selected_grid;
+    }
+
+    async function selectGrid(grid) {
+      state.selected_grid = grid;
+      $("coin").value = grid.coin || "";
+      populateModifyForm(grid);
+      renderActiveGrids(state.active_grids);
+      await loadDetail();
+    }
+
     function render(data) {
       const raw = `${data.command ? `$ ${data.command}\n\n` : ""}${data.output || ""}${data.elapsed_ms === undefined ? "" : `\n\n[${data.elapsed_ms} ms]`}`;
       $("raw").textContent = raw;
@@ -1383,8 +1654,8 @@ GRID_HTML = r"""<!doctype html>
       setStatus(data.command_ok ? "Loaded" : "Error", Boolean(data.command_ok));
     }
 
-    async function refresh(event) {
-      event.preventDefault();
+    async function loadDetail() {
+      if (!normalizeCoin($("coin").value)) return;
       try {
         setBusy(true);
         render(await apiGrid());
@@ -1398,15 +1669,82 @@ GRID_HTML = r"""<!doctype html>
       }
     }
 
+    async function refresh(event) {
+      event.preventDefault();
+      try {
+        setBusy(true);
+        const data = await apiGrids();
+        state.active_grids = data.grids || [];
+        const currentCoin = normalizeCoin($("coin").value);
+        state.selected_grid = state.active_grids.find((grid) => grid.coin === currentCoin) || state.active_grids[0] || null;
+        renderActiveGrids(state.active_grids);
+        if (state.selected_grid) {
+          $("coin").value = state.selected_grid.coin;
+          populateModifyForm(state.selected_grid);
+          await loadDetail();
+        } else {
+          renderSummary([]);
+          renderOrders({ columns: [], rows: [] });
+          $("raw").textContent = "No active grid batches found.";
+        }
+      } catch (error) {
+        $("raw").textContent = `error: ${error.message}`;
+        renderSummary([]);
+        renderOrders({ columns: [], rows: [] });
+        setStatus("Error", false);
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function applyModify(event) {
+      event.preventDefault();
+      if (!state.selected_grid) return;
+      const command = buildModifyCommand();
+      if (!command) return;
+      if (!confirm(`Run modify command?\n\n${command}`)) return;
+      try {
+        setBusy(true);
+        render(await apiRun(command));
+        const grids = await apiGrids();
+        state.active_grids = grids.grids || [];
+        state.selected_grid = state.active_grids.find((grid) => grid.coin === normalizeCoin($("coin").value)) || state.selected_grid;
+        renderActiveGrids(state.active_grids);
+        if (state.selected_grid) populateModifyForm(state.selected_grid);
+      } catch (error) {
+        $("raw").textContent = `error: ${error.message}`;
+        setStatus("Error", false);
+      } finally {
+        setBusy(false);
+      }
+    }
+
     function clearPage() {
       $("raw").textContent = "Ready.";
       renderSummary([]);
       renderOrders({ columns: [], rows: [] });
+      state.active_grids = [];
+      state.selected_grid = null;
+      renderActiveGrids([]);
+      $("modifyCommand").textContent = "Pick an active grid.";
       setStatus("Ready", false);
     }
 
     $("gridForm").addEventListener("submit", refresh);
+    $("detailRefresh").addEventListener("click", () => loadDetail());
+    $("modifyForm").addEventListener("submit", applyModify);
     $("clear").addEventListener("click", clearPage);
+    $("activeGrids").addEventListener("click", (event) => {
+      if (!(event.target instanceof Element)) return;
+      const button = event.target.closest("button[data-grid-id]");
+      if (!button) return;
+      const grid = state.active_grids.find((item) => item.id === button.dataset.gridId);
+      if (grid) selectGrid(grid);
+    });
+    for (const id of ["coin", "limitMode", "maxPosition", "minPosition", "gap", "minOrder", "strategyMode", "strategyValue"]) {
+      $(id).addEventListener("input", updateModifyPreview);
+      $(id).addEventListener("change", updateModifyPreview);
+    }
     $("walletInput").addEventListener("input", syncCredentialUsername);
     $("credentialUsername").addEventListener("input", syncWalletFromCredential);
     $("credentialUsername").addEventListener("change", syncWalletFromCredential);
@@ -1670,6 +2008,78 @@ def parse_grid_coin(raw: Any) -> str:
     return coin
 
 
+def load_grid_batch_rows(account_address: str, network: str = "mainnet") -> list[dict[str, Any]]:
+    path = PROJECT_DIR / "server_batch.json"
+    if not path.exists():
+        return []
+    try:
+        raw_rows = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(raw_rows, list):
+        return []
+    account = account_address.lower()
+    rows: list[dict[str, Any]] = []
+    for row in raw_rows:
+        if not isinstance(row, dict):
+            continue
+        if row.get("type") != "grid":
+            continue
+        if str(row.get("status", "")) not in {"active", "error"}:
+            continue
+        if str(row.get("network", "mainnet")) != network:
+            continue
+        if str(row.get("account", "")).lower() != account:
+            continue
+        rows.append(row)
+    rows.sort(key=lambda row: int(row.get("updated_at") or row.get("created_at") or 0), reverse=True)
+    return rows
+
+
+def summarize_grid_row(row: dict[str, Any]) -> dict[str, Any]:
+    levels = [item for item in row.get("levels") or [] if isinstance(item, dict)]
+    live_statuses = {
+        "active",
+        "pending",
+        "paused_max",
+        "paused_limit",
+        "paused_margin",
+        "paused_reduce_capacity",
+        "paused_account_margin",
+        "paused_roe",
+    }
+    active_buy = len([item for item in levels if item.get("side") == "buy" and str(item.get("status", "active")) in live_statuses])
+    active_sell = len([item for item in levels if item.get("side") == "sell" and str(item.get("status", "active")) in live_statuses])
+    return {
+        "id": str(row.get("id", "")),
+        "coin": str(row.get("coin", "")),
+        "status": str(row.get("status", "")),
+        "network": str(row.get("network", "")),
+        "dex": str(row.get("dex", "")),
+        "limit_mode": str(row.get("position_limit_mode", "abs")),
+        "min_position_value": str(row.get("min_position_value", "0")),
+        "max_position_value": str(row.get("max_position_value", "")),
+        "min_order_value": str(row.get("min_order_value", "")),
+        "gap": str(row.get("gap", "")),
+        "gap_rate": str(row.get("gap_rate", "")),
+        "avg": "" if row.get("avg") is None else str(row.get("avg", "")),
+        "trend": str(row.get("trend", "0")),
+        "active_buy": active_buy,
+        "active_sell": active_sell,
+        "level_count": len(levels),
+        "updated_at": int(row.get("updated_at") or row.get("created_at") or 0),
+        "note": str(row.get("note", "")),
+    }
+
+
+def list_grid_batches(payload: dict[str, Any], account_address: str) -> dict[str, Any]:
+    network = str(payload.get("network") or "mainnet")
+    if network not in {"mainnet", "testnet"}:
+        raise ValueError("invalid network")
+    grids = [summarize_grid_row(row) for row in load_grid_batch_rows(account_address, network)]
+    return {"ok": True, "grids": grids, "count": len(grids), "network": network}
+
+
 def clean_web_output(output: str) -> str:
     lines = [line for line in output.splitlines() if not line.startswith("log: ")]
     return "\n".join(lines).rstrip()
@@ -1801,11 +2211,14 @@ class SimpleHyperHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         try:
-            if path not in {"/api/run", "/api/grid"}:
+            if path not in {"/api/run", "/api/grid", "/api/grids"}:
                 self.send_json({"ok": False, "error": "not found"}, HTTPStatus.NOT_FOUND)
                 return
             payload = parse_json_body(self)
             account_address, secret_key = normalize_credentials(payload)
+            if path == "/api/grids":
+                self.send_json(list_grid_batches(payload, account_address))
+                return
             if path == "/api/grid":
                 self.send_json(run_grid_query(payload, account_address, secret_key))
                 return
