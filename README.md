@@ -254,7 +254,7 @@ BTC --cancel grid
 - 为避免异常循环无限堆积可恢复记录，`levels` 内同侧 active、pending、recovery_deferred 和 paused 合计最多保留 1024 张；历史记录不占这个名额，仍由独立历史裁剪控制。超过时会优先清理普通 paused，必要时先撤交易所 active 挂单再从本地清除，`replacement_order` 最后才会被清。
 - 全仓或逐仓的加仓方向若被交易所以保证金不足拒绝，worker 会对该方向冷却 10 分钟，本轮不再继续试单；减仓方向照常维护。仓位缩小会提前解除冷却，否则到期后探测一次。
 - reduce-only 子单的活动数量总和不会超过当前可减仓数量；交易所因可减仓数量不足自动取消的 `reduceOnlyCanceled` 不会被当作手动撤单反复补回。
-- 单边漂移接近爆仓时会主动泄压：空仓用 `(liqPx - mid) / (mid - 最近active买入减仓价)`，多仓用 `(mid - liqPx) / (最近active卖出减仓价 - mid)` 计算 `panic_ratio`；若低于 `panic_ratio_threshold`（默认 `65`），Worker 会用 IOC + 滑点保护市价 reduce-only 减一单对应方向的 grid base size。减仓成功后会在当轮 mid 远离 `10 * gap` 的位置提交一张普通反向 grid 单（后续仍按普通 `gap_rate` 维护），不把 panic 减仓本身作为普通 fill 近距离回补。
+- 单边漂移接近爆仓时会主动泄压：空仓用 `(liqPx - mid) / (mid - 最近active买入减仓价)`，多仓用 `(mid - liqPx) / (最近active卖出减仓价 - mid)` 计算 `panic_ratio`；若低于 `panic_ratio_threshold`（默认 `70`），Worker 会用 IOC + 滑点保护市价 reduce-only 减一单对应方向的 grid base size。减仓成功后会在当轮 mid 远离 `10 * gap` 的位置提交一张普通反向 grid 单（后续仍按普通 `gap_rate` 维护），不把 panic 减仓本身作为普通 fill 近距离回补。
 - 每轮只查询一次账户 USDC 的“维护保证金后余量 / 总余额”。比例低于 `70%` 时不修改已有挂单，但所有新 grid 子单必须减少当前净仓位并强制使用 reduce-only；会加仓或反手的新单直接跳过该价格。比例恢复到 `70%` 后，Worker 按当时盘口重新计算缺失档位，并保持每轮每方向最多新增一张，不恢复保护期间的旧价格。
 - grid/trail 创建、修改和取消与 Worker 共用 `server_batch.lock`；命令执行期间 Worker 会跳过该轮，避免旧任务快照覆盖刚完成的修改，不需要手动暂停定时器。
 - 旧版保存的非 ALO grid 子单在 Worker 再次提交时会自动刷新为 ALO；历史 post-only 拒绝仍按可恢复状态兼容处理。
