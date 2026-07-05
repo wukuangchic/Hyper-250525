@@ -161,6 +161,7 @@ class GridAvgTests(unittest.TestCase):
             "raw_coin": "xyz:SPCX",
             "dex": "xyz",
             "error": "'xyz:SPCX'",
+            "note": "grid maintained before the old key error",
         }
 
         self.assertTrue(grid_row_recoverable_from_error(row))

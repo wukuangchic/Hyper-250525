@@ -183,6 +183,12 @@ def grid_row_recoverable_from_error(row: dict[str, Any]) -> bool:
     if row.get("status") != "error":
         return False
     error_text = " ".join(str(row.get(key, "")) for key in ("error", "last_error", "note"))
+    raw_error_texts = {str(row.get(key, "")).strip() for key in ("error", "last_error")}
+    bare_coin_key_errors = {
+        repr(str(row.get("coin") or "")),
+        repr(str(row.get("raw_coin") or "")),
+        repr(batch_row_raw_coin(row)),
+    }
     if (
         is_post_only_reject_text(error_text)
         or is_transient_error_text(error_text)
@@ -193,11 +199,7 @@ def grid_row_recoverable_from_error(row: dict[str, Any]) -> bool:
             "unknown perp coin" in error_text.lower()
             and batch_row_raw_coin(row) != str(row.get("raw_coin") or row.get("coin") or "")
         )
-        or error_text.strip() in {
-            repr(str(row.get("coin") or "")),
-            repr(str(row.get("raw_coin") or "")),
-            repr(batch_row_raw_coin(row)),
-        }
+        or bool(raw_error_texts & bare_coin_key_errors)
     ):
         return True
     for entry in row.get("levels") or []:
