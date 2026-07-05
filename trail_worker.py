@@ -122,6 +122,14 @@ class GridPostOnlyRejected(Exception):
     """A post-only grid child became marketable before submission."""
 
 
+def batch_row_raw_coin(row: dict[str, Any]) -> str:
+    raw_coin = str(row.get("raw_coin") or row["coin"])
+    dex = str(row.get("dex") or "")
+    if dex and ":" not in raw_coin:
+        return f"{dex}:{raw_coin}"
+    return raw_coin
+
+
 def transient_error_status(exc: Exception) -> int | None:
     status_code = getattr(exc, "status_code", None)
     if status_code is None and exc.args:
@@ -563,9 +571,9 @@ def modify_trail_stop(row: dict[str, Any], mid_px: Decimal) -> tuple[dict[str, A
     info, exchange, account, _signer, _role = build_clients(
         str(row.get("network") or "mainnet"),
         float(row.get("timeout") or 20),
-        str(row.get("raw_coin") or row["coin"]),
+        batch_row_raw_coin(row),
     )
-    coin, asset = resolve_perp_asset(info, str(row.get("raw_coin") or row["coin"]))
+    coin, asset = resolve_perp_asset(info, batch_row_raw_coin(row))
     dex = str(row.get("dex") or "")
     oid = int(row["oid"])
 
@@ -2719,7 +2727,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     changed = ensure_grid_base_sizes(row)
     network = str(row.get("network") or "mainnet")
     timeout = float(row.get("timeout") or 20)
-    raw_coin = str(row.get("raw_coin") or row["coin"])
+    raw_coin = batch_row_raw_coin(row)
     dex = str(row.get("dex") or "")
     client_cache = cache.setdefault("clients", {})
     client_key = (network, timeout, dex)
@@ -2727,7 +2735,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         client_cache[client_key] = build_clients(network, timeout, raw_coin)
     info, exchange, account, _signer, _role = client_cache[client_key]
     mark_phase("clients")
-    coin, asset = resolve_perp_asset(info, str(row.get("raw_coin") or row["coin"]))
+    coin, asset = resolve_perp_asset(info, batch_row_raw_coin(row))
     mark_phase("asset")
     now = int(cache.setdefault("now", int(time.time())))
     now_ms = now * 1000
@@ -3778,7 +3786,7 @@ def run_once() -> None:
         row = rows[index]
         try:
             network = str(row.get("network") or "mainnet")
-            raw_coin = str(row.get("raw_coin") or row["coin"])
+            raw_coin = batch_row_raw_coin(row)
             dex = str(row.get("dex") or "")
             cache_key = (network, dex)
             if cache_key not in mids_cache:

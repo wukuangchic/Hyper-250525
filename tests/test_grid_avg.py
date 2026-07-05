@@ -21,6 +21,7 @@ from hl_order import (
 )
 from trail_worker import (
     active_grid_oids,
+    batch_row_raw_coin,
     build_grid_panic_reduce_order,
     clear_stale_grid_margin_pauses,
     clear_grid_side_cap_entries,
@@ -128,6 +129,11 @@ class GridAvgTests(unittest.TestCase):
         ]
 
         ensure_no_duplicate_grid_batch(rows, "mainnet", "0xabc", "xyz:SP500")
+
+    def test_worker_uses_row_dex_for_legacy_raw_coin(self) -> None:
+        row = {"coin": "xyz:JPY", "raw_coin": "JPY", "dex": "xyz"}
+
+        self.assertEqual(batch_row_raw_coin(row), "xyz:JPY")
 
     def test_grid_detail_rows_sort_all_sides_by_price_desc(self) -> None:
         row = {
