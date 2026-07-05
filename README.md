@@ -175,21 +175,19 @@ JPY both 20 --offset 2% --tp 1% --sl 0.7%
 ### 创建
 
 ```bash
-BTC grid --abs 300 --gap 0.5% --trend 10%
-BTC grid --long 300 --gap 0.5% --min 20
-BTC grid --long 200 300 --gap 0.5%
-BTC grid --long 100 400 --avg 200
-BTC grid --short 300
+BTC grid --limit -300 300 --gap 0.5% --trend 10%
+BTC grid --limit 0 300 --gap 0.5% --min 20
+BTC grid --limit 200 300 --gap 0.5%
+BTC grid --limit 100 400 --avg 200
+BTC grid --limit -300 0
 ```
 
-仓位限制三选一：
+仓位限制统一使用 `--limit MIN MAX`，按 signed 仓位价值表示范围：空仓为负数，多仓为正数。
 
-- `--long 200`：只允许开多头仓位，持仓价值范围为 0–200；卖单只用于已有多仓的 reduce-only 减仓。
-- `--long 100 200`：只允许开多头仓位，并把持仓价值维持在 100–200；低于 100 时不再减仓，高于 200 时不再加仓。
-- `--short 200`：只允许开空头仓位，持仓绝对价值范围为 0–200；买单只用于已有空仓的 reduce-only 减仓。
-- `--short 100 200`：只允许开空头仓位，并把持仓绝对价值维持在 100–200。
-- `--abs 200`：多空都可以开，最大绝对持仓价值 200。
-- `--abs` 只接受一个最大值，不设置最低绝对仓位。
+- `--limit -200 400`：仓位下限为空仓 200，上限为多仓 400。
+- `--limit 200 400`：永远保持多仓，范围为 200–400；低于 200 时不再减仓，高于 400 时不再加仓。
+- `--limit -400 0`：永远保持空仓，最多空仓 400。
+- `--limit -300 300`：多空都可以开，最大绝对仓位价值 300。
 
 参数：
 
@@ -197,12 +195,12 @@ BTC grid --short 300
 - 不写 `--gap`，或写 `--gap 0` / `--gap 0%` 时，默认使用 `最小价格变动百分比 + 折扣后 takerFee + 折扣后 makerFee`。
 - `--trend`：数量倾向，默认 `0`；正数让买入数量大于卖出数量，负数让卖出数量大于买入数量。取消趋势用 `--modify --trend 0`。
 - `--avg 200`：把 200 设为目标持仓价值，并与 `--trend` 互斥。`avg` 只调整补档间距，不调整单量；回归侧保持基础 `gap`，偏离目标的一侧按偏离度指数放大补档 `gap`。偏离 25% 时约 `1.46` 倍，50% 时约 `1.74` 倍，接近上下限时倍率趋向无限大。
-- `--long` / `--short` 的 `avg` 使用该方向的绝对持仓价值；`--abs` 的 `avg` 可以是负数，例如 `--abs 300 --avg -100` 表示目标为空仓 100。
+- `--avg` 使用同样的 signed 仓位价值；例如 `--limit -300 300 --avg -100` 表示目标为空仓 100。
 - `avg` 模式下买卖基础单量保持一致；订单低于交易所最小名义价值时，仍沿用最小下单额保护。
 - 成交反向单始终使用基础 `gap` 和基础单量。paused 恢复和创建时的初始网格使用基础参数，且不会仅因仓位变化撤掉旧挂单。
 - 修改 `--gap` 只影响后续成交反向单、常规补档和恢复提交；既有 active 单不会被改价，密集去重也优先按旧单保存的 `plan.grid_gap` 判断，避免新 gap 反向清掉旧网格。
 - `--min 20`：每张子单价值至少 20；不填时按交易所最小名义价值。
-- `--total` 和旧 `--max` 不再用于 grid；如果写了会直接报错。
+- `--total`、旧 `--max` 和旧 `--long` / `--short` / `--abs` 都不再作为推荐 grid 参数；新命令使用 `--limit MIN MAX`。
 - grid 子单使用 ALO，目标是只挂 maker 单；网格档位仍按提交限价推进，不因实际成交价更优而漂移。
 - 成交反向单如果 ALO 因会立即成交被拒，会先确认同侧前后 `0.95 * gap` 内没有已有活跃或可恢复 paused grid 档位；若不太近，会先向远离盘口方向移动一个 `gap`，若太近才优先插入外移方向上间距大于 `1.95 * gap` 的相邻两格中间，最多 20 次。其他 grid 子单 ALO 被拒时只跳过本轮，不换价重试。
 - worker 补齐每侧子单时，交易所一旦接受提交，本轮就视为已补一个名额；即使订单随后很快成交，也不会在同一轮为了凑够 10 张活跃单连续追单。
@@ -214,9 +212,9 @@ BTC grid --short 300
 ### 修改
 
 ```bash
-BTC grid --modify --abs 500
-BTC grid --modify --short 300
-BTC grid --modify --long 200 500
+BTC grid --modify --limit -500 500
+BTC grid --modify --limit -300 0
+BTC grid --modify --limit 200 500
 BTC grid --modify --gap 0.3%
 BTC grid --modify --gap 0
 BTC grid --modify --trend 0
@@ -228,17 +226,17 @@ BTC grid --modify --min 20
 - 模式、仓位范围或最低下单额变化后，如果现有订单违反新的方向、仓位上下限、保证金保护或 reduce-only 要求，Worker 仍会按安全规则单独撤销相关订单。
 - 从 `avg` 模式切回无方向的普通网格可使用 `--modify --trend 0`。
 - `--modify` 只改变命令中明确提供的参数；例如只传 `--trend` 时会沿用原来的 gap，只传 `--gap` 时也会沿用原来的 trend。`--modify --gap 0` 会按当前价格和费率重算默认 gap。
-- 修改 `--long` / `--short` 的下限后，Worker 会按新仓位范围维护后续订单；账户安全余量率低于 70% 时，账户保护仍优先，Worker 不会为了达到下限而新增风险。
+- 修改 `--limit` 的下限后，Worker 会按新仓位范围维护后续订单；账户安全余量率低于 70% 时，账户保护仍优先，Worker 不会为了达到下限而新增风险。
 
 ### 查询、恢复、取消
 
 ```bash
-BTC grid --recover --abs 300 --gap 0.5%
+BTC grid --recover --limit -300 300 --gap 0.5%
 BTC grid --query
 BTC --cancel grid
 ```
 
-- `BTC grid --recover --abs 300 --gap 0.5%` 会从当前该币普通 limit open orders 里按近侧最多每边 10 张接管到 `server_batch.json`，用于服务器断点或 JSON 丢失后的人工恢复。
+- `BTC grid --recover --limit -300 300 --gap 0.5%` 会从当前该币普通 limit open orders 里按近侧最多每边 10 张接管到 `server_batch.json`，用于服务器断点或 JSON 丢失后的人工恢复。
 - `BTC grid --query` 会展示该币 grid 的 limit/min/gap/仓位、买卖两边 active 数量、每张子单的 oid/价格/状态/live 情况和最近成交。
 - `BTC --cancel grid` 会取消服务器维护的网格和所有活跃子单。
 

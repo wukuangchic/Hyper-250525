@@ -127,6 +127,10 @@ def protect_grid_range_values(argv: list[str]) -> list[str]:
     index = 0
     while index < len(argv):
         token = argv[index]
+        if token == "--limit" and index + 2 < len(argv):
+            protected.extend([token, f"{argv[index + 1]},{argv[index + 2]}"])
+            index += 3
+            continue
         if token == "--range" and index + 2 < len(argv):
             protected.extend([token, f"{argv[index + 1]},{argv[index + 2]}"])
             index += 3
@@ -2482,21 +2486,43 @@ def grid_gap_spec(args: argparse.Namespace) -> list[str]:
 
 def grid_limit_policy_from_row(row: dict[str, Any]) -> str:
     policy = str(row.get("position_limit_mode") or row.get("max_position_mode") or "abs").strip().lower()
-    if policy in {"long", "short", "abs"}:
+    if policy in {"limit", "long", "short", "abs"}:
         return policy
     return "abs"
+
+
+def grid_position_bounds(policy: str, min_position_value: Decimal, max_position_value: Decimal) -> tuple[Decimal, Decimal]:
+    if policy == "limit":
+        return min_position_value, max_position_value
+    if policy == "long":
+        return min_position_value, max_position_value
+    if policy == "short":
+        return -max_position_value, -min_position_value
+    return -max_position_value, max_position_value
+
+
+def signed_position_value(position_size: Decimal, position_value: Decimal) -> Decimal:
+    return position_value.copy_sign(position_size) if position_size != 0 else Decimal("0")
 
 
 def grid_limit_display(row: dict[str, Any]) -> str:
     policy = grid_limit_policy_from_row(row)
     minimum = Decimal(str(row.get("min_position_value") or "0"))
-    maximum = str(row.get("max_position_value", ""))
-    if policy in {"long", "short"} and minimum > 0:
-        return f"{policy} {decimal_to_plain(minimum)}-{maximum}"
-    return f"{policy} {maximum}"
+    maximum = Decimal(str(row.get("max_position_value", "0")))
+    lower, upper = grid_position_bounds(policy, minimum, maximum)
+    return f"limit {decimal_to_plain(lower)} {decimal_to_plain(upper)}"
 
 
 def grid_limit_arg(args: argparse.Namespace) -> tuple[str | None, str | None, str | None]:
+    explicit_limit = getattr(args, "grid_limit", None)
+    if explicit_limit is not None:
+        values_list = list(explicit_limit)
+        if len(values_list) == 1 and "," in str(values_list[0]):
+            values_list = str(values_list[0]).split(",", 1)
+        if len(values_list) != 2:
+            raise ValueError("--limit accepts exactly two values: MIN MAX")
+        return "limit", str(values_list[0]), str(values_list[1])
+
     values = [
         ("long", getattr(args, "grid_long", None)),
         ("short", getattr(args, "grid_short", None)),
@@ -2519,13 +2545,15 @@ def grid_limit_arg(args: argparse.Namespace) -> tuple[str | None, str | None, st
 
 
 def grid_avg_bounds(policy: str, min_position_value: Decimal, max_position_value: Decimal) -> tuple[Decimal, Decimal]:
+    if policy == "limit":
+        return grid_position_bounds(policy, min_position_value, max_position_value)
     if policy == "abs":
         return -max_position_value, max_position_value
     return min_position_value, max_position_value
 
 
 def grid_avg_position_value(policy: str, position_size: Decimal, position_value: Decimal) -> Decimal:
-    signed_value = position_value.copy_sign(position_size) if position_size != 0 else Decimal("0")
+    signed_value = signed_position_value(position_size, position_value)
     return -signed_value if policy == "short" else signed_value
 
 
@@ -2930,6 +2958,8 @@ def grid_order_would_add_risk(position_size: Decimal, is_buy: bool) -> bool:
 
 
 def grid_order_allowed_by_policy(position_size: Decimal, is_buy: bool, policy: str) -> bool:
+    if policy == "limit":
+        return True
     if policy == "abs":
         return True
     if policy == "long":
@@ -2943,6 +2973,8 @@ def grid_order_should_reduce_only(position_size: Decimal, is_buy: bool, policy: 
     if position_size == 0:
         return False
     reduces_position = (position_size > 0 and not is_buy) or (position_size < 0 and is_buy)
+    if policy == "limit":
+        return False
     if policy == "long":
         return reduces_position
     if policy == "short":
@@ -2960,6 +2992,17 @@ def grid_order_allowed_by_max(
     min_position_value: Decimal = Decimal("0"),
 ) -> bool:
     if not grid_order_allowed_by_policy(position_size, is_buy, policy):
+        return False
+    if policy == "limit":
+        lower, upper = grid_position_bounds(policy, min_position_value, max_position_value)
+        current = signed_position_value(position_size, position_value)
+        projected = current + order_notional if is_buy else current - order_notional
+        if lower <= current <= upper:
+            return lower <= projected <= upper
+        if current < lower:
+            return projected > current
+        if current > upper:
+            return projected < current
         return False
     if grid_order_would_add_risk(position_size, is_buy):
         return position_value + order_notional <= max_position_value
@@ -3069,8 +3112,6 @@ def build_grid_orders(
 ) -> list[dict[str, Any]]:
     if current_mid is None:
         raise ValueError(f"No mid price found for {coin}, cannot place grid orders")
-    if max_position_value < MIN_NOTIONAL:
-        raise ValueError(f"grid max must be at least {MIN_NOTIONAL} USD")
 
     trend = parse_percent_decimal(args.trend or "0", "--trend", allow_signed=True)
     if trend <= Decimal("-1"):
@@ -3082,6 +3123,9 @@ def build_grid_orders(
     position_size, position_value = current_position_size_value(info, account, coin, dex, current_mid)
     policy = getattr(args, "grid_position_limit_mode", None) or "abs"
     min_position_value = Decimal(str(getattr(args, "grid_position_min_value", None) or "0"))
+    lower_bound, upper_bound = grid_position_bounds(policy, min_position_value, max_position_value)
+    if max(abs(lower_bound), abs(upper_bound)) < MIN_NOTIONAL:
+        raise ValueError(f"grid limit range must allow at least {MIN_NOTIONAL} USD of position")
     avg_value = decimal_or_none(getattr(args, "grid_avg", None))
     avg_multiplier = Decimal("1")
     avg_favored_side: str | None = None
@@ -3885,7 +3929,7 @@ def modify_grid_batch_order(
         )
         if not avg_value.is_finite() or avg_value < avg_lower or avg_value > avg_upper:
             raise ValueError(
-                f"--avg must be between {decimal_to_plain(avg_lower)} and {decimal_to_plain(avg_upper)} for --{new_limit_mode}"
+                f"--avg must be between {decimal_to_plain(avg_lower)} and {decimal_to_plain(avg_upper)} for --limit"
             )
         row["avg"] = decimal_to_plain(avg_value)
         row["trend"] = "0"
@@ -3914,7 +3958,7 @@ def modify_grid_batch_order(
         if not effective_avg.is_finite() or effective_avg < effective_lower or effective_avg > effective_upper:
             raise ValueError(
                 f"--avg must be between {decimal_to_plain(effective_lower)} and {decimal_to_plain(effective_upper)} "
-                f"for --{args.grid_position_limit_mode}"
+                "for --limit"
             )
 
     if current_mid is None:
@@ -5309,18 +5353,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--total", dest="total_amount", help="Total USD notional. Ladder and symmetric orders divide it across legs.")
     parser.add_argument("--max", dest="grid_max", help=argparse.SUPPRESS)
     parser.add_argument(
+        "--limit",
+        dest="grid_limit",
+        nargs=1,
+        metavar="MIN MAX",
+        help="Grid signed position value range in USD, e.g. --limit -200 400.",
+    )
+    parser.add_argument(
         "--long",
         dest="grid_long",
         nargs="+",
-        help="Grid long-only position value range: MAX or MIN MAX in USD.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--short",
         dest="grid_short",
         nargs="+",
-        help="Grid short-only position value range: MAX or MIN MAX in USD.",
+        help=argparse.SUPPRESS,
     )
-    parser.add_argument("--abs", dest="grid_abs", help="Grid absolute maximum position value in USD.")
+    parser.add_argument("--abs", dest="grid_abs", help=argparse.SUPPRESS)
     parser.add_argument("--min", dest="grid_min", help="Grid minimum value per child order in USD. Default: exchange minimum.")
     parser.add_argument("--modify", dest="grid_modify", action="store_true", help="Modify an active server grid for this coin.")
     parser.add_argument("--recover", dest="grid_recover", action="store_true", help="Recover a server grid from current open limit orders for this coin.")
@@ -5588,7 +5639,7 @@ def parse_args() -> argparse.Namespace:
         args.ladder_mode = "while"
         args.ladder_step = unprotect_ladder_step_value(step_text)
     if args.range_spec and args.grid:
-        parser.error("grid no longer uses --range; use --gap with one of --long, --short, or --abs")
+        parser.error("grid no longer uses --range; use --gap with --limit MIN MAX")
     elif args.range_spec and not combined_range_count_to_end and args.cancel is None:
         if len(args.range_spec) != 3:
             parser.error("--range requires START END STEP unless combined as --range START END --for COUNT")
@@ -5616,20 +5667,20 @@ def parse_args() -> argparse.Namespace:
         if args.grid_modify and args.grid_recover:
             parser.error("grid --modify and --recover are mutually exclusive")
         if args.total_amount is not None:
-            parser.error("grid no longer uses --total; use one of --long, --short, or --abs")
+            parser.error("grid no longer uses --total; use --limit MIN MAX")
         if args.amount and args.amount != "10":
-            parser.error("grid no longer uses positional amount; use one of --long, --short, or --abs")
+            parser.error("grid no longer uses positional amount; use --limit MIN MAX")
         if args.grid_max is not None:
-            parser.error("grid no longer uses --max; use one of --long, --short, or --abs")
+            parser.error("grid no longer uses --max; use --limit MIN MAX")
         selected_grid_limits = [
-            value for value in (args.grid_long, args.grid_short, args.grid_abs) if value is not None
+            value for value in (args.grid_limit, args.grid_long, args.grid_short, args.grid_abs) if value is not None
         ]
         if len(selected_grid_limits) > 1:
-            parser.error("grid accepts only one of --long, --short, or --abs")
+            parser.error("grid accepts only one position range option; use --limit MIN MAX")
         if not args.query and not args.grid_modify and not selected_grid_limits:
-            parser.error("grid orders require one of --long, --short, or --abs")
+            parser.error("grid orders require --limit MIN MAX")
         if args.grid_recover and not selected_grid_limits:
-            parser.error("grid --recover requires one of --long, --short, or --abs")
+            parser.error("grid --recover requires --limit MIN MAX")
         try:
             if args.gap and not is_auto_grid_gap(args.gap):
                 parse_grid_gap(args.gap)
@@ -5641,12 +5692,12 @@ def parse_args() -> argparse.Namespace:
             if limit_value is not None:
                 grid_min_limit = Decimal(str(min_limit_value or "0"))
                 grid_limit = Decimal(limit_value)
-                if not grid_min_limit.is_finite() or grid_min_limit < 0:
-                    parser.error(f"--{policy} minimum must be zero or positive")
-                if not grid_limit.is_finite() or grid_limit <= 0:
-                    parser.error(f"--{policy} must be positive")
+                if not grid_min_limit.is_finite() or not grid_limit.is_finite():
+                    parser.error("--limit MIN and MAX must be finite numbers")
                 if grid_min_limit >= grid_limit:
-                    parser.error(f"--{policy} requires MIN < MAX")
+                    parser.error("--limit requires MIN < MAX")
+                if max(abs(grid_min_limit), abs(grid_limit)) < MIN_NOTIONAL:
+                    parser.error(f"--limit range must allow at least {MIN_NOTIONAL} USD of position")
                 if args.grid_avg is not None:
                     avg_value = Decimal(str(args.grid_avg))
                     if not avg_value.is_finite():
@@ -5654,7 +5705,7 @@ def parse_args() -> argparse.Namespace:
                     avg_lower, avg_upper = grid_avg_bounds(policy, grid_min_limit, grid_limit)
                     if avg_value < avg_lower or avg_value > avg_upper:
                         parser.error(
-                            f"--avg must be between {decimal_to_plain(avg_lower)} and {decimal_to_plain(avg_upper)} for --{policy}"
+                            f"--avg must be between {decimal_to_plain(avg_lower)} and {decimal_to_plain(avg_upper)} for --limit"
                         )
             if args.grid_min is not None:
                 grid_min_notional(args)

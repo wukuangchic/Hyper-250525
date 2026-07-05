@@ -37,12 +37,14 @@ from hl_order import (  # noqa: E402
     grid_order_allowed_by_max,
     grid_order_should_reduce_only,
     grid_order_would_add_risk,
+    grid_position_bounds,
     grid_size_for_min_notional,
     is_post_only_reject_text,
     load_server_batch,
     log_event,
     mask,
     position_matches_coin,
+    signed_position_value,
     resolve_perp_asset,
     rounded_perp_price,
     save_server_batch,
@@ -327,10 +329,22 @@ def grid_reduce_only_capacity_available(
     if reserved_size + requested_size > abs(position_size):
         return False
     policy = grid_limit_policy_from_row(row)
-    position_matches_target = (policy == "long" and position_size > 0) or (policy == "short" and position_size < 0)
-    min_position_value = Decimal(str(row.get("min_position_value") or "0")) if position_matches_target else Decimal("0")
+    min_position_value = Decimal(str(row.get("min_position_value") or "0"))
+    max_position_value = Decimal(str(row.get("max_position_value") or "0"))
     requested_price = decimal_or_none(order.get("price", order.get("limit_px"))) or Decimal("0")
-    return position_value - reserved_notional - requested_size * requested_price >= min_position_value
+    requested_notional = requested_size * requested_price
+    if policy != "limit":
+        position_matches_target = (policy == "long" and position_size > 0) or (policy == "short" and position_size < 0)
+        minimum = min_position_value if position_matches_target else Decimal("0")
+        return position_value - reserved_notional - requested_notional >= minimum
+
+    lower_bound, upper_bound = grid_position_bounds(policy, min_position_value, max_position_value)
+    signed_value = signed_position_value(position_size, position_value)
+    if position_size < 0:
+        projected_value = signed_value + reserved_notional + requested_notional
+    else:
+        projected_value = signed_value - reserved_notional - requested_notional
+    return lower_bound <= projected_value <= upper_bound
 
 
 def pause_grid_margin_side(

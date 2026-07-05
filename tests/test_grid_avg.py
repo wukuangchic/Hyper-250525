@@ -12,6 +12,9 @@ from hl_order import (
     grid_avg_multiplier,
     grid_avg_size_pair,
     grid_avg_topup_params,
+    grid_limit_display,
+    grid_order_allowed_by_max,
+    grid_order_should_reduce_only,
     format_grid_detail_rows,
     grid_query_avg_summary,
     grid_query_rows,
@@ -2838,6 +2841,72 @@ class GridAvgTests(unittest.TestCase):
             grid_avg_bounds("abs", Decimal("0"), Decimal("300")),
             (Decimal("-300"), Decimal("300")),
         )
+
+    def test_limit_bounds_use_signed_position_values(self) -> None:
+        self.assertEqual(
+            grid_avg_bounds("limit", Decimal("-200"), Decimal("400")),
+            (Decimal("-200"), Decimal("400")),
+        )
+        self.assertEqual(
+            grid_limit_display(
+                {
+                    "position_limit_mode": "limit",
+                    "min_position_value": "-200",
+                    "max_position_value": "400",
+                }
+            ),
+            "limit -200 400",
+        )
+
+    def test_limit_allows_only_orders_inside_or_toward_signed_range(self) -> None:
+        self.assertTrue(
+            grid_order_allowed_by_max(
+                Decimal("1"),
+                Decimal("250"),
+                False,
+                Decimal("40"),
+                Decimal("400"),
+                "limit",
+                Decimal("200"),
+            )
+        )
+        self.assertFalse(
+            grid_order_allowed_by_max(
+                Decimal("1"),
+                Decimal("250"),
+                False,
+                Decimal("60"),
+                Decimal("400"),
+                "limit",
+                Decimal("200"),
+            )
+        )
+        self.assertTrue(
+            grid_order_allowed_by_max(
+                Decimal("-3"),
+                Decimal("300"),
+                True,
+                Decimal("50"),
+                Decimal("400"),
+                "limit",
+                Decimal("200"),
+            )
+        )
+        self.assertFalse(
+            grid_order_allowed_by_max(
+                Decimal("-3"),
+                Decimal("300"),
+                False,
+                Decimal("50"),
+                Decimal("400"),
+                "limit",
+                Decimal("200"),
+            )
+        )
+
+    def test_limit_cross_zero_range_does_not_force_reduce_only(self) -> None:
+        self.assertFalse(grid_order_should_reduce_only(Decimal("1"), False, "limit"))
+        self.assertFalse(grid_order_should_reduce_only(Decimal("-1"), True, "limit"))
 
     def test_avg_size_pair_keeps_base_sizes(self) -> None:
         self.assertEqual(

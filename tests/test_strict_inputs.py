@@ -48,6 +48,16 @@ class StrictInputTests(unittest.TestCase):
         self.assertEqual(normalize_coin_input("BTCUSD"), ["BTCUSD", "BTCUSD"])
         self.assertEqual(normalize_coin_input("BTC-PERP"), ["BTC-PERP", "BTC-PERP"])
 
+    def test_grid_limit_accepts_signed_min_max(self) -> None:
+        args = self.parse_cli("BTC", "grid", "--limit", "-200", "400", "--dry-run")
+        self.assertEqual(args.grid_position_limit_mode, "limit")
+        self.assertEqual(args.grid_position_min_value, "-200")
+        self.assertEqual(args.grid_position_limit_value, "400")
+
+    def test_grid_requires_limit_range(self) -> None:
+        self.assert_cli_rejected("BTC", "grid", "--dry-run")
+        self.assert_cli_rejected("BTC", "grid", "--limit", "400", "200", "--dry-run")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -465,6 +465,7 @@ VALUE_OPTION_STRINGS = {
     "--offset",
     "--trend",
     "--avg",
+    "--limit",
     "--gap",
     "--range",
     "--for",
