@@ -580,7 +580,12 @@ INDEX_HTML = r"""<!doctype html>
       input.setSelectionRange(input.value.length, input.value.length);
     }
 
+    function isWalletAddress(value) {
+      return /^0x[a-fA-F0-9]{40}$/.test(value.trim());
+    }
+
     function credentials() {
+      syncWalletFromCredential();
       syncCredentialUsername();
       return {
         account_address: state.verified ? state.account_address : $("walletInput").value.trim(),
@@ -589,12 +594,21 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function syncCredentialUsername() {
-      $("credentialUsername").value = $("walletInput").value.trim();
+      const wallet = $("walletInput").value.trim();
+      const credential = $("credentialUsername").value.trim();
+      if (!wallet) {
+        $("credentialUsername").value = "";
+        return;
+      }
+      if (isWalletAddress(wallet) || !credential || !isWalletAddress(credential)) {
+        $("credentialUsername").value = wallet;
+      }
     }
 
     function syncWalletFromCredential() {
       const credentialUsername = $("credentialUsername").value.trim();
-      if (credentialUsername && !$("walletInput").value.trim()) {
+      const wallet = $("walletInput").value.trim();
+      if (isWalletAddress(credentialUsername) && !isWalletAddress(wallet)) {
         $("walletInput").value = credentialUsername;
       }
     }
