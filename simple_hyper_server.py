@@ -440,7 +440,7 @@ INDEX_HTML = r"""<!doctype html>
     </section>
 
     <footer class="footer footer-block">
-      <a href="/readme">README</a>
+      <a href="/grid">Grid Detail</a> · <a href="/readme">README</a>
     </footer>
   </main>
 
@@ -777,6 +777,625 @@ INDEX_HTML = r"""<!doctype html>
 """
 
 
+GRID_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#eef1ed">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Grid Detail">
+  <title>Simple-Hyper Grid Detail</title>
+  <link rel="icon" href="/icon-192.png" sizes="192x192" type="image/png">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #eef1ed;
+      --panel: #fffdf9;
+      --ink: #141716;
+      --muted: #5e6761;
+      --line: #cbd4cc;
+      --accent: #235c67;
+      --buy: #126b47;
+      --sell: #9f3333;
+      --warn: #9a6a18;
+      --terminal: #141716;
+      --terminal-ink: #f4f0e8;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      margin: 0;
+      min-height: 100%;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+
+    body {
+      padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom);
+    }
+
+    button,
+    input {
+      font: inherit;
+    }
+
+    .shell {
+      width: min(100%, 1240px);
+      margin: 0 auto;
+      padding: 18px 12px 28px;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 23px;
+      line-height: 1.12;
+      font-weight: 780;
+    }
+
+    a {
+      color: var(--accent);
+      font-weight: 740;
+      text-decoration: none;
+    }
+
+    .status {
+      min-width: 78px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 7px 10px;
+      color: var(--muted);
+      background: rgba(255, 255, 255, 0.72);
+      text-align: center;
+      font-size: 13px;
+      white-space: nowrap;
+    }
+
+    .status.ready {
+      color: var(--buy);
+      border-color: rgba(18, 107, 71, 0.28);
+      background: rgba(18, 107, 71, 0.08);
+    }
+
+    .grid-layout {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 10px;
+      align-items: start;
+    }
+
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 12px;
+      min-width: 0;
+    }
+
+    .toolbar {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 10px;
+    }
+
+    .field {
+      display: grid;
+      gap: 6px;
+    }
+
+    label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 680;
+    }
+
+    input {
+      width: 100%;
+      min-height: 44px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 10px 11px;
+      background: #fff;
+      color: var(--ink);
+      outline: none;
+    }
+
+    input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(35, 92, 103, 0.13);
+    }
+
+    .credential-proxy {
+      position: absolute;
+      left: -9999px;
+      width: 1px;
+      height: 1px;
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    .actions {
+      display: flex;
+      gap: 8px;
+      align-items: end;
+    }
+
+    button {
+      min-height: 44px;
+      border: 1px solid transparent;
+      border-radius: 7px;
+      padding: 10px 12px;
+      font-weight: 760;
+      color: #fff;
+      background: var(--accent);
+      white-space: nowrap;
+    }
+
+    button.secondary {
+      color: var(--accent);
+      border-color: var(--line);
+      background: #fff;
+    }
+
+    button:disabled {
+      opacity: 0.52;
+    }
+
+    button:active {
+      transform: translateY(1px);
+    }
+
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+      gap: 8px;
+    }
+
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 9px;
+      min-height: 72px;
+    }
+
+    .metric .label {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 720;
+      text-transform: uppercase;
+    }
+
+    .metric .value {
+      margin-top: 6px;
+      overflow-wrap: anywhere;
+      font-size: 14px;
+      font-weight: 760;
+      line-height: 1.25;
+    }
+
+    .section-title {
+      margin: 0 0 10px;
+      font-size: 14px;
+      font-weight: 780;
+    }
+
+    .table-wrap {
+      overflow: auto;
+      -webkit-overflow-scrolling: touch;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 860px;
+      font-size: 12px;
+    }
+
+    th,
+    td {
+      border-bottom: 1px solid var(--line);
+      padding: 8px 7px;
+      text-align: left;
+      white-space: nowrap;
+    }
+
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      color: var(--muted);
+      background: var(--panel);
+      font-size: 11px;
+      font-weight: 780;
+    }
+
+    td.price,
+    td.value,
+    td.size {
+      font-variant-numeric: tabular-nums;
+    }
+
+    tr.mid td {
+      color: var(--warn);
+      background: rgba(154, 106, 24, 0.09);
+      font-weight: 760;
+    }
+
+    .side-buy {
+      color: var(--buy);
+      font-weight: 760;
+    }
+
+    .side-sell {
+      color: var(--sell);
+      font-weight: 760;
+    }
+
+    .raw {
+      min-height: 240px;
+      max-height: 62vh;
+      overflow: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 0;
+      border: 1px solid #242723;
+      border-radius: 8px;
+      padding: 12px;
+      background: var(--terminal);
+      color: var(--terminal-ink);
+      font-family: "SF Mono", Menlo, Consolas, monospace;
+      font-size: 11px;
+      line-height: 1.52;
+      white-space: pre;
+    }
+
+    .empty {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    @media (min-width: 900px) {
+      .grid-layout {
+        grid-template-columns: minmax(320px, 0.8fr) minmax(560px, 1.2fr);
+        grid-template-areas:
+          "controls summary"
+          "raw orders";
+      }
+
+      .controls-panel {
+        grid-area: controls;
+      }
+
+      .summary-panel {
+        grid-area: summary;
+      }
+
+      .orders-panel {
+        grid-area: orders;
+      }
+
+      .raw-panel {
+        grid-area: raw;
+        position: sticky;
+        top: 12px;
+      }
+    }
+
+    @media (max-width: 560px) {
+      .shell {
+        padding-inline: 10px;
+      }
+
+      h1 {
+        font-size: 21px;
+      }
+
+      .actions {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+      }
+
+      .raw {
+        font-size: 10px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <h1>Grid Detail</h1>
+      <div id="status" class="status">Ready</div>
+    </header>
+
+    <div class="grid-layout">
+      <section class="panel controls-panel">
+        <form id="gridForm" class="toolbar" autocomplete="off">
+          <input id="credentialUsername" class="credential-proxy" name="username" type="text" autocomplete="username" tabindex="-1" aria-hidden="true">
+          <div class="field">
+            <label for="walletInput">Wallet</label>
+            <input id="walletInput" name="hyper_wallet" type="search" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="0x..." data-form-type="other" data-lpignore="true">
+          </div>
+          <div class="field">
+            <label for="secret">Private Key or Agent Key</label>
+            <input id="secret" name="password" type="password" autocomplete="current-password" autocapitalize="off" spellcheck="false" placeholder="0x...">
+          </div>
+          <div class="field">
+            <label for="coin">Coin</label>
+            <input id="coin" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="BTC" value="BTC">
+          </div>
+          <div class="actions">
+            <button id="refresh" type="submit">Refresh</button>
+            <button id="clear" type="button" class="secondary">Clear</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel summary-panel">
+        <h2 class="section-title">Summary</h2>
+        <div id="summary" class="summary">
+          <div class="empty">Run a grid query to show current config, risk, spacing, position, and live oid counts.</div>
+        </div>
+      </section>
+
+      <section class="panel orders-panel">
+        <h2 class="section-title">Grid Orders</h2>
+        <div id="orders" class="table-wrap">
+          <div class="empty">No grid orders loaded.</div>
+        </div>
+      </section>
+
+      <section class="panel raw-panel">
+        <h2 class="section-title">Raw Output</h2>
+        <pre id="raw" class="raw">Ready.</pre>
+      </section>
+    </div>
+
+    <p class="empty" style="text-align:center; margin: 14px 0 0;"><a href="/">Main console</a> · <a href="/readme">README</a></p>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const state = { account_address: "", secret_key: "" };
+
+    function setStatus(text, ready = false) {
+      $("status").textContent = text;
+      $("status").classList.toggle("ready", ready);
+    }
+
+    function isWalletAddress(value) {
+      return /^0x[a-fA-F0-9]{40}$/.test(value.trim());
+    }
+
+    function syncCredentialUsername() {
+      const wallet = $("walletInput").value.trim();
+      const credential = $("credentialUsername").value.trim();
+      if (!wallet) {
+        $("credentialUsername").value = "";
+        return;
+      }
+      if (isWalletAddress(wallet) || !credential || !isWalletAddress(credential)) {
+        $("credentialUsername").value = wallet;
+      }
+    }
+
+    function syncWalletFromCredential() {
+      const credentialUsername = $("credentialUsername").value.trim();
+      const wallet = $("walletInput").value.trim();
+      if (isWalletAddress(credentialUsername) && !isWalletAddress(wallet)) {
+        $("walletInput").value = credentialUsername;
+      }
+    }
+
+    function credentials() {
+      syncWalletFromCredential();
+      syncCredentialUsername();
+      state.account_address = $("walletInput").value.trim();
+      state.secret_key = $("secret").value.trim();
+      return { account_address: state.account_address, secret_key: state.secret_key };
+    }
+
+    function setBusy(busy) {
+      $("refresh").disabled = busy;
+      $("clear").disabled = busy;
+      setStatus(busy ? "Loading" : "Ready", !busy);
+    }
+
+    function normalizeCoin(value) {
+      return String(value || "").trim().toUpperCase();
+    }
+
+    async function apiGrid() {
+      const response = await fetch("/api/grid", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...credentials(), coin: normalizeCoin($("coin").value) }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || data.ok === false) {
+        throw new Error(data.error || `HTTP ${response.status}`);
+      }
+      return data;
+    }
+
+    function cleanCell(value) {
+      return String(value || "").trim();
+    }
+
+    function parseGridSummary(output) {
+      const rows = [];
+      const lines = String(output || "").split(/\r?\n/);
+      let inGrid = false;
+      for (const line of lines) {
+        if (/^\+- Grid -+/.test(line)) {
+          inGrid = true;
+          rows.length = 0;
+          continue;
+        }
+        if (inGrid && /^\+-/.test(line)) break;
+        if (!inGrid || !line.startsWith("|")) continue;
+        const text = line.replace(/^\|\s*/, "").replace(/\s*\|$/, "");
+        const index = text.indexOf(":");
+        if (index <= 0) continue;
+        rows.push([cleanCell(text.slice(0, index)), cleanCell(text.slice(index + 1))]);
+      }
+      return rows;
+    }
+
+    function parseGridOrders(output) {
+      const lines = String(output || "").split(/\r?\n/);
+      const titleIndex = lines.findIndex((line) => /^\+- Grid Orders/.test(line));
+      if (titleIndex < 0) return { columns: [], rows: [] };
+      const tableLines = [];
+      for (let i = titleIndex + 1; i < lines.length; i += 1) {
+        const line = lines[i];
+        if (/^\+- /.test(line) && tableLines.length) break;
+        if (line.startsWith("|") || line.startsWith("+")) tableLines.push(line);
+      }
+      const pipeLines = tableLines.filter((line) => line.startsWith("|"));
+      if (!pipeLines.length) return { columns: [], rows: [] };
+      const columns = pipeLines[0].split("|").slice(1, -1).map(cleanCell);
+      const rows = pipeLines.slice(1).map((line) => {
+        const cells = line.split("|").slice(1, -1).map(cleanCell);
+        return Object.fromEntries(columns.map((column, index) => [column, cells[index] || ""]));
+      });
+      return { columns, rows };
+    }
+
+    function metric(key, value) {
+      const node = document.createElement("div");
+      node.className = "metric";
+      const label = document.createElement("div");
+      label.className = "label";
+      label.textContent = key;
+      const body = document.createElement("div");
+      body.className = "value";
+      body.textContent = value || "-";
+      node.append(label, body);
+      return node;
+    }
+
+    function renderSummary(rows) {
+      const summary = $("summary");
+      summary.replaceChildren();
+      if (!rows.length) {
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        empty.textContent = "No grid summary found in command output.";
+        summary.appendChild(empty);
+        return;
+      }
+      const preferred = [
+        "coin", "status", "limit", "position", "min", "avg", "avg_position", "avg_multiplier",
+        "avg_side", "base_gap", "topup_gap", "base_size", "topup_size", "trend", "margin_gap",
+        "roe", "roe_limit", "roe_allowed", "panic_ratio", "panic_threshold", "panic_reduced",
+        "panic_last", "target_side", "active_buy", "active_sell", "live_oids", "updated", "note",
+      ];
+      const byKey = new Map(rows);
+      for (const key of preferred) {
+        if (byKey.has(key)) summary.appendChild(metric(key, byKey.get(key)));
+      }
+      for (const [key, value] of rows) {
+        if (!preferred.includes(key)) summary.appendChild(metric(key, value));
+      }
+    }
+
+    function renderOrders(parsed) {
+      const mount = $("orders");
+      mount.replaceChildren();
+      if (!parsed.rows.length) {
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        empty.textContent = "No order table found.";
+        mount.appendChild(empty);
+        return;
+      }
+      const table = document.createElement("table");
+      const thead = document.createElement("thead");
+      const headerRow = document.createElement("tr");
+      for (const column of parsed.columns) {
+        const th = document.createElement("th");
+        th.textContent = column;
+        headerRow.appendChild(th);
+      }
+      thead.appendChild(headerRow);
+      const tbody = document.createElement("tbody");
+      for (const row of parsed.rows) {
+        const tr = document.createElement("tr");
+        if (row.status === "mid") tr.className = "mid";
+        for (const column of parsed.columns) {
+          const td = document.createElement("td");
+          const value = row[column] || "";
+          td.textContent = value;
+          if (column === "side" && value === "buy") td.className = "side-buy";
+          if (column === "side" && value === "sell") td.className = "side-sell";
+          if (["price", "value", "size"].includes(column)) td.classList.add(column);
+          tr.appendChild(td);
+        }
+        tbody.appendChild(tr);
+      }
+      table.append(thead, tbody);
+      mount.appendChild(table);
+    }
+
+    function render(data) {
+      const raw = `${data.command ? `$ ${data.command}\n\n` : ""}${data.output || ""}${data.elapsed_ms === undefined ? "" : `\n\n[${data.elapsed_ms} ms]`}`;
+      $("raw").textContent = raw;
+      renderSummary(parseGridSummary(data.output));
+      renderOrders(parseGridOrders(data.output));
+      setStatus(data.command_ok ? "Loaded" : "Error", Boolean(data.command_ok));
+    }
+
+    async function refresh(event) {
+      event.preventDefault();
+      try {
+        setBusy(true);
+        render(await apiGrid());
+      } catch (error) {
+        $("raw").textContent = `error: ${error.message}`;
+        renderSummary([]);
+        renderOrders({ columns: [], rows: [] });
+        setStatus("Error", false);
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    function clearPage() {
+      $("raw").textContent = "Ready.";
+      renderSummary([]);
+      renderOrders({ columns: [], rows: [] });
+      setStatus("Ready", false);
+    }
+
+    $("gridForm").addEventListener("submit", refresh);
+    $("clear").addEventListener("click", clearPage);
+    $("walletInput").addEventListener("input", syncCredentialUsername);
+    $("credentialUsername").addEventListener("input", syncWalletFromCredential);
+    $("credentialUsername").addEventListener("change", syncWalletFromCredential);
+    const autofillSync = window.setInterval(syncWalletFromCredential, 250);
+    window.setTimeout(() => window.clearInterval(autofillSync), 5000);
+  </script>
+</body>
+</html>
+"""
+
+
 README_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -1020,6 +1639,15 @@ def parse_command(raw: Any) -> list[str]:
     return args
 
 
+def parse_grid_coin(raw: Any) -> str:
+    coin = str(raw or "").strip().upper()
+    if not coin:
+        raise ValueError("coin is required")
+    if len(coin) > 24 or not re.fullmatch(r"[A-Z0-9:_-]+", coin):
+        raise ValueError("invalid coin")
+    return coin
+
+
 def clean_web_output(output: str) -> str:
     lines = [line for line in output.splitlines() if not line.startswith("log: ")]
     return "\n".join(lines).rstrip()
@@ -1050,6 +1678,11 @@ def run_hl_order(args: list[str], account_address: str, secret_key: str) -> dict
         "elapsed_ms": elapsed_ms,
         "returncode": completed.returncode,
     }
+
+
+def run_grid_query(payload: dict[str, Any], account_address: str, secret_key: str) -> dict[str, Any]:
+    coin = parse_grid_coin(payload.get("coin"))
+    return run_hl_order([coin, "grid", "--query"], account_address, secret_key)
 
 
 class SimpleHyperHandler(BaseHTTPRequestHandler):
@@ -1091,6 +1724,9 @@ class SimpleHyperHandler(BaseHTTPRequestHandler):
         if path == "/":
             self.send_payload(HTTPStatus.OK, INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
             return
+        if path == "/grid":
+            self.send_payload(HTTPStatus.OK, GRID_HTML.encode("utf-8"), "text/html; charset=utf-8")
+            return
         if path == "/readme":
             self.send_payload(HTTPStatus.OK, README_HTML.encode("utf-8"), "text/html; charset=utf-8")
             return
@@ -1114,6 +1750,9 @@ class SimpleHyperHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/":
             self.send_headers(HTTPStatus.OK, len(INDEX_HTML.encode("utf-8")), "text/html; charset=utf-8")
+            return
+        if path == "/grid":
+            self.send_headers(HTTPStatus.OK, len(GRID_HTML.encode("utf-8")), "text/html; charset=utf-8")
             return
         if path == "/readme":
             self.send_headers(HTTPStatus.OK, len(README_HTML.encode("utf-8")), "text/html; charset=utf-8")
@@ -1140,11 +1779,14 @@ class SimpleHyperHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         try:
-            if path != "/api/run":
+            if path not in {"/api/run", "/api/grid"}:
                 self.send_json({"ok": False, "error": "not found"}, HTTPStatus.NOT_FOUND)
                 return
             payload = parse_json_body(self)
             account_address, secret_key = normalize_credentials(payload)
+            if path == "/api/grid":
+                self.send_json(run_grid_query(payload, account_address, secret_key))
+                return
             args = parse_command(payload.get("command"))
             self.send_json(run_hl_order(args, account_address, secret_key))
         except subprocess.TimeoutExpired:
