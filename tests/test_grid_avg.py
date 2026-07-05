@@ -30,6 +30,7 @@ from trail_worker import (
     defer_paused_grid_restore_if_crossing,
     grid_panic_ratio,
     grid_panic_ratio_threshold,
+    grid_row_recoverable_from_error,
     grid_active_cap_restore_allowed,
     grid_active_cap_pause_candidates,
     grid_margin_gap_multiplier,
@@ -134,6 +135,18 @@ class GridAvgTests(unittest.TestCase):
         row = {"coin": "xyz:JPY", "raw_coin": "JPY", "dex": "xyz"}
 
         self.assertEqual(batch_row_raw_coin(row), "xyz:JPY")
+
+    def test_legacy_dex_raw_coin_error_is_recoverable(self) -> None:
+        row = {
+            "type": "grid",
+            "status": "error",
+            "coin": "xyz:JPY",
+            "raw_coin": "JPY",
+            "dex": "xyz",
+            "error": "Unknown perp coin: JPY",
+        }
+
+        self.assertTrue(grid_row_recoverable_from_error(row))
 
     def test_grid_detail_rows_sort_all_sides_by_price_desc(self) -> None:
         row = {
