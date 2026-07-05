@@ -238,15 +238,16 @@ class GridAvgTests(unittest.TestCase):
         self.assertIsNone(grid_panic_ratio(long_row, Decimal("4"), Decimal("100"), Decimal("60")))
 
     def test_panic_threshold_migrates_legacy_defaults_only(self) -> None:
-        self.assertEqual(grid_panic_ratio_threshold({}), Decimal("80"))
-        self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "10"}), Decimal("80"))
-        self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "20"}), Decimal("80"))
-        self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "30"}), Decimal("80"))
-        self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "50"}), Decimal("80"))
-        self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "60"}), Decimal("80"))
-        self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "65"}), Decimal("80"))
-        self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "70"}), Decimal("80"))
-        self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "75"}), Decimal("80"))
+        self.assertEqual(grid_panic_ratio_threshold({}), Decimal("85"))
+        self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "10"}), Decimal("85"))
+        self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "20"}), Decimal("85"))
+        self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "30"}), Decimal("85"))
+        self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "50"}), Decimal("85"))
+        self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "60"}), Decimal("85"))
+        self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "65"}), Decimal("85"))
+        self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "70"}), Decimal("85"))
+        self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "75"}), Decimal("85"))
+        self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "80"}), Decimal("85"))
         self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "15"}), Decimal("15"))
 
     def test_panic_reduce_order_uses_base_size_ioc_and_reduce_only(self) -> None:
