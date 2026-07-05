@@ -93,15 +93,13 @@ from simple_hyper.order_specs import (
 )
 from simple_hyper.runtime import load_dotenv, mask
 
-from coin_aliases import coin_alias_key
-
 
 DEFAULT_SLIPPAGE = "0.05"
 ISOLATED_FALLBACK_LEVERAGE = 5
 SERVER_BATCH_PATH = Path(__file__).resolve().parent / "server_batch.json"
 SERVER_BATCH_LOCK_PATH = Path(__file__).resolve().parent / "server_batch.lock"
-SYMMETRIC_SIDE_ALIASES = {"both", "sym", "symmetric", "dual", "双向", "对称", "对称单"}
-GRID_SIDE_ALIASES = {"grid", "网格", "网格单"}
+SYMMETRIC_SIDE_ALIASES = {"both"}
+GRID_SIDE_ALIASES = {"grid"}
 DEFAULT_GRID_GAP_LABEL = ["auto-minTick", "auto-takerFee", "auto-makerFee"]
 DEFAULT_GRID_RANGE = ["auto", "auto"]
 GRID_TARGET_ORDERS_PER_SIDE = 10
@@ -798,7 +796,7 @@ def format_position_leverage(position: dict[str, Any]) -> str:
 
 
 def position_matches_coin(position_coin: str, coin: str) -> bool:
-    return coin_alias_key(position_coin) == coin_alias_key(coin)
+    return position_coin.strip().upper() == coin.strip().upper()
 
 
 def fill_matches_coin(fill_coin: str, coin: str) -> bool:
@@ -5305,7 +5303,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "side",
         nargs="?",
-        help="buy/long/看多, sell/short/看空, or both/sym/对称. Not needed with --cancel.",
+        help="buy, sell, both, or grid. Not needed with --cancel.",
     )
     parser.add_argument("amount", nargs="?", help="USD notional. Default: 10.")
     parser.add_argument("--total", dest="total_amount", help="Total USD notional. Ladder and symmetric orders divide it across legs.")
@@ -5338,7 +5336,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--market", action="store_true", help="Submit as a market order using IOC with slippage protection.")
     parser.add_argument("--slippage", default=DEFAULT_SLIPPAGE, help="Market slippage protection. Default: 0.05. Also accepts 5%%.")
     parser.add_argument("--trail", help="Create a server-managed trailing stop distance, e.g. 2%% or 800.")
-    parser.add_argument("--level", "--book-level", dest="book_level", type=int, default=10, help="Same-side book level when --price is omitted.")
+    parser.add_argument("--level", dest="book_level", type=int, default=10, help="Same-side book level when --price is omitted.")
     parser.add_argument("--tif", choices=["Gtc", "Ioc", "Alo"], help="Time in force. Limit orders default to Alo.")
     parser.add_argument(
         "--reduce-only",
@@ -5609,7 +5607,7 @@ def parse_args() -> argparse.Namespace:
         args.ladder_step = unprotect_ladder_step_value(step_text)
         args.range_spec = [decimal_to_plain(start_px), decimal_to_plain(args.ladder_end), args.ladder_step]
     if args.symmetric_offset and not args.symmetric:
-        parser.error("--offset requires side both/sym/对称")
+        parser.error("--offset requires side both")
     if (args.trend or args.grid_avg is not None or args.gap or args.grid_min) and not args.grid:
         parser.error("--trend, --avg, --gap, and --min require side grid")
     if args.grid:

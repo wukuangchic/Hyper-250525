@@ -33,12 +33,8 @@ if [ "$current_etag" = "$target_etag" ]; then
 fi
 
 tmp_root="$(mktemp -d)"
-alias_backup=""
 cleanup() {
   rm -rf "$tmp_root"
-  if [ -n "$alias_backup" ]; then
-    rm -f "$alias_backup"
-  fi
 }
 trap cleanup EXIT
 
@@ -51,28 +47,16 @@ if [ -z "$source_dir" ] || [ ! -d "$source_dir" ]; then
   exit 1
 fi
 
-if [ -f "$PROJECT_DIR/coin_aliases.csv" ]; then
-  alias_backup="$(mktemp)"
-  cp "$PROJECT_DIR/coin_aliases.csv" "$alias_backup"
-fi
-
 rsync -a --delete \
   --exclude '.venv/' \
   --exclude 'logs/' \
   --exclude '.env' \
   --exclude '.simple-hyper-sync.etag' \
   --exclude '.git/' \
-  --exclude 'coin_aliases.csv' \
   --exclude 'server_batch.json' \
   --exclude 'server_batch.lock' \
   --exclude '.server_batch.json.*.tmp' \
   "$source_dir"/ "$PROJECT_DIR"/
-
-if [ -n "$alias_backup" ] && [ -f "$alias_backup" ]; then
-  cp "$alias_backup" "$PROJECT_DIR/coin_aliases.csv"
-elif [ -f "$source_dir/coin_aliases.csv" ]; then
-  cp "$source_dir/coin_aliases.csv" "$PROJECT_DIR/coin_aliases.csv"
-fi
 
 if [ -x "$PROJECT_DIR/.venv/bin/python" ]; then
   "$PROJECT_DIR/.venv/bin/python" -m pip install -r "$PROJECT_DIR/requirements.txt" >/dev/null

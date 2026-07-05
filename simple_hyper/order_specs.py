@@ -6,44 +6,28 @@ import re
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Any
 
-from coin_aliases import coin_alias_key, load_coin_aliases, load_coin_alias_rates
 from simple_hyper.formatting import decimal_to_display, decimal_to_plain, format_percent
 
 
 MIN_NOTIONAL = Decimal("10")
-COIN_ALIASES = load_coin_aliases()
-COIN_ALIAS_RATES = load_coin_alias_rates()
 
 
 def parse_side(side: str) -> bool:
     normalized = side.strip().lower()
-    long_aliases = {"b", "buy", "long", "up", "多", "买", "看多", "做多"}
-    short_aliases = {"s", "sell", "short", "down", "空", "卖", "看空", "做空"}
-    if normalized in long_aliases:
+    if normalized == "buy":
         return True
-    if normalized in short_aliases:
+    if normalized == "sell":
         return False
-    raise ValueError(f"Unknown side: {side}. Use buy/long/看多 or sell/short/看空.")
+    raise ValueError(f"Unknown side: {side}. Use buy or sell.")
 
 
 def normalize_coin_input(raw_coin: str) -> list[str]:
     coin = canonical_coin_input(raw_coin)
-    upper = coin.upper().replace("-", "").replace("/", "")
-    candidates = [coin, coin.upper(), upper]
-    if upper.endswith("USDC"):
-        candidates.append(upper[: -len("USDC")])
-    if upper.endswith("USD"):
-        candidates.append(upper[: -len("USD")])
-    if upper.endswith("PERP"):
-        candidates.append(upper[: -len("PERP")])
-    return candidates
+    return [coin, coin.upper()]
 
 
 def canonical_coin_input(raw_coin: str) -> str:
     coin = raw_coin.strip()
-    alias = COIN_ALIASES.get(coin_alias_key(coin))
-    if alias:
-        return alias
     if ":" in coin:
         dex, name = coin.split(":", 1)
         return f"{dex.lower()}:{name.upper()}"
@@ -56,10 +40,6 @@ def coin_dex(raw_coin: str) -> str:
 
 
 def coin_display_rate(raw_coin: str, resolved_coin: str) -> Decimal | None:
-    for coin in (raw_coin, canonical_coin_input(raw_coin), resolved_coin):
-        rate = COIN_ALIAS_RATES.get(coin_alias_key(coin))
-        if rate is not None:
-            return rate
     return None
 
 
@@ -465,7 +445,6 @@ VALUE_OPTION_STRINGS = {
     "--price",
     "--slippage",
     "--level",
-    "--book-level",
     "--tif",
     "--stop-entry",
     "--stop",

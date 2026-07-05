@@ -12,9 +12,6 @@ from simple_hyper.runtime import ensure_local_venv
 
 ensure_local_venv(__file__)
 
-from simple_hyper.order_specs import canonical_coin_input
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Show Hyperliquid perp meta()["universe"] as a table.')
     parser.add_argument("keyword", nargs="?", help="Optional coin/code filter, e.g. BTC, ETH, HYPE.")
@@ -34,7 +31,7 @@ def main() -> None:
     base_url = constants.TESTNET_API_URL if args.network == "testnet" else constants.MAINNET_API_URL
     info = Info(base_url, skip_ws=True, timeout=args.timeout)
     rows = []
-    keyword_value = canonical_coin_input(args.keyword) if args.keyword else None
+    keyword_value = args.keyword.strip() if args.keyword else None
     inferred_dex = keyword_value.split(":", 1)[0] if keyword_value and ":" in keyword_value else None
     dex = args.dex or inferred_dex or ""
     keyword = keyword_value.upper() if keyword_value else None

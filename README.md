@@ -5,7 +5,7 @@
 日常推荐：
 
 - macOS：双击 `order-terminal.command`，打开后可以直接输入 `BTC buy`、`query`。
-- 普通终端：先执行 `. ./aliases`，再使用 `order BTC buy`。
+- 普通终端：直接使用 `./order BTC buy`。
 - Windows：双击 `order-terminal-windows.cmd`。
 
 > 真实下单默认会提交到 Hyperliquid。新命令建议先加 `--dry-run` 预演。
@@ -121,8 +121,8 @@ BTC buy 100 --price 68000 --tp 72000 --sl 65000
 
 各段含义：
 
-- `coin`：标的，例如 `BTC`、`ETH`、`GOLD`、`xyz:SMSN`。
-- `side`：方向，支持 `buy/sell`、`long/short`、`看多/看空`，也支持 `both/sym/对称`。
+- `coin`：标的，例如 `BTC`、`ETH`、`xyz:SMSN`，以 Hyperliquid `meta` API 返回的名字为准。
+- `side`：方向，支持 `buy/sell`，对称单使用 `both`。
 - `amount`：美元名义金额，默认 `10`；也可以用 `--total` 表示总金额。
 - `entry/exec`：入场或执行方式，例如 `--market`、`--price`、`--offset`、`--stop`、`--take`、`--level`、`--range`、`--for`、`--while`、`--tif`、`--slippage`。
 - `tp/sl`：止盈止损，例如 `--tp 2%+0.1% --sl 2%-0.1%`；百分比不写正负号时会按方向自动判断。
@@ -151,7 +151,7 @@ BTC both 100 --offset 2%
 BTC both 100 --price 75000 --offset 2%
 
 # 总金额 200，自动拆成买卖各 100
-BTC sym --total 200 --offset 2% --explain
+BTC both --total 200 --offset 2% --explain
 
 # 对称单也可以给两边各自带 TP/SL
 JPY both 20 --offset 2% --tp 1% --sl 0.7%
@@ -449,35 +449,10 @@ HYPE buy --total 120 --range 66 65 -0.05 --tp 0.07%+0.01d0.9 --explain
 - 普通梯子可以再配 `--tp` / `--sl`，每一档都会带自己的 bracket。
 - 触发梯子可以再配 `--stop` / `--take`，但不能再把 `--tp` / `--sl` 放进同一条命令。
 
-## 标的和别名
+## 标的
 
 官方可交易标的以 Hyperliquid `meta` API 返回的名字为准，不以 App URL 为准。比如 App 路由能打开 `xyz:SAMSUNG`，但 API 真实标的是 `xyz:SMSN`。
-
-本地别名维护在 `coin_aliases.csv`：
-
-```csv
-alias,target,note,rate
-GOLD,xyz:GOLD,Hyperliquid app route uses builder DEX xyz,
-SAMSUNG,xyz:SMSN,Samsung Electronics on xyz,
-QQQ,xyz:XYZ100,Nasdaq100,41.09
-```
-
-字段说明：
-
-- `alias`：日常输入的名字。
-- `target`：Hyperliquid API / SDK 实际下单用的标的。
-- `note`：备注。
-- `rate`：可选换算倍率。前台价格会显示为 `原始报价 (原始报价/rate)`。
-
-这些命令都可以使用：
-
-```bash
-GOLD buy
-SAMSUNG buy
-QQQ buy
-xyz:GOLD buy
-xyz:SMSN buy
-```
+本工具不再维护本地标的别名，也不会把 `BTCUSD`、`BTC-PERP`、`SAMSUNG` 这类输入自动改写成其他 API 标的；下单时请直接输入真实标的名。
 
 查询官方标的：
 
@@ -499,8 +474,7 @@ order-terminal.command
 普通终端：
 
 ```bash
-. ./aliases
-order BTC buy --dry-run
+./order BTC buy --dry-run
 ```
 
 Windows 首次安装：
@@ -620,7 +594,7 @@ logs/trail-rate-limit.jsonl
 BTC buy --dry-run --verbose
 ```
 
-如果出现 `Unknown perp coin`，优先用 `markets` 查真实 API 标的，再把常用缩写写入 `coin_aliases.csv`。
+如果出现 `Unknown perp coin`，优先用 `markets` 查真实 API 标的，然后在下单命令里直接使用真实标的。
 
 ## 项目结构
 
@@ -630,7 +604,6 @@ hl_markets.py            # 标的查询入口
 trail_worker.py          # server_batch.json 的 trail 任务维护器
 simple_hyper/            # 可复用 Python 业务代码
 simple_hyper_server.py   # 手机网页控制台
-coin_aliases.csv         # 本地标的别名
 server_batch.json        # 本地/服务器运行时 batch 状态，不提交 Git
 scripts/                 # 运维脚本
 systemd/                 # systemd 单元
