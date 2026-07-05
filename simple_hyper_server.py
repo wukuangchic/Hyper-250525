@@ -127,6 +127,12 @@ INDEX_HTML = r"""<!doctype html>
       margin-bottom: 12px;
     }
 
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
     h1 {
       margin: 0;
       font-size: 24px;
@@ -150,6 +156,19 @@ INDEX_HTML = r"""<!doctype html>
       color: var(--accent-2);
       border-color: rgba(19, 117, 71, 0.28);
       background: rgba(19, 117, 71, 0.08);
+    }
+
+    .button-link {
+      min-height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 7px 10px;
+      color: var(--accent);
+      background: #fff;
+      font-size: 12px;
+      font-weight: 760;
+      text-decoration: none;
+      white-space: nowrap;
     }
 
     .panel {
@@ -395,7 +414,10 @@ INDEX_HTML = r"""<!doctype html>
   <main class="shell content-grid">
     <header class="header-block">
       <h1>Simple-Hyper</h1>
-      <div id="status" class="status">Not verified</div>
+      <div class="header-actions">
+        <a class="button-link" href="/grid">Grid</a>
+        <div id="status" class="status">Not verified</div>
+      </div>
     </header>
 
     <form id="authPanel" class="panel auth-block" method="post" action="/api/run" autocomplete="off">
