@@ -136,6 +136,11 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertEqual(batch_row_raw_coin(row), "xyz:JPY")
 
+    def test_worker_prefers_resolved_coin_over_legacy_alias(self) -> None:
+        row = {"coin": "xyz:XYZ100", "raw_coin": "QQQ", "dex": "xyz"}
+
+        self.assertEqual(batch_row_raw_coin(row), "xyz:XYZ100")
+
     def test_legacy_dex_raw_coin_error_is_recoverable(self) -> None:
         row = {
             "type": "grid",
@@ -144,6 +149,18 @@ class GridAvgTests(unittest.TestCase):
             "raw_coin": "JPY",
             "dex": "xyz",
             "error": "Unknown perp coin: JPY",
+        }
+
+        self.assertTrue(grid_row_recoverable_from_error(row))
+
+    def test_bare_coin_key_error_is_recoverable(self) -> None:
+        row = {
+            "type": "grid",
+            "status": "error",
+            "coin": "xyz:SPCX",
+            "raw_coin": "xyz:SPCX",
+            "dex": "xyz",
+            "error": "'xyz:SPCX'",
         }
 
         self.assertTrue(grid_row_recoverable_from_error(row))

@@ -123,6 +123,9 @@ class GridPostOnlyRejected(Exception):
 
 
 def batch_row_raw_coin(row: dict[str, Any]) -> str:
+    coin = str(row.get("coin") or "")
+    if ":" in coin:
+        return coin
     raw_coin = str(row.get("raw_coin") or row["coin"])
     dex = str(row.get("dex") or "")
     if dex and ":" not in raw_coin:
@@ -190,6 +193,11 @@ def grid_row_recoverable_from_error(row: dict[str, Any]) -> bool:
             "unknown perp coin" in error_text.lower()
             and batch_row_raw_coin(row) != str(row.get("raw_coin") or row.get("coin") or "")
         )
+        or error_text.strip() in {
+            repr(str(row.get("coin") or "")),
+            repr(str(row.get("raw_coin") or "")),
+            repr(batch_row_raw_coin(row)),
+        }
     ):
         return True
     for entry in row.get("levels") or []:
