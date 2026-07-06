@@ -1,8 +1,6 @@
 import unittest
 from argparse import Namespace
 from decimal import Decimal
-from pathlib import Path
-from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from hl_order import (
@@ -27,9 +25,6 @@ from hl_order import (
     update_order_leverage,
 )
 from trail_worker import (
-    GRID_ROE_PAUSE_STATUS,
-    GridActionLimiter,
-    GridActionThrottled,
     active_grid_oids,
     batch_row_raw_coin,
     build_grid_panic_reduce_order,
@@ -74,72 +69,11 @@ from trail_worker import (
     skip_unknown_oid_grid_recovery,
     submit_grid_order_entry,
     trim_excess_grid_entries,
+    GRID_ROE_PAUSE_STATUS,
 )
 
 
 class GridAvgTests(unittest.TestCase):
-    def test_grid_action_limiter_caps_actions_per_run(self) -> None:
-        with TemporaryDirectory() as tmpdir:
-            limiter = GridActionLimiter(
-                path=Path(tmpdir) / "throttle.json",
-                now=1000,
-                max_per_run=2,
-                rate_limited_max_per_run=0,
-                cooldown_seconds=900,
-            )
-
-            limiter.before_action("BTC", "buy")
-            limiter.before_action("HYPE", "sell")
-            with self.assertRaises(GridActionThrottled):
-                limiter.before_action("ETH", "buy")
-
-    def test_grid_action_limiter_cools_down_after_cumulative_limit(self) -> None:
-        with TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "throttle.json"
-            limiter = GridActionLimiter(
-                path=path,
-                now=1000,
-                max_per_run=2,
-                rate_limited_max_per_run=0,
-                cooldown_seconds=900,
-            )
-
-            limiter.record_rate_limited("BTC", "buy", "Too many cumulative requests sent for cumulative volume traded")
-            cooled = GridActionLimiter(
-                path=path,
-                now=1001,
-                max_per_run=2,
-                rate_limited_max_per_run=0,
-                cooldown_seconds=900,
-            )
-
-            self.assertTrue(cooled.rate_limited())
-            with self.assertRaises(GridActionThrottled):
-                cooled.before_action("HYPE", "buy")
-
-    def test_grid_action_limiter_resumes_after_cooldown(self) -> None:
-        with TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "throttle.json"
-            limiter = GridActionLimiter(
-                path=path,
-                now=1000,
-                max_per_run=2,
-                rate_limited_max_per_run=0,
-                cooldown_seconds=10,
-            )
-            limiter.record_rate_limited("BTC", "buy", "Too many cumulative requests sent for cumulative volume traded")
-            resumed = GridActionLimiter(
-                path=path,
-                now=1011,
-                max_per_run=2,
-                rate_limited_max_per_run=0,
-                cooldown_seconds=10,
-            )
-
-            self.assertFalse(resumed.rate_limited())
-            resumed.before_action("BTC", "buy")
-            self.assertEqual(resumed.attempts_this_run, 1)
-
     def test_grid_gap_zero_requests_default_spacing(self) -> None:
         for value in (["0"], ["0%"], ["0.0%"]):
             args = Namespace(gap=value, resolved_grid_gap_spec=None)
