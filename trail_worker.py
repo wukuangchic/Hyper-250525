@@ -3252,19 +3252,21 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         changed = True
     mark_phase("refresh")
 
-    dense_regridded = regrid_dense_entries(
-        exchange,
-        coin,
-        row,
-        asset,
-        now,
-        position_size,
-        position_value,
-        policy,
-        account_margin_protected,
-        isolated_leverage_ready,
-        margin_blocked_sides,
-    )
+    dense_regridded = 0
+    if not action_limit_error(cache):
+        dense_regridded = regrid_dense_entries(
+            exchange,
+            coin,
+            row,
+            asset,
+            now,
+            position_size,
+            position_value,
+            policy,
+            account_margin_protected,
+            isolated_leverage_ready,
+            margin_blocked_sides,
+        )
     if dense_regridded:
         changed = True
     mark_phase("dense")
@@ -3462,7 +3464,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     mark_phase("post_cap")
 
     replacement_rebalanced = 0
-    if isinstance(levels, list):
+    if isinstance(levels, list) and not action_limit_error(cache):
         for side in ("buy", "sell"):
             if not side_submission_allowed(side):
                 continue
