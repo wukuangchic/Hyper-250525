@@ -563,6 +563,7 @@ def unified_account_metrics(
 
 def print_account_metrics(info: Info, account: str) -> None:
     unified_ratio, unified_leverage, account_safety_margin_ratio = unified_account_metrics(info, account)
+    action_rate = user_action_rate_limit_metrics(info, account)
     protection_status = "未知"
     if account_safety_margin_ratio is not None:
         protection_status = "开启" if account_safety_margin_ratio < GRID_ACCOUNT_MARGIN_RATIO_THRESHOLD else "关闭"
@@ -573,8 +574,36 @@ def print_account_metrics(info: Info, account: str) -> None:
             ("Grid保护(<70%)", protection_status),
             ("统一账户比率", format_percent(unified_ratio)),
             ("统一账户杠杆", format_leverage(unified_leverage)),
+            ("nRequestsUsed", action_rate.get("nRequestsUsed", "-")),
+            ("nRequestsCap", action_rate.get("nRequestsCap", "-")),
+            ("deficit", action_rate.get("deficit", "-")),
         ],
     )
+
+
+def user_action_rate_limit_metrics(info: Any, account: str) -> dict[str, str]:
+    try:
+        result = info.post("/info", {"type": "userRateLimit", "user": account})
+    except Exception as exc:
+        log_event("user_action_rate_limit_error", {"type": type(exc).__name__, "message": str(exc)})
+        return {"nRequestsUsed": "-", "nRequestsCap": "-", "deficit": "-"}
+    log_event("user_action_rate_limit", result)
+    if not isinstance(result, dict):
+        return {"nRequestsUsed": "-", "nRequestsCap": "-", "deficit": "-"}
+    try:
+        used = int(result.get("nRequestsUsed") or 0)
+        cap = int(result.get("nRequestsCap") or 0)
+    except (TypeError, ValueError):
+        return {
+            "nRequestsUsed": str(result.get("nRequestsUsed", "-")),
+            "nRequestsCap": str(result.get("nRequestsCap", "-")),
+            "deficit": "-",
+        }
+    return {
+        "nRequestsUsed": str(used),
+        "nRequestsCap": str(cap),
+        "deficit": str(used - cap),
+    }
 
 
 def print_order_row(

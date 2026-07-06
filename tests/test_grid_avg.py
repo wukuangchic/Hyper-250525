@@ -23,6 +23,7 @@ from hl_order import (
     refresh_grid_row_strategy_params,
     resolve_grid_spacing,
     update_order_leverage,
+    user_action_rate_limit_metrics,
 )
 from trail_worker import (
     active_grid_oids,
@@ -81,6 +82,18 @@ from trail_worker import (
 
 
 class GridAvgTests(unittest.TestCase):
+    def test_user_action_rate_limit_metrics_formats_deficit(self) -> None:
+        class FakeInfo:
+            def post(self, path: str, payload: dict) -> dict:
+                if path != "/info" or payload.get("type") != "userRateLimit":
+                    raise AssertionError("unexpected userRateLimit request")
+                return {"nRequestsUsed": 209725, "nRequestsCap": 207711}
+
+        self.assertEqual(
+            user_action_rate_limit_metrics(FakeInfo(), "0xabc"),
+            {"nRequestsUsed": "209725", "nRequestsCap": "207711", "deficit": "2014"},
+        )
+
     def test_precheck_action_limit_blocks_p1_when_used_reaches_cap(self) -> None:
         class FakeInfo:
             def __init__(self) -> None:
