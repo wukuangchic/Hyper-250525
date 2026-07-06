@@ -161,6 +161,44 @@ def pause_grid_order_for_action_limit(
         order["action_limit_deferred_oid"] = old_oid
 
 
+def user_action_rate_limit(info: Any, account: str, cache: dict[str, Any], network: str) -> dict[str, Any] | None:
+    rate_cache = cache.setdefault("user_action_rate_limits", {})
+    rate_key = (network, account)
+    if rate_key not in rate_cache:
+        try:
+            result = info.post("/info", {"type": "userRateLimit", "user": account})
+        except Exception as exc:
+            log_event("user_action_rate_limit_error", {"type": type(exc).__name__, "message": str(exc)})
+            result = None
+        else:
+            log_event("user_action_rate_limit", result)
+        rate_cache[rate_key] = result if isinstance(result, dict) else None
+    return rate_cache[rate_key]
+
+
+def precheck_action_limit(info: Any, account: str, cache: dict[str, Any], network: str, now: int) -> str | None:
+    existing = action_limit_error(cache)
+    if existing:
+        return existing
+    rate = user_action_rate_limit(info, account, cache, network)
+    if not isinstance(rate, dict):
+        return None
+    try:
+        used = int(rate.get("nRequestsUsed") or 0)
+        cap = int(rate.get("nRequestsCap") or 0)
+    except (TypeError, ValueError):
+        return None
+    if cap > 0 and used >= cap:
+        deficit = used - cap
+        error_text = (
+            "address action limit exhausted before P1 submissions: "
+            f"nRequestsUsed={used} nRequestsCap={cap} deficit={deficit}"
+        )
+        mark_action_limit_hit(cache, error_text, now)
+        return error_text
+    return None
+
+
 def batch_row_raw_coin(row: dict[str, Any]) -> str:
     coin = str(row.get("coin") or "")
     if ":" in coin:
@@ -2803,6 +2841,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     coin, asset = resolve_perp_asset(info, batch_row_raw_coin(row))
     mark_phase("asset")
     now = int(cache.setdefault("now", int(time.time())))
+    precheck_action_limit(info, account, cache, network, now)
     now_ms = now * 1000
     stale_margin_pauses_cleared = clear_stale_grid_margin_pauses(row, now)
     start_ms = int(row.get("last_fill_check_ms") or (now - 24 * 60 * 60) * 1000)

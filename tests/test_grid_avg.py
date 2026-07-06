@@ -62,6 +62,7 @@ from trail_worker import (
     pause_grid_margin_side,
     pause_grid_margin_side_entries,
     pause_skipped_account_margin_replacement,
+    precheck_action_limit,
     prune_add_risk_brake_state,
     preserve_replacement_order,
     prune_grid_levels,
@@ -77,6 +78,28 @@ from trail_worker import (
 
 
 class GridAvgTests(unittest.TestCase):
+    def test_precheck_action_limit_blocks_p1_when_used_reaches_cap(self) -> None:
+        class FakeInfo:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def post(self, path: str, payload: dict) -> dict:
+                self.calls += 1
+                if path != "/info" or payload.get("type") != "userRateLimit":
+                    raise AssertionError("unexpected userRateLimit request")
+                return {"nRequestsUsed": 209689, "nRequestsCap": 207702}
+
+        info = FakeInfo()
+        cache: dict = {}
+        error = precheck_action_limit(info, "0xabc", cache, "mainnet", 123)
+
+        self.assertIn("deficit=1987", error or "")
+        self.assertEqual(cache["action_limit_error"], error)
+        self.assertEqual(cache["action_limit_at"], 123)
+        self.assertEqual(info.calls, 1)
+        self.assertEqual(precheck_action_limit(info, "0xabc", cache, "mainnet", 124), error)
+        self.assertEqual(info.calls, 1)
+
     def test_cumulative_action_limit_text_is_recognized(self) -> None:
         text = (
             "Failed to submit grid child order: {'status': 'err', 'response': "
