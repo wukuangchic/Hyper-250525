@@ -92,6 +92,7 @@ GRID_RISK_DENSITY_PAUSE_STATUS = "paused_risk_density"
 GRID_ROE_PAUSE_STATUS = "paused_roe"
 GRID_ACTIVE_CAP_PAUSE_STATUS = "paused_active_cap"
 GRID_ACTION_LIMIT_PAUSE_STATUS = "paused_action_limit"
+GRID_ACTION_LIMIT_P1_BUDGET_PER_RUN = 1
 GRID_MAX_LEVELS_PER_SIDE = 1024
 GRID_MAX_ACTIVE_ORDERS_PER_SIDE = 32
 GRID_PAUSED_STATUSES = {
@@ -144,6 +145,7 @@ def mark_action_limit_hit(cache: dict[str, Any] | None, error_text: str, now: in
         return
     cache["action_limit_error"] = error_text
     cache["action_limit_at"] = now
+    cache.setdefault("action_limit_p1_budget_remaining", 0)
 
 
 def pause_grid_order_for_action_limit(
@@ -159,6 +161,33 @@ def pause_grid_order_for_action_limit(
     order["action_limit_paused_at"] = now
     if old_oid is not None:
         order["action_limit_deferred_oid"] = old_oid
+
+
+def action_limit_p1_budget_remaining(cache: dict[str, Any] | None) -> int | None:
+    if not action_limit_error(cache):
+        return None
+    if not isinstance(cache, dict):
+        return 0
+    try:
+        return max(0, int(cache.get("action_limit_p1_budget_remaining") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def action_limit_p1_enabled(cache: dict[str, Any] | None) -> bool:
+    return bool(isinstance(cache, dict) and cache.get("action_limit_p1_enabled"))
+
+
+def consume_action_limit_p1_budget(cache: dict[str, Any] | None) -> None:
+    remaining = action_limit_p1_budget_remaining(cache)
+    if remaining is None or not isinstance(cache, dict):
+        return
+    cache["action_limit_p1_budget_remaining"] = max(0, remaining - 1)
+
+
+def enable_action_limit_p1_budget(cache: dict[str, Any] | None) -> None:
+    if isinstance(cache, dict):
+        cache["action_limit_p1_enabled"] = True
 
 
 def user_action_rate_limit(info: Any, account: str, cache: dict[str, Any], network: str) -> dict[str, Any] | None:
@@ -195,6 +224,8 @@ def precheck_action_limit(info: Any, account: str, cache: dict[str, Any], networ
             f"nRequestsUsed={used} nRequestsCap={cap} deficit={deficit}"
         )
         mark_action_limit_hit(cache, error_text, now)
+        cache["action_limit_p1_budget_remaining"] = GRID_ACTION_LIMIT_P1_BUDGET_PER_RUN
+        cache["action_limit_deficit"] = deficit
         return error_text
     return None
 
@@ -2999,8 +3030,9 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             return False
         existing_action_limit = action_limit_error(cache)
         if existing_action_limit:
-            pause_grid_order_for_action_limit(order, now, existing_action_limit)
-            return False
+            if not action_limit_p1_enabled(cache) or not action_limit_p1_budget_remaining(cache):
+                pause_grid_order_for_action_limit(order, now, existing_action_limit)
+                return False
         try:
             submitted = submit_grid_order_entry(
                 exchange,
@@ -3025,6 +3057,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             pause_grid_order_for_action_limit(order, now, error_text)
             return False
         if submitted:
+            if existing_action_limit:
+                consume_action_limit_p1_budget(cache)
             submissions_by_side[side] = submissions_by_side.get(side, 0) + 1
             if str(order.get("status")) == "filled":
                 filled_submission_sides.add(side)
@@ -3034,8 +3068,9 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         side = str(order.get("side") or "")
         existing_action_limit = action_limit_error(cache)
         if existing_action_limit:
-            pause_grid_order_for_action_limit(order, now, existing_action_limit)
-            return False
+            if not action_limit_p1_enabled(cache) or not action_limit_p1_budget_remaining(cache):
+                pause_grid_order_for_action_limit(order, now, existing_action_limit)
+                return False
         try:
             submitted = submit_grid_order_entry(
                 exchange,
@@ -3061,6 +3096,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             pause_grid_order_for_action_limit(order, now, error_text)
             return False
         if submitted:
+            if existing_action_limit:
+                consume_action_limit_p1_budget(cache)
             submissions_by_side[side] = submissions_by_side.get(side, 0) + 1
             replacement_quota_sides.add(side)
         return submitted
@@ -3390,6 +3427,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                                 )
                     changed = True
     mark_phase("panic")
+    enable_action_limit_p1_budget(cache)
     replacements = 0
     for entry in newly_filled:
         submitted_limit_px = decimal_or_none(entry.get("price", entry.get("limit_px"))) or Decimal("0")
@@ -3729,13 +3767,15 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     margin_cooldowns = ",".join(sorted((row.get("margin_pauses") or {}).keys())) or "-"
     margin_ratio_label = f"{margin_ratio * Decimal('100'):.2f}%" if margin_ratio is not None else "unknown"
     action_limit_label = "1" if action_limit_error(cache) else "0"
+    action_limit_budget = action_limit_p1_budget_remaining(cache)
+    action_limit_budget_label = "-" if action_limit_budget is None else str(action_limit_budget)
     row["note"] = (
         f"grid maintained; replacements={replacements}; replacement_rebalanced={replacement_rebalanced}; topped_up={topped_up}; "
         f"paused={paused}; refreshed={refreshed}; dense_regridded={dense_regridded}; restored={restored}; trimmed={trimmed}; near_regrids={near_regrids}; "
         f"add_risk_braked={add_risk_braked}; side_cap_cleared={side_cap_cleared}; "
         f"recovered_missing={recovered_missing}; margin_cooldown={margin_cooldowns}; "
         f"submissions=buy:{submissions_by_side['buy']},sell:{submissions_by_side['sell']}; "
-        f"action_limit={action_limit_label}; "
+        f"action_limit={action_limit_label}; action_limit_p1_budget={action_limit_budget_label}; "
         f"filled_stop={','.join(sorted(filled_submission_sides)) or '-'}; "
         f"avg={row.get('avg') if row.get('avg') is not None else '-'}; avg_multiplier={row.get('avg_multiplier', '1')}; "
         f"margin_gap_multiplier={decimal_to_plain(margin_gap_multiplier)}; "

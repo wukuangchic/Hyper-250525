@@ -26,13 +26,16 @@ from hl_order import (
 )
 from trail_worker import (
     active_grid_oids,
+    action_limit_p1_budget_remaining,
     batch_row_raw_coin,
     build_grid_panic_reduce_order,
     clear_stale_grid_margin_pauses,
     clear_grid_side_cap_entries,
+    consume_action_limit_p1_budget,
     apply_grid_add_risk_brake,
     dense_grid_entries,
     defer_paused_grid_restore_if_crossing,
+    enable_action_limit_p1_budget,
     grid_panic_ratio,
     grid_panic_ratio_threshold,
     grid_row_recoverable_from_error,
@@ -96,6 +99,12 @@ class GridAvgTests(unittest.TestCase):
         self.assertIn("deficit=1987", error or "")
         self.assertEqual(cache["action_limit_error"], error)
         self.assertEqual(cache["action_limit_at"], 123)
+        self.assertEqual(action_limit_p1_budget_remaining(cache), 1)
+        self.assertFalse(cache.get("action_limit_p1_enabled", False))
+        enable_action_limit_p1_budget(cache)
+        self.assertTrue(cache["action_limit_p1_enabled"])
+        consume_action_limit_p1_budget(cache)
+        self.assertEqual(action_limit_p1_budget_remaining(cache), 0)
         self.assertEqual(info.calls, 1)
         self.assertEqual(precheck_action_limit(info, "0xabc", cache, "mainnet", 124), error)
         self.assertEqual(info.calls, 1)
