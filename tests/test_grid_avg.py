@@ -16,6 +16,7 @@ from hl_order import (
     grid_order_allowed_by_max,
     grid_order_should_reduce_only,
     format_grid_detail_rows,
+    format_server_batch_rows,
     grid_query_avg_summary,
     grid_query_rows,
     is_auto_grid_gap,
@@ -2602,6 +2603,35 @@ class GridAvgTests(unittest.TestCase):
             grid_query_rows(rows, "mainnet", "0xabc", "BTC"),
             [rows[1]],
         )
+
+    def test_server_batch_rows_display_grid_avg(self) -> None:
+        rows = [
+            {
+                "type": "grid",
+                "status": "active",
+                "network": "mainnet",
+                "account": "0xabc",
+                "coin": "BTC",
+                "avg": "200",
+                "position_limit_mode": "abs",
+                "max_position_value": "400",
+                "levels": [],
+            },
+            {
+                "type": "trail",
+                "status": "active",
+                "network": "mainnet",
+                "account": "0xabc",
+                "coin": "ETH",
+                "side": "sell",
+                "oid": "123",
+            },
+        ]
+
+        display_rows = format_server_batch_rows(rows, "mainnet", "0xabc")
+
+        self.assertEqual(display_rows[0]["avg"], "200")
+        self.assertEqual(display_rows[1]["avg"], "-")
 
     def test_grid_plan_persists_base_and_effective_values(self) -> None:
         class FakeInfo:

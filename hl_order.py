@@ -3668,6 +3668,7 @@ def format_server_batch_rows(rows: list[dict[str, Any]], network: str, account: 
         limit = grid_limit_display(row) if is_grid else "-"
         trend = f"{row.get('trend', '0')} / {row.get('actual_trend', '0%')}" if is_grid else "-"
         margin_gap = format_optional_decimal(row.get("margin_gap_multiplier")) if is_grid else "-"
+        avg = str(row.get("avg")) if is_grid and row.get("avg") is not None else "-"
         display_rows.append(
             {
                 "type": str(row.get("type", "")),
@@ -3675,6 +3676,7 @@ def format_server_batch_rows(rows: list[dict[str, Any]], network: str, account: 
                 "coin": str(row.get("coin", "")),
                 "side": str(row.get("side", "grid" if is_grid else "")),
                 "limit": limit,
+                "avg": avg,
                 "trend": trend,
                 "mgap": margin_gap,
                 "trail": str(row.get("trail", row.get("gap", "-"))),
@@ -3716,6 +3718,7 @@ def print_server_batch(rows: list[dict[str, Any]], network: str, account: str | 
             ("coin", "coin"),
             ("side", "side"),
             ("limit", "limit"),
+            ("avg", "avg"),
             ("trend", "trend"),
             ("mgap", "mgap"),
             ("trail", "trail"),
