@@ -91,6 +91,7 @@ GRID_REPLACEMENT_PAUSE_STATUS = "paused_replacement"
 GRID_RISK_DENSITY_PAUSE_STATUS = "paused_risk_density"
 GRID_ROE_PAUSE_STATUS = "paused_roe"
 GRID_ACTIVE_CAP_PAUSE_STATUS = "paused_active_cap"
+GRID_ACTION_LIMIT_PAUSE_STATUS = "paused_action_limit"
 GRID_MAX_LEVELS_PER_SIDE = 1024
 GRID_MAX_ACTIVE_ORDERS_PER_SIDE = 32
 GRID_PAUSED_STATUSES = {
@@ -98,6 +99,7 @@ GRID_PAUSED_STATUSES = {
     "paused_limit",
     "paused_margin",
     "paused_reduce_capacity",
+    GRID_ACTION_LIMIT_PAUSE_STATUS,
     GRID_REPLACEMENT_PAUSE_STATUS,
     GRID_RISK_DENSITY_PAUSE_STATUS,
     GRID_ROE_PAUSE_STATUS,
@@ -123,6 +125,40 @@ TRANSIENT_ERROR_TEXTS = (
 
 class GridPostOnlyRejected(Exception):
     """A post-only grid child became marketable before submission."""
+
+
+def is_cumulative_action_limit_text(text: str) -> bool:
+    lowered = text.lower()
+    return "too many cumulative requests" in lowered and "cumulative volume traded" in lowered
+
+
+def action_limit_error(cache: dict[str, Any] | None) -> str | None:
+    if not isinstance(cache, dict):
+        return None
+    error = cache.get("action_limit_error")
+    return str(error) if error else None
+
+
+def mark_action_limit_hit(cache: dict[str, Any] | None, error_text: str, now: int) -> None:
+    if not isinstance(cache, dict):
+        return
+    cache["action_limit_error"] = error_text
+    cache["action_limit_at"] = now
+
+
+def pause_grid_order_for_action_limit(
+    order: dict[str, Any],
+    now: int,
+    error_text: str,
+    old_oid: int | None = None,
+) -> None:
+    order["status"] = GRID_ACTION_LIMIT_PAUSE_STATUS
+    order["oid"] = None
+    order["last_error"] = error_text
+    order["paused_at"] = now
+    order["action_limit_paused_at"] = now
+    if old_oid is not None:
+        order["action_limit_deferred_oid"] = old_oid
 
 
 def batch_row_raw_coin(row: dict[str, Any]) -> str:
@@ -2922,21 +2958,33 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         side = str(order.get("side") or "")
         if not side_submission_allowed(side):
             return False
-        submitted = submit_grid_order_entry(
-            exchange,
-            coin,
-            order,
-            now,
-            row,
-            asset,
-            position_size,
-            position_value,
-            policy,
-            account_margin_protected,
-            isolated_leverage_ready,
-            margin_blocked_sides=margin_blocked_sides,
-            open_orders=current_open_orders,
-        )
+        existing_action_limit = action_limit_error(cache)
+        if existing_action_limit:
+            pause_grid_order_for_action_limit(order, now, existing_action_limit)
+            return False
+        try:
+            submitted = submit_grid_order_entry(
+                exchange,
+                coin,
+                order,
+                now,
+                row,
+                asset,
+                position_size,
+                position_value,
+                policy,
+                account_margin_protected,
+                isolated_leverage_ready,
+                margin_blocked_sides=margin_blocked_sides,
+                open_orders=current_open_orders,
+            )
+        except RuntimeError as exc:
+            error_text = str(exc)
+            if not is_cumulative_action_limit_text(error_text):
+                raise
+            mark_action_limit_hit(cache, error_text, now)
+            pause_grid_order_for_action_limit(order, now, error_text)
+            return False
         if submitted:
             submissions_by_side[side] = submissions_by_side.get(side, 0) + 1
             if str(order.get("status")) == "filled":
@@ -2945,22 +2993,34 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
 
     def submit_replacement(order: dict[str, Any]) -> bool:
         side = str(order.get("side") or "")
-        submitted = submit_grid_order_entry(
-            exchange,
-            coin,
-            order,
-            now,
-            row,
-            asset,
-            position_size,
-            position_value,
-            policy,
-            account_margin_protected,
-            isolated_leverage_ready,
-            True,
-            margin_blocked_sides=margin_blocked_sides,
-            open_orders=current_open_orders,
-        )
+        existing_action_limit = action_limit_error(cache)
+        if existing_action_limit:
+            pause_grid_order_for_action_limit(order, now, existing_action_limit)
+            return False
+        try:
+            submitted = submit_grid_order_entry(
+                exchange,
+                coin,
+                order,
+                now,
+                row,
+                asset,
+                position_size,
+                position_value,
+                policy,
+                account_margin_protected,
+                isolated_leverage_ready,
+                True,
+                margin_blocked_sides=margin_blocked_sides,
+                open_orders=current_open_orders,
+            )
+        except RuntimeError as exc:
+            error_text = str(exc)
+            if not is_cumulative_action_limit_text(error_text):
+                raise
+            mark_action_limit_hit(cache, error_text, now)
+            pause_grid_order_for_action_limit(order, now, error_text)
+            return False
         if submitted:
             submissions_by_side[side] = submissions_by_side.get(side, 0) + 1
             replacement_quota_sides.add(side)
@@ -3013,10 +3073,13 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                     newly_filled.append(entry)
             else:
                 deferred_status = str(entry.get("status") or "recovery_deferred")
-                entry["status"] = "recovery_deferred"
-                entry["oid"] = old_oid
-                entry["recovery_deferred_status"] = deferred_status
-                entry["recovery_deferred_at"] = now
+                if deferred_status == GRID_ACTION_LIMIT_PAUSE_STATUS:
+                    entry["action_limit_deferred_oid"] = old_oid
+                else:
+                    entry["status"] = "recovery_deferred"
+                    entry["oid"] = old_oid
+                    entry["recovery_deferred_status"] = deferred_status
+                    entry["recovery_deferred_at"] = now
             changed = True
             continue
         entry["status"] = "filled"
@@ -3497,6 +3560,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 break
             submitted = submit_tracked(topup)
             if not submitted:
+                if str(topup.get("status")) in GRID_PAUSED_STATUSES:
+                    levels.append(topup)
                 changed = True
                 break
             levels.append(topup)
@@ -3622,12 +3687,14 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     row["open_oids"] = sorted(grid_batch_open_oids(row))
     margin_cooldowns = ",".join(sorted((row.get("margin_pauses") or {}).keys())) or "-"
     margin_ratio_label = f"{margin_ratio * Decimal('100'):.2f}%" if margin_ratio is not None else "unknown"
+    action_limit_label = "1" if action_limit_error(cache) else "0"
     row["note"] = (
         f"grid maintained; replacements={replacements}; replacement_rebalanced={replacement_rebalanced}; topped_up={topped_up}; "
         f"paused={paused}; refreshed={refreshed}; dense_regridded={dense_regridded}; restored={restored}; trimmed={trimmed}; near_regrids={near_regrids}; "
         f"add_risk_braked={add_risk_braked}; side_cap_cleared={side_cap_cleared}; "
         f"recovered_missing={recovered_missing}; margin_cooldown={margin_cooldowns}; "
         f"submissions=buy:{submissions_by_side['buy']},sell:{submissions_by_side['sell']}; "
+        f"action_limit={action_limit_label}; "
         f"filled_stop={','.join(sorted(filled_submission_sides)) or '-'}; "
         f"avg={row.get('avg') if row.get('avg') is not None else '-'}; avg_multiplier={row.get('avg_multiplier', '1')}; "
         f"margin_gap_multiplier={decimal_to_plain(margin_gap_multiplier)}; "

@@ -41,6 +41,7 @@ from trail_worker import (
     grid_margin_gap_multiplier,
     grid_margin_pause_active,
     find_current_position_from_state,
+    is_cumulative_action_limit_text,
     grid_order_entry,
     grid_replacement_rebalance_pair,
     grid_reduce_only_canceled_restore_without_reduce_only,
@@ -57,6 +58,7 @@ from trail_worker import (
     pause_refresh_reduce_only_replacement,
     pause_reduce_only_canceled_entry,
     pause_refreshed_reduce_only_entries,
+    pause_grid_order_for_action_limit,
     pause_grid_margin_side,
     pause_grid_margin_side_entries,
     pause_skipped_account_margin_replacement,
@@ -69,11 +71,29 @@ from trail_worker import (
     skip_unknown_oid_grid_recovery,
     submit_grid_order_entry,
     trim_excess_grid_entries,
+    GRID_ACTION_LIMIT_PAUSE_STATUS,
     GRID_ROE_PAUSE_STATUS,
 )
 
 
 class GridAvgTests(unittest.TestCase):
+    def test_cumulative_action_limit_text_is_recognized(self) -> None:
+        text = (
+            "Failed to submit grid child order: {'status': 'err', 'response': "
+            "'Too many cumulative requests sent (208641 > 207574) for cumulative volume traded $197575. "
+            "Place taker orders to free up 1 request per USDC traded.'}"
+        )
+        self.assertTrue(is_cumulative_action_limit_text(text))
+        self.assertFalse(is_cumulative_action_limit_text("Too many requests"))
+
+    def test_action_limit_pause_marks_order_without_oid(self) -> None:
+        order = {"status": "active", "oid": 123, "side": "buy"}
+        pause_grid_order_for_action_limit(order, 456, "Too many cumulative requests sent", old_oid=123)
+        self.assertEqual(order["status"], GRID_ACTION_LIMIT_PAUSE_STATUS)
+        self.assertIsNone(order["oid"])
+        self.assertEqual(order["paused_at"], 456)
+        self.assertEqual(order["action_limit_deferred_oid"], 123)
+
     def test_grid_gap_zero_requests_default_spacing(self) -> None:
         for value in (["0"], ["0%"], ["0.0%"]):
             args = Namespace(gap=value, resolved_grid_gap_spec=None)
