@@ -803,6 +803,37 @@ def position_matches_coin(position_coin: str, coin: str) -> bool:
     return position_coin.strip().upper() == coin.strip().upper()
 
 
+def position_leverage_matches(position: dict[str, Any], leverage_type: str, leverage_value: int) -> bool:
+    leverage = position.get("leverage") or {}
+    if str(leverage.get("type") or "").strip().lower() != leverage_type:
+        return False
+    try:
+        return int(leverage.get("value")) == int(leverage_value)
+    except (TypeError, ValueError):
+        return False
+
+
+def current_position_leverage_matches(
+    info: Info,
+    account: str,
+    dex: str,
+    coin: str,
+    leverage_type: str,
+    leverage_value: int,
+) -> bool:
+    try:
+        state = info.user_state(account, dex=dex)
+    except Exception as exc:
+        log_event("user_state_leverage_check_error", {"coin": coin, "type": type(exc).__name__, "message": str(exc)})
+        return False
+
+    for item in state.get("assetPositions", []):
+        position = item.get("position") or {}
+        if position_matches_coin(str(position.get("coin", "")), coin):
+            return position_leverage_matches(position, leverage_type, leverage_value)
+    return False
+
+
 def fill_matches_coin(fill_coin: str, coin: str) -> bool:
     return canonical_coin_input(fill_coin).upper() == canonical_coin_input(coin).upper()
 
@@ -2053,7 +2084,27 @@ def cancel_order(
         )
 
 
-def update_order_leverage(exchange: Exchange, max_leverage: int, coin: str) -> tuple[str, dict[str, Any]]:
+def update_order_leverage(
+    exchange: Exchange,
+    max_leverage: int,
+    coin: str,
+    info: Info | None = None,
+    account: str | None = None,
+    dex: str = "",
+) -> tuple[str, dict[str, Any]]:
+    if info is not None and account is not None and current_position_leverage_matches(info, account, dex, coin, "cross", max_leverage):
+        result = {"status": "ok", "response": "already cross leverage", "skipped": True}
+        log_event("update_leverage_result", {"mode": "cross", "leverage": max_leverage, "result": result})
+        return "cross", result
+
+    isolated_leverage = min(ISOLATED_FALLBACK_LEVERAGE, max_leverage)
+    if info is not None and account is not None and current_position_leverage_matches(
+        info, account, dex, coin, "isolated", isolated_leverage
+    ):
+        result = {"status": "ok", "response": "already isolated leverage", "skipped": True}
+        log_event("update_leverage_result", {"mode": "isolated", "leverage": isolated_leverage, "result": result})
+        return "isolated", result
+
     result = exchange.update_leverage(max_leverage, coin, is_cross=True)
     log_event("update_leverage_result", {"mode": "cross", "leverage": max_leverage, "result": result})
     if result.get("status") == "ok":
@@ -2063,7 +2114,6 @@ def update_order_leverage(exchange: Exchange, max_leverage: int, coin: str) -> t
     if "Cross margin is not allowed" not in response:
         return "cross", result
 
-    isolated_leverage = min(ISOLATED_FALLBACK_LEVERAGE, max_leverage)
     result = exchange.update_leverage(isolated_leverage, coin, is_cross=False)
     log_event("update_leverage_result", {"mode": "isolated", "leverage": isolated_leverage, "result": result})
     return "isolated", result
@@ -3468,7 +3518,7 @@ def submit_order_plans(
         return None
 
     if update_leverage and not args.reduce_only:
-        leverage_mode, leverage_result = update_order_leverage(exchange, max_leverage, coin)
+        leverage_mode, leverage_result = update_order_leverage(exchange, max_leverage, coin, info, account)
         if args.verbose:
             print("leverage_mode:", leverage_mode)
             print("update_leverage_result:", leverage_result)
@@ -5293,7 +5343,7 @@ def place_order(args: argparse.Namespace) -> None:
         return
 
     if not args.reduce_only:
-        leverage_mode, leverage_result = update_order_leverage(exchange, max_leverage, coin)
+        leverage_mode, leverage_result = update_order_leverage(exchange, max_leverage, coin, info, account, dex)
         if args.verbose:
             print("leverage_mode:", leverage_mode)
             print("update_leverage_result:", leverage_result)

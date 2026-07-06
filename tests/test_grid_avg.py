@@ -22,6 +22,7 @@ from hl_order import (
     is_auto_grid_gap,
     refresh_grid_row_strategy_params,
     resolve_grid_spacing,
+    update_order_leverage,
 )
 from trail_worker import (
     active_grid_oids,
@@ -1385,6 +1386,81 @@ class GridAvgTests(unittest.TestCase):
         self.assertTrue(asset_requires_isolated_margin({"onlyIsolated": True}))
         self.assertTrue(asset_requires_isolated_margin({"marginMode": "noCross"}))
         self.assertFalse(asset_requires_isolated_margin({"maxLeverage": 40}))
+
+    def test_update_order_leverage_skips_matching_cross_position(self) -> None:
+        class FakeInfo:
+            def user_state(self, account: str, dex: str = "") -> dict:
+                return {
+                    "assetPositions": [
+                        {"position": {"coin": "BTC", "leverage": {"type": "cross", "value": 40}}},
+                    ]
+                }
+
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def update_leverage(self, leverage: int, coin: str, is_cross: bool) -> dict:
+                self.calls.append((leverage, coin, is_cross))
+                return {"status": "ok"}
+
+        exchange = FakeExchange()
+
+        mode, result = update_order_leverage(exchange, 40, "BTC", FakeInfo(), "account")
+
+        self.assertEqual(mode, "cross")
+        self.assertTrue(result["skipped"])
+        self.assertEqual(exchange.calls, [])
+
+    def test_update_order_leverage_skips_matching_isolated_position(self) -> None:
+        class FakeInfo:
+            def user_state(self, account: str, dex: str = "") -> dict:
+                return {
+                    "assetPositions": [
+                        {"position": {"coin": "xyz:JPY", "leverage": {"type": "isolated", "value": 5}}},
+                    ]
+                }
+
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def update_leverage(self, leverage: int, coin: str, is_cross: bool) -> dict:
+                self.calls.append((leverage, coin, is_cross))
+                return {"status": "ok"}
+
+        exchange = FakeExchange()
+
+        mode, result = update_order_leverage(exchange, 20, "xyz:JPY", FakeInfo(), "account", "xyz")
+
+        self.assertEqual(mode, "isolated")
+        self.assertTrue(result["skipped"])
+        self.assertEqual(exchange.calls, [])
+
+    def test_update_order_leverage_updates_when_position_mismatches(self) -> None:
+        class FakeInfo:
+            def user_state(self, account: str, dex: str = "") -> dict:
+                return {
+                    "assetPositions": [
+                        {"position": {"coin": "BTC", "leverage": {"type": "cross", "value": 20}}},
+                    ]
+                }
+
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def update_leverage(self, leverage: int, coin: str, is_cross: bool) -> dict:
+                self.calls.append((leverage, coin, is_cross))
+                return {"status": "ok"}
+
+        exchange = FakeExchange()
+
+        mode, result = update_order_leverage(exchange, 40, "BTC", FakeInfo(), "account")
+
+        self.assertEqual(mode, "cross")
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(exchange.calls, [(40, "BTC", True)])
 
     def test_flat_isolated_grid_sets_capped_leverage_once_before_orders(self) -> None:
         class FakeExchange:
