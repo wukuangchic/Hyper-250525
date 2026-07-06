@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import time
 from copy import deepcopy
 from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
@@ -56,12 +57,16 @@ from simple_hyper.order_specs import MIN_NOTIONAL
 
 
 RATE_LIMIT_LOG_PATH = Path(__file__).resolve().parent / "logs" / "trail-rate-limit.jsonl"
+ACTION_THROTTLE_PATH = Path(__file__).resolve().parent / "logs" / "grid-action-throttle.json"
 DONE_RETENTION_DAYS = 7
 DONE_RETENTION_MAX = 500
 GRID_LEVEL_HISTORY_MAX = 120
 GRID_FILL_LOOKBACK_SECONDS = 24 * 60 * 60
 GRID_ACCOUNT_MARGIN_RATIO_SOFT_THRESHOLD = Decimal("0.90")
 GRID_MAX_SUBMISSIONS_PER_SIDE_PER_RUN = 1
+GRID_MAX_SUBMISSIONS_PER_ACCOUNT_PER_RUN = int(os.environ.get("GRID_MAX_SUBMISSIONS_PER_ACCOUNT_PER_RUN", "2"))
+GRID_RATE_LIMITED_MAX_SUBMISSIONS_PER_RUN = int(os.environ.get("GRID_RATE_LIMITED_MAX_SUBMISSIONS_PER_RUN", "0"))
+GRID_ACTION_RATE_LIMIT_COOLDOWN_SECONDS = int(os.environ.get("GRID_ACTION_RATE_LIMIT_COOLDOWN_SECONDS", "900"))
 GRID_ADD_RISK_BRAKE_STREAK = 2
 GRID_ADD_RISK_BRAKE_PAIR_RETENTION_SECONDS = 24 * 60 * 60
 GRID_ADD_RISK_BRAKE_HISTORY_RETENTION_SECONDS = 7 * 24 * 60 * 60
@@ -96,6 +101,7 @@ GRID_PAUSED_STATUSES = {
     "paused_max",
     "paused_limit",
     "paused_margin",
+    "paused_action_rate_limit",
     "paused_reduce_capacity",
     GRID_REPLACEMENT_PAUSE_STATUS,
     GRID_RISK_DENSITY_PAUSE_STATUS,
@@ -122,6 +128,88 @@ TRANSIENT_ERROR_TEXTS = (
 
 class GridPostOnlyRejected(Exception):
     """A post-only grid child became marketable before submission."""
+
+
+class GridActionThrottled(Exception):
+    """Grid action submissions are temporarily throttled to preserve account quota."""
+
+
+def is_cumulative_action_rate_limit_text(text: str) -> bool:
+    lowered = text.lower()
+    return "too many cumulative requests" in lowered and "cumulative volume traded" in lowered
+
+
+class GridActionLimiter:
+    def __init__(
+        self,
+        path: Path = ACTION_THROTTLE_PATH,
+        now: int | None = None,
+        max_per_run: int = GRID_MAX_SUBMISSIONS_PER_ACCOUNT_PER_RUN,
+        rate_limited_max_per_run: int = GRID_RATE_LIMITED_MAX_SUBMISSIONS_PER_RUN,
+        cooldown_seconds: int = GRID_ACTION_RATE_LIMIT_COOLDOWN_SECONDS,
+    ) -> None:
+        self.path = path
+        self.now = int(time.time()) if now is None else int(now)
+        self.max_per_run = max(0, int(max_per_run))
+        self.rate_limited_max_per_run = max(0, int(rate_limited_max_per_run))
+        self.cooldown_seconds = max(0, int(cooldown_seconds))
+        self.attempts_this_run = 0
+        self.state = self._load_state()
+
+    def _load_state(self) -> dict[str, Any]:
+        try:
+            raw = json.loads(self.path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return {}
+        return raw if isinstance(raw, dict) else {}
+
+    def _save_state(self) -> None:
+        self.path.parent.mkdir(exist_ok=True)
+        tmp = self.path.with_suffix(f"{self.path.suffix}.tmp")
+        tmp.write_text(json.dumps(self.state, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        os.replace(tmp, self.path)
+
+    def rate_limited(self) -> bool:
+        try:
+            return int(self.state.get("cooldown_until") or 0) > self.now
+        except (TypeError, ValueError):
+            return False
+
+    def max_allowed_this_run(self) -> int:
+        return self.rate_limited_max_per_run if self.rate_limited() else self.max_per_run
+
+    def status(self) -> str:
+        if not self.rate_limited():
+            return f"normal {self.attempts_this_run}/{self.max_per_run}"
+        return f"rate_limited {self.attempts_this_run}/{self.rate_limited_max_per_run} until {self.state.get('cooldown_until')}"
+
+    def before_action(self, coin: str, side: str = "") -> None:
+        limit = self.max_allowed_this_run()
+        if self.attempts_this_run >= limit:
+            raise GridActionThrottled(f"grid action throttled ({self.status()})")
+        self.attempts_this_run += 1
+        self.state.update(
+            {
+                "last_action_at": self.now,
+                "last_action_coin": coin,
+                "last_action_side": side,
+                "attempts_this_run": self.attempts_this_run,
+            }
+        )
+        self._save_state()
+
+    def record_rate_limited(self, coin: str, side: str, error_text: str) -> None:
+        cooldown_until = self.now + self.cooldown_seconds
+        self.state.update(
+            {
+                "cooldown_until": cooldown_until,
+                "last_rate_limited_at": self.now,
+                "last_rate_limited_coin": coin,
+                "last_rate_limited_side": side,
+                "last_error": error_text,
+            }
+        )
+        self._save_state()
 
 
 def batch_row_raw_coin(row: dict[str, Any]) -> str:
@@ -733,10 +821,18 @@ def recent_fills_by_oid(
     return by_oid
 
 
-def submit_grid_child_order(exchange: Any, coin: str, order: dict[str, Any]) -> tuple[int | None, str, dict[str, Any] | None]:
+def submit_grid_child_order(
+    exchange: Any,
+    coin: str,
+    order: dict[str, Any],
+    action_limiter: GridActionLimiter | None = None,
+) -> tuple[int | None, str, dict[str, Any] | None]:
     plan = order.get("plan")
     if not isinstance(plan, dict):
         raise ValueError("grid child order is missing its saved plan")
+    side = str(order.get("side") or ("buy" if plan.get("is_buy") else "sell"))
+    if action_limiter is not None:
+        action_limiter.before_action(coin, side)
     result = exchange.order(
         coin,
         bool(plan["is_buy"]),
@@ -747,6 +843,8 @@ def submit_grid_child_order(exchange: Any, coin: str, order: dict[str, Any]) -> 
     )
     log_event("grid_child_order", {"side": "buy" if plan["is_buy"] else "sell", "result": result})
     if result.get("status") != "ok":
+        if action_limiter is not None and is_cumulative_action_rate_limit_text(str(result)):
+            action_limiter.record_rate_limited(coin, side, str(result))
         if is_post_only_reject_text(str(result)):
             raise GridPostOnlyRejected(str(result))
         raise RuntimeError(f"Failed to submit grid child order: {result}")
@@ -755,6 +853,8 @@ def submit_grid_child_order(exchange: Any, coin: str, order: dict[str, Any]) -> 
         if not isinstance(status, dict):
             continue
         if status.get("error"):
+            if action_limiter is not None and is_cumulative_action_rate_limit_text(str(status["error"])):
+                action_limiter.record_rate_limited(coin, side, str(status["error"]))
             if is_post_only_reject_text(str(status["error"])):
                 raise GridPostOnlyRejected(str(status["error"]))
             raise RuntimeError(f"Failed to submit grid child order: {status['error']}")
@@ -1411,6 +1511,7 @@ def regrid_dense_entries(
     account_margin_protected: bool,
     isolated_leverage_ready: set[str],
     margin_blocked_sides: set[tuple[str, str]] | None = None,
+    action_limiter: GridActionLimiter | None = None,
 ) -> int:
     if account_margin_protected:
         return 0
@@ -1472,6 +1573,7 @@ def regrid_dense_entries(
             isolated_leverage_ready,
             retry_alo_reject=True,
             margin_blocked_sides=margin_blocked_sides,
+            action_limiter=action_limiter,
         )
         if submitted:
             regridded += 1
@@ -2015,6 +2117,7 @@ def submit_grid_order_entry(
     retry_alo_reject: bool = False,
     margin_blocked_sides: set[tuple[str, str]] | None = None,
     open_orders: list[dict[str, Any]] | None = None,
+    action_limiter: GridActionLimiter | None = None,
 ) -> bool:
     restore_without_reduce_only = grid_reduce_only_canceled_restore_without_reduce_only(order)
     refresh_grid_order_reduce_only(order, position_size, policy)
@@ -2059,11 +2162,22 @@ def submit_grid_order_entry(
         and asset_requires_isolated_margin(asset)
         and coin not in isolated_leverage_ready
     ):
+        if action_limiter is not None:
+            try:
+                action_limiter.before_action(coin, side)
+            except GridActionThrottled as exc:
+                order["status"] = "paused_action_rate_limit"
+                order["oid"] = None
+                order["last_error"] = str(exc)
+                order["paused_at"] = now
+                return False
         leverage, leverage_result = update_isolated_opening_leverage(
             exchange,
             int(asset["maxLeverage"]),
             coin,
         )
+        if action_limiter is not None and is_cumulative_action_rate_limit_text(str(leverage_result)):
+            action_limiter.record_rate_limited(coin, side, str(leverage_result))
         if leverage_result.get("status") != "ok":
             raise RuntimeError(
                 f"Failed to set isolated opening leverage to {leverage}x for {coin}; order was not submitted."
@@ -2102,8 +2216,14 @@ def submit_grid_order_entry(
         try:
             if adopt_matching_open_grid_order(open_orders, coin, order, now, row):
                 return {"adopted": True}
-            retry_oid, retry_state, retry_status = submit_grid_child_order(exchange, coin, order)
+            retry_oid, retry_state, retry_status = submit_grid_child_order(exchange, coin, order, action_limiter)
             return {"submitted": True, "oid": retry_oid, "state": retry_state, "status": retry_status}
+        except GridActionThrottled as retry_exc:
+            order["status"] = "paused_action_rate_limit"
+            order["oid"] = None
+            order["last_error"] = str(retry_exc)
+            order["paused_at"] = now
+            return {"handled": True}
         except GridPostOnlyRejected as retry_exc:
             order["status"] = "skipped_post_only"
             order["oid"] = None
@@ -2123,7 +2243,13 @@ def submit_grid_order_entry(
             raise
 
     try:
-        oid, state, status = submit_grid_child_order(exchange, coin, order)
+        oid, state, status = submit_grid_child_order(exchange, coin, order, action_limiter)
+    except GridActionThrottled as exc:
+        order["status"] = "paused_action_rate_limit"
+        order["oid"] = None
+        order["last_error"] = str(exc)
+        order["paused_at"] = now
+        return False
     except GridPostOnlyRejected as exc:
         if not retry_alo_reject:
             order["status"] = "skipped_post_only"
@@ -2166,8 +2292,14 @@ def submit_grid_order_entry(
             if adopt_matching_open_grid_order(open_orders, coin, order, now, row):
                 return True
             try:
-                oid, state, status = submit_grid_child_order(exchange, coin, order)
+                oid, state, status = submit_grid_child_order(exchange, coin, order, action_limiter)
                 break
+            except GridActionThrottled as throttle_exc:
+                order["status"] = "paused_action_rate_limit"
+                order["oid"] = None
+                order["last_error"] = str(throttle_exc)
+                order["paused_at"] = now
+                return False
             except GridPostOnlyRejected as retry_exc:
                 alo_rejects += 1
                 order["last_error"] = str(retry_exc)
@@ -2215,7 +2347,7 @@ def submit_grid_order_entry(
                     raise
                 bump_grid_order_size_one_step(asset, order)
                 order["resized_min_retry_at"] = now
-                oid, state, status = submit_grid_child_order(exchange, coin, order)
+                oid, state, status = submit_grid_child_order(exchange, coin, order, action_limiter)
                 break
         else:
             order["status"] = "skipped_post_only"
@@ -2271,7 +2403,13 @@ def submit_grid_order_entry(
         bump_grid_order_size_one_step(asset, order)
         order["resized_min_retry_at"] = now
         try:
-            oid, state, status = submit_grid_child_order(exchange, coin, order)
+            oid, state, status = submit_grid_child_order(exchange, coin, order, action_limiter)
+        except GridActionThrottled as exc:
+            order["status"] = "paused_action_rate_limit"
+            order["oid"] = None
+            order["last_error"] = str(exc)
+            order["paused_at"] = now
+            return False
         except GridPostOnlyRejected as exc:
             order["status"] = "skipped_post_only"
             order["oid"] = None
@@ -2766,6 +2904,9 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     coin, asset = resolve_perp_asset(info, batch_row_raw_coin(row))
     mark_phase("asset")
     now = int(cache.setdefault("now", int(time.time())))
+    if "action_limiter" not in cache:
+        cache["action_limiter"] = GridActionLimiter(now=now)
+    action_limiter = cache["action_limiter"]
     now_ms = now * 1000
     stale_margin_pauses_cleared = clear_stale_grid_margin_pauses(row, now)
     start_ms = int(row.get("last_fill_check_ms") or (now - 24 * 60 * 60) * 1000)
@@ -2935,6 +3076,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             isolated_leverage_ready,
             margin_blocked_sides=margin_blocked_sides,
             open_orders=current_open_orders,
+            action_limiter=action_limiter,
         )
         if submitted:
             submissions_by_side[side] = submissions_by_side.get(side, 0) + 1
@@ -2959,6 +3101,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             True,
             margin_blocked_sides=margin_blocked_sides,
             open_orders=current_open_orders,
+            action_limiter=action_limiter,
         )
         if submitted:
             submissions_by_side[side] = submissions_by_side.get(side, 0) + 1
@@ -3161,6 +3304,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         account_margin_protected,
         isolated_leverage_ready,
         margin_blocked_sides,
+        action_limiter,
     )
     if dense_regridded:
         changed = True
@@ -3630,6 +3774,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         f"filled_stop={','.join(sorted(filled_submission_sides)) or '-'}; "
         f"avg={row.get('avg') if row.get('avg') is not None else '-'}; avg_multiplier={row.get('avg_multiplier', '1')}; "
         f"margin_gap_multiplier={decimal_to_plain(margin_gap_multiplier)}; "
+        f"action_limiter={action_limiter.status()}; "
         f"account_margin={margin_ratio_label}; account_protected={int(account_margin_protected)}; "
         f"roe={row.get('roe') or '-'}; roe_allowed=buy:{row.get('roe_add_risk_allowed_buy')},sell:{row.get('roe_add_risk_allowed_sell')}; "
         f"panic_ratio={row.get('panic_ratio') or '-'}; panic_reduced={panic_reduced}"
