@@ -73,6 +73,7 @@ GRID_NEAR_REGRID_STALE_GAP_MULTIPLE = Decimal("30")
 GRID_NEAR_REGRID_TARGET_GAP_MULTIPLE = Decimal("15")
 GRID_PANIC_RATIO_THRESHOLD = Decimal("100")
 GRID_PANIC_REVERSAL_GAP_MULTIPLIER = Decimal("10")
+GRID_PANIC_REDUCE_MIN_NOTIONAL = MIN_NOTIONAL * Decimal("1.10")
 GRID_ROE_DENSITY_THRESHOLD = Decimal("-0.10")
 GRID_ROE_STOP_THRESHOLD = Decimal("-0.40")
 GRID_PANIC_RATIO_LEGACY_DEFAULT_THRESHOLDS = {
@@ -318,7 +319,7 @@ def grid_row_recoverable_from_error(row: dict[str, Any]) -> bool:
 
 def is_min_order_value_error_text(text: str) -> bool:
     lowered = text.lower()
-    return "minimum value" in lowered or "min value" in lowered
+    return "minimum value" in lowered or "min value" in lowered or "mintradentlrejected" in lowered
 
 
 def is_reduce_only_would_increase_text(text: str) -> bool:
@@ -2428,13 +2429,13 @@ def build_grid_panic_reduce_order(
     limit_px = rounded_perp_price(limit_px, sz_decimals)
     if limit_px <= 0:
         return None
-    if size * limit_px < MIN_NOTIONAL:
-        size = grid_size_for_min_notional(size, limit_px, sz_decimals, MIN_NOTIONAL)
+    if size * limit_px < GRID_PANIC_REDUCE_MIN_NOTIONAL:
+        size = grid_size_for_min_notional(size, limit_px, sz_decimals, GRID_PANIC_REDUCE_MIN_NOTIONAL)
         size = min(size, max_size)
         size = (size / step).to_integral_value(rounding=ROUND_FLOOR) * step
         if size <= 0:
             return None
-        if size * limit_px < MIN_NOTIONAL:
+        if size * limit_px < GRID_PANIC_REDUCE_MIN_NOTIONAL:
             return None
     notional = size * limit_px
     return {

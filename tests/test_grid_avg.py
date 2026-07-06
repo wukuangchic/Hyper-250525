@@ -46,6 +46,7 @@ from trail_worker import (
     grid_margin_pause_active,
     find_current_position_from_state,
     is_cumulative_action_limit_text,
+    is_min_order_value_error_text,
     grid_order_entry,
     grid_replacement_rebalance_pair,
     grid_reduce_only_canceled_restore_without_reduce_only,
@@ -130,6 +131,9 @@ class GridAvgTests(unittest.TestCase):
         )
         self.assertTrue(is_cumulative_action_limit_text(text))
         self.assertFalse(is_cumulative_action_limit_text("Too many requests"))
+
+    def test_min_trade_notional_rejected_is_min_order_value_error(self) -> None:
+        self.assertTrue(is_min_order_value_error_text("minTradeNtlRejected"))
 
     def test_action_limit_pause_marks_order_without_oid(self) -> None:
         order = {"status": "active", "oid": 123, "side": "buy"}
@@ -365,8 +369,8 @@ class GridAvgTests(unittest.TestCase):
                 return reference_price * (1.001 if is_buy else 0.999)
 
         row = {
-            "base_buy_size": "0.16",
-            "base_sell_size": "0.16",
+            "base_buy_size": "0.20",
+            "base_sell_size": "0.20",
             "slippage": "0.001",
             "sz_decimals": 2,
         }
@@ -382,10 +386,35 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertIsNotNone(order)
         self.assertEqual(order["side"], "buy")
-        self.assertEqual(order["size"], "0.16")
+        self.assertEqual(order["size"], "0.2")
         self.assertTrue(order["reduce_only"])
         self.assertEqual(order["plan"]["order_type"], {"limit": {"tif": "Ioc"}})
         self.assertTrue(order["plan"]["reduce_only"])
+
+    def test_panic_reduce_order_uses_min_notional_buffer(self) -> None:
+        class FakeExchange:
+            def _slippage_price(self, coin, is_buy, slippage, reference_price):
+                return Decimal("65483.0")
+
+        row = {
+            "base_buy_size": "0.00016",
+            "base_sell_size": "0.00016",
+            "slippage": "0.001",
+            "sz_decimals": 5,
+        }
+
+        order = build_grid_panic_reduce_order(
+            FakeExchange(),
+            row,
+            "BTC",
+            {"szDecimals": 5},
+            Decimal("65500"),
+            Decimal("-0.001"),
+        )
+
+        self.assertIsNotNone(order)
+        self.assertEqual(order["size"], "0.00017")
+        self.assertGreaterEqual(Decimal(str(order["plan"]["notional"])), Decimal("11"))
 
     def test_panic_reversal_after_short_reduce_is_far_sell_with_normal_gap(self) -> None:
         row = {
