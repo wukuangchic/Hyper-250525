@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import math
+import random
 import time
 from copy import deepcopy
 from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
@@ -3803,6 +3804,7 @@ def run_once() -> None:
         for index, row in enumerate(rows)
         if grid_row_recoverable_from_error(row)
     ]
+    random.shuffle(active_grid_indexes)
     if not active_trail_indexes and not active_grid_indexes:
         print("trail_worker: no active trail/grid orders")
         return
