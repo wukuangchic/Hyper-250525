@@ -2536,6 +2536,29 @@ def cancel_grid_entries(exchange: Any, coin: str, entries: list[dict[str, Any]],
     return len(cancelled)
 
 
+def cancel_grid_entries_with_p1_budget(
+    exchange: Any,
+    coin: str,
+    entries: list[dict[str, Any]],
+    now: int,
+    note: str,
+    cache: dict[str, Any] | None,
+) -> int:
+    existing_action_limit = action_limit_error(cache)
+    if existing_action_limit:
+        if not action_limit_p1_enabled(cache):
+            return 0
+        remaining = action_limit_p1_budget_remaining(cache) or 0
+        if remaining <= 0:
+            return 0
+        entries = entries[:remaining]
+    cancelled = cancel_grid_entries(exchange, coin, entries, now, note)
+    if cancelled and existing_action_limit:
+        for _ in range(cancelled):
+            consume_action_limit_p1_budget(cache)
+    return cancelled
+
+
 def grid_fill_time(entry: dict[str, Any]) -> int:
     fill = entry.get("fill")
     if isinstance(fill, dict):
@@ -3181,35 +3204,6 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     add_risk_braked = 0
 
     paused = 0
-    to_pause_limit: list[dict[str, Any]] = []
-    for side in ("buy", "sell"):
-        entries = active_grid_entries(row, side)
-        entries.sort(
-            key=lambda entry: decimal_or_none(entry.get("price", entry.get("limit_px"))) or Decimal("0"),
-            reverse=side == "buy",
-        )
-        projected_side_value = position_value
-        for entry in entries:
-            is_buy = bool(entry.get("is_buy"))
-            order_notional = Decimal(str(entry.get("size"))) * Decimal(str(entry.get("price", entry.get("limit_px"))))
-            if not grid_order_allowed_by_max(
-                position_size,
-                projected_side_value,
-                is_buy,
-                order_notional,
-                max_position_value,
-                policy,
-                min_position_value,
-            ):
-                to_pause_limit.append(entry)
-                continue
-            if grid_order_would_add_risk(position_size, is_buy):
-                projected_side_value += order_notional
-            else:
-                projected_side_value = max(Decimal("0"), projected_side_value - order_notional)
-    if to_pause_limit:
-        paused += cancel_grid_entries(exchange, coin, to_pause_limit, now, "paused_limit")
-    paused_limit_ids = {id(entry) for entry in to_pause_limit}
     to_pause_density: list[dict[str, Any]] = []
     risk_density_allowed: dict[str, int] = {}
     risk_density_multiplier: dict[str, Decimal] = {}
@@ -3223,7 +3217,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         )
         risk_density_allowed[side] = allowed
         risk_density_multiplier[side] = multiplier
-        to_pause_density.extend(entry for entry in candidates if id(entry) not in paused_limit_ids)
+        to_pause_density.extend(candidates)
     if to_pause_density:
         paused += cancel_grid_entries(exchange, coin, to_pause_density, now, GRID_RISK_DENSITY_PAUSE_STATUS)
         for entry in to_pause_density:
@@ -3247,7 +3241,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         to_pause_roe.extend(
             entry
             for entry in candidates
-            if id(entry) not in paused_limit_ids and id(entry) not in paused_density_ids
+            if id(entry) not in paused_density_ids
         )
     if to_pause_roe:
         paused += cancel_grid_entries(exchange, coin, to_pause_roe, now, GRID_ROE_PAUSE_STATUS)
@@ -3256,39 +3250,11 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             entry["roe_allowed"] = roe_allowed.get(side, target_per_side)
             entry["roe_paused_at"] = now
     paused_roe_ids = {id(entry) for entry in to_pause_roe}
-    to_pause_active_cap: list[dict[str, Any]] = []
-    for side in ("buy", "sell"):
-        candidates, allowed = grid_active_cap_pause_candidates(row, side)
-        to_pause_active_cap.extend(
-            entry
-            for entry in candidates
-            if id(entry) not in paused_limit_ids and id(entry) not in paused_density_ids and id(entry) not in paused_roe_ids
-        )
-    if to_pause_active_cap:
-        paused += cancel_grid_entries(exchange, coin, to_pause_active_cap, now, GRID_ACTIVE_CAP_PAUSE_STATUS)
-        for entry in to_pause_active_cap:
-            entry["active_cap_allowed"] = GRID_MAX_ACTIVE_ORDERS_PER_SIDE
-            entry["active_cap_paused_at"] = now
     if paused:
         changed = True
-    mark_phase("pause_caps")
+    mark_phase("pre_replacement_risk_pauses")
 
     refreshed = 0
-    to_refresh: list[dict[str, Any]] = []
-    if not account_margin_protected:
-        for entry in active_grid_entries(row):
-            desired_reduce_only = grid_order_should_reduce_only(position_size, bool(entry.get("is_buy")), policy)
-            if bool(entry.get("reduce_only", False)) == desired_reduce_only:
-                plan = entry.get("plan")
-                if not isinstance(plan, dict) or bool(plan.get("reduce_only", False)) == desired_reduce_only:
-                    continue
-            to_refresh.append(entry)
-    if to_refresh:
-        refreshed = cancel_grid_entries(exchange, coin, to_refresh, now, "refresh_reduce_only")
-        if refreshed:
-            pause_refreshed_reduce_only_entries(to_refresh, now)
-        changed = True
-    mark_phase("refresh")
 
     dense_regridded = 0
     if not action_limit_error(cache):
@@ -3490,17 +3456,83 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         changed = True
     mark_phase("replacements")
 
+    to_pause_limit: list[dict[str, Any]] = []
+    high_priority_pause_ids = paused_density_ids | paused_roe_ids
+    for side in ("buy", "sell"):
+        entries = active_grid_entries(row, side)
+        entries.sort(
+            key=lambda entry: decimal_or_none(entry.get("price", entry.get("limit_px"))) or Decimal("0"),
+            reverse=side == "buy",
+        )
+        projected_side_value = position_value
+        for entry in entries:
+            if id(entry) in high_priority_pause_ids:
+                continue
+            is_buy = bool(entry.get("is_buy"))
+            order_notional = Decimal(str(entry.get("size"))) * Decimal(str(entry.get("price", entry.get("limit_px"))))
+            if not grid_order_allowed_by_max(
+                position_size,
+                projected_side_value,
+                is_buy,
+                order_notional,
+                max_position_value,
+                policy,
+                min_position_value,
+            ):
+                to_pause_limit.append(entry)
+                continue
+            if grid_order_would_add_risk(position_size, is_buy):
+                projected_side_value += order_notional
+            else:
+                projected_side_value = max(Decimal("0"), projected_side_value - order_notional)
+    if to_pause_limit:
+        limit_paused = cancel_grid_entries_with_p1_budget(exchange, coin, to_pause_limit, now, "paused_limit", cache)
+        paused += limit_paused
+        if limit_paused:
+            changed = True
+    paused_limit_ids = {id(entry) for entry in to_pause_limit}
     to_pause_post_replacement_cap: list[dict[str, Any]] = []
     for side in ("buy", "sell"):
         candidates, _allowed = grid_active_cap_pause_candidates(row, side)
-        to_pause_post_replacement_cap.extend(candidates)
+        to_pause_post_replacement_cap.extend(
+            entry
+            for entry in candidates
+            if id(entry) not in high_priority_pause_ids and id(entry) not in paused_limit_ids
+        )
     if to_pause_post_replacement_cap:
-        paused += cancel_grid_entries(exchange, coin, to_pause_post_replacement_cap, now, GRID_ACTIVE_CAP_PAUSE_STATUS)
+        active_cap_paused = cancel_grid_entries_with_p1_budget(
+            exchange,
+            coin,
+            to_pause_post_replacement_cap,
+            now,
+            GRID_ACTIVE_CAP_PAUSE_STATUS,
+            cache,
+        )
+        paused += active_cap_paused
         for entry in to_pause_post_replacement_cap:
+            if str(entry.get("status") or "") != GRID_ACTIVE_CAP_PAUSE_STATUS or entry.get("cancelled_at") != now:
+                continue
             entry["active_cap_allowed"] = GRID_MAX_ACTIVE_ORDERS_PER_SIDE
             entry["active_cap_paused_at"] = now
-        changed = True
-    mark_phase("post_cap")
+        if active_cap_paused:
+            changed = True
+    mark_phase("post_replacement_limit_cap")
+
+    to_refresh: list[dict[str, Any]] = []
+    if not account_margin_protected:
+        for entry in active_grid_entries(row):
+            desired_reduce_only = grid_order_should_reduce_only(position_size, bool(entry.get("is_buy")), policy)
+            if bool(entry.get("reduce_only", False)) == desired_reduce_only:
+                plan = entry.get("plan")
+                if not isinstance(plan, dict) or bool(plan.get("reduce_only", False)) == desired_reduce_only:
+                    continue
+            to_refresh.append(entry)
+    if to_refresh:
+        refreshed = cancel_grid_entries_with_p1_budget(exchange, coin, to_refresh, now, "refresh_reduce_only", cache)
+        if refreshed:
+            pause_refreshed_reduce_only_entries(to_refresh, now)
+            changed = True
+    mark_phase("refresh")
 
     replacement_rebalanced = 0
     if isinstance(levels, list) and not action_limit_error(cache):

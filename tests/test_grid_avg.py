@@ -30,6 +30,7 @@ from trail_worker import (
     action_limit_p1_budget_remaining,
     batch_row_raw_coin,
     build_grid_panic_reduce_order,
+    cancel_grid_entries_with_p1_budget,
     clear_stale_grid_margin_pauses,
     clear_grid_side_cap_entries,
     consume_action_limit_p1_budget,
@@ -122,6 +123,32 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(info.calls, 1)
         self.assertEqual(precheck_action_limit(info, "0xabc", cache, "mainnet", 124), error)
         self.assertEqual(info.calls, 1)
+
+    def test_action_limit_p1_budget_gates_cancels(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.requests = []
+
+            def bulk_cancel(self, requests: list[dict]) -> dict:
+                self.requests.append(requests)
+                return {"status": "ok"}
+
+        exchange = FakeExchange()
+        entries = [{"oid": 1, "status": "active"}, {"oid": 2, "status": "active"}]
+        cache = {
+            "action_limit_error": "address action limit exhausted",
+            "action_limit_p1_budget_remaining": 1,
+        }
+
+        self.assertEqual(cancel_grid_entries_with_p1_budget(exchange, "BTC", entries, 123, "paused_limit", cache), 0)
+        self.assertEqual(exchange.requests, [])
+        enable_action_limit_p1_budget(cache)
+        self.assertEqual(cancel_grid_entries_with_p1_budget(exchange, "BTC", entries, 124, "paused_limit", cache), 1)
+
+        self.assertEqual(exchange.requests, [[{"coin": "BTC", "oid": 1}]])
+        self.assertEqual(entries[0]["status"], "paused_limit")
+        self.assertEqual(entries[1]["status"], "active")
+        self.assertEqual(action_limit_p1_budget_remaining(cache), 0)
 
     def test_cumulative_action_limit_text_is_recognized(self) -> None:
         text = (
