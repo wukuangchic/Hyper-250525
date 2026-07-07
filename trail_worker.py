@@ -222,6 +222,13 @@ def noncritical_grid_work_allowed(cache: dict[str, Any] | None) -> bool:
         return False
 
 
+def action_limit_p1_budget_for_deficit(deficit: int) -> int:
+    if deficit < 3:
+        return GRID_ACTION_LIMIT_P1_BUDGET_PER_RUN
+    probability = Decimal("1") / Decimal(str(math.log(deficit)))
+    return GRID_ACTION_LIMIT_P1_BUDGET_PER_RUN if random.random() < float(probability) else 0
+
+
 def user_action_rate_limit(info: Any, account: str, cache: dict[str, Any], network: str) -> dict[str, Any] | None:
     rate_cache = cache.setdefault("user_action_rate_limits", {})
     rate_key = (network, account)
@@ -257,7 +264,7 @@ def precheck_action_limit(info: Any, account: str, cache: dict[str, Any], networ
         )
         mark_action_limit_hit(cache, error_text, now)
         if not cache.get("action_limit_p1_budget_initialized"):
-            cache["action_limit_p1_budget_remaining"] = GRID_ACTION_LIMIT_P1_BUDGET_PER_RUN
+            cache["action_limit_p1_budget_remaining"] = action_limit_p1_budget_for_deficit(deficit)
             cache["action_limit_p1_budget_initialized"] = True
         cache["action_limit_deficit"] = deficit
         return error_text

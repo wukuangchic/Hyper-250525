@@ -27,6 +27,7 @@ from hl_order import (
 )
 from trail_worker import (
     active_grid_oids,
+    action_limit_p1_budget_for_deficit,
     action_limit_p1_budget_remaining,
     batch_row_raw_coin,
     build_grid_panic_reduce_order,
@@ -111,12 +112,13 @@ class GridAvgTests(unittest.TestCase):
 
         info = FakeInfo()
         cache: dict = {}
-        error = precheck_action_limit(info, "0xabc", cache, "mainnet", 123)
+        with patch("trail_worker.random.random", return_value=0.99):
+            error = precheck_action_limit(info, "0xabc", cache, "mainnet", 123)
 
         self.assertIn("deficit=1987", error or "")
         self.assertEqual(cache["action_limit_error"], error)
         self.assertEqual(cache["action_limit_at"], 123)
-        self.assertEqual(action_limit_p1_budget_remaining(cache), 1)
+        self.assertEqual(action_limit_p1_budget_remaining(cache), 0)
         self.assertFalse(cache.get("action_limit_p1_enabled", False))
         enable_action_limit_p1_budget(cache)
         self.assertTrue(cache["action_limit_p1_enabled"])
@@ -125,6 +127,17 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(info.calls, 1)
         self.assertEqual(precheck_action_limit(info, "0xabc", cache, "mainnet", 124), error)
         self.assertEqual(info.calls, 1)
+
+    def test_action_limit_p1_budget_for_deficit_edges_and_probability(self) -> None:
+        self.assertEqual(action_limit_p1_budget_for_deficit(0), 1)
+        self.assertEqual(action_limit_p1_budget_for_deficit(1), 1)
+        self.assertEqual(action_limit_p1_budget_for_deficit(2), 1)
+        with patch("trail_worker.random.random", return_value=0.99):
+            self.assertEqual(action_limit_p1_budget_for_deficit(3), 0)
+        with patch("trail_worker.random.random", return_value=0):
+            self.assertEqual(action_limit_p1_budget_for_deficit(1779), 1)
+        with patch("trail_worker.random.random", return_value=0.99):
+            self.assertEqual(action_limit_p1_budget_for_deficit(1779), 0)
 
     def test_precheck_action_limit_initializes_shared_p1_budget_below_cap_once(self) -> None:
         class FakeInfo:

@@ -205,7 +205,12 @@ BTC grid --limit -300 0
 - 成交反向单如果 ALO 因会立即成交被拒，会先确认同侧前后 `0.95 * gap` 内没有已有活跃或可恢复 paused grid 档位；若不太近，会先向远离盘口方向移动一个 `gap`，若太近才优先插入外移方向上间距大于 `1.95 * gap` 的相邻两格中间，最多 20 次。其他 grid 子单 ALO 被拒时只跳过本轮，不换价重试。
 - worker 补齐每侧子单时，交易所一旦接受提交，本轮就视为已补一个名额；即使订单随后很快成交，也不会在同一轮为了凑够 10 张活跃单连续追单。
 - 每轮每侧最多向交易所提交 1 张新 grid 单；成交对向单、常规补档和历史档位恢复共用这一额度。
-- 每侧提交额度的优先级固定为：成交对向单 > paused 风险密度恢复 > 常规补档 > 其他 paused 恢复。
+- 遇到地址 action limit 紧张时，worker 会把维护动作分级执行：
+  - P0：必要安全动作，不占共享 P1 预算。当前包括 `panic_ratio` 触发的 IOC reduce-only 减仓、`paused_risk_density` 必要撤单、`paused_roe` 必要撤单；panic 后的反向普通挂单也在这段流程内，但仍会经过自身的 ALO、仓位和保证金判断。
+  - P1：共享预算动作。当前包括成交后的 replacement 提交、`paused_limit` 撤单、`paused_active_cap` 撤单、`refresh_reduce_only` 撤单、普通补档和 paused 恢复；同一轮所有 P1 动作共用 `action_limit_p1_budget`。
+  - P2：非关键整理动作。当前包括 dense regrid 和 replacement rebalance；只有执行完 P0/P1 后预估 action headroom 仍大于 `100` 才会运行。
+- P1 预算每轮都会预先计算，不等到确认超限后才计算。未超限时最多给 1 次，且不会超过当前 headroom；已超限时若 `deficit < 3` 仍给 1 次，若 `deficit >= 3` 则按 `1 / ln(deficit)` 的概率给 1 次，否则本轮 P1 为 0。这样 deficit 回到低位时也会继续按每轮最多 1 次恢复，不会集中补发请求。
+- 每侧 P1 提交额度的优先级固定为：成交对向 replacement > 常规补档 > paused 恢复；P1 撤单按代码阶段插在对应维护点，共享同一个 P1 预算。
 - paused 档位恢复提交前会先用当前 best bid/ask（读取失败时用 mid）判断限价是否会立即成交；会穿盘口的 paused 单只本轮延后恢复，不提交给交易所，避免反复触发 ALO 拒单。
 - 同一轮同一侧的成交对向单不限制张数，会处理全部待补成交；整批对向单只算一次优先级额度，处理后该侧本轮不再提交其他类型的新单。
 
