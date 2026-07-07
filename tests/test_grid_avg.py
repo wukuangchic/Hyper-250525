@@ -33,6 +33,7 @@ from trail_worker import (
     cancel_grid_entries_with_p1_budget,
     clear_stale_grid_margin_pauses,
     clear_grid_side_cap_entries,
+    consume_action_limit_headroom,
     consume_action_limit_p1_budget,
     apply_grid_add_risk_brake,
     dense_grid_entries,
@@ -59,6 +60,7 @@ from trail_worker import (
     move_grid_order_away_from_active,
     near_grid_orders_if_stale,
     next_depth_order,
+    noncritical_grid_work_allowed,
     normalize_margin_paused_replacement,
     panic_reversal_order_from_reduce,
     pause_refresh_reduce_only_replacement,
@@ -193,6 +195,23 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(cancel_grid_entries_with_p1_budget(exchange, "BTC", entries, 123, "paused_limit", cache), 0)
         self.assertEqual(exchange.requests, [])
         self.assertEqual(entries[0]["status"], "active")
+
+    def test_p2_work_requires_more_than_one_hundred_headroom(self) -> None:
+        self.assertTrue(noncritical_grid_work_allowed({"action_limit_headroom": 101}))
+        self.assertFalse(noncritical_grid_work_allowed({"action_limit_headroom": 100}))
+        self.assertFalse(
+            noncritical_grid_work_allowed(
+                {"action_limit_error": "address action limit exhausted", "action_limit_headroom": 1000}
+            )
+        )
+
+    def test_p1_consumption_reduces_p2_headroom(self) -> None:
+        cache = {"action_limit_headroom": 101}
+
+        consume_action_limit_headroom(cache)
+
+        self.assertEqual(cache["action_limit_headroom"], 100)
+        self.assertFalse(noncritical_grid_work_allowed(cache))
 
     def test_cumulative_action_limit_text_is_recognized(self) -> None:
         text = (

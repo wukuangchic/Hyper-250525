@@ -94,6 +94,7 @@ GRID_ROE_PAUSE_STATUS = "paused_roe"
 GRID_ACTIVE_CAP_PAUSE_STATUS = "paused_active_cap"
 GRID_ACTION_LIMIT_PAUSE_STATUS = "paused_action_limit"
 GRID_ACTION_LIMIT_P1_BUDGET_PER_RUN = 1
+GRID_ACTION_LIMIT_P2_HEADROOM_THRESHOLD = 100
 GRID_MAX_LEVELS_PER_SIDE = 1024
 GRID_MAX_ACTIVE_ORDERS_PER_SIDE = 32
 GRID_PAUSED_STATUSES = {
@@ -186,6 +187,16 @@ def consume_action_limit_p1_budget(cache: dict[str, Any] | None) -> None:
     cache["action_limit_p1_budget_remaining"] = max(0, remaining - 1)
 
 
+def consume_action_limit_headroom(cache: dict[str, Any] | None, count: int = 1) -> None:
+    if not isinstance(cache, dict) or "action_limit_headroom" not in cache:
+        return
+    try:
+        headroom = int(cache.get("action_limit_headroom") or 0)
+    except (TypeError, ValueError):
+        headroom = 0
+    cache["action_limit_headroom"] = max(0, headroom - max(0, count))
+
+
 def enable_action_limit_p1_budget(cache: dict[str, Any] | None) -> None:
     if isinstance(cache, dict):
         cache["action_limit_p1_enabled"] = True
@@ -201,7 +212,14 @@ def p1_budget_tracked(cache: dict[str, Any] | None) -> bool:
 
 
 def noncritical_grid_work_allowed(cache: dict[str, Any] | None) -> bool:
-    return not action_limit_error(cache) and not p1_budget_tracked(cache)
+    if action_limit_error(cache):
+        return False
+    if not isinstance(cache, dict) or "action_limit_headroom" not in cache:
+        return True
+    try:
+        return int(cache.get("action_limit_headroom") or 0) > GRID_ACTION_LIMIT_P2_HEADROOM_THRESHOLD
+    except (TypeError, ValueError):
+        return False
 
 
 def user_action_rate_limit(info: Any, account: str, cache: dict[str, Any], network: str) -> dict[str, Any] | None:
@@ -2576,6 +2594,8 @@ def cancel_grid_entries_with_p1_budget(
     if cancelled and budget_tracked:
         for _ in range(cancelled):
             consume_action_limit_p1_budget(cache)
+    if cancelled:
+        consume_action_limit_headroom(cache, cancelled)
     return cancelled
 
 
@@ -3105,8 +3125,9 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             pause_grid_order_for_action_limit(order, now, error_text)
             return False
         if submitted:
-            if action_limit_p1_enabled(cache) and budget_tracked:
+            if budget_tracked:
                 consume_action_limit_p1_budget(cache)
+            consume_action_limit_headroom(cache)
             submissions_by_side[side] = submissions_by_side.get(side, 0) + 1
             if str(order.get("status")) == "filled":
                 filled_submission_sides.add(side)
@@ -3148,8 +3169,9 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             pause_grid_order_for_action_limit(order, now, error_text)
             return False
         if submitted:
-            if action_limit_p1_enabled(cache) and budget_tracked:
+            if budget_tracked:
                 consume_action_limit_p1_budget(cache)
+            consume_action_limit_headroom(cache)
             submissions_by_side[side] = submissions_by_side.get(side, 0) + 1
             replacement_quota_sides.add(side)
         return submitted
@@ -3247,7 +3269,9 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         risk_density_multiplier[side] = multiplier
         to_pause_density.extend(candidates)
     if to_pause_density:
-        paused += cancel_grid_entries(exchange, coin, to_pause_density, now, GRID_RISK_DENSITY_PAUSE_STATUS)
+        paused_density = cancel_grid_entries(exchange, coin, to_pause_density, now, GRID_RISK_DENSITY_PAUSE_STATUS)
+        paused += paused_density
+        consume_action_limit_headroom(cache, paused_density)
         for entry in to_pause_density:
             entry["risk_density_allowed"] = risk_density_allowed.get(str(entry.get("side") or ""), target_per_side)
             entry["risk_density_multiplier"] = decimal_to_plain(
@@ -3272,7 +3296,9 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             if id(entry) not in paused_density_ids
         )
     if to_pause_roe:
-        paused += cancel_grid_entries(exchange, coin, to_pause_roe, now, GRID_ROE_PAUSE_STATUS)
+        paused_roe = cancel_grid_entries(exchange, coin, to_pause_roe, now, GRID_ROE_PAUSE_STATUS)
+        paused += paused_roe
+        consume_action_limit_headroom(cache, paused_roe)
         for entry in to_pause_roe:
             side = str(entry.get("side") or "")
             entry["roe_allowed"] = roe_allowed.get(side, target_per_side)
@@ -3341,6 +3367,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             panic_order["panic_ratio_threshold"] = decimal_to_plain(panic_threshold)
             submitted = submit_grid_panic_reduce(exchange, coin, panic_order, now, row)
             if submitted:
+                consume_action_limit_headroom(cache)
                 panic_reduced = 1
                 row["panic_reduce_at"] = now
                 row["panic_reduce_count"] = int(row.get("panic_reduce_count") or 0) + 1
