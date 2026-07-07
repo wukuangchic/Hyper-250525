@@ -165,10 +165,10 @@ def pause_grid_order_for_action_limit(
 
 
 def action_limit_p1_budget_remaining(cache: dict[str, Any] | None) -> int | None:
-    if not action_limit_error(cache):
-        return None
     if not isinstance(cache, dict):
         return 0
+    if "action_limit_p1_budget_remaining" not in cache:
+        return None
     try:
         return max(0, int(cache.get("action_limit_p1_budget_remaining") or 0))
     except (TypeError, ValueError):
@@ -189,6 +189,19 @@ def consume_action_limit_p1_budget(cache: dict[str, Any] | None) -> None:
 def enable_action_limit_p1_budget(cache: dict[str, Any] | None) -> None:
     if isinstance(cache, dict):
         cache["action_limit_p1_enabled"] = True
+
+
+def p1_budget_available(cache: dict[str, Any] | None) -> bool:
+    remaining = action_limit_p1_budget_remaining(cache)
+    return remaining is None or remaining > 0
+
+
+def p1_budget_tracked(cache: dict[str, Any] | None) -> bool:
+    return isinstance(cache, dict) and "action_limit_p1_budget_remaining" in cache
+
+
+def noncritical_grid_work_allowed(cache: dict[str, Any] | None) -> bool:
+    return not action_limit_error(cache) and not p1_budget_tracked(cache)
 
 
 def user_action_rate_limit(info: Any, account: str, cache: dict[str, Any], network: str) -> dict[str, Any] | None:
@@ -225,9 +238,16 @@ def precheck_action_limit(info: Any, account: str, cache: dict[str, Any], networ
             f"nRequestsUsed={used} nRequestsCap={cap} deficit={deficit}"
         )
         mark_action_limit_hit(cache, error_text, now)
-        cache["action_limit_p1_budget_remaining"] = GRID_ACTION_LIMIT_P1_BUDGET_PER_RUN
+        if not cache.get("action_limit_p1_budget_initialized"):
+            cache["action_limit_p1_budget_remaining"] = GRID_ACTION_LIMIT_P1_BUDGET_PER_RUN
+            cache["action_limit_p1_budget_initialized"] = True
         cache["action_limit_deficit"] = deficit
         return error_text
+    if cap > 0 and not cache.get("action_limit_p1_budget_initialized"):
+        headroom = max(0, cap - used)
+        cache["action_limit_p1_budget_remaining"] = min(GRID_ACTION_LIMIT_P1_BUDGET_PER_RUN, headroom)
+        cache["action_limit_p1_budget_initialized"] = True
+        cache["action_limit_headroom"] = headroom
     return None
 
 
@@ -2544,8 +2564,8 @@ def cancel_grid_entries_with_p1_budget(
     note: str,
     cache: dict[str, Any] | None,
 ) -> int:
-    existing_action_limit = action_limit_error(cache)
-    if existing_action_limit:
+    budget_tracked = p1_budget_tracked(cache)
+    if budget_tracked:
         if not action_limit_p1_enabled(cache):
             return 0
         remaining = action_limit_p1_budget_remaining(cache) or 0
@@ -2553,7 +2573,7 @@ def cancel_grid_entries_with_p1_budget(
             return 0
         entries = entries[:remaining]
     cancelled = cancel_grid_entries(exchange, coin, entries, now, note)
-    if cancelled and existing_action_limit:
+    if cancelled and budget_tracked:
         for _ in range(cancelled):
             consume_action_limit_p1_budget(cache)
     return cancelled
@@ -3053,10 +3073,14 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         if not side_submission_allowed(side):
             return False
         existing_action_limit = action_limit_error(cache)
-        if existing_action_limit:
-            if not action_limit_p1_enabled(cache) or not action_limit_p1_budget_remaining(cache):
+        budget_tracked = p1_budget_tracked(cache)
+        if action_limit_p1_enabled(cache) and budget_tracked and not p1_budget_available(cache):
+            if existing_action_limit:
                 pause_grid_order_for_action_limit(order, now, existing_action_limit)
-                return False
+            return False
+        if existing_action_limit and not action_limit_p1_enabled(cache):
+            pause_grid_order_for_action_limit(order, now, existing_action_limit)
+            return False
         try:
             submitted = submit_grid_order_entry(
                 exchange,
@@ -3081,7 +3105,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             pause_grid_order_for_action_limit(order, now, error_text)
             return False
         if submitted:
-            if existing_action_limit:
+            if action_limit_p1_enabled(cache) and budget_tracked:
                 consume_action_limit_p1_budget(cache)
             submissions_by_side[side] = submissions_by_side.get(side, 0) + 1
             if str(order.get("status")) == "filled":
@@ -3091,10 +3115,14 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     def submit_replacement(order: dict[str, Any]) -> bool:
         side = str(order.get("side") or "")
         existing_action_limit = action_limit_error(cache)
-        if existing_action_limit:
-            if not action_limit_p1_enabled(cache) or not action_limit_p1_budget_remaining(cache):
+        budget_tracked = p1_budget_tracked(cache)
+        if action_limit_p1_enabled(cache) and budget_tracked and not p1_budget_available(cache):
+            if existing_action_limit:
                 pause_grid_order_for_action_limit(order, now, existing_action_limit)
-                return False
+            return False
+        if existing_action_limit and not action_limit_p1_enabled(cache):
+            pause_grid_order_for_action_limit(order, now, existing_action_limit)
+            return False
         try:
             submitted = submit_grid_order_entry(
                 exchange,
@@ -3120,7 +3148,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             pause_grid_order_for_action_limit(order, now, error_text)
             return False
         if submitted:
-            if existing_action_limit:
+            if action_limit_p1_enabled(cache) and budget_tracked:
                 consume_action_limit_p1_budget(cache)
             submissions_by_side[side] = submissions_by_side.get(side, 0) + 1
             replacement_quota_sides.add(side)
@@ -3257,24 +3285,6 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     refreshed = 0
 
     dense_regridded = 0
-    if not action_limit_error(cache):
-        dense_regridded = regrid_dense_entries(
-            exchange,
-            coin,
-            row,
-            asset,
-            now,
-            position_size,
-            position_value,
-            policy,
-            account_margin_protected,
-            isolated_leverage_ready,
-            margin_blocked_sides,
-        )
-    if dense_regridded:
-        changed = True
-    mark_phase("dense")
-
     near_regrids = 0
 
     projected_position_values: dict[str, Decimal] = {}
@@ -3534,8 +3544,26 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             changed = True
     mark_phase("refresh")
 
+    if noncritical_grid_work_allowed(cache):
+        dense_regridded = regrid_dense_entries(
+            exchange,
+            coin,
+            row,
+            asset,
+            now,
+            position_size,
+            position_value,
+            policy,
+            account_margin_protected,
+            isolated_leverage_ready,
+            margin_blocked_sides,
+        )
+    if dense_regridded:
+        changed = True
+    mark_phase("dense")
+
     replacement_rebalanced = 0
-    if isinstance(levels, list) and not action_limit_error(cache):
+    if isinstance(levels, list) and noncritical_grid_work_allowed(cache):
         for side in ("buy", "sell"):
             if not side_submission_allowed(side):
                 continue
