@@ -77,6 +77,7 @@ from trail_worker import (
     prune_grid_levels,
     regrid_dense_entries,
     replacement_order_from_fill,
+    run_once,
     skip_stale_grid_recovery,
     skip_unknown_oid_grid_recovery,
     submit_grid_order_entry,
@@ -138,6 +139,48 @@ class GridAvgTests(unittest.TestCase):
             self.assertEqual(action_limit_p1_budget_for_deficit(1779), 1)
         with patch("trail_worker.random.random", return_value=0.99):
             self.assertEqual(action_limit_p1_budget_for_deficit(1779), 0)
+
+    def test_run_once_scans_all_grids_by_global_action_phase(self) -> None:
+        rows = [
+            {"type": "grid", "status": "active", "coin": "BTC", "levels": []},
+            {"type": "grid", "status": "active", "coin": "ETH", "levels": []},
+        ]
+        calls = []
+
+        def fake_maintain_grid(row: dict, cache: dict) -> tuple[dict, bool]:
+            calls.append((row["coin"], cache.get("grid_action_phase")))
+            return row, False
+
+        with (
+            patch("trail_worker.load_server_batch", return_value=rows),
+            patch("trail_worker.maintain_grid", side_effect=fake_maintain_grid),
+            patch("trail_worker.random.shuffle", side_effect=lambda indexes: indexes.reverse()),
+            patch("trail_worker.prune_done_rows", return_value=(rows, False)),
+            patch("trail_worker.prune_grid_level_history", return_value=False),
+            patch("trail_worker.save_server_batch") as save_server_batch,
+        ):
+            run_once()
+
+        self.assertEqual(
+            calls,
+            [
+                ("ETH", "p0"),
+                ("BTC", "p0"),
+                ("ETH", "p1_latest_replacement"),
+                ("BTC", "p1_latest_replacement"),
+                ("ETH", "p1_paused_replacement"),
+                ("BTC", "p1_paused_replacement"),
+                ("ETH", "p1_cancels"),
+                ("BTC", "p1_cancels"),
+                ("ETH", "p1_topup"),
+                ("BTC", "p1_topup"),
+                ("ETH", "p1_restore"),
+                ("BTC", "p1_restore"),
+                ("ETH", "p2"),
+                ("BTC", "p2"),
+            ],
+        )
+        save_server_batch.assert_not_called()
 
     def test_precheck_action_limit_initializes_shared_p1_budget_below_cap_once(self) -> None:
         class FakeInfo:
