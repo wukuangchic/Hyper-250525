@@ -423,15 +423,7 @@ INDEX_HTML = r"""<!doctype html>
     </header>
 
     <form id="authPanel" class="panel auth-block" method="post" action="/api/run" autocomplete="off">
-      <input id="credentialUsername" class="credential-proxy" name="username" type="text" autocomplete="username" tabindex="-1" aria-hidden="true">
-      <div class="field">
-        <label for="walletInput">Wallet</label>
-        <input id="walletInput" name="hyper_wallet" type="search" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="0x..." data-form-type="other" data-lpignore="true">
-      </div>
-      <div class="field">
-        <label for="secret">Private Key or Agent Key</label>
-        <input id="secret" name="password" type="password" autocomplete="current-password" autocapitalize="off" spellcheck="false" placeholder="0x...">
-      </div>
+      <p class="verify-copy">Using the wallet and private key saved on this server.</p>
       <div class="buttons">
         <button id="verify" type="submit">Verify</button>
       </div>
@@ -471,8 +463,6 @@ INDEX_HTML = r"""<!doctype html>
   <script>
     const $ = (id) => document.getElementById(id);
     const state = {
-      account_address: "",
-      secret_key: "",
       verified: false,
       command_history: [],
       command_history_index: -1,
@@ -503,7 +493,7 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function currentHistoryScope() {
-      return state.verified ? normalizeHistoryScope(state.account_address) : COMMAND_HISTORY_SHARED_SCOPE;
+      return state.verified ? "server" : COMMAND_HISTORY_SHARED_SCOPE;
     }
 
     function historyStorageKey(scope = currentHistoryScope()) {
@@ -604,37 +594,8 @@ INDEX_HTML = r"""<!doctype html>
       input.setSelectionRange(input.value.length, input.value.length);
     }
 
-    function isWalletAddress(value) {
-      return /^0x[a-fA-F0-9]{40}$/.test(value.trim());
-    }
-
     function credentials() {
-      syncWalletFromCredential();
-      syncCredentialUsername();
-      return {
-        account_address: state.verified ? state.account_address : $("walletInput").value.trim(),
-        secret_key: state.verified ? state.secret_key : $("secret").value.trim(),
-      };
-    }
-
-    function syncCredentialUsername() {
-      const wallet = $("walletInput").value.trim();
-      const credential = $("credentialUsername").value.trim();
-      if (!wallet) {
-        $("credentialUsername").value = "";
-        return;
-      }
-      if (isWalletAddress(wallet) || !credential || !isWalletAddress(credential)) {
-        $("credentialUsername").value = wallet;
-      }
-    }
-
-    function syncWalletFromCredential() {
-      const credentialUsername = $("credentialUsername").value.trim();
-      const wallet = $("walletInput").value.trim();
-      if (isWalletAddress(credentialUsername) && !isWalletAddress(wallet)) {
-        $("walletInput").value = credentialUsername;
-      }
+      return {};
     }
 
     function setBusy(busy) {
@@ -709,9 +670,6 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     async function verify() {
-      syncWalletFromCredential();
-      state.account_address = $("walletInput").value.trim();
-      state.secret_key = $("secret").value.trim();
       try {
         setBusy(true);
         const data = await apiRun("query");
@@ -720,7 +678,7 @@ INDEX_HTML = r"""<!doctype html>
         }
         state.verified = true;
         syncAuth();
-        setHistoryScope(state.account_address);
+        setHistoryScope("server");
         renderRun(data);
       } catch (error) {
         state.verified = false;
@@ -733,11 +691,6 @@ INDEX_HTML = r"""<!doctype html>
 
     function reverify() {
       state.verified = false;
-      state.account_address = "";
-      state.secret_key = "";
-      $("walletInput").value = "";
-      $("credentialUsername").value = "";
-      $("secret").value = "";
       syncAuth();
       setHistoryScope(COMMAND_HISTORY_SHARED_SCOPE);
       setOutput("Ready.");
@@ -756,9 +709,6 @@ INDEX_HTML = r"""<!doctype html>
       event.preventDefault();
       verify();
     });
-    $("walletInput").addEventListener("input", syncCredentialUsername);
-    $("credentialUsername").addEventListener("input", syncWalletFromCredential);
-    $("credentialUsername").addEventListener("change", syncWalletFromCredential);
     $("reverify").addEventListener("click", reverify);
     $("clear").addEventListener("click", clearCommand);
     $("history").addEventListener("click", (event) => {
@@ -793,8 +743,6 @@ INDEX_HTML = r"""<!doctype html>
     syncAuth();
     state.command_history = loadHistory();
     renderHistory();
-    const autofillSync = window.setInterval(syncWalletFromCredential, 250);
-    window.setTimeout(() => window.clearInterval(autofillSync), 5000);
   </script>
 </body>
 </html>
@@ -1228,15 +1176,6 @@ GRID_HTML = r"""<!doctype html>
     <div class="grid-layout">
       <section class="panel controls-panel">
         <form id="gridForm" class="toolbar" autocomplete="off">
-          <input id="credentialUsername" class="credential-proxy" name="username" type="text" autocomplete="username" tabindex="-1" aria-hidden="true">
-          <div class="field">
-            <label for="walletInput">Wallet</label>
-            <input id="walletInput" name="hyper_wallet" type="search" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="0x..." data-form-type="other" data-lpignore="true">
-          </div>
-          <div class="field">
-            <label for="secret">Private Key or Agent Key</label>
-            <input id="secret" name="password" type="password" autocomplete="current-password" autocapitalize="off" spellcheck="false" placeholder="0x...">
-          </div>
           <div class="field">
             <label for="coin">Coin</label>
             <input id="coin" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="BTC" value="BTC">
@@ -1329,8 +1268,6 @@ GRID_HTML = r"""<!doctype html>
   <script>
     const $ = (id) => document.getElementById(id);
     const state = {
-      account_address: "",
-      secret_key: "",
       active_grids: [],
       selected_grid: null,
     };
@@ -1340,36 +1277,8 @@ GRID_HTML = r"""<!doctype html>
       $("status").classList.toggle("ready", ready);
     }
 
-    function isWalletAddress(value) {
-      return /^0x[a-fA-F0-9]{40}$/.test(value.trim());
-    }
-
-    function syncCredentialUsername() {
-      const wallet = $("walletInput").value.trim();
-      const credential = $("credentialUsername").value.trim();
-      if (!wallet) {
-        $("credentialUsername").value = "";
-        return;
-      }
-      if (isWalletAddress(wallet) || !credential || !isWalletAddress(credential)) {
-        $("credentialUsername").value = wallet;
-      }
-    }
-
-    function syncWalletFromCredential() {
-      const credentialUsername = $("credentialUsername").value.trim();
-      const wallet = $("walletInput").value.trim();
-      if (isWalletAddress(credentialUsername) && !isWalletAddress(wallet)) {
-        $("walletInput").value = credentialUsername;
-      }
-    }
-
     function credentials() {
-      syncWalletFromCredential();
-      syncCredentialUsername();
-      state.account_address = $("walletInput").value.trim();
-      state.secret_key = $("secret").value.trim();
-      return { account_address: state.account_address, secret_key: state.secret_key };
+      return {};
     }
 
     function setBusy(busy) {
@@ -1745,11 +1654,6 @@ GRID_HTML = r"""<!doctype html>
       $(id).addEventListener("input", updateModifyPreview);
       $(id).addEventListener("change", updateModifyPreview);
     }
-    $("walletInput").addEventListener("input", syncCredentialUsername);
-    $("credentialUsername").addEventListener("input", syncWalletFromCredential);
-    $("credentialUsername").addEventListener("change", syncWalletFromCredential);
-    const autofillSync = window.setInterval(syncWalletFromCredential, 250);
-    window.setTimeout(() => window.clearInterval(autofillSync), 5000);
   </script>
 </body>
 </html>
@@ -1828,7 +1732,7 @@ README_HTML = r"""<!doctype html>
     </section>
     <section>
       <h2>Flow</h2>
-      <p>Enter your wallet address and private key or agent key, then tap Verify. The server does not save these credentials.</p>
+      <p>The server reads the wallet address and private key or agent key from its local environment. Tap Verify to run a server-side query before sending commands.</p>
     </section>
     <section>
       <h2>Examples</h2>
@@ -1902,7 +1806,7 @@ README_HTML = r"""<!doctype html>
         <li>The web page shows the same local timestamps as the terminal.</li>
         <li><code>--level</code> sets the same-side book depth.</li>
         <li><code>--scale</code> splits a total USD amount into multiple limit orders.</li>
-        <li>Command history is saved in the browser's local storage and grouped by account, so it stays after refresh and browser relaunch.</li>
+        <li>Command history is saved in the browser's local storage, so it stays after refresh and browser relaunch.</li>
         <li>The command box is parsed as <code>hl_order.py</code> arguments, not as a shell command.</li>
       </ul>
     </section>
@@ -1968,13 +1872,33 @@ def parse_json_body(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
     return payload
 
 
-def normalize_credentials(payload: dict[str, Any]) -> tuple[str, str]:
-    account_address = str(payload.get("account_address", "")).strip()
-    secret_key = str(payload.get("secret_key", "")).strip()
+def load_server_credentials(env_path: Path = PROJECT_DIR / ".env") -> tuple[str, str]:
+    values: dict[str, str] = {}
+    if env_path.exists():
+        for raw in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key.strip().lower()] = value.strip().strip('"').strip("'")
+
+    account_address = values.get("account_address", "")
+    secret_key = values.get("secret_key", "")
+    for key in ("account_address", "secret_key"):
+        for env_key in (key, key.upper()):
+            env_value = os.environ.get(env_key)
+            if not env_value:
+                continue
+            if key == "account_address":
+                account_address = env_value.strip()
+            else:
+                secret_key = env_value.strip()
+            break
+
     if not ADDRESS_RE.fullmatch(account_address):
-        raise ValueError("invalid wallet address")
+        raise ValueError("invalid server wallet address")
     if not SECRET_RE.fullmatch(secret_key):
-        raise ValueError("invalid key")
+        raise ValueError("invalid server key")
     return account_address, secret_key
 
 
@@ -2215,7 +2139,7 @@ class SimpleHyperHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": "not found"}, HTTPStatus.NOT_FOUND)
                 return
             payload = parse_json_body(self)
-            account_address, secret_key = normalize_credentials(payload)
+            account_address, secret_key = load_server_credentials()
             if path == "/api/grids":
                 self.send_json(list_grid_batches(payload, account_address))
                 return
