@@ -95,6 +95,8 @@ from simple_hyper.runtime import load_dotenv, mask
 
 
 DEFAULT_SLIPPAGE = "0.05"
+MANUAL_ACTION_LIMIT_RETRY_DELAY_SECONDS = 10
+MANUAL_ACTION_LIMIT_MAX_RETRIES = 6
 ISOLATED_FALLBACK_LEVERAGE = 5
 SERVER_BATCH_PATH = Path(__file__).resolve().parent / "server_batch.json"
 SERVER_BATCH_LOCK_PATH = Path(__file__).resolve().parent / "server_batch.lock"
@@ -3318,6 +3320,55 @@ def status_is_post_only_reject(status: dict[str, Any] | None) -> bool:
     return is_post_only_reject_text(str(status.get("error")))
 
 
+def is_cumulative_action_limit_text(text: str) -> bool:
+    lowered = text.lower()
+    return "too many cumulative requests" in lowered and "cumulative volume traded" in lowered
+
+
+def order_result_is_retryable_action_limit(result: dict[str, Any] | None) -> bool:
+    if not isinstance(result, dict):
+        return False
+    if result.get("status") != "ok":
+        return is_cumulative_action_limit_text(str(result))
+
+    statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+    if not isinstance(statuses, list) or not statuses:
+        return False
+
+    saw_action_limit = False
+    for status in statuses:
+        if not isinstance(status, dict):
+            return False
+        error = status.get("error")
+        if not error:
+            return False
+        if not is_cumulative_action_limit_text(str(error)):
+            return False
+        saw_action_limit = True
+    return saw_action_limit
+
+
+def submit_with_action_limit_retry(
+    submit,
+    label: str,
+    *,
+    max_retries: int = MANUAL_ACTION_LIMIT_MAX_RETRIES,
+    retry_delay_seconds: int = MANUAL_ACTION_LIMIT_RETRY_DELAY_SECONDS,
+) -> dict[str, Any]:
+    attempt = 0
+    while True:
+        result = submit()
+        if not order_result_is_retryable_action_limit(result) or attempt >= max_retries:
+            return result
+        attempt += 1
+        print(f"action_limit_retry: {label} retry {attempt}/{max_retries} in {retry_delay_seconds}s")
+        log_event(
+            "action_limit_retry",
+            {"label": label, "attempt": attempt, "max_retries": max_retries, "delay_seconds": retry_delay_seconds},
+        )
+        time.sleep(retry_delay_seconds)
+
+
 def status_order_state(status: dict[str, Any] | None) -> str:
     if not isinstance(status, dict):
         return "unknown"
@@ -3535,6 +3586,7 @@ def submit_order_plans(
     price_rate: Decimal | None,
     title: str,
     update_leverage: bool = True,
+    retry_action_limit: bool = True,
 ) -> list[dict[str, Any]] | None:
     if args.explain:
         print_explain(title, plans, args, price_rate)
@@ -3555,7 +3607,13 @@ def submit_order_plans(
             raise RuntimeError(f"Failed to update {leverage_mode} leverage; order was not submitted.")
 
     requests = [order_plan_request(plan) for plan in plans]
-    result = exchange.bulk_orders(requests, grouping=grouping)
+    if retry_action_limit:
+        result = submit_with_action_limit_retry(
+            lambda: exchange.bulk_orders(requests, grouping=grouping),
+            f"bulk_orders {coin}",
+        )
+    else:
+        result = exchange.bulk_orders(requests, grouping=grouping)
     if args.verbose:
         print("order_result:", result)
     log_event("bulk_order_requests", requests)
@@ -5064,6 +5122,7 @@ def place_order(args: argparse.Namespace) -> None:
             args,
             price_rate,
             "Grid Limit Orders",
+            retry_action_limit=False,
         )
         if statuses is not None:
             row = build_grid_batch_row(args, account, coin, dex, asset, plans, statuses, amount, slippage)
@@ -5379,13 +5438,16 @@ def place_order(args: argparse.Namespace) -> None:
         if leverage_result.get("status") != "ok":
             raise RuntimeError(f"Failed to update {leverage_mode} leverage; order was not submitted.")
 
-    result = exchange.order(
-        coin,
-        is_buy,
-        float(size),
-        float(price),
-        order_type,
-        reduce_only=args.reduce_only,
+    result = submit_with_action_limit_retry(
+        lambda: exchange.order(
+            coin,
+            is_buy,
+            float(size),
+            float(price),
+            order_type,
+            reduce_only=args.reduce_only,
+        ),
+        f"order {coin}",
     )
     if args.verbose:
         print("order_result:", result)

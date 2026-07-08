@@ -19,9 +19,12 @@ from hl_order import (
     format_server_batch_rows,
     grid_query_avg_summary,
     grid_query_rows,
+    is_cumulative_action_limit_text as hl_order_is_cumulative_action_limit_text,
     is_auto_grid_gap,
+    order_result_is_retryable_action_limit,
     refresh_grid_row_strategy_params,
     resolve_grid_spacing,
+    submit_with_action_limit_retry,
     update_order_leverage,
     user_action_rate_limit_metrics,
 )
@@ -278,6 +281,83 @@ class GridAvgTests(unittest.TestCase):
         )
         self.assertTrue(is_cumulative_action_limit_text(text))
         self.assertFalse(is_cumulative_action_limit_text("Too many requests"))
+
+    def test_manual_order_action_limit_text_is_recognized(self) -> None:
+        text = (
+            "Too many cumulative requests sent (211928 > 211236) for cumulative volume traded $201237.65. "
+            "Place taker orders to free up 1 request per USDC traded."
+        )
+        self.assertTrue(hl_order_is_cumulative_action_limit_text(text))
+        self.assertFalse(hl_order_is_cumulative_action_limit_text("Too many requests"))
+
+    def test_manual_order_action_limit_retry_retries_then_succeeds(self) -> None:
+        action_limit_result = {
+            "status": "err",
+            "response": (
+                "Too many cumulative requests sent (211928 > 211236) for cumulative volume traded $201237.65. "
+                "Place taker orders to free up 1 request per USDC traded."
+            ),
+        }
+        ok_result = {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 1}}]}}}
+        results = [action_limit_result, action_limit_result, ok_result]
+        calls = []
+
+        def submit():
+            calls.append(1)
+            return results.pop(0)
+
+        with patch("hl_order.time.sleep") as sleep:
+            self.assertEqual(
+                submit_with_action_limit_retry(submit, "test", max_retries=3, retry_delay_seconds=10),
+                ok_result,
+            )
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sleep.call_count, 2)
+        sleep.assert_called_with(10)
+
+    def test_manual_bulk_partial_success_action_limit_does_not_retry(self) -> None:
+        result = {
+            "status": "ok",
+            "response": {
+                "data": {
+                    "statuses": [
+                        {"resting": {"oid": 1}},
+                        {
+                            "error": (
+                                "Too many cumulative requests sent (211928 > 211236) "
+                                "for cumulative volume traded $201237.65."
+                            )
+                        },
+                    ]
+                }
+            },
+        }
+        self.assertFalse(order_result_is_retryable_action_limit(result))
+
+    def test_manual_bulk_all_action_limit_errors_are_retryable(self) -> None:
+        result = {
+            "status": "ok",
+            "response": {
+                "data": {
+                    "statuses": [
+                        {
+                            "error": (
+                                "Too many cumulative requests sent (211928 > 211236) "
+                                "for cumulative volume traded $201237.65."
+                            )
+                        },
+                        {
+                            "error": (
+                                "Too many cumulative requests sent (211928 > 211236) "
+                                "for cumulative volume traded $201237.65."
+                            )
+                        },
+                    ]
+                }
+            },
+        }
+        self.assertTrue(order_result_is_retryable_action_limit(result))
 
     def test_min_trade_notional_rejected_is_min_order_value_error(self) -> None:
         self.assertTrue(is_min_order_value_error_text("minTradeNtlRejected"))
