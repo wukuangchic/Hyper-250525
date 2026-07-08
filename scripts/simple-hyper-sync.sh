@@ -56,6 +56,8 @@ rsync -a --delete \
   --exclude 'server_batch.json' \
   --exclude 'server_batch.lock' \
   --exclude '.server_batch.json.*.tmp' \
+  --exclude 'command_history.json' \
+  --exclude '.command_history.json.tmp' \
   "$source_dir"/ "$PROJECT_DIR"/
 
 if [ -x "$PROJECT_DIR/.venv/bin/python" ]; then
@@ -66,10 +68,12 @@ if id simplehyper >/dev/null 2>&1; then
   chown simplehyper:simplehyper "$PROJECT_DIR" 2>/dev/null || true
   [ -f "$PROJECT_DIR/server_batch.json" ] && chown simplehyper:simplehyper "$PROJECT_DIR/server_batch.json" 2>/dev/null || true
   [ -f "$PROJECT_DIR/server_batch.lock" ] && chown simplehyper:simplehyper "$PROJECT_DIR/server_batch.lock" 2>/dev/null || true
+  [ -f "$PROJECT_DIR/command_history.json" ] && chown simplehyper:simplehyper "$PROJECT_DIR/command_history.json" 2>/dev/null || true
   [ -d "$PROJECT_DIR/logs" ] && chown simplehyper:simplehyper "$PROJECT_DIR/logs" 2>/dev/null || true
   chmod 775 "$PROJECT_DIR" 2>/dev/null || true
   [ -f "$PROJECT_DIR/server_batch.json" ] && chmod 664 "$PROJECT_DIR/server_batch.json" 2>/dev/null || true
   [ -f "$PROJECT_DIR/server_batch.lock" ] && chmod 664 "$PROJECT_DIR/server_batch.lock" 2>/dev/null || true
+  [ -f "$PROJECT_DIR/command_history.json" ] && chmod 664 "$PROJECT_DIR/command_history.json" 2>/dev/null || true
   [ -d "$PROJECT_DIR/logs" ] && chmod 775 "$PROJECT_DIR/logs" 2>/dev/null || true
 fi
 

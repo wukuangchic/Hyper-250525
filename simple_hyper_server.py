@@ -15,6 +15,7 @@ import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Lock
 from typing import Any
 from urllib.parse import urlparse
 
@@ -37,6 +38,9 @@ TLS_CERT = os.environ.get("SIMPLE_HYPER_TLS_CERT", "")
 TLS_KEY = os.environ.get("SIMPLE_HYPER_TLS_KEY", "")
 COMMAND_TIMEOUT = float(os.environ.get("SIMPLE_HYPER_COMMAND_TIMEOUT", "300"))
 MAX_COMMAND_LENGTH = int(os.environ.get("SIMPLE_HYPER_MAX_COMMAND_LENGTH", "240"))
+COMMAND_HISTORY_LIMIT = int(os.environ.get("SIMPLE_HYPER_COMMAND_HISTORY_LIMIT", "30"))
+COMMAND_HISTORY_PATH = Path(os.environ.get("SIMPLE_HYPER_COMMAND_HISTORY", str(PROJECT_DIR / "command_history.json")))
+COMMAND_HISTORY_LOCK = Lock()
 ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 SECRET_RE = re.compile(r"^0x[a-fA-F0-9]{64}$")
 
@@ -470,8 +474,6 @@ INDEX_HTML = r"""<!doctype html>
     };
 
     const COMMAND_HISTORY_LIMIT = 30;
-    const COMMAND_HISTORY_STORAGE_PREFIX = "simple_hyper.command_history.v2";
-    const COMMAND_HISTORY_SHARED_SCOPE = "shared";
 
     function setStatus(text, ready = false) {
       $("status").textContent = text;
@@ -487,44 +489,50 @@ INDEX_HTML = r"""<!doctype html>
       return String(command || "").trim();
     }
 
-    function normalizeHistoryScope(scope) {
-      const normalized = normalizeHistoryCommand(scope);
-      return normalized || COMMAND_HISTORY_SHARED_SCOPE;
+    function applyHistory(items) {
+      if (!Array.isArray(items)) {
+        state.command_history = [];
+        renderHistory();
+        return;
+      }
+      state.command_history = items.map((item) => normalizeHistoryCommand(item)).filter(Boolean).slice(0, COMMAND_HISTORY_LIMIT);
+      renderHistory();
     }
 
-    function currentHistoryScope() {
-      return state.verified ? "server" : COMMAND_HISTORY_SHARED_SCOPE;
-    }
-
-    function historyStorageKey(scope = currentHistoryScope()) {
-      return `${COMMAND_HISTORY_STORAGE_PREFIX}:${normalizeHistoryScope(scope)}`;
-    }
-
-    function loadHistory(scope = currentHistoryScope()) {
+    async function loadHistory() {
       try {
-        const raw = localStorage.getItem(historyStorageKey(scope));
-        if (!raw) return [];
-        const parsed = JSON.parse(raw);
-        if (!Array.isArray(parsed)) return [];
-        return parsed.map((item) => normalizeHistoryCommand(item)).filter(Boolean).slice(0, COMMAND_HISTORY_LIMIT);
+        const response = await fetch("/api/history", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}",
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || data.ok === false) throw new Error(data.error || `HTTP ${response.status}`);
+        applyHistory(data.history);
       } catch {
-        return [];
+        applyHistory([]);
       }
     }
 
-    function saveHistory(scope = currentHistoryScope()) {
+    async function saveHistory(command) {
       try {
-        localStorage.setItem(historyStorageKey(scope), JSON.stringify(state.command_history.slice(0, COMMAND_HISTORY_LIMIT)));
+        const response = await fetch("/api/history", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ command }),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || data.ok === false) throw new Error(data.error || `HTTP ${response.status}`);
+        applyHistory(data.history);
       } catch {
-        // Ignore storage quota or privacy mode errors.
+        // Keep the optimistic in-page history if the history endpoint is briefly unavailable.
       }
     }
 
-    function setHistoryScope(scope) {
-      const nextScope = normalizeHistoryScope(scope);
+    function resetHistory() {
       state.command_history_index = -1;
       state.command_history_draft = "";
-      state.command_history = loadHistory(nextScope);
+      state.command_history = [];
       renderHistory();
     }
 
@@ -558,7 +566,7 @@ INDEX_HTML = r"""<!doctype html>
       if (existing === 0) {
         state.command_history_index = -1;
         state.command_history_draft = "";
-        saveHistory();
+        saveHistory(normalized);
         renderHistory();
         return;
       }
@@ -571,7 +579,7 @@ INDEX_HTML = r"""<!doctype html>
       }
       state.command_history_index = -1;
       state.command_history_draft = "";
-      saveHistory();
+      saveHistory(normalized);
       renderHistory();
     }
 
@@ -678,7 +686,7 @@ INDEX_HTML = r"""<!doctype html>
         }
         state.verified = true;
         syncAuth();
-        setHistoryScope("server");
+        await loadHistory();
         renderRun(data);
       } catch (error) {
         state.verified = false;
@@ -692,7 +700,7 @@ INDEX_HTML = r"""<!doctype html>
     function reverify() {
       state.verified = false;
       syncAuth();
-      setHistoryScope(COMMAND_HISTORY_SHARED_SCOPE);
+      resetHistory();
       setOutput("Ready.");
     }
 
@@ -741,7 +749,6 @@ INDEX_HTML = r"""<!doctype html>
     });
 
     syncAuth();
-    state.command_history = loadHistory();
     renderHistory();
   </script>
 </body>
@@ -1806,7 +1813,7 @@ README_HTML = r"""<!doctype html>
         <li>The web page shows the same local timestamps as the terminal.</li>
         <li><code>--level</code> sets the same-side book depth.</li>
         <li><code>--scale</code> splits a total USD amount into multiple limit orders.</li>
-        <li>Command history is saved in the browser's local storage, so it stays after refresh and browser relaunch.</li>
+        <li>Command history is saved on the server, so the same history appears across devices using this server.</li>
         <li>The command box is parsed as <code>hl_order.py</code> arguments, not as a shell command.</li>
       </ul>
     </section>
@@ -1870,6 +1877,63 @@ def parse_json_body(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("json body must be an object")
     return payload
+
+
+def normalize_history_command(raw: Any) -> str:
+    command = str(raw or "").strip()
+    if not command:
+        return ""
+    command = " ".join(command.splitlines()).strip()
+    if len(command) > MAX_COMMAND_LENGTH:
+        raise ValueError("command is too long")
+    return command
+
+
+def normalize_history_items(items: Any) -> list[str]:
+    if not isinstance(items, list):
+        return []
+    history: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        command = normalize_history_command(item)
+        if not command or command in seen:
+            continue
+        seen.add(command)
+        history.append(command)
+        if len(history) >= COMMAND_HISTORY_LIMIT:
+            break
+    return history
+
+
+def load_command_history() -> list[str]:
+    with COMMAND_HISTORY_LOCK:
+        try:
+            raw = json.loads(COMMAND_HISTORY_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        if isinstance(raw, dict):
+            raw = raw.get("history")
+        return normalize_history_items(raw)
+
+
+def save_command_history(history: list[str]) -> None:
+    with COMMAND_HISTORY_LOCK:
+        COMMAND_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"history": normalize_history_items(history), "updated_at": int(time.time())}
+        tmp_path = COMMAND_HISTORY_PATH.with_name(f".{COMMAND_HISTORY_PATH.name}.tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp_path, COMMAND_HISTORY_PATH)
+
+
+def append_command_history(command: Any) -> list[str]:
+    normalized = normalize_history_command(command)
+    history = load_command_history()
+    if normalized:
+        history = [item for item in history if item != normalized]
+        history.insert(0, normalized)
+        history = history[:COMMAND_HISTORY_LIMIT]
+        save_command_history(history)
+    return history
 
 
 def load_server_credentials(env_path: Path = PROJECT_DIR / ".env") -> tuple[str, str]:
@@ -2135,10 +2199,15 @@ class SimpleHyperHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         try:
-            if path not in {"/api/run", "/api/grid", "/api/grids"}:
+            if path not in {"/api/run", "/api/grid", "/api/grids", "/api/history"}:
                 self.send_json({"ok": False, "error": "not found"}, HTTPStatus.NOT_FOUND)
                 return
             payload = parse_json_body(self)
+            if path == "/api/history":
+                command = payload.get("command")
+                history = append_command_history(command) if command is not None else load_command_history()
+                self.send_json({"ok": True, "history": history, "count": len(history)})
+                return
             account_address, secret_key = load_server_credentials()
             if path == "/api/grids":
                 self.send_json(list_grid_batches(payload, account_address))

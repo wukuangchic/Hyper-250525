@@ -533,6 +533,7 @@ https://服务器地址:8787
 - 服务器本地 `.env` 或环境变量保存 `account_address` 和 `secret_key`。
 - 网页不显示、不接收、不保存私钥；浏览器请求只发送命令和页面参数。
 - 后端每次执行时从服务器本地读取凭证，再只放进子进程环境变量。
+- 命令历史保存在服务器本地 `command_history.json`，不同设备访问同一服务器会显示同一份历史。
 - 后端用 `shlex.split()` 解析输入框命令，不走 shell。
 - 命令不含 `--dry-run` 且不是 `query` 时，前端会弹出真实提交确认。
 - 服务日志不记录请求 body，`hl_order.py` 日志也不会写入密钥。
@@ -608,6 +609,7 @@ trail_worker.py          # server_batch.json 的 trail 任务维护器
 simple_hyper/            # 可复用 Python 业务代码
 simple_hyper_server.py   # 手机网页控制台
 server_batch.json        # 本地/服务器运行时 batch 状态，不提交 Git
+command_history.json     # 网页命令历史，不提交 Git
 scripts/                 # 运维脚本
 systemd/                 # systemd 单元
 requirements.txt         # Python 依赖

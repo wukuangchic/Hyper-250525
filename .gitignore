@@ -17,6 +17,7 @@ __pycache__/
 logs/
 server_batch.json
 server_batch.lock
+command_history.json
 *.log
 
 # Dedicated zsh terminal state
