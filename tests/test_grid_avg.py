@@ -2712,6 +2712,53 @@ class GridAvgTests(unittest.TestCase):
         self.assertTrue(changed)
         self.assertEqual([entry["price"] for entry in row["levels"]], ["99", "98"])
 
+    def test_duplicate_paused_replacement_keeps_canonical_status(self) -> None:
+        row = {
+            "type": "grid",
+            "target_orders_per_side": 1,
+            "gap_rate": "0.01",
+            "levels": [
+                {
+                    "side": "buy",
+                    "status": "paused_action_limit",
+                    "oid": None,
+                    "price": "29172",
+                    "size": "0.0004",
+                    "replacement_order": True,
+                    "paused_at": 1,
+                },
+                {
+                    "side": "buy",
+                    "status": "paused_replacement",
+                    "oid": None,
+                    "price": "29172",
+                    "size": "0.0004",
+                    "replacement_order": True,
+                    "paused_at": 2,
+                },
+                {
+                    "side": "sell",
+                    "status": "paused_action_limit",
+                    "oid": None,
+                    "price": "29172",
+                    "size": "0.0004",
+                    "replacement_order": True,
+                    "paused_at": 1,
+                },
+            ],
+        }
+
+        changed = prune_grid_levels(row)
+
+        self.assertTrue(changed)
+        self.assertEqual(
+            [(entry["side"], entry["status"], entry["price"]) for entry in row["levels"]],
+            [
+                ("buy", "paused_replacement", "29172"),
+                ("sell", "paused_action_limit", "29172"),
+            ],
+        )
+
     def test_paused_replacement_does_not_count_as_active_oid(self) -> None:
         row = {
             "levels": [

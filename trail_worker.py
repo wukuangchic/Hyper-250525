@@ -4047,6 +4047,40 @@ def grid_level_updated_at(entry: dict[str, Any]) -> int:
     return 0
 
 
+def grid_paused_dedupe_key(entry: dict[str, Any]) -> tuple[str, str, str, bool]:
+    return (
+        str(entry.get("side")),
+        str(entry.get("price", entry.get("limit_px", ""))),
+        str(entry.get("size", "")),
+        bool(entry.get("reduce_only", False)),
+    )
+
+
+def replacement_pause_keep_score(entry: dict[str, Any]) -> tuple[int, int]:
+    status = str(entry.get("status", ""))
+    status_priority = {
+        GRID_REPLACEMENT_PAUSE_STATUS: 4,
+        "paused_margin": 3,
+        "skipped_account_margin": 3,
+        "paused_limit": 2,
+        GRID_ACTIVE_CAP_PAUSE_STATUS: 2,
+        "refresh_reduce_only": 2,
+        GRID_ACTION_LIMIT_PAUSE_STATUS: 1,
+        "paused_action_rate_limit": 1,
+    }.get(status, 0)
+    return status_priority, grid_level_updated_at(entry)
+
+
+def dedupe_paused_replacement_orders(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    kept_by_key: dict[tuple[str, str, str, bool], dict[str, Any]] = {}
+    for entry in entries:
+        key = grid_paused_dedupe_key(entry)
+        current = kept_by_key.get(key)
+        if current is None or replacement_pause_keep_score(entry) > replacement_pause_keep_score(current):
+            kept_by_key[key] = entry
+    return [entry for entry in entries if kept_by_key.get(grid_paused_dedupe_key(entry)) is entry]
+
+
 def prune_grid_levels(row: dict[str, Any]) -> bool:
     if row.get("type") != "grid":
         return False
@@ -4081,11 +4115,9 @@ def prune_grid_levels(row: dict[str, Any]) -> bool:
         side: len(active_grid_oids(row, side))
         for side in ("buy", "sell")
     }
-    kept_paused: list[dict[str, Any]] = [
-        entry
-        for entry in paused_levels
-        if bool(entry.get("replacement_order"))
-    ]
+    kept_paused: list[dict[str, Any]] = dedupe_paused_replacement_orders(
+        [entry for entry in paused_levels if bool(entry.get("replacement_order"))]
+    )
     for side in ("buy", "sell"):
         keep_count = max(0, target_per_side - active_counts[side])
         if keep_count == 0:
@@ -4102,12 +4134,7 @@ def prune_grid_levels(row: dict[str, Any]) -> bool:
         seen: set[tuple[str, str, str, bool]] = set()
         side_kept = 0
         for entry in side_paused:
-            key = (
-                str(entry.get("side")),
-                str(entry.get("price", entry.get("limit_px", ""))),
-                str(entry.get("size", "")),
-                bool(entry.get("reduce_only", False)),
-            )
+            key = grid_paused_dedupe_key(entry)
             if key in seen:
                 continue
             seen.add(key)
