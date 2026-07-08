@@ -211,6 +211,7 @@ BTC grid --limit -300 0
   - P2：非关键整理动作。当前包括 dense regrid 和 replacement rebalance；只有执行完 P0/P1 后预估 action headroom 仍大于 `100` 才会运行。
 - P1 预算每轮都会预先计算，不等到确认超限后才计算。未超限时本轮共享 P1 预算为 `max(1, headroom - 1)`，即至少放行 1 次，headroom 足够时预留 1 个 action headroom；已超限时若 `deficit < 3` 仍给 1 次，若 `deficit >= 3` 则按 `1 / ln(deficit)` 的概率给 1 次，否则本轮 P1 为 0。这样 deficit 回到限额内时会按剩余 headroom 逐步恢复。
 - Worker 每轮会先把币种顺序打乱，再按全局动作优先级分桶扫描所有 grid：`P0` > 最新成交 `replacement_pending` > 旧 `replacement_order` 恢复 > P1 撤单 > topup > 普通 paused 恢复 > `P2`。每个桶都会跨所有币种扫完后才进入下一桶，因此单个币种的 topup 不会抢在其他币种的 replacement 前面消耗共享 P1 预算；最终 note 记录整轮累计动作数。
+- P1 因 action limit 没有执行时，worker 只记录 `action_limit_deferred_at` / `last_error`，保留原 `status` 和 `oid`，不会再把订单改成 `paused_action_limit` 或 `paused_action_rate_limit`；历史保存的旧状态仍按兼容逻辑识别。
 - paused 档位恢复提交前会先用当前 best bid/ask（读取失败时用 mid）判断限价是否会立即成交；会穿盘口的 paused 单只本轮延后恢复，不提交给交易所，避免反复触发 ALO 拒单。
 - 同一轮同一侧的成交对向单不限制张数，会处理全部待补成交；整批对向单只算一次优先级额度，处理后该侧本轮不再提交其他类型的新单。
 

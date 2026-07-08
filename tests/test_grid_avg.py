@@ -369,12 +369,13 @@ class GridAvgTests(unittest.TestCase):
     def test_min_trade_notional_rejected_is_min_order_value_error(self) -> None:
         self.assertTrue(is_min_order_value_error_text("minTradeNtlRejected"))
 
-    def test_action_limit_pause_marks_order_without_oid(self) -> None:
+    def test_action_limit_defer_keeps_order_status_and_oid(self) -> None:
         order = {"status": "active", "oid": 123, "side": "buy"}
         pause_grid_order_for_action_limit(order, 456, "Too many cumulative requests sent", old_oid=123)
-        self.assertEqual(order["status"], GRID_ACTION_LIMIT_PAUSE_STATUS)
-        self.assertIsNone(order["oid"])
-        self.assertEqual(order["paused_at"], 456)
+        self.assertEqual(order["status"], "active")
+        self.assertEqual(order["oid"], 123)
+        self.assertEqual(order["action_limit_deferred_at"], 456)
+        self.assertEqual(order["action_limit_deferred_status"], "active")
         self.assertEqual(order["action_limit_deferred_oid"], 123)
 
     def test_grid_gap_zero_requests_default_spacing(self) -> None:

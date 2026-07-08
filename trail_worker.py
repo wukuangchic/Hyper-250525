@@ -173,11 +173,9 @@ def pause_grid_order_for_action_limit(
     error_text: str,
     old_oid: int | None = None,
 ) -> None:
-    order["status"] = GRID_ACTION_LIMIT_PAUSE_STATUS
-    order["oid"] = None
+    order["action_limit_deferred_status"] = order.get("status")
     order["last_error"] = error_text
-    order["paused_at"] = now
-    order["action_limit_paused_at"] = now
+    order["action_limit_deferred_at"] = now
     if old_oid is not None:
         order["action_limit_deferred_oid"] = old_oid
 
@@ -3333,7 +3331,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                     newly_filled.append(entry)
             else:
                 deferred_status = str(entry.get("status") or "recovery_deferred")
-                if deferred_status == GRID_ACTION_LIMIT_PAUSE_STATUS:
+                if entry.get("action_limit_deferred_at") == now:
                     entry["action_limit_deferred_oid"] = old_oid
                 else:
                     entry["status"] = "recovery_deferred"
