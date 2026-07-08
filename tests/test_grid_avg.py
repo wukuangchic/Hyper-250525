@@ -31,6 +31,7 @@ from hl_order import (
 from trail_worker import (
     active_grid_oids,
     action_limit_p1_budget_for_deficit,
+    action_limit_p1_budget_for_headroom,
     action_limit_p1_budget_remaining,
     batch_row_raw_coin,
     build_grid_panic_reduce_order,
@@ -144,6 +145,12 @@ class GridAvgTests(unittest.TestCase):
         with patch("trail_worker.random.random", return_value=0.99):
             self.assertEqual(action_limit_p1_budget_for_deficit(1779), 0)
 
+    def test_action_limit_p1_budget_for_headroom_leaves_one_request(self) -> None:
+        self.assertEqual(action_limit_p1_budget_for_headroom(0), 1)
+        self.assertEqual(action_limit_p1_budget_for_headroom(1), 1)
+        self.assertEqual(action_limit_p1_budget_for_headroom(2), 1)
+        self.assertEqual(action_limit_p1_budget_for_headroom(100), 99)
+
     def test_run_once_scans_all_grids_by_global_action_phase(self) -> None:
         rows = [
             {"type": "grid", "status": "active", "coin": "BTC", "levels": []},
@@ -201,12 +208,12 @@ class GridAvgTests(unittest.TestCase):
         cache: dict = {}
 
         self.assertIsNone(precheck_action_limit(info, "0xabc", cache, "mainnet", 123))
-        self.assertEqual(action_limit_p1_budget_remaining(cache), 1)
+        self.assertEqual(action_limit_p1_budget_remaining(cache), 4)
         consume_action_limit_p1_budget(cache)
-        self.assertEqual(action_limit_p1_budget_remaining(cache), 0)
+        self.assertEqual(action_limit_p1_budget_remaining(cache), 3)
         self.assertIsNone(precheck_action_limit(info, "0xabc", cache, "mainnet", 124))
 
-        self.assertEqual(action_limit_p1_budget_remaining(cache), 0)
+        self.assertEqual(action_limit_p1_budget_remaining(cache), 3)
         self.assertEqual(info.calls, 1)
 
     def test_action_limit_p1_budget_gates_cancels(self) -> None:
@@ -784,6 +791,101 @@ class GridAvgTests(unittest.TestCase):
         reversal = next(entry for entry in updated["levels"] if entry.get("panic_reversal_order"))
         self.assertEqual(reversal["status"], "active")
         self.assertEqual(reversal["oid"], 11)
+
+    def test_panic_reversal_waits_and_retries_action_limit_once(self) -> None:
+        class FakeInfo:
+            def post(self, path, payload):
+                return {"nRequestsUsed": 9, "nRequestsCap": 10}
+
+            def meta(self, dex=""):
+                return {"universe": [{"name": "BTC", "szDecimals": 2, "maxLeverage": 20}]}
+
+            def all_mids(self, dex=""):
+                return {"BTC": "100"}
+
+            def l2_snapshot(self, coin):
+                return {"levels": [[{"px": "99"}], [{"px": "101"}]]}
+
+            def user_state(self, account, dex=""):
+                return {
+                    "assetPositions": [
+                        {
+                            "position": {
+                                "coin": "BTC",
+                                "szi": "-4",
+                                "positionValue": "400",
+                                "liquidationPx": "130",
+                                "returnOnEquity": "-0.50",
+                            }
+                        }
+                    ]
+                }
+
+            def spot_user_state(self, account):
+                return {
+                    "balances": [{"token": 0, "coin": "USDC", "total": "100"}],
+                    "tokenToAvailableAfterMaintenance": [[0, "100"]],
+                }
+
+            def frontend_open_orders(self, account, dex=""):
+                return [{"coin": "BTC", "oid": 1}]
+
+            def user_fills_by_time(self, account, start_ms, end_ms):
+                return []
+
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.orders = []
+
+            def _slippage_price(self, coin, is_buy, slippage, reference_price):
+                side_factor = Decimal("1.001") if is_buy else Decimal("0.999")
+                return Decimal(str(reference_price)) * side_factor
+
+            def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
+                self.orders.append((coin, is_buy, Decimal(str(limit_px)), order_type, reduce_only))
+                if len(self.orders) == 1:
+                    return {"status": "ok", "response": {"data": {"statuses": [{"filled": {"oid": 10}}]}}}
+                if len(self.orders) == 2:
+                    return {
+                        "status": "err",
+                        "response": (
+                            "Too many cumulative requests sent (10 > 9) for cumulative volume traded $100. "
+                            "Place taker orders to free up 1 request per USDC traded."
+                        ),
+                    }
+                return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 11}}]}}}
+
+        info = FakeInfo()
+        exchange = FakeExchange()
+        row = {
+            "coin": "BTC",
+            "network": "mainnet",
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "max_position_value": "1",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+            "slippage": "0.001",
+            "sz_decimals": 2,
+            "levels": [
+                {"side": "buy", "status": "active", "oid": 1, "price": "90", "size": "1", "reduce_only": True}
+            ],
+        }
+
+        with (
+            patch("trail_worker.build_clients", return_value=(info, exchange, "acct", "signer", {})),
+            patch("trail_worker.time.sleep") as sleep_mock,
+        ):
+            updated, changed = maintain_grid(row, {"now": 123, "grid_action_phase": "p0"})
+
+        self.assertTrue(changed)
+        sleep_mock.assert_called_once_with(10)
+        self.assertEqual(len(exchange.orders), 3)
+        reversal = next(entry for entry in updated["levels"] if entry.get("panic_reversal_order"))
+        self.assertEqual(reversal["status"], "active")
+        self.assertEqual(reversal["oid"], 11)
+        self.assertEqual(reversal["panic_reversal_action_limit_wait_seconds"], 10)
+        self.assertEqual(reversal["panic_reversal_action_limit_wait_at"], 123)
 
     def test_refresh_reduce_only_cancel_becomes_non_reduce_paused_replacement(self) -> None:
         entry = {

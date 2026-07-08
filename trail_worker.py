@@ -73,6 +73,7 @@ GRID_NEAR_REGRID_STALE_GAP_MULTIPLE = Decimal("30")
 GRID_NEAR_REGRID_TARGET_GAP_MULTIPLE = Decimal("15")
 GRID_PANIC_RATIO_THRESHOLD = Decimal("100")
 GRID_PANIC_REVERSAL_GAP_MULTIPLIER = Decimal("2.71")
+GRID_PANIC_REVERSAL_ACTION_LIMIT_WAIT_SECONDS = 10
 GRID_PANIC_REDUCE_MIN_NOTIONAL = MIN_NOTIONAL * Decimal("1.10")
 GRID_ROE_DENSITY_THRESHOLD = Decimal("-0.10")
 GRID_ROE_STOP_THRESHOLD = Decimal("-0.40")
@@ -247,6 +248,10 @@ def action_limit_p1_budget_for_deficit(deficit: int) -> int:
     return GRID_ACTION_LIMIT_P1_BUDGET_PER_RUN if random.random() < float(probability) else 0
 
 
+def action_limit_p1_budget_for_headroom(headroom: int) -> int:
+    return max(GRID_ACTION_LIMIT_P1_BUDGET_PER_RUN, headroom - 1)
+
+
 def user_action_rate_limit(info: Any, account: str, cache: dict[str, Any], network: str) -> dict[str, Any] | None:
     rate_cache = cache.setdefault("user_action_rate_limits", {})
     rate_key = (network, account)
@@ -288,7 +293,7 @@ def precheck_action_limit(info: Any, account: str, cache: dict[str, Any], networ
         return error_text
     if cap > 0 and not cache.get("action_limit_p1_budget_initialized"):
         headroom = max(0, cap - used)
-        cache["action_limit_p1_budget_remaining"] = min(GRID_ACTION_LIMIT_P1_BUDGET_PER_RUN, headroom)
+        cache["action_limit_p1_budget_remaining"] = action_limit_p1_budget_for_headroom(headroom)
         cache["action_limit_p1_budget_initialized"] = True
         cache["action_limit_headroom"] = headroom
     return None
@@ -2379,6 +2384,8 @@ def submit_grid_order_entry(
                         pause_grid_margin_side(row, side, now, position_value)
                         pause_grid_margin_side_entries(row, side, now, error_text)
                     return False
+                if is_cumulative_action_limit_text(error_text):
+                    raise RuntimeError(error_text)
                 if skip_grid_exchange_reject(order, error_text, now):
                     return False
                 if not is_min_order_value_error_text(error_text) or order.get("resized_min_retry_at"):
@@ -2434,6 +2441,8 @@ def submit_grid_order_entry(
                 pause_grid_margin_side(row, side, now, position_value)
                 pause_grid_margin_side_entries(row, side, now, error_text)
             return False
+        if is_cumulative_action_limit_text(error_text):
+            raise RuntimeError(error_text)
         if skip_grid_exchange_reject(order, error_text, now):
             return False
         if not is_min_order_value_error_text(error_text) or order.get("resized_min_retry_at"):
@@ -3217,8 +3226,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         return submitted
 
     def submit_panic_reversal(order: dict[str, Any]) -> bool:
-        try:
-            submitted = submit_grid_order_entry(
+        def submit_once() -> bool:
+            return submit_grid_order_entry(
                 exchange,
                 coin,
                 order,
@@ -3234,13 +3243,34 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 margin_blocked_sides=None,
                 open_orders=current_open_orders,
             )
+
+        try:
+            submitted = submit_once()
         except RuntimeError as exc:
             error_text = str(exc)
             if not is_cumulative_action_limit_text(error_text):
                 raise
-            mark_action_limit_hit(cache, error_text, now)
-            pause_grid_order_for_action_limit(order, now, error_text)
-            return False
+            wait_seconds = GRID_PANIC_REVERSAL_ACTION_LIMIT_WAIT_SECONDS
+            order["panic_reversal_action_limit_wait_seconds"] = wait_seconds
+            order["panic_reversal_action_limit_wait_at"] = now
+            time.sleep(wait_seconds)
+            if isinstance(cache, dict):
+                cache.pop("action_limit_error", None)
+                cache.pop("action_limit_at", None)
+                cache.pop("action_limit_deficit", None)
+                rate_cache = cache.get("user_action_rate_limits")
+                if isinstance(rate_cache, dict):
+                    rate_cache.pop((network, account), None)
+            try:
+                submitted = submit_once()
+            except RuntimeError as retry_exc:
+                retry_error_text = str(retry_exc)
+                if not is_cumulative_action_limit_text(retry_error_text):
+                    raise
+                mark_action_limit_hit(cache, retry_error_text, now)
+                pause_grid_order_for_action_limit(order, now, retry_error_text)
+                order["panic_reversal_action_limit_retry_error"] = retry_error_text
+                return False
         if submitted:
             consume_action_limit_headroom(cache)
             side = str(order.get("side") or "")

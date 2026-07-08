@@ -209,7 +209,7 @@ BTC grid --limit -300 0
   - P0：必要安全动作，不占共享 P1 预算。当前包括 `panic_ratio` 触发的 IOC reduce-only 减仓、`paused_risk_density` 必要撤单、`paused_roe` 必要撤单；panic 后的反向普通挂单也在这段流程内，但仍会经过自身的 ALO、仓位和保证金判断。
   - P1：共享预算动作。当前包括成交后的 replacement 提交、`paused_limit` 撤单、`paused_active_cap` 撤单、`refresh_reduce_only` 撤单、普通补档和 paused 恢复；同一轮所有 P1 动作共用 `action_limit_p1_budget`。
   - P2：非关键整理动作。当前包括 dense regrid 和 replacement rebalance；只有执行完 P0/P1 后预估 action headroom 仍大于 `100` 才会运行。
-- P1 预算每轮都会预先计算，不等到确认超限后才计算。未超限时最多给 1 次，且不会超过当前 headroom；已超限时若 `deficit < 3` 仍给 1 次，若 `deficit >= 3` 则按 `1 / ln(deficit)` 的概率给 1 次，否则本轮 P1 为 0。这样 deficit 回到低位时也会继续按每轮最多 1 次恢复，不会集中补发请求。
+- P1 预算每轮都会预先计算，不等到确认超限后才计算。未超限时本轮共享 P1 预算为 `max(1, headroom - 1)`，即至少放行 1 次，headroom 足够时预留 1 个 action headroom；已超限时若 `deficit < 3` 仍给 1 次，若 `deficit >= 3` 则按 `1 / ln(deficit)` 的概率给 1 次，否则本轮 P1 为 0。这样 deficit 回到限额内时会按剩余 headroom 逐步恢复。
 - Worker 每轮会先把币种顺序打乱，再按全局动作优先级分桶扫描所有 grid：`P0` > 最新成交 `replacement_pending` > 旧 `replacement_order` 恢复 > P1 撤单 > topup > 普通 paused 恢复 > `P2`。每个桶都会跨所有币种扫完后才进入下一桶，因此单个币种的 topup 不会抢在其他币种的 replacement 前面消耗共享 P1 预算；最终 note 记录整轮累计动作数。
 - paused 档位恢复提交前会先用当前 best bid/ask（读取失败时用 mid）判断限价是否会立即成交；会穿盘口的 paused 单只本轮延后恢复，不提交给交易所，避免反复触发 ALO 拒单。
 - 同一轮同一侧的成交对向单不限制张数，会处理全部待补成交；整批对向单只算一次优先级额度，处理后该侧本轮不再提交其他类型的新单。
@@ -257,7 +257,7 @@ BTC --cancel grid
 - 为避免异常循环无限堆积可恢复记录，`levels` 内同侧 active、pending、recovery_deferred 和 paused 合计最多保留 1024 张；历史记录不占这个名额，仍由独立历史裁剪控制。超过时会优先清理普通 paused，必要时先撤交易所 active 挂单再从本地清除，`replacement_order` 最后才会被清。
 - 全仓或逐仓的加仓方向若被交易所以保证金不足拒绝，worker 会对该方向冷却 10 分钟，本轮不再继续试单；减仓方向照常维护。仓位缩小会提前解除冷却，否则到期后探测一次。
 - reduce-only 子单的活动数量总和不会超过当前可减仓数量；交易所因可减仓数量不足自动取消的 `reduceOnlyCanceled` 不会被当作手动撤单反复补回。
-- 单边漂移接近爆仓时会主动泄压：空仓用 `(liqPx - mid) / (mid - 最近active买入减仓价)`，多仓用 `(mid - liqPx) / (最近active卖出减仓价 - mid)` 计算 `panic_ratio`；若低于 `panic_ratio_threshold`（默认 `100`），Worker 会用 IOC + 滑点保护市价 reduce-only 减一单对应方向的 grid base size。减仓成功后会在当轮 mid 远离 `2.71 * gap` 的位置直接提交一张普通反向 grid 单（后续仍按普通 `gap_rate` 维护），这张反向单和 panic reduce 同轮处理，不走下一轮的保证金、ROE 或仓位上限恢复限制，也不把 panic 减仓本身作为普通 fill 近距离回补。
+- 单边漂移接近爆仓时会主动泄压：空仓用 `(liqPx - mid) / (mid - 最近active买入减仓价)`，多仓用 `(mid - liqPx) / (最近active卖出减仓价 - mid)` 计算 `panic_ratio`；若低于 `panic_ratio_threshold`（默认 `100`），Worker 会用 IOC + 滑点保护市价 reduce-only 减一单对应方向的 grid base size。减仓成功后会在当轮 mid 远离 `2.71 * gap` 的位置直接提交一张普通反向 grid 单（后续仍按普通 `gap_rate` 维护），这张反向单和 panic reduce 同轮处理，不走下一轮的保证金、ROE 或仓位上限恢复限制；若提交遇到 cumulative action limit，会等待 10 秒后重试一次，也不把 panic 减仓本身作为普通 fill 近距离回补。
 - 每轮只查询一次账户 USDC 的“维护保证金后余量 / 总余额”。比例低于 `70%` 时不修改已有挂单，但所有新 grid 子单必须减少当前净仓位并强制使用 reduce-only；会加仓或反手的新单直接跳过该价格。比例恢复到 `70%` 后，Worker 按当时盘口重新计算缺失档位，并保持每轮每方向最多新增一张，不恢复保护期间的旧价格。
 - grid/trail 创建、修改和取消与 Worker 共用 `server_batch.lock`；命令执行期间 Worker 会跳过该轮，避免旧任务快照覆盖刚完成的修改，不需要手动暂停定时器。
 - 旧版保存的非 ALO grid 子单在 Worker 再次提交时会自动刷新为 ALO；历史 post-only 拒绝仍按可恢复状态兼容处理。
