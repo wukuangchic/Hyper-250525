@@ -474,6 +474,18 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertTrue(grid_row_recoverable_from_error(row))
 
+    def test_isolated_opening_leverage_error_is_recoverable(self) -> None:
+        row = {
+            "type": "grid",
+            "status": "error",
+            "coin": "xyz:JPY",
+            "raw_coin": "JPY",
+            "dex": "xyz",
+            "error": "Failed to set isolated opening leverage to 5x for xyz:JPY; order was not submitted.",
+        }
+
+        self.assertTrue(grid_row_recoverable_from_error(row))
+
     def test_grid_detail_rows_sort_all_sides_by_price_desc(self) -> None:
         row = {
             "levels": [

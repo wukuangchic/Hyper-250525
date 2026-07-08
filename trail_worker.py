@@ -352,6 +352,14 @@ def transient_note(status_code: int) -> str:
     return "transient network error; will retry"
 
 
+def is_isolated_opening_leverage_error_text(text: str) -> bool:
+    lowered = text.lower()
+    return (
+        "failed to set isolated opening leverage" in lowered
+        and "order was not submitted" in lowered
+    )
+
+
 def grid_row_recoverable_from_error(row: dict[str, Any]) -> bool:
     if row.get("type") != "grid":
         return False
@@ -372,6 +380,7 @@ def grid_row_recoverable_from_error(row: dict[str, Any]) -> bool:
         or is_min_order_value_error_text(error_text)
         or is_reduce_only_would_increase_text(error_text)
         or is_insufficient_margin_text(error_text)
+        or is_isolated_opening_leverage_error_text(error_text)
         or (
             "unknown perp coin" in error_text.lower()
             and batch_row_raw_coin(row) != str(row.get("raw_coin") or row.get("coin") or "")
