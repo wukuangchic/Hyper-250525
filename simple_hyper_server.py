@@ -637,6 +637,19 @@ INDEX_HTML = r"""<!doctype html>
       return data;
     }
 
+    async function apiVerify() {
+      const response = await fetch("/api/verify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || data.ok === false) {
+        throw new Error(data.error || `HTTP ${response.status}`);
+      }
+      return data;
+    }
+
     function renderRun(data) {
       const shownCommand = data.command ? `$ ${data.command}\n\n` : "";
       const elapsed = data.elapsed_ms === undefined ? "" : `\n\n[${data.elapsed_ms} ms]`;
@@ -680,14 +693,11 @@ INDEX_HTML = r"""<!doctype html>
     async function verify() {
       try {
         setBusy(true);
-        const data = await apiRun("query");
-        if (!data.command_ok) {
-          throw new Error(data.output || "Verification failed.");
-        }
+        await apiVerify();
         state.verified = true;
         syncAuth();
         await loadHistory();
-        renderRun(data);
+        setOutput("Verified. Ready.");
       } catch (error) {
         state.verified = false;
         syncAuth();
@@ -1861,6 +1871,10 @@ def json_bytes(payload: dict[str, Any], status: int = HTTPStatus.OK) -> tuple[in
     return status, json.dumps(payload, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8"
 
 
+def mask_account(account_address: str) -> str:
+    return f"{account_address[:6]}...{account_address[-4:]}" if account_address else ""
+
+
 def parse_json_body(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
     raw_length = handler.headers.get("Content-Length", "0")
     try:
@@ -2199,7 +2213,7 @@ class SimpleHyperHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         try:
-            if path not in {"/api/run", "/api/grid", "/api/grids", "/api/history"}:
+            if path not in {"/api/run", "/api/grid", "/api/grids", "/api/history", "/api/verify"}:
                 self.send_json({"ok": False, "error": "not found"}, HTTPStatus.NOT_FOUND)
                 return
             payload = parse_json_body(self)
@@ -2207,6 +2221,10 @@ class SimpleHyperHandler(BaseHTTPRequestHandler):
                 command = payload.get("command")
                 history = append_command_history(command) if command is not None else load_command_history()
                 self.send_json({"ok": True, "history": history, "count": len(history)})
+                return
+            if path == "/api/verify":
+                account_address, _secret_key = load_server_credentials()
+                self.send_json({"ok": True, "account": mask_account(account_address)})
                 return
             account_address, secret_key = load_server_credentials()
             if path == "/api/grids":
