@@ -96,6 +96,7 @@ GRID_ACTIVE_CAP_PAUSE_STATUS = "paused_active_cap"
 GRID_ACTION_LIMIT_PAUSE_STATUS = "paused_action_limit"
 GRID_ACTION_LIMIT_P1_BUDGET_PER_RUN = 1
 GRID_ACTION_LIMIT_P2_HEADROOM_THRESHOLD = 100
+GRID_REPLACEMENT_ACTIVE_CAP_SUBMIT_THRESHOLD = 64
 GRID_ACTION_PHASE_P0 = "p0"
 GRID_ACTION_PHASE_P1_LATEST_REPLACEMENT = "p1_latest_replacement"
 GRID_ACTION_PHASE_P1_PAUSED_REPLACEMENT = "p1_paused_replacement"
@@ -2131,6 +2132,15 @@ def grid_active_cap_restore_allowed(
     return id(entry) in keep_ids
 
 
+def replacement_active_cap_submit_allowed(
+    row: dict[str, Any],
+    side: str,
+    threshold: int = GRID_REPLACEMENT_ACTIVE_CAP_SUBMIT_THRESHOLD,
+) -> bool:
+    """Keep replacement orders pending while a side is badly over the active cap."""
+    return len(active_grid_entries(row, side)) <= threshold
+
+
 def next_depth_order(
     row: dict[str, Any],
     coin: str,
@@ -3191,6 +3201,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
 
     def submit_replacement(order: dict[str, Any]) -> bool:
         side = str(order.get("side") or "")
+        if not replacement_active_cap_submit_allowed(row, side):
+            return False
         existing_action_limit = action_limit_error(cache)
         budget_tracked = p1_budget_tracked(cache)
         if action_limit_p1_enabled(cache) and budget_tracked and not p1_budget_available(cache):

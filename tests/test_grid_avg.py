@@ -49,6 +49,7 @@ from trail_worker import (
     grid_row_recoverable_from_error,
     grid_active_cap_restore_allowed,
     grid_active_cap_pause_candidates,
+    replacement_active_cap_submit_allowed,
     grid_margin_gap_multiplier,
     grid_margin_pause_active,
     find_current_position_from_state,
@@ -1709,6 +1710,25 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertFalse(grid_active_cap_restore_allowed(row, should_wait, "sell"))
         self.assertTrue(grid_active_cap_restore_allowed(row, should_restore, "sell"))
+
+    def test_replacement_waits_until_active_side_is_at_most_64(self) -> None:
+        row = {
+            "levels": [
+                {
+                    "side": "sell",
+                    "status": "active",
+                    "oid": oid,
+                    "is_buy": False,
+                    "price": str(100 + oid),
+                    "size": "1",
+                }
+                for oid in range(65)
+            ]
+        }
+
+        self.assertFalse(replacement_active_cap_submit_allowed(row, "sell"))
+        row["levels"].pop()
+        self.assertTrue(replacement_active_cap_submit_allowed(row, "sell"))
 
     def test_replacement_rebalance_swaps_toward_logarithmic_distribution(self) -> None:
         row = {
