@@ -2871,6 +2871,9 @@ def cancel_grid_entries_with_p1_budget(
 ) -> int:
     if isinstance(cache, dict) and cache.get("grid_action_phase") not in (None, GRID_ACTION_PHASE_P1_CANCELS):
         return 0
+    entries, deferred = prepare_grid_cancel_entries(row, entries, now, note, current_mid, cache)
+    if deferred and isinstance(cache, dict):
+        cache["pending_cancel_changed"] = True
     budget_tracked = p1_budget_tracked(cache)
     if budget_tracked:
         if not action_limit_p1_enabled(cache):
