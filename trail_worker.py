@@ -59,6 +59,7 @@ from simple_hyper.order_specs import MIN_NOTIONAL
 
 
 RATE_LIMIT_LOG_PATH = SERVER_BATCH_PATH.parent / "logs" / "trail-rate-limit.jsonl"
+ACTION_AUDIT_LOG_PATH = SERVER_BATCH_PATH.parent / "logs" / "trail-action-audit.jsonl"
 DONE_RETENTION_DAYS = 7
 DONE_RETENTION_MAX = 500
 GRID_LEVEL_HISTORY_MAX = 120
@@ -77,6 +78,9 @@ GRID_PANIC_RATIO_THRESHOLD = Decimal("100")
 GRID_PANIC_REVERSAL_GAP_MULTIPLIER = Decimal("2.71")
 GRID_PANIC_REVERSAL_ACTION_LIMIT_WAIT_SECONDS = 10
 GRID_PANIC_REDUCE_MIN_NOTIONAL = MIN_NOTIONAL * Decimal("1.10")
+GRID_PENDING_CANCEL_STATUS = "pending_cancel"
+GRID_PENDING_CANCEL_MIN_RATE_PERCENT = Decimal("1")
+GRID_PENDING_CANCEL_SPECIAL_RATE = Decimal("0.20")
 GRID_ROE_DENSITY_THRESHOLD = Decimal("-0.10")
 GRID_ROE_STOP_THRESHOLD = Decimal("-0.40")
 GRID_PANIC_RATIO_LEGACY_DEFAULT_THRESHOLDS = {
@@ -132,6 +136,7 @@ GRID_PRICE_OCCUPANCY_STATUSES = {
     "active",
     "pending",
     "recovery_deferred",
+    GRID_PENDING_CANCEL_STATUS,
     *GRID_PAUSED_STATUSES,
 }
 TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -148,6 +153,85 @@ TRANSIENT_ERROR_TEXTS = (
 
 class GridPostOnlyRejected(Exception):
     """A post-only grid child became marketable before submission."""
+
+
+def audit_grid_action(action: str, **payload: Any) -> None:
+    record = {"ts": int(time.time()), "action": action, **payload}
+    ACTION_AUDIT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with ACTION_AUDIT_LOG_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+
+
+def pending_cancel_rate(deficit: int) -> Decimal | None:
+    if deficit <= 0:
+        return None
+    if deficit == 1:
+        return GRID_PENDING_CANCEL_SPECIAL_RATE
+    return max(
+        GRID_PENDING_CANCEL_MIN_RATE_PERCENT,
+        Decimal("4") / Decimal(str(math.log10(deficit))),
+    ) / Decimal("100")
+
+
+def action_limit_deficit(cache: dict[str, Any] | None) -> int:
+    if not isinstance(cache, dict):
+        return 0
+    try:
+        return max(0, int(cache.get("action_limit_deficit") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def grid_order_far_from_mid(entry: dict[str, Any], current_mid: Decimal, rate: Decimal) -> bool:
+    price = decimal_or_none(entry.get("price", entry.get("limit_px")))
+    if price is None or price <= 0 or current_mid <= 0:
+        return False
+    side = str(entry.get("side") or "")
+    if side == "buy":
+        return price < current_mid * (Decimal("1") - rate)
+    if side == "sell":
+        return price > current_mid * (Decimal("1") + rate)
+    return False
+
+
+def restore_pending_cancel_entries(
+    row: dict[str, Any],
+    current_mid: Decimal,
+    cache: dict[str, Any] | None,
+    now: int,
+) -> int:
+    rate = pending_cancel_rate(action_limit_deficit(cache))
+    restored = 0
+    for entry in row.get("levels") or []:
+        if not isinstance(entry, dict) or str(entry.get("status")) != GRID_PENDING_CANCEL_STATUS:
+            continue
+        if entry.get("oid") is None:
+            entry["status"] = "cancelled"
+            entry["cancelled_at"] = now
+            entry.pop("pending_cancel_reason", None)
+            entry.pop("pending_cancel_at", None)
+            entry.pop("pending_cancel_mid", None)
+            entry.pop("pending_cancel_rate", None)
+            restored += 1
+            continue
+        if rate is not None and grid_order_far_from_mid(entry, current_mid, rate):
+            continue
+        entry["status"] = "active"
+        entry["pending_cancel_restored_at"] = now
+        entry.pop("pending_cancel_reason", None)
+        entry.pop("pending_cancel_at", None)
+        entry.pop("pending_cancel_mid", None)
+        entry.pop("pending_cancel_rate", None)
+        audit_grid_action(
+            "pending_cancel_restore",
+            coin=row.get("coin"),
+            side=entry.get("side"),
+            oid=entry.get("oid"),
+            price=entry.get("price", entry.get("limit_px")),
+            deficit=action_limit_deficit(cache),
+        )
+        restored += 1
+    return restored
 
 
 def is_cumulative_action_limit_text(text: str) -> bool:
@@ -288,6 +372,19 @@ def precheck_action_limit(info: Any, account: str, cache: dict[str, Any], networ
         cap = int(rate.get("nRequestsCap") or 0)
     except (TypeError, ValueError):
         return None
+    cache["action_limit_deficit"] = max(0, used - cap) if cap > 0 else 0
+    audit_snapshots = cache.setdefault("rate_limit_audit_snapshots", {})
+    audit_key = (network, account)
+    snapshot = (used, cap)
+    if audit_snapshots.get(audit_key) != snapshot:
+        audit_grid_action(
+            "rate_limit_snapshot",
+            network=network,
+            nRequestsUsed=used,
+            nRequestsCap=cap,
+            deficit=cache["action_limit_deficit"],
+        )
+        audit_snapshots[audit_key] = snapshot
     if cap > 0 and used >= cap:
         deficit = used - cap
         error_text = (
@@ -298,7 +395,6 @@ def precheck_action_limit(info: Any, account: str, cache: dict[str, Any], networ
         if not cache.get("action_limit_p1_budget_initialized"):
             cache["action_limit_p1_budget_remaining"] = action_limit_p1_budget_for_deficit(deficit)
             cache["action_limit_p1_budget_initialized"] = True
-        cache["action_limit_deficit"] = deficit
         return error_text
     if cap > 0 and not cache.get("action_limit_p1_budget_initialized"):
         headroom = max(0, cap - used)
@@ -951,6 +1047,18 @@ def submit_grid_child_order(exchange: Any, coin: str, order: dict[str, Any]) -> 
         plan["order_type"],
         reduce_only=bool(plan.get("reduce_only", False)),
     )
+    audit_grid_action(
+        "grid_order_submit",
+        coin=coin,
+        side="buy" if plan["is_buy"] else "sell",
+        price=decimal_to_plain(plan["limit_px"]),
+        size=decimal_to_plain(plan["size"]),
+        reduce_only=bool(plan.get("reduce_only", False)),
+        replacement=bool(order.get("replacement_order")),
+        phase=order.get("audit_phase"),
+        deficit=order.get("audit_deficit"),
+        result=result,
+    )
     log_event("grid_child_order", {"side": "buy" if plan["is_buy"] else "sell", "result": result})
     if result.get("status") != "ok":
         if is_post_only_reject_text(str(result)):
@@ -1463,7 +1571,7 @@ def active_grid_entries(row: dict[str, Any], side: str | None = None) -> list[di
         for entry in row.get("levels") or []
         if isinstance(entry, dict)
         and entry.get("side")
-        and str(entry.get("status", "active")) == "active"
+        and str(entry.get("status", "active")) in {"active", GRID_PENDING_CANCEL_STATUS}
         and (side is None or str(entry.get("side")) == side)
     ]
     return entries
@@ -1617,6 +1725,8 @@ def regrid_dense_entries(
     account_margin_protected: bool,
     isolated_leverage_ready: set[str],
     margin_blocked_sides: set[tuple[str, str]] | None = None,
+    current_mid: Decimal | None = None,
+    cache: dict[str, Any] | None = None,
 ) -> int:
     if account_margin_protected:
         return 0
@@ -1643,28 +1753,35 @@ def regrid_dense_entries(
             entry["dense_regrid_deferred_at"] = now
             entry["dense_regrid_deferred_reason"] = "unchanged_price"
             continue
-        cancel_request = {"coin": coin, "oid": old_oid}
-        cancel_result = exchange.bulk_cancel([cancel_request])
-        log_event(
-            "grid_dense_regrid_cancel",
-            {
-                "coin": coin,
-                "old_oid": old_oid,
-                "old_price": decimal_to_plain(old_price) if old_price is not None else None,
-                "new_price": decimal_to_plain(new_price),
-                "result": cancel_result,
-            },
-        )
-        if cancel_result.get("status") != "ok":
+        try:
+            cancelled = cancel_grid_entries(
+                exchange,
+                coin,
+                [entry],
+                now,
+                "dense_regrid",
+                row=row,
+                current_mid=current_mid,
+                cache=cache,
+                raise_on_unconfirmed=True,
+            )
+        except RuntimeError:
             entry.clear()
             entry.update(old_snapshot)
-            raise RuntimeError(f"Failed to cancel dense grid order before regrid: {cancel_result}")
-        cancelled_oids, cancel_errors = successful_cancel_oids(cancel_result, [cancel_request])
-        if old_oid not in cancelled_oids:
-            entry.clear()
-            entry.update(old_snapshot)
-            detail = "; ".join(cancel_errors) if cancel_errors else "cancel was not confirmed"
-            raise RuntimeError(f"Failed to cancel dense grid order before regrid: {detail}")
+            raise
+        if not cancelled:
+            if str(entry.get("status")) != GRID_PENDING_CANCEL_STATUS:
+                entry.clear()
+                entry.update(old_snapshot)
+                raise RuntimeError("Failed to cancel dense grid order before regrid: cancel was not confirmed")
+            else:
+                entry.clear()
+                entry.update(old_snapshot)
+                prepare_grid_cancel_entries(
+                    row, [entry], now, "dense_regrid", current_mid, cache
+                )
+                entry["dense_regrid_pending"] = True
+            continue
         entry["oid"] = None
         entry["dense_regrid_from_oid"] = old_oid
         if old_price is not None:
@@ -2608,6 +2725,14 @@ def submit_grid_panic_reduce(
         plan["order_type"],
         reduce_only=True,
     )
+    audit_grid_action(
+        "panic_reduce_submit",
+        coin=coin,
+        side=order.get("side"),
+        price=order.get("price"),
+        size=order.get("size"),
+        result=result,
+    )
     log_event("grid_panic_reduce_order", {"coin": coin, "side": order.get("side"), "result": result})
     if result.get("status") != "ok":
         row["panic_reduce_error"] = str(result)
@@ -2638,7 +2763,61 @@ def submit_grid_panic_reduce(
     return False
 
 
-def cancel_grid_entries(exchange: Any, coin: str, entries: list[dict[str, Any]], now: int, note: str) -> int:
+def prepare_grid_cancel_entries(
+    row: dict[str, Any] | None,
+    entries: list[dict[str, Any]],
+    now: int,
+    note: str,
+    current_mid: Decimal | None,
+    cache: dict[str, Any] | None,
+) -> tuple[list[dict[str, Any]], int]:
+    if row is None or current_mid is None:
+        return entries, 0
+    rate = pending_cancel_rate(action_limit_deficit(cache))
+    if rate is None:
+        return entries, 0
+    immediate: list[dict[str, Any]] = []
+    deferred = 0
+    for entry in entries:
+        if not isinstance(entry, dict) or str(entry.get("status")) == GRID_PENDING_CANCEL_STATUS:
+            continue
+        if not grid_order_far_from_mid(entry, current_mid, rate):
+            immediate.append(entry)
+            continue
+        entry["status"] = GRID_PENDING_CANCEL_STATUS
+        entry["pending_cancel_reason"] = note
+        entry["pending_cancel_at"] = now
+        entry["pending_cancel_mid"] = decimal_to_plain(current_mid)
+        entry["pending_cancel_rate"] = decimal_to_plain(rate)
+        audit_grid_action(
+            "pending_cancel_defer",
+            coin=row.get("coin"),
+            side=entry.get("side"),
+            oid=entry.get("oid"),
+            price=entry.get("price", entry.get("limit_px")),
+            reason=note,
+            deficit=action_limit_deficit(cache),
+            pending_rate=decimal_to_plain(rate),
+            phase=cache.get("grid_action_phase") if isinstance(cache, dict) else None,
+        )
+        deferred += 1
+    return immediate, deferred
+
+
+def cancel_grid_entries(
+    exchange: Any,
+    coin: str,
+    entries: list[dict[str, Any]],
+    now: int,
+    note: str,
+    row: dict[str, Any] | None = None,
+    current_mid: Decimal | None = None,
+    cache: dict[str, Any] | None = None,
+    raise_on_unconfirmed: bool = False,
+) -> int:
+    entries, deferred = prepare_grid_cancel_entries(row, entries, now, note, current_mid, cache)
+    if deferred and isinstance(cache, dict):
+        cache["pending_cancel_changed"] = True
     requests = []
     for entry in entries:
         try:
@@ -2648,12 +2827,23 @@ def cancel_grid_entries(exchange: Any, coin: str, entries: list[dict[str, Any]],
     if not requests:
         return 0
     result = exchange.bulk_cancel(requests)
+    audit_grid_action(
+        "grid_cancel",
+        coin=coin,
+        note=note,
+        requests=requests,
+        result=result,
+        deficit=action_limit_deficit(cache),
+        phase=cache.get("grid_action_phase") if isinstance(cache, dict) else None,
+    )
     log_event("grid_cancel_entries", {"note": note, "requests": requests, "result": result})
     if result.get("status") != "ok":
         raise RuntimeError(f"Failed to cancel grid orders: {result}")
     cancelled, cancel_errors = successful_cancel_oids(result, requests)
     if cancel_errors:
         log_event("grid_cancel_entry_errors", {"note": note, "errors": cancel_errors})
+        if raise_on_unconfirmed:
+            raise RuntimeError("; ".join(cancel_errors))
     for entry in entries:
         try:
             oid = int(entry["oid"])
@@ -2662,6 +2852,10 @@ def cancel_grid_entries(exchange: Any, coin: str, entries: list[dict[str, Any]],
         if oid in cancelled:
             entry["status"] = note
             entry["cancelled_at"] = now
+            entry.pop("pending_cancel_reason", None)
+            entry.pop("pending_cancel_at", None)
+            entry.pop("pending_cancel_mid", None)
+            entry.pop("pending_cancel_rate", None)
     return len(cancelled)
 
 
@@ -2672,6 +2866,8 @@ def cancel_grid_entries_with_p1_budget(
     now: int,
     note: str,
     cache: dict[str, Any] | None,
+    row: dict[str, Any] | None = None,
+    current_mid: Decimal | None = None,
 ) -> int:
     if isinstance(cache, dict) and cache.get("grid_action_phase") not in (None, GRID_ACTION_PHASE_P1_CANCELS):
         return 0
@@ -2683,7 +2879,16 @@ def cancel_grid_entries_with_p1_budget(
         if remaining <= 0:
             return 0
         entries = entries[:remaining]
-    cancelled = cancel_grid_entries(exchange, coin, entries, now, note)
+    cancelled = cancel_grid_entries(
+        exchange,
+        coin,
+        entries,
+        now,
+        note,
+        row=row,
+        current_mid=current_mid,
+        cache=cache,
+    )
     if cancelled and budget_tracked:
         for _ in range(cancelled):
             consume_action_limit_p1_budget(cache)
@@ -3054,6 +3259,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     mark_phase("mids")
     best_bid, best_ask = best_bid_ask(info, coin)
     mark_phase("book")
+    pending_restored = restore_pending_cancel_entries(row, current_mid, cache, now)
     user_state_cache = cache.setdefault("user_states", {})
     user_state_key = (network, account, dex)
     if user_state_key not in user_state_cache:
@@ -3166,7 +3372,14 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         log_event("grid_user_fills_by_time", {"start_ms": common_start_ms, "end_ms": now_ms, "count": len(fills_cache[fills_key])})
     fills_by_oid = recent_fills_by_oid(info, account, coin, start_ms, now_ms, fills_cache[fills_key])
     mark_phase("fills")
-    changed = avg_state_changed or margin_state_changed or brake_state_pruned or stale_margin_pauses_cleared
+    changed = (
+        avg_state_changed
+        or margin_state_changed
+        or brake_state_pruned
+        or stale_margin_pauses_cleared
+        or pending_restored > 0
+        or bool(cache.pop("pending_cancel_changed", False))
+    )
     missing_without_fill: list[int] = []
     recovered_missing = 0
     newly_filled: list[dict[str, Any]] = [
@@ -3208,6 +3421,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             pause_grid_order_for_action_limit(order, now, existing_action_limit)
             return False
         try:
+            order["audit_phase"] = grid_action_phase
+            order["audit_deficit"] = action_limit_deficit(cache)
             submitted = submit_grid_order_entry(
                 exchange,
                 coin,
@@ -3253,6 +3468,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             pause_grid_order_for_action_limit(order, now, existing_action_limit)
             return False
         try:
+            order["audit_phase"] = grid_action_phase
+            order["audit_deficit"] = action_limit_deficit(cache)
             submitted = submit_grid_order_entry(
                 exchange,
                 coin,
@@ -3429,7 +3646,10 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         risk_density_multiplier[side] = multiplier
         to_pause_density.extend(candidates)
     if to_pause_density and allow_p0:
-        paused_density = cancel_grid_entries(exchange, coin, to_pause_density, now, GRID_RISK_DENSITY_PAUSE_STATUS)
+        paused_density = cancel_grid_entries(
+            exchange, coin, to_pause_density, now, GRID_RISK_DENSITY_PAUSE_STATUS,
+            row=row, current_mid=current_mid, cache=cache,
+        )
         paused += paused_density
         consume_action_limit_headroom(cache, paused_density)
         for entry in to_pause_density:
@@ -3456,7 +3676,10 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             if id(entry) not in paused_density_ids
         )
     if to_pause_roe and allow_p0:
-        paused_roe = cancel_grid_entries(exchange, coin, to_pause_roe, now, GRID_ROE_PAUSE_STATUS)
+        paused_roe = cancel_grid_entries(
+            exchange, coin, to_pause_roe, now, GRID_ROE_PAUSE_STATUS,
+            row=row, current_mid=current_mid, cache=cache,
+        )
         paused += paused_roe
         consume_action_limit_headroom(cache, paused_roe)
         for entry in to_pause_roe:
@@ -3668,7 +3891,10 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             else:
                 projected_side_value = max(Decimal("0"), projected_side_value - order_notional)
     if to_pause_limit:
-        limit_paused = cancel_grid_entries_with_p1_budget(exchange, coin, to_pause_limit, now, "paused_limit", cache)
+        limit_paused = cancel_grid_entries_with_p1_budget(
+            exchange, coin, to_pause_limit, now, "paused_limit", cache,
+            row=row, current_mid=current_mid,
+        )
         paused += limit_paused
         if limit_paused:
             changed = True
@@ -3689,6 +3915,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             now,
             GRID_ACTIVE_CAP_PAUSE_STATUS,
             cache,
+            row=row,
+            current_mid=current_mid,
         )
         paused += active_cap_paused
         for entry in to_pause_post_replacement_cap:
@@ -3710,7 +3938,10 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                     continue
             to_refresh.append(entry)
     if to_refresh:
-        refreshed = cancel_grid_entries_with_p1_budget(exchange, coin, to_refresh, now, "refresh_reduce_only", cache)
+        refreshed = cancel_grid_entries_with_p1_budget(
+            exchange, coin, to_refresh, now, "refresh_reduce_only", cache,
+            row=row, current_mid=current_mid,
+        )
         if refreshed:
             pause_refreshed_reduce_only_entries(to_refresh, now)
             changed = True
@@ -3729,6 +3960,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             account_margin_protected,
             isolated_leverage_ready,
             margin_blocked_sides,
+            current_mid=current_mid,
+            cache=cache,
         )
     if dense_regridded:
         changed = True
@@ -3750,7 +3983,10 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             )
             if pause_entry is None or restore_entry is None:
                 continue
-            cancelled = cancel_grid_entries(exchange, coin, [pause_entry], now, GRID_REPLACEMENT_PAUSE_STATUS)
+            cancelled = cancel_grid_entries(
+                exchange, coin, [pause_entry], now, GRID_REPLACEMENT_PAUSE_STATUS,
+                row=row, current_mid=current_mid, cache=cache,
+            )
             if not cancelled:
                 continue
             pause_entry["paused_at"] = now
@@ -3998,6 +4234,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     side_cap_cleared = 0 if phase_limited else clear_grid_side_cap_entries(exchange, coin, row, now)
     if side_cap_cleared:
         changed = True
+    changed = changed or bool(cache.pop("pending_cancel_changed", False))
     mark_phase("trim")
 
     row["status"] = "active"
@@ -4165,6 +4402,7 @@ def prune_grid_levels(row: dict[str, Any]) -> bool:
         "active",
         "pending",
         "recovery_deferred",
+        GRID_PENDING_CANCEL_STATUS,
     }
     live_levels: list[dict[str, Any]] = []
     paused_levels: list[dict[str, Any]] = []

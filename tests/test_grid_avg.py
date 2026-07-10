@@ -81,6 +81,8 @@ from trail_worker import (
     pause_grid_order_for_action_limit,
     pause_grid_margin_side,
     pause_grid_margin_side_entries,
+    pending_cancel_rate,
+    prepare_grid_cancel_entries,
     pause_skipped_account_margin_replacement,
     precheck_action_limit,
     prune_add_risk_brake_state,
@@ -88,12 +90,14 @@ from trail_worker import (
     prune_grid_levels,
     regrid_dense_entries,
     replacement_order_from_fill,
+    restore_pending_cancel_entries,
     run_once,
     skip_stale_grid_recovery,
     skip_unknown_oid_grid_recovery,
     submit_grid_order_entry,
     trim_excess_grid_entries,
     GRID_ACTION_LIMIT_PAUSE_STATUS,
+    GRID_PENDING_CANCEL_STATUS,
     GRID_ROE_PAUSE_STATUS,
     grid_entries_fit_within_max,
 )
@@ -1922,6 +1926,55 @@ class GridAvgTests(unittest.TestCase):
         self.assertFalse(replacement_active_cap_submit_allowed(row, "sell"))
         row["levels"].pop()
         self.assertTrue(replacement_active_cap_submit_allowed(row, "sell"))
+
+    def test_pending_cancel_rate_uses_special_one_and_deficit_floor(self) -> None:
+        self.assertIsNone(pending_cancel_rate(0))
+        self.assertEqual(pending_cancel_rate(1), Decimal("0.20"))
+        self.assertEqual(pending_cancel_rate(100), Decimal("0.02"))
+        self.assertEqual(pending_cancel_rate(1000000), Decimal("0.01"))
+
+    def test_far_cancel_becomes_pending_without_exchange_request(self) -> None:
+        row = {"coin": "BTC", "levels": []}
+        entry = {
+            "side": "sell",
+            "status": "active",
+            "oid": 123,
+            "price": "120",
+            "size": "1",
+        }
+        row["levels"].append(entry)
+        cache = {"action_limit_deficit": 100}
+
+        immediate, deferred = prepare_grid_cancel_entries(
+            row, [entry], 10, "paused_limit", Decimal("100"), cache
+        )
+
+        self.assertEqual(immediate, [])
+        self.assertEqual(deferred, 1)
+        self.assertEqual(entry["status"], GRID_PENDING_CANCEL_STATUS)
+        self.assertEqual(entry["pending_cancel_reason"], "paused_limit")
+
+    def test_pending_cancel_restores_locally_when_price_returns(self) -> None:
+        row = {
+            "coin": "BTC",
+            "levels": [
+                {
+                    "side": "sell",
+                    "status": GRID_PENDING_CANCEL_STATUS,
+                    "oid": 123,
+                    "price": "101",
+                    "size": "1",
+                    "pending_cancel_reason": "paused_limit",
+                    "pending_cancel_at": 1,
+                }
+            ],
+        }
+
+        restored = restore_pending_cancel_entries(row, Decimal("100"), {"action_limit_deficit": 100}, 10)
+
+        self.assertEqual(restored, 1)
+        self.assertEqual(row["levels"][0]["status"], "active")
+        self.assertNotIn("pending_cancel_reason", row["levels"][0])
 
     def test_replacement_rebalance_swaps_toward_logarithmic_distribution(self) -> None:
         row = {

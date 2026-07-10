@@ -1735,6 +1735,7 @@ def format_grid_detail_rows(
     ]
     live_statuses = {
         "active",
+        "pending_cancel",
         "pending",
         "paused_max",
         "paused_limit",
@@ -1758,7 +1759,7 @@ def format_grid_detail_rows(
             oid = 0
         status = str(entry.get("status", ""))
         display_status = format_grid_entry_status(entry)
-        live = "1" if status == "active" and oid in open_oids else "0"
+        live = "1" if status in {"active", "pending_cancel"} and oid in open_oids else "0"
         fill = entry.get("fill") if isinstance(entry.get("fill"), dict) else {}
         rows.append(
             {
@@ -1947,7 +1948,7 @@ def active_grid_entries_for_row(row: dict[str, Any], side: str | None = None) ->
         for entry in row.get("levels") or []
         if isinstance(entry, dict)
         and entry.get("side")
-        and str(entry.get("status", "active")) == "active"
+        and str(entry.get("status", "active")) in {"active", "pending_cancel"}
         and (side is None or str(entry.get("side")) == side)
     ]
 
@@ -3861,7 +3862,7 @@ def grid_batch_open_oids(row: dict[str, Any]) -> set[int]:
     for level in row.get("levels") or []:
         if not isinstance(level, dict):
             continue
-        if level.get("side") and str(level.get("status", "active")) == "active":
+        if level.get("side") and str(level.get("status", "active")) in {"active", "pending_cancel"}:
             try:
                 oids.add(int(level["oid"]))
             except (KeyError, TypeError, ValueError):
