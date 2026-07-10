@@ -5,7 +5,7 @@ Description=Run Simple-Hyper trail/grid worker every minute
 OnCalendar=*-*-* *:*:00
 AccuracySec=1s
 Persistent=false
-Unit=simple-hyper-trail-worker.service
+Unit=simple-hyper-trail-worker-dispatch.service
 
 [Install]
 WantedBy=timers.target

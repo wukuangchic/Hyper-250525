@@ -1,0 +1,6 @@
+[Unit]
+Description=Dispatch Simple-Hyper trail/grid worker if the previous run is idle
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'state=$$(systemctl show -p ActiveState --value simple-hyper-trail-worker.service); if [ "$$state" = active ] || [ "$$state" = activating ]; then echo "trail-worker-dispatch: previous run still active; skipping window"; exit 0; fi; systemctl start --no-block simple-hyper-trail-worker.service'
