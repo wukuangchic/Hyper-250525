@@ -4531,6 +4531,39 @@ def save_worker_progress(rows: list[dict[str, Any]], changed: bool) -> bool:
     return False
 
 
+def reconcile_cached_grid_open_orders(
+    rows: list[dict[str, Any]],
+    active_grid_indexes: list[int],
+    grid_cache: dict[str, Any],
+) -> None:
+    """Keep the worker-level open-order snapshot consistent with our own actions.
+
+    The exchange snapshot is intentionally fetched once per worker run. Orders
+    that this worker cancelled are removed here, while newly submitted orders
+    are already appended by ``record_submitted_open_grid_order``.
+    """
+    current_tracked_oids: set[int] = set()
+    for index in active_grid_indexes:
+        current_tracked_oids.update(grid_batch_open_oids(rows[index]))
+    previous_tracked_oids = grid_cache.setdefault("tracked_grid_open_oids", current_tracked_oids.copy())
+    removed_oids = previous_tracked_oids - current_tracked_oids
+    if removed_oids:
+        for open_orders in grid_cache.get("open_orders", {}).values():
+            if isinstance(open_orders, list):
+                retained: list[dict[str, Any]] = []
+                for order in open_orders:
+                    if not isinstance(order, dict):
+                        continue
+                    try:
+                        oid = int(order.get("oid", -1))
+                    except (TypeError, ValueError):
+                        oid = -1
+                    if oid not in removed_oids:
+                        retained.append(order)
+                open_orders[:] = retained
+    grid_cache["tracked_grid_open_oids"] = current_tracked_oids
+
+
 def run_once() -> None:
     rows = load_server_batch()
     active_trail_indexes = [
@@ -4613,10 +4646,14 @@ def run_once() -> None:
         grid_cache["grid_action_phase"] = phase
         for index in active_grid_indexes:
             process_grid_index(index, f"grid {phase}")
+        reconcile_cached_grid_open_orders(rows, active_grid_indexes, grid_cache)
         for info, _exchange, _account, _signer, _role in grid_cache.get("clients", {}).values():
             clear_info_cache(info)
-        for cache_name in ("user_states", "account_margin_ratios", "open_orders", "fills"):
-            grid_cache.pop(cache_name, None)
+        # Keep worker-start snapshots across action phases.  The global phase
+        # order is still enforced above; only the expensive read-side data is
+        # reused.  l2/book caches are cleared so marketability checks remain
+        # fresh, while our in-memory open-order delta stays authoritative for
+        # duplicate detection inside this run.
     grid_cache.pop("grid_action_phase", None)
 
     rows, pruned = prune_done_rows(rows)

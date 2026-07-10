@@ -232,7 +232,7 @@ class GridAvgTests(unittest.TestCase):
         )
         save_server_batch.assert_not_called()
 
-    def test_run_once_refreshes_risk_caches_between_action_phases(self) -> None:
+    def test_run_once_reuses_read_caches_between_action_phases(self) -> None:
         rows = [{"type": "grid", "status": "active", "coin": "BTC", "levels": []}]
         seen = []
 
@@ -266,7 +266,7 @@ class GridAvgTests(unittest.TestCase):
             run_once()
 
         self.assertEqual(seen[0], (None, None, None))
-        self.assertEqual(seen[1], (None, {"shared": True}, 3))
+        self.assertEqual(seen[1], ({"stale": True}, {"shared": True}, 3))
         self.assertEqual(info.clear_calls, 7)
 
     def test_precheck_action_limit_initializes_shared_p1_budget_below_cap_once(self) -> None:
