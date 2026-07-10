@@ -3350,12 +3350,19 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         row.get("effective_gap_rate"),
     )
     margin_ratio = account_margin_ratio(info, account, network, cache)
-    account_margin_protected = margin_ratio is not None and margin_ratio < GRID_ACCOUNT_MARGIN_RATIO_THRESHOLD
+    withdrawable = decimal_or_none(user_state_cache[user_state_key].get("withdrawable"))
+    withdrawable_zero = withdrawable is not None and withdrawable <= 0
+    account_margin_protected = (
+        (margin_ratio is not None and margin_ratio < GRID_ACCOUNT_MARGIN_RATIO_THRESHOLD)
+        or withdrawable_zero
+    )
     margin_gap_multiplier = grid_margin_gap_multiplier(margin_ratio)
     margin_gap_multiplier_text = decimal_to_plain(margin_gap_multiplier)
     margin_state_changed = row.get("margin_gap_multiplier") != margin_gap_multiplier_text
     row["margin_gap_multiplier"] = margin_gap_multiplier_text
     row["margin_gap_soft_threshold"] = decimal_to_plain(GRID_ACCOUNT_MARGIN_RATIO_SOFT_THRESHOLD)
+    row["withdrawable"] = decimal_to_plain(withdrawable) if withdrawable is not None else None
+    row["withdrawable_zero_reduce_only_only"] = withdrawable_zero
     brake_state_pruned = prune_add_risk_brake_state(row, now)
     mark_phase("margin")
 
