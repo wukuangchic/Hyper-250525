@@ -3290,7 +3290,15 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     mids = mids_cache[mids_key]
     current_mid = Decimal(str(mids[coin]))
     mark_phase("mids")
-    best_bid, best_ask = best_bid_ask(info, coin)
+    # The worker already uses one mid snapshot for the whole run. Reuse one
+    # order-book snapshot per coin as well; repeatedly refreshing it in every
+    # global action phase was a large source of REST wait time. The phase
+    # ordering still prevents lower-priority actions from running early.
+    books_cache = cache.setdefault("books", {})
+    books_key = (network, coin)
+    if books_key not in books_cache:
+        books_cache[books_key] = best_bid_ask(info, coin)
+    best_bid, best_ask = books_cache[books_key]
     mark_phase("book")
     pending_restored = restore_pending_cancel_entries(row, current_mid, cache, now)
     user_state_cache = cache.setdefault("user_states", {})
