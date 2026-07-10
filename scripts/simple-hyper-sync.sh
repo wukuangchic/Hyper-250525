@@ -6,6 +6,7 @@ SERVICE="${SIMPLE_HYPER_SERVICE:-simple-hyper.service}"
 SOURCE_URL="${SIMPLE_HYPER_SYNC_URL:-https://codeload.github.com/wukuangchic/Hyper-250525/tar.gz/refs/heads/main}"
 STATE_FILE="${SIMPLE_HYPER_SYNC_STATE_FILE:-/var/lib/simple-hyper-sync/main.etag}"
 LOCK_FILE="${SIMPLE_HYPER_SYNC_LOCK_FILE:-/run/simple-hyper-sync.lock}"
+RUNTIME_DIR="${SIMPLE_HYPER_STATE_DIR:-/var/lib/simple-hyper}"
 
 mkdir -p "$(dirname "$STATE_FILE")"
 exec 9>"$LOCK_FILE"
@@ -48,9 +49,12 @@ if [ -z "$source_dir" ] || [ ! -d "$source_dir" ]; then
 fi
 
 rsync -a --delete \
+  --no-owner \
+  --no-group \
   --exclude '.venv/' \
   --exclude 'logs/' \
   --exclude '.env' \
+  --exclude 'simple-hyper.env' \
   --exclude '.simple-hyper-sync.etag' \
   --exclude '.git/' \
   --exclude 'server_batch.json' \
@@ -61,22 +65,39 @@ rsync -a --delete \
   "$source_dir"/ "$PROJECT_DIR"/
 
 if [ -x "$PROJECT_DIR/.venv/bin/python" ]; then
-  "$PROJECT_DIR/.venv/bin/python" -m pip install -r "$PROJECT_DIR/requirements.txt" >/dev/null
+  if id simplehyper >/dev/null 2>&1; then
+    chown -R simplehyper:simplehyper "$PROJECT_DIR/.venv"
+    runuser -u simplehyper -- "$PROJECT_DIR/.venv/bin/python" -m pip install -r "$PROJECT_DIR/requirements.txt" >/dev/null
+  else
+    echo "simple-hyper-sync: simplehyper user is required for dependency installation" >&2
+    exit 1
+  fi
 fi
 
 if id simplehyper >/dev/null 2>&1; then
-  chown simplehyper:simplehyper "$PROJECT_DIR" 2>/dev/null || true
-  [ -f "$PROJECT_DIR/server_batch.json" ] && chown simplehyper:simplehyper "$PROJECT_DIR/server_batch.json" 2>/dev/null || true
-  [ -f "$PROJECT_DIR/server_batch.lock" ] && chown simplehyper:simplehyper "$PROJECT_DIR/server_batch.lock" 2>/dev/null || true
-  [ -f "$PROJECT_DIR/command_history.json" ] && chown simplehyper:simplehyper "$PROJECT_DIR/command_history.json" 2>/dev/null || true
-  [ -d "$PROJECT_DIR/logs" ] && chown simplehyper:simplehyper "$PROJECT_DIR/logs" 2>/dev/null || true
-  chmod 775 "$PROJECT_DIR" 2>/dev/null || true
-  [ -f "$PROJECT_DIR/server_batch.json" ] && chmod 664 "$PROJECT_DIR/server_batch.json" 2>/dev/null || true
-  [ -f "$PROJECT_DIR/server_batch.lock" ] && chmod 664 "$PROJECT_DIR/server_batch.lock" 2>/dev/null || true
-  [ -f "$PROJECT_DIR/command_history.json" ] && chmod 664 "$PROJECT_DIR/command_history.json" 2>/dev/null || true
-  [ -d "$PROJECT_DIR/logs" ] && chmod 775 "$PROJECT_DIR/logs" 2>/dev/null || true
+  install -d -o simplehyper -g simplehyper -m 0750 "$RUNTIME_DIR" "$RUNTIME_DIR/logs"
+  for name in server_batch.json server_batch.lock command_history.json; do
+    if [ -e "$PROJECT_DIR/$name" ] && [ ! -e "$RUNTIME_DIR/$name" ]; then
+      mv "$PROJECT_DIR/$name" "$RUNTIME_DIR/$name"
+    fi
+  done
+  if [ -d "$PROJECT_DIR/logs" ]; then
+    rsync -a "$PROJECT_DIR/logs"/ "$RUNTIME_DIR/logs"/
+    rm -rf "$PROJECT_DIR/logs"
+  fi
+  chown -R simplehyper:simplehyper "$RUNTIME_DIR"
+  find "$RUNTIME_DIR" -type d -exec chmod 0750 {} +
+  find "$RUNTIME_DIR" -type f -exec chmod 0640 {} +
 fi
 
-printf '%s\n' "$target_etag" > "$STATE_FILE"
+chown -R root:root "$PROJECT_DIR"
+chmod -R u=rwX,go=rX "$PROJECT_DIR"
+for env_file in "$PROJECT_DIR/.env" "$PROJECT_DIR/simple-hyper.env"; do
+  if [ -f "$env_file" ] && id simplehyper >/dev/null 2>&1; then
+    chown root:simplehyper "$env_file"
+    chmod 0640 "$env_file"
+  fi
+done
 systemctl restart "$SERVICE"
+printf '%s\n' "$target_etag" > "$STATE_FILE"
 echo "simple-hyper-sync: updated to $target_etag and restarted $SERVICE"

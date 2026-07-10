@@ -515,7 +515,7 @@ set +a
 python3 simple_hyper_server.py --host 0.0.0.0 --port 8787
 ```
 
-网页控制台等待命令完成的默认超时是 `300` 秒，可通过 `SIMPLE_HYPER_COMMAND_TIMEOUT` 调整。循环单档数较多时，建议保持 `300` 秒或更高。
+网页控制台等待命令完成的默认超时是 `300` 秒，可通过 `SIMPLE_HYPER_COMMAND_TIMEOUT` 调整。循环单档数较多时，建议保持 `300` 秒或更高。HTTP 连接读取默认超时为 `15` 秒；同时最多接受 `32` 个连接、运行 `2` 个下单子进程，可分别通过 `SIMPLE_HYPER_CONNECTION_READ_TIMEOUT`、`SIMPLE_HYPER_MAX_CONNECTIONS` 和 `SIMPLE_HYPER_MAX_CONCURRENT_COMMANDS` 调整。命令容量已满时 API 快速返回 HTTP `503`。
 
 访问：
 
@@ -543,7 +543,21 @@ systemd 常驻可参考：
 
 - `systemd/simple-hyper-sync.service`
 - `systemd/simple-hyper-sync.timer`
+- `systemd/simple-hyper.service`
 - `scripts/simple-hyper-sync.sh`
+
+服务器权限建议：`/opt/simple-hyper` 及其父目录必须由 `root` 所有且不可由 `simplehyper` 写；仅将 `/var/lib/simple-hyper` 运行时状态目录交给 `simplehyper` 写。首次部署先创建服务用户，并安装环境文件、root 执行副本和 units：
+
+```bash
+sudo useradd --system --home /var/lib/simple-hyper --shell /usr/sbin/nologin simplehyper
+sudo install -o root -g root -m 0755 scripts/simple-hyper-sync.sh /usr/local/sbin/simple-hyper-sync.sh
+sudo install -o root -g simplehyper -m 0640 simple-hyper.env /opt/simple-hyper/simple-hyper.env
+sudo install -o root -g root -m 0644 systemd/*.service systemd/*.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now simple-hyper.service simple-hyper-trail-worker.timer simple-hyper-sync.timer
+```
+
+同步脚本的 root 副本属于部署边界；仓库中的同步脚本有更新时，应重新执行对应的 `install` 命令。同步会迁移旧的 `server_batch.json`、`server_batch.lock`、`command_history.json` 和 `logs/`，并在服务成功重启后才记录新 ETag。`simple-hyper.env` 和 `.env` 会在 rsync 更新时保留。
 
 常用命令：
 

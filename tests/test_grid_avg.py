@@ -4,9 +4,11 @@ from decimal import Decimal
 from unittest.mock import patch
 
 from hl_order import (
+    append_server_batch_or_cancel_orders,
     asset_requires_isolated_margin,
     build_grid_batch_row,
     build_grid_orders,
+    cancel_order,
     ensure_no_duplicate_grid_batch,
     grid_avg_bounds,
     grid_avg_multiplier,
@@ -25,6 +27,7 @@ from hl_order import (
     refresh_grid_row_strategy_params,
     resolve_grid_spacing,
     submit_with_action_limit_retry,
+    successful_cancel_oids,
     update_order_leverage,
     user_action_rate_limit_metrics,
 )
@@ -36,6 +39,7 @@ from trail_worker import (
     batch_row_raw_coin,
     build_grid_panic_reduce_order,
     cancel_grid_entries_with_p1_budget,
+    cancel_grid_entries,
     clear_stale_grid_margin_pauses,
     clear_grid_side_cap_entries,
     consume_action_limit_headroom,
@@ -64,6 +68,7 @@ from trail_worker import (
     grid_risk_density_pause_candidates,
     grid_risk_density_restore_allowed,
     maintain_grid,
+    modify_trail_stop,
     move_grid_order_away_from_active,
     near_grid_orders_if_stale,
     next_depth_order,
@@ -90,10 +95,39 @@ from trail_worker import (
     trim_excess_grid_entries,
     GRID_ACTION_LIMIT_PAUSE_STATUS,
     GRID_ROE_PAUSE_STATUS,
+    grid_entries_fit_within_max,
 )
 
 
 class GridAvgTests(unittest.TestCase):
+    def test_batch_persist_failure_cancels_submitted_orders(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.requests = []
+
+            def bulk_cancel(self, requests: list[dict]) -> dict:
+                self.requests.append(requests)
+                return {"status": "ok", "response": {"data": {"statuses": ["success", "success"]}}}
+
+        exchange = FakeExchange()
+        with patch("hl_order.append_server_batch", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(RuntimeError, "submitted orders were cancelled"):
+                append_server_batch_or_cancel_orders({}, exchange, "BTC", {22, 11})
+
+        self.assertEqual(exchange.requests, [[{"coin": "BTC", "oid": 11}, {"coin": "BTC", "oid": 22}]])
+
+    def test_batch_persist_failure_reports_unconfirmed_orders(self) -> None:
+        class FakeExchange:
+            def bulk_cancel(self, requests: list[dict]) -> dict:
+                return {
+                    "status": "ok",
+                    "response": {"data": {"statuses": ["success", {"error": "order was already filled"}]}},
+                }
+
+        with patch("hl_order.append_server_batch", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(RuntimeError, r"orders may still be active: \[22\].*already filled"):
+                append_server_batch_or_cancel_orders({}, FakeExchange(), "BTC", {11, 22})
+
     def test_user_action_rate_limit_metrics_formats_deficit(self) -> None:
         class FakeInfo:
             def post(self, path: str, payload: dict) -> dict:
@@ -194,6 +228,43 @@ class GridAvgTests(unittest.TestCase):
         )
         save_server_batch.assert_not_called()
 
+    def test_run_once_refreshes_risk_caches_between_action_phases(self) -> None:
+        rows = [{"type": "grid", "status": "active", "coin": "BTC", "levels": []}]
+        seen = []
+
+        class FakeInfo:
+            def __init__(self) -> None:
+                self.clear_calls = 0
+
+            def clear_cache(self) -> None:
+                self.clear_calls += 1
+
+        info = FakeInfo()
+
+        def fake_maintain_grid(row: dict, cache: dict) -> tuple[dict, bool]:
+            seen.append((cache.get("user_states"), cache.get("mids"), cache.get("action_limit_p1_budget_remaining")))
+            cache["user_states"] = {"stale": True}
+            cache["account_margin_ratios"] = {"stale": True}
+            cache["open_orders"] = {"stale": True}
+            cache["fills"] = {"stale": True}
+            cache.setdefault("mids", {})["shared"] = True
+            cache.setdefault("action_limit_p1_budget_remaining", 3)
+            cache.setdefault("clients", {})["shared"] = (info, None, "account", None, None)
+            return row, False
+
+        with (
+            patch("trail_worker.load_server_batch", return_value=rows),
+            patch("trail_worker.maintain_grid", side_effect=fake_maintain_grid),
+            patch("trail_worker.random.shuffle"),
+            patch("trail_worker.prune_done_rows", return_value=(rows, False)),
+            patch("trail_worker.prune_grid_level_history", return_value=False),
+        ):
+            run_once()
+
+        self.assertEqual(seen[0], (None, None, None))
+        self.assertEqual(seen[1], (None, {"shared": True}, 3))
+        self.assertEqual(info.clear_calls, 7)
+
     def test_precheck_action_limit_initializes_shared_p1_budget_below_cap_once(self) -> None:
         class FakeInfo:
             def __init__(self) -> None:
@@ -224,7 +295,7 @@ class GridAvgTests(unittest.TestCase):
 
             def bulk_cancel(self, requests: list[dict]) -> dict:
                 self.requests.append(requests)
-                return {"status": "ok"}
+                return {"status": "ok", "response": {"data": {"statuses": ["success"] * len(requests)}}}
 
         exchange = FakeExchange()
         entries = [{"oid": 1, "status": "active"}, {"oid": 2, "status": "active"}]
@@ -243,6 +314,59 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(entries[1]["status"], "active")
         self.assertEqual(action_limit_p1_budget_remaining(cache), 0)
 
+    def test_cancel_grid_entries_marks_only_item_successes(self) -> None:
+        class FakeExchange:
+            def bulk_cancel(self, requests: list[dict]) -> dict:
+                return {
+                    "status": "ok",
+                    "response": {"data": {"statuses": ["success", {"error": "order was already filled"}]}},
+                }
+
+        entries = [{"oid": 1, "status": "active"}, {"oid": 2, "status": "active"}]
+
+        self.assertEqual(cancel_grid_entries(FakeExchange(), "BTC", entries, 123, "paused_limit"), 1)
+        self.assertEqual(entries[0]["status"], "paused_limit")
+        self.assertEqual(entries[1]["status"], "active")
+
+    def test_cancel_statuses_missing_or_wrong_length_confirm_nothing(self) -> None:
+        requests = [{"coin": "BTC", "oid": 1}, {"coin": "BTC", "oid": 2}]
+
+        missing = successful_cancel_oids({"status": "ok"}, requests)
+        mismatched = successful_cancel_oids(
+            {"status": "ok", "response": {"data": {"statuses": ["success"]}}},
+            requests,
+        )
+
+        self.assertEqual(missing[0], set())
+        self.assertIn("did not include statuses", missing[1][0])
+        self.assertEqual(mismatched[0], set())
+        self.assertIn("did not match requests length", mismatched[1][0])
+
+    def test_regular_bulk_cancel_marks_only_successful_batch_oids(self) -> None:
+        class FakeExchange:
+            def bulk_cancel(self, requests: list[dict]) -> dict:
+                return {
+                    "status": "ok",
+                    "response": {"data": {"statuses": ["success", {"error": "order was already filled"}]}},
+                }
+
+        orders = [
+            {"coin": "BTC", "side": "B", "oid": 1, "limitPx": "100", "origSz": "1"},
+            {"coin": "BTC", "side": "A", "oid": 2, "limitPx": "101", "origSz": "1"},
+        ]
+        with (
+            patch("hl_order.collect_frontend_open_orders", return_value=orders),
+            patch("hl_order.mark_cancelled_server_batch_oids", return_value=1) as mark_cancelled,
+            patch("hl_order.print_account_metrics"),
+            patch("hl_order.print_box"),
+            patch("hl_order.print_order_row"),
+            patch("builtins.print"),
+        ):
+            cancel_order(FakeExchange(), object(), "account", "mainnet", "BTC", "", "all", False)
+
+        mark_cancelled.assert_called_once()
+        self.assertEqual(mark_cancelled.call_args.args[2], {1})
+
     def test_tracked_p1_budget_gates_cancels_below_cap(self) -> None:
         class FakeExchange:
             def __init__(self) -> None:
@@ -250,7 +374,7 @@ class GridAvgTests(unittest.TestCase):
 
             def bulk_cancel(self, requests: list[dict]) -> dict:
                 self.requests.append(requests)
-                return {"status": "ok"}
+                return {"status": "ok", "response": {"data": {"statuses": ["success"] * len(requests)}}}
 
         exchange = FakeExchange()
         entries = [{"oid": 1, "status": "active"}]
@@ -366,6 +490,75 @@ class GridAvgTests(unittest.TestCase):
             },
         }
         self.assertTrue(order_result_is_retryable_action_limit(result))
+
+    def test_trail_modify_keeps_active_on_response_action_limit(self) -> None:
+        class FakeExchange:
+            def modify_order(self, *args, **kwargs):
+                return {
+                    "status": "ok",
+                    "response": {"data": {"statuses": [{"error": "Too many requests: action limit reached"}]}},
+                }
+
+        row = {
+            "network": "mainnet",
+            "coin": "BTC",
+            "oid": 1,
+            "is_buy": False,
+            "side": "A",
+            "amount": "10",
+            "size": "1",
+            "best_px": "100",
+            "stop_px": "95",
+            "trail_distance": "5",
+            "status": "active",
+        }
+        plan = {"size": Decimal("1"), "limit_px": Decimal("96"), "order_type": {"trigger": {}}}
+        with (
+            patch("trail_worker.build_clients", return_value=(object(), FakeExchange(), "account", None, None)),
+            patch("trail_worker.resolve_perp_asset", return_value=("BTC", {"szDecimals": 2})),
+            patch("trail_worker.find_open_order_by_oid", return_value={"oid": 1}),
+            patch("trail_worker.build_trigger_order_plan", return_value=plan),
+        ):
+            updated, changed = modify_trail_stop(row, Decimal("101"))
+
+        self.assertTrue(changed)
+        self.assertEqual(updated["status"], "active")
+        self.assertIn("action limit", updated["last_error"])
+        self.assertEqual(updated["stop_px"], "95")
+
+    def test_trail_modify_marks_permanent_response_error(self) -> None:
+        class FakeExchange:
+            def modify_order(self, *args, **kwargs):
+                return {
+                    "status": "ok",
+                    "response": {"data": {"statuses": [{"error": "invalid trigger price"}]}},
+                }
+
+        row = {
+            "network": "mainnet",
+            "coin": "BTC",
+            "oid": 1,
+            "is_buy": False,
+            "side": "A",
+            "amount": "10",
+            "size": "1",
+            "best_px": "100",
+            "stop_px": "95",
+            "trail_distance": "5",
+            "status": "active",
+        }
+        plan = {"size": Decimal("1"), "limit_px": Decimal("96"), "order_type": {"trigger": {}}}
+        with (
+            patch("trail_worker.build_clients", return_value=(object(), FakeExchange(), "account", None, None)),
+            patch("trail_worker.resolve_perp_asset", return_value=("BTC", {"szDecimals": 2})),
+            patch("trail_worker.find_open_order_by_oid", return_value={"oid": 1}),
+            patch("trail_worker.build_trigger_order_plan", return_value=plan),
+        ):
+            updated, changed = modify_trail_stop(row, Decimal("101"))
+
+        self.assertTrue(changed)
+        self.assertEqual(updated["status"], "error")
+        self.assertIn("invalid trigger price", updated["error"])
 
     def test_min_trade_notional_rejected_is_min_order_value_error(self) -> None:
         self.assertTrue(is_min_order_value_error_text("minTradeNtlRejected"))
@@ -1108,7 +1301,7 @@ class GridAvgTests(unittest.TestCase):
 
             def bulk_cancel(self, requests):
                 self.cancelled.extend(requests)
-                return {"status": "ok"}
+                return {"status": "ok", "response": {"data": {"statuses": ["success"] * len(requests)}}}
 
         row = {
             "levels": [
@@ -1135,7 +1328,7 @@ class GridAvgTests(unittest.TestCase):
 
             def bulk_cancel(self, requests):
                 self.cancelled.extend(requests)
-                return {"status": "ok"}
+                return {"status": "ok", "response": {"data": {"statuses": ["success"] * len(requests)}}}
 
         row = {
             "last_add_risk_brake_pair": "10:11",
@@ -1777,7 +1970,7 @@ class GridAvgTests(unittest.TestCase):
 
             def bulk_cancel(self, requests):
                 self.cancelled.extend(requests)
-                return {"status": "ok"}
+                return {"status": "ok", "response": {"data": {"statuses": ["success"] * len(requests)}}}
 
         row = {
             "levels": [
@@ -1802,7 +1995,7 @@ class GridAvgTests(unittest.TestCase):
 
             def bulk_cancel(self, requests):
                 self.cancelled.extend(requests)
-                return {"status": "ok"}
+                return {"status": "ok", "response": {"data": {"statuses": ["success"] * len(requests)}}}
 
         row = {
             "levels": [
@@ -1833,7 +2026,7 @@ class GridAvgTests(unittest.TestCase):
 
             def bulk_cancel(self, requests):
                 self.cancelled.extend(requests)
-                return {"status": "ok"}
+                return {"status": "ok", "response": {"data": {"statuses": ["success"] * len(requests)}}}
 
         row = {
             "levels": [
@@ -2803,7 +2996,7 @@ class GridAvgTests(unittest.TestCase):
 
             def bulk_cancel(self, requests):
                 self.cancel_requests.extend(requests)
-                return {"status": "ok"}
+                return {"status": "ok", "response": {"data": {"statuses": ["success"] * len(requests)}}}
 
         row = {
             "levels": [
@@ -2854,7 +3047,7 @@ class GridAvgTests(unittest.TestCase):
 
             def bulk_cancel(self, requests):
                 self.cancel_requests.extend(requests)
-                return {"status": "ok"}
+                return {"status": "ok", "response": {"data": {"statuses": ["success"] * len(requests)}}}
 
             def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
                 self.orders.append((coin, is_buy, Decimal(str(limit_px)), order_type, reduce_only))
@@ -2898,6 +3091,36 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(dense["dense_regrid_from_price"], "99.5")
         self.assertLess(Decimal(dense["price"]), Decimal("99.5"))
         self.assertNotIn("dedup_dense", {entry["status"] for entry in row["levels"]})
+
+    def test_dense_grid_does_not_replace_when_cancel_is_not_confirmed(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.orders = []
+
+            def bulk_cancel(self, requests):
+                return {"status": "ok", "response": {"data": {"statuses": [{"error": "action limit"}]}}}
+
+            def order(self, *args, **kwargs):
+                self.orders.append((args, kwargs))
+                raise AssertionError("replacement must not be submitted")
+
+        row = {"gap_rate": "0.01", "min_order_value": "10", "base_buy_size": "1", "base_sell_size": "1", "levels": []}
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        keep = grid_order_entry(row, "BTC", asset, True, Decimal("100"), False)
+        keep.update({"status": "active", "oid": 1})
+        dense = grid_order_entry(row, "BTC", asset, True, Decimal("99.5"), False)
+        dense.update({"status": "active", "oid": 2})
+        row["levels"] = [keep, dense]
+        exchange = FakeExchange()
+
+        with self.assertRaisesRegex(RuntimeError, "action limit"):
+            regrid_dense_entries(
+                exchange, "BTC", row, asset, 123, Decimal("0"), Decimal("0"), "abs", False, set()
+            )
+
+        self.assertEqual(dense["oid"], 2)
+        self.assertEqual(dense["price"], "99.5")
+        self.assertEqual(exchange.orders, [])
 
     def test_grid_order_moves_away_from_near_active_price_before_submit(self) -> None:
         row = {
@@ -3553,6 +3776,65 @@ class GridAvgTests(unittest.TestCase):
             "limit -200 400",
         )
 
+    def test_initial_limit_plan_keeps_signed_projection_after_crossing_zero(self) -> None:
+        class FakeInfo:
+            def user_state(self, account: str, dex: str = "") -> dict:
+                return {"assetPositions": [{"position": {"coin": "BTC", "szi": "5", "positionValue": "50"}}]}
+
+        args = Namespace(
+            trend=None,
+            gap=["1%"],
+            grid_min="30",
+            grid_position_limit_mode="limit",
+            grid_position_min_value="-100",
+            grid_avg=None,
+            resolved_grid_gap_spec=None,
+            network="mainnet",
+            coin="BTC",
+        )
+
+        plans = build_grid_orders(
+            args,
+            FakeInfo(),
+            "account",
+            "",
+            None,
+            "BTC",
+            {"szDecimals": 2},
+            Decimal("100"),
+            Decimal("10"),
+            Decimal("0.05"),
+        )
+
+        sell_notional = Decimal("50")
+        sell_count = 0
+        for plan in plans:
+            if plan["is_buy"]:
+                continue
+            sell_notional -= plan["notional"]
+            sell_count += 1
+        self.assertLess(sell_count, 10)
+        self.assertGreaterEqual(sell_notional, Decimal("-100"))
+
+    def test_worker_limit_projection_rejects_after_crossing_zero_and_lower_bound(self) -> None:
+        entries = [
+            {"is_buy": False, "price": "60", "size": "1"},
+            {"is_buy": False, "price": "60", "size": "1"},
+            {"is_buy": False, "price": "60", "size": "1"},
+        ]
+
+        projected = grid_entries_fit_within_max(
+            entries,
+            "sell",
+            Decimal("5"),
+            Decimal("50"),
+            Decimal("100"),
+            "limit",
+            Decimal("-100"),
+        )
+
+        self.assertIsNone(projected)
+
     def test_limit_allows_only_orders_inside_or_toward_signed_range(self) -> None:
         self.assertTrue(
             grid_order_allowed_by_max(
@@ -3574,6 +3856,18 @@ class GridAvgTests(unittest.TestCase):
                 Decimal("400"),
                 "limit",
                 Decimal("200"),
+            )
+        )
+
+    def test_limit_outside_range_cannot_cross_beyond_opposite_bound(self) -> None:
+        self.assertFalse(
+            grid_order_allowed_by_max(
+                Decimal("-1"), Decimal("150"), True, Decimal("300"), Decimal("100"), "limit", Decimal("-100")
+            )
+        )
+        self.assertFalse(
+            grid_order_allowed_by_max(
+                Decimal("1"), Decimal("150"), False, Decimal("300"), Decimal("100"), "limit", Decimal("-100")
             )
         )
         self.assertTrue(

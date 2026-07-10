@@ -1,0 +1,26 @@
+[Unit]
+Description=Simple-Hyper mobile web console
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=simplehyper
+Group=simplehyper
+WorkingDirectory=/opt/simple-hyper
+Environment=SIMPLE_HYPER_STATE_DIR=/var/lib/simple-hyper
+EnvironmentFile=-/opt/simple-hyper/simple-hyper.env
+ExecStart=/opt/simple-hyper/.venv/bin/python /opt/simple-hyper/simple_hyper_server.py
+Restart=on-failure
+RestartSec=5s
+UMask=0027
+StateDirectory=simple-hyper
+StateDirectoryMode=0750
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/simple-hyper
+
+[Install]
+WantedBy=multi-user.target

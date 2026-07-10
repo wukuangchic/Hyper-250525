@@ -26,6 +26,7 @@ from hl_order import (  # noqa: E402
     build_clients,
     build_grid_limit_order_plan,
     build_trigger_order_plan,
+    clear_info_cache,
     collect_frontend_open_orders,
     decimal_or_none,
     decimal_to_plain,
@@ -46,6 +47,7 @@ from hl_order import (  # noqa: E402
     mask,
     position_matches_coin,
     signed_position_value,
+    successful_cancel_oids,
     resolve_perp_asset,
     rounded_perp_price,
     save_server_batch,
@@ -56,7 +58,7 @@ from hl_order import (  # noqa: E402
 from simple_hyper.order_specs import MIN_NOTIONAL
 
 
-RATE_LIMIT_LOG_PATH = Path(__file__).resolve().parent / "logs" / "trail-rate-limit.jsonl"
+RATE_LIMIT_LOG_PATH = SERVER_BATCH_PATH.parent / "logs" / "trail-rate-limit.jsonl"
 DONE_RETENTION_DAYS = 7
 DONE_RETENTION_MAX = 500
 GRID_LEVEL_HISTORY_MAX = 120
@@ -151,6 +153,14 @@ class GridPostOnlyRejected(Exception):
 def is_cumulative_action_limit_text(text: str) -> bool:
     lowered = text.lower()
     return "too many cumulative requests" in lowered and "cumulative volume traded" in lowered
+
+
+def is_temporary_action_limit_text(text: str) -> bool:
+    lowered = text.lower()
+    return is_cumulative_action_limit_text(text) or any(
+        pattern in lowered
+        for pattern in ("action limit", "rate limit", "too many requests", "status 429", "status_code=429")
+    )
 
 
 def action_limit_error(cache: dict[str, Any] | None) -> str | None:
@@ -851,13 +861,26 @@ def modify_trail_stop(row: dict[str, Any], mid_px: Decimal) -> tuple[dict[str, A
     )
     log_event("trail_modify_order", {"id": row.get("id"), "oid": oid, "stop_px": decimal_to_plain(new_stop_px), "result": result})
     if result.get("status") != "ok":
+        if is_temporary_action_limit_text(str(result)):
+            row["status"] = "active"
+            row["last_error"] = str(result)
+            row["note"] = "temporary action/rate limit; retrying"
+            row["updated_at"] = int(time.time())
+            return row, True
         row["status"] = "error"
         row["error"] = str(result)
         row["updated_at"] = int(time.time())
         return row, True
 
     statuses = result.get("response", {}).get("data", {}).get("statuses", [])
-    if any("error" in status for status in statuses):
+    status_errors = [str(status["error"]) for status in statuses if isinstance(status, dict) and status.get("error")]
+    if status_errors:
+        if all(is_temporary_action_limit_text(error) for error in status_errors):
+            row["status"] = "active"
+            row["last_error"] = str(statuses)
+            row["note"] = "temporary action/rate limit; retrying"
+            row["updated_at"] = int(time.time())
+            return row, True
         row["status"] = "error"
         row["error"] = str(statuses)
         row["updated_at"] = int(time.time())
@@ -1636,6 +1659,12 @@ def regrid_dense_entries(
             entry.clear()
             entry.update(old_snapshot)
             raise RuntimeError(f"Failed to cancel dense grid order before regrid: {cancel_result}")
+        cancelled_oids, cancel_errors = successful_cancel_oids(cancel_result, [cancel_request])
+        if old_oid not in cancelled_oids:
+            entry.clear()
+            entry.update(old_snapshot)
+            detail = "; ".join(cancel_errors) if cancel_errors else "cancel was not confirmed"
+            raise RuntimeError(f"Failed to cancel dense grid order before regrid: {detail}")
         entry["oid"] = None
         entry["dense_regrid_from_oid"] = old_oid
         if old_price is not None:
@@ -1889,8 +1918,13 @@ def grid_entries_fit_within_max(
     max_position_value: Decimal,
     policy: str,
     min_position_value: Decimal,
+    position_value_is_signed: bool = False,
 ) -> Decimal | None:
-    projected_position_value = position_value
+    projected_position_value = (
+        position_value
+        if policy != "limit" or position_value_is_signed
+        else signed_position_value(position_size, position_value)
+    )
     ordered = sorted(
         entries,
         key=lambda entry: decimal_or_none(entry.get("price", entry.get("limit_px"))) or Decimal("0"),
@@ -1906,9 +1940,12 @@ def grid_entries_fit_within_max(
             max_position_value,
             policy,
             min_position_value,
+            position_value_is_signed=policy == "limit",
         ):
             return None
-        if grid_order_would_add_risk(position_size, bool(entry.get("is_buy"))):
+        if policy == "limit":
+            projected_position_value += order_notional if bool(entry.get("is_buy")) else -order_notional
+        elif grid_order_would_add_risk(position_size, bool(entry.get("is_buy"))):
             projected_position_value += order_notional
         else:
             projected_position_value = max(Decimal("0"), projected_position_value - order_notional)
@@ -1970,6 +2007,7 @@ def grid_replacement_rebalance_keep_ids(
                 max_position_value,
                 policy,
                 min_position_value,
+                position_value_is_signed=policy == "limit",
             )
             is not None
         ):
@@ -2613,7 +2651,9 @@ def cancel_grid_entries(exchange: Any, coin: str, entries: list[dict[str, Any]],
     log_event("grid_cancel_entries", {"note": note, "requests": requests, "result": result})
     if result.get("status") != "ok":
         raise RuntimeError(f"Failed to cancel grid orders: {result}")
-    cancelled = {int(request["oid"]) for request in requests}
+    cancelled, cancel_errors = successful_cancel_oids(result, requests)
+    if cancel_errors:
+        log_event("grid_cancel_entry_errors", {"note": note, "errors": cancel_errors})
     for entry in entries:
         try:
             oid = int(entry["oid"])
@@ -3435,10 +3475,12 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
 
     projected_position_values: dict[str, Decimal] = {}
     for side in ("buy", "sell"):
-        projected = position_value
+        projected = signed_position_value(position_size, position_value) if policy == "limit" else position_value
         for entry in active_grid_entries(row, side):
             order_notional = Decimal(str(entry.get("size"))) * Decimal(str(entry.get("price", entry.get("limit_px"))))
-            if grid_order_would_add_risk(position_size, bool(entry.get("is_buy"))):
+            if policy == "limit":
+                projected += order_notional if bool(entry.get("is_buy")) else -order_notional
+            elif grid_order_would_add_risk(position_size, bool(entry.get("is_buy"))):
                 projected += order_notional
             else:
                 projected = max(Decimal("0"), projected - order_notional)
@@ -3515,7 +3557,11 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                     else:
                         levels.append(panic_reversal)
                         projected_position_value = projected_position_values.get(reversal_side, Decimal("0"))
-                        if grid_order_would_add_risk(position_size, bool(panic_reversal["is_buy"])):
+                        if policy == "limit":
+                            projected_position_values[reversal_side] += (
+                                order_notional if bool(panic_reversal["is_buy"]) else -order_notional
+                            )
+                        elif grid_order_would_add_risk(position_size, bool(panic_reversal["is_buy"])):
                             projected_position_values[reversal_side] = projected_position_value + order_notional
                         else:
                             projected_position_values[reversal_side] = max(
@@ -3565,6 +3611,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             max_position_value,
             policy,
             min_position_value,
+            position_value_is_signed=policy == "limit",
         ):
             replacement["status"] = "paused_limit"
             replacement["paused_at"] = now
@@ -3578,7 +3625,9 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             continue
         levels.append(replacement)
         order_notional = Decimal(str(replacement["size"])) * Decimal(str(replacement["price"]))
-        if grid_order_would_add_risk(position_size, bool(replacement["is_buy"])):
+        if policy == "limit":
+            projected_position_values[replacement_side] += order_notional if bool(replacement["is_buy"]) else -order_notional
+        elif grid_order_would_add_risk(position_size, bool(replacement["is_buy"])):
             projected_position_values[replacement_side] += order_notional
         else:
             projected_position_values[replacement_side] = max(Decimal("0"), projected_position_value - order_notional)
@@ -3594,7 +3643,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             key=lambda entry: decimal_or_none(entry.get("price", entry.get("limit_px"))) or Decimal("0"),
             reverse=side == "buy",
         )
-        projected_side_value = position_value
+        projected_side_value = signed_position_value(position_size, position_value) if policy == "limit" else position_value
         for entry in entries:
             if id(entry) in high_priority_pause_ids:
                 continue
@@ -3608,10 +3657,13 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 max_position_value,
                 policy,
                 min_position_value,
+                position_value_is_signed=policy == "limit",
             ):
                 to_pause_limit.append(entry)
                 continue
-            if grid_order_would_add_risk(position_size, is_buy):
+            if policy == "limit":
+                projected_side_value += order_notional if is_buy else -order_notional
+            elif grid_order_would_add_risk(position_size, is_buy):
                 projected_side_value += order_notional
             else:
                 projected_side_value = max(Decimal("0"), projected_side_value - order_notional)
@@ -3751,12 +3803,15 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             max_position_value,
             policy,
             min_position_value,
+            position_value_is_signed=policy == "limit",
         ):
             continue
         if not submit_tracked(entry):
             changed = True
             continue
-        if grid_order_would_add_risk(position_size, bool(entry.get("is_buy"))):
+        if policy == "limit":
+            projected_position_values[side] += order_notional if bool(entry.get("is_buy")) else -order_notional
+        elif grid_order_would_add_risk(position_size, bool(entry.get("is_buy"))):
             projected_position_values[side] += order_notional
         else:
             projected_position_values[side] = max(Decimal("0"), projected_position_value - order_notional)
@@ -3812,6 +3867,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 max_position_value,
                 policy,
                 min_position_value,
+                position_value_is_signed=policy == "limit",
             ):
                 topup["status"] = "paused_limit"
                 topup["paused_at"] = now
@@ -3827,7 +3883,9 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             levels.append(topup)
             order_notional = Decimal(str(topup["size"])) * Decimal(str(topup["price"]))
             remaining_topups -= 1
-            if grid_order_would_add_risk(position_size, bool(topup["is_buy"])):
+            if policy == "limit":
+                projected_position_values[side] += order_notional if bool(topup["is_buy"]) else -order_notional
+            elif grid_order_would_add_risk(position_size, bool(topup["is_buy"])):
                 projected_position_values[side] += order_notional
             else:
                 projected_position_values[side] = max(Decimal("0"), projected_position_value - order_notional)
@@ -3912,6 +3970,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             max_position_value,
             policy,
             min_position_value,
+            position_value_is_signed=policy == "limit",
         ):
             if is_replacement_order:
                 preserve_replacement_order(levels, entry, now, "limit_still_blocked", normalize_margin=True)
@@ -3923,7 +3982,9 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             changed = True
             continue
         order_notional = Decimal(str(entry.get("size"))) * Decimal(str(entry.get("price", entry.get("limit_px"))))
-        if grid_order_would_add_risk(position_size, bool(entry.get("is_buy"))):
+        if policy == "limit":
+            projected_position_values[side] += order_notional if bool(entry.get("is_buy")) else -order_notional
+        elif grid_order_would_add_risk(position_size, bool(entry.get("is_buy"))):
             projected_position_values[side] += order_notional
         else:
             projected_position_values[side] = max(Decimal("0"), projected_position_value - order_notional)
@@ -4259,7 +4320,10 @@ def run_once() -> None:
         grid_cache["grid_action_phase"] = phase
         for index in active_grid_indexes:
             process_grid_index(index, f"grid {phase}")
-        grid_cache.pop("open_orders", None)
+        for info, _exchange, _account, _signer, _role in grid_cache.get("clients", {}).values():
+            clear_info_cache(info)
+        for cache_name in ("user_states", "account_margin_ratios", "open_orders", "fills"):
+            grid_cache.pop(cache_name, None)
     grid_cache.pop("grid_action_phase", None)
 
     rows, pruned = prune_done_rows(rows)

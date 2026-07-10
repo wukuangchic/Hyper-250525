@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shlex
+import socket
 import ssl
 import subprocess
 import sys
@@ -15,12 +16,19 @@ import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Lock
+from threading import BoundedSemaphore, Lock
 from typing import Any
 from urllib.parse import urlparse
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
+DEFAULT_RUNTIME_DIR = Path("/var/lib/simple-hyper")
+RUNTIME_DIR = Path(
+    os.environ.get(
+        "SIMPLE_HYPER_STATE_DIR",
+        str(DEFAULT_RUNTIME_DIR if DEFAULT_RUNTIME_DIR.is_dir() and os.access(DEFAULT_RUNTIME_DIR, os.W_OK) else PROJECT_DIR),
+    )
+)
 ICON_FILES = {
     "/apple-touch-icon.png": PROJECT_DIR / "simple-hyper-icon-180.png",
     "/apple-touch-icon-180.png": PROJECT_DIR / "simple-hyper-icon-180.png",
@@ -37,9 +45,19 @@ ICON_FILES = {
 TLS_CERT = os.environ.get("SIMPLE_HYPER_TLS_CERT", "")
 TLS_KEY = os.environ.get("SIMPLE_HYPER_TLS_KEY", "")
 COMMAND_TIMEOUT = float(os.environ.get("SIMPLE_HYPER_COMMAND_TIMEOUT", "300"))
+CONNECTION_READ_TIMEOUT = float(os.environ.get("SIMPLE_HYPER_CONNECTION_READ_TIMEOUT", "15"))
+MAX_CONCURRENT_COMMANDS = int(os.environ.get("SIMPLE_HYPER_MAX_CONCURRENT_COMMANDS", "2"))
+MAX_CONNECTIONS = int(os.environ.get("SIMPLE_HYPER_MAX_CONNECTIONS", "32"))
+if CONNECTION_READ_TIMEOUT <= 0:
+    raise ValueError("SIMPLE_HYPER_CONNECTION_READ_TIMEOUT must be greater than zero")
+if MAX_CONCURRENT_COMMANDS <= 0:
+    raise ValueError("SIMPLE_HYPER_MAX_CONCURRENT_COMMANDS must be greater than zero")
+if MAX_CONNECTIONS <= 0:
+    raise ValueError("SIMPLE_HYPER_MAX_CONNECTIONS must be greater than zero")
+COMMAND_SLOTS = BoundedSemaphore(MAX_CONCURRENT_COMMANDS)
 MAX_COMMAND_LENGTH = int(os.environ.get("SIMPLE_HYPER_MAX_COMMAND_LENGTH", "240"))
 COMMAND_HISTORY_LIMIT = int(os.environ.get("SIMPLE_HYPER_COMMAND_HISTORY_LIMIT", "30"))
-COMMAND_HISTORY_PATH = Path(os.environ.get("SIMPLE_HYPER_COMMAND_HISTORY", str(PROJECT_DIR / "command_history.json")))
+COMMAND_HISTORY_PATH = Path(os.environ.get("SIMPLE_HYPER_COMMAND_HISTORY", str(RUNTIME_DIR / "command_history.json")))
 COMMAND_HISTORY_LOCK = Lock()
 ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 SECRET_RE = re.compile(r"^0x[a-fA-F0-9]{64}$")
@@ -1881,6 +1899,8 @@ def parse_json_body(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
         length = int(raw_length)
     except ValueError as exc:
         raise ValueError("invalid content length") from exc
+    if length < 0:
+        raise ValueError("invalid content length")
     if length > 8192:
         raise ValueError("request body too large")
     body = handler.rfile.read(length) if length else b"{}"
@@ -2011,7 +2031,7 @@ def parse_grid_coin(raw: Any) -> str:
 
 
 def load_grid_batch_rows(account_address: str, network: str = "mainnet") -> list[dict[str, Any]]:
-    path = PROJECT_DIR / "server_batch.json"
+    path = RUNTIME_DIR / "server_batch.json"
     if not path.exists():
         return []
     try:
@@ -2087,22 +2107,31 @@ def clean_web_output(output: str) -> str:
     return "\n".join(lines).rstrip()
 
 
+class CommandCapacityError(RuntimeError):
+    pass
+
+
 def run_hl_order(args: list[str], account_address: str, secret_key: str) -> dict[str, Any]:
+    if not COMMAND_SLOTS.acquire(blocking=False):
+        raise CommandCapacityError("command capacity is full; retry later")
     started = time.monotonic()
-    command = [sys.executable, str(PROJECT_DIR / "hl_order.py"), *args]
-    child_env = os.environ.copy()
-    child_env["account_address"] = account_address
-    child_env["secret_key"] = secret_key
-    completed = subprocess.run(
-        command,
-        cwd=PROJECT_DIR,
-        env=child_env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=COMMAND_TIMEOUT,
-        check=False,
-    )
+    try:
+        command = [sys.executable, str(PROJECT_DIR / "hl_order.py"), *args]
+        child_env = os.environ.copy()
+        child_env["account_address"] = account_address
+        child_env["secret_key"] = secret_key
+        completed = subprocess.run(
+            command,
+            cwd=PROJECT_DIR,
+            env=child_env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=COMMAND_TIMEOUT,
+            check=False,
+        )
+    finally:
+        COMMAND_SLOTS.release()
     elapsed_ms = int((time.monotonic() - started) * 1000)
     return {
         "ok": True,
@@ -2121,6 +2150,10 @@ def run_grid_query(payload: dict[str, Any], account_address: str, secret_key: st
 
 class SimpleHyperHandler(BaseHTTPRequestHandler):
     server_version = "SimpleHyper/2.0"
+
+    def setup(self) -> None:
+        super().setup()
+        self.connection.settimeout(CONNECTION_READ_TIMEOUT)
 
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write("%s - - [%s] %s\n" % (self.client_address[0], self.log_date_time_string(), fmt % args))
@@ -2240,8 +2273,36 @@ class SimpleHyperHandler(BaseHTTPRequestHandler):
                 {"ok": False, "error": f"command timed out after {COMMAND_TIMEOUT:g}s"},
                 HTTPStatus.REQUEST_TIMEOUT,
             )
+        except CommandCapacityError as exc:
+            self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.SERVICE_UNAVAILABLE)
+        except (socket.timeout, TimeoutError):
+            self.send_json({"ok": False, "error": "request body read timed out"}, HTTPStatus.REQUEST_TIMEOUT)
         except ValueError as exc:
             self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+
+
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, server_address: tuple[str, int], handler_class: type[BaseHTTPRequestHandler]) -> None:
+        self.connection_slots = BoundedSemaphore(MAX_CONNECTIONS)
+        super().__init__(server_address, handler_class)
+
+    def process_request(self, request: socket.socket, client_address: tuple[str, int]) -> None:
+        if not self.connection_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.connection_slots.release()
+            raise
+
+    def process_request_thread(self, request: socket.socket, client_address: tuple[str, int]) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.connection_slots.release()
 
 
 def parse_args() -> argparse.Namespace:
@@ -2253,7 +2314,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    server = ThreadingHTTPServer((args.host, args.port), SimpleHyperHandler)
+    server = BoundedThreadingHTTPServer((args.host, args.port), SimpleHyperHandler)
     scheme = "http"
     if TLS_CERT or TLS_KEY:
         if not TLS_CERT or not TLS_KEY:

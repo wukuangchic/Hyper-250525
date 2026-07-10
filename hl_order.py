@@ -98,8 +98,16 @@ DEFAULT_SLIPPAGE = "0.05"
 MANUAL_ACTION_LIMIT_RETRY_DELAY_SECONDS = 10
 MANUAL_ACTION_LIMIT_MAX_RETRIES = 6
 ISOLATED_FALLBACK_LEVERAGE = 5
-SERVER_BATCH_PATH = Path(__file__).resolve().parent / "server_batch.json"
-SERVER_BATCH_LOCK_PATH = Path(__file__).resolve().parent / "server_batch.lock"
+PROJECT_DIR = Path(__file__).resolve().parent
+DEFAULT_RUNTIME_DIR = Path("/var/lib/simple-hyper")
+RUNTIME_DIR = Path(
+    os.environ.get(
+        "SIMPLE_HYPER_STATE_DIR",
+        str(DEFAULT_RUNTIME_DIR if DEFAULT_RUNTIME_DIR.is_dir() and os.access(DEFAULT_RUNTIME_DIR, os.W_OK) else PROJECT_DIR),
+    )
+)
+SERVER_BATCH_PATH = RUNTIME_DIR / "server_batch.json"
+SERVER_BATCH_LOCK_PATH = RUNTIME_DIR / "server_batch.lock"
 SYMMETRIC_SIDE_ALIASES = {"both"}
 GRID_SIDE_ALIASES = {"grid"}
 DEFAULT_GRID_GAP_LABEL = ["auto-minTick", "auto-takerFee", "auto-makerFee"]
@@ -152,7 +160,7 @@ class RunLogger:
         self.path = self._make_path()
 
     def _make_path(self) -> Path:
-        logs_dir = Path(__file__).resolve().parent / "logs"
+        logs_dir = RUNTIME_DIR / "logs"
         logs_dir.mkdir(exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         return logs_dir / f"order-{timestamp}.log"
@@ -2085,7 +2093,7 @@ def cancel_order(
         print_account_metrics(info, account)
         print("error:", result)
         return
-    cancelled_oids = {int(request["oid"]) for request in cancel_requests}
+    cancelled_oids, cancel_errors = successful_cancel_oids(result, cancel_requests)
     batch_cancelled = mark_cancelled_server_batch_oids(
         network,
         account,
@@ -2095,7 +2103,9 @@ def cancel_order(
 
     clear_info_cache(info)
     print_account_metrics(info, account)
-    rows = [("coin", coin), ("filter", cancel_filter_label(filter_arg)), ("cancelled", str(len(matching_orders)))]
+    if cancel_errors:
+        print("error:", cancel_errors)
+    rows = [("coin", coin), ("filter", cancel_filter_label(filter_arg)), ("cancelled", str(len(cancelled_oids)))]
     if batch_cancelled:
         rows.append(("batch", str(batch_cancelled)))
     if threshold_price is not None:
@@ -2104,6 +2114,8 @@ def cancel_order(
         rows.append(("age", format_cancel_age_range(filter_arg, cancel_age_range or (Decimal(1), None))))
     print_box("Cancel", rows)
     for order in matching_orders:
+        if int(order["oid"]) not in cancelled_oids:
+            continue
         display_px = open_order_cancel_price(order) or decimal_or_none(order.get("limitPx")) or Decimal("0")
         print_order_row(
             order["coin"],
@@ -3071,19 +3083,20 @@ def grid_order_allowed_by_max(
     max_position_value: Decimal,
     policy: str = "abs",
     min_position_value: Decimal = Decimal("0"),
+    position_value_is_signed: bool = False,
 ) -> bool:
     if not grid_order_allowed_by_policy(position_size, is_buy, policy):
         return False
     if policy == "limit":
         lower, upper = grid_position_bounds(policy, min_position_value, max_position_value)
-        current = signed_position_value(position_size, position_value)
+        current = position_value if position_value_is_signed else signed_position_value(position_size, position_value)
         projected = current + order_notional if is_buy else current - order_notional
         if lower <= current <= upper:
             return lower <= projected <= upper
         if current < lower:
-            return projected > current
+            return current < projected <= upper
         if current > upper:
-            return projected < current
+            return lower <= projected < current
         return False
     if grid_order_would_add_risk(position_size, is_buy):
         return position_value + order_notional <= max_position_value
@@ -3247,7 +3260,8 @@ def build_grid_orders(
     else:
         args.resolved_grid_trend = "0%"
 
-    projected_position_values = {"buy": position_value, "sell": position_value}
+    initial_projected_value = signed_position_value(position_size, position_value) if policy == "limit" else position_value
+    projected_position_values = {"buy": initial_projected_value, "sell": initial_projected_value}
     plans: list[dict[str, Any]] = []
     for depth in range(1, GRID_TARGET_ORDERS_PER_SIDE + 1):
         for is_buy, base_size, label, multiplier in (
@@ -3269,6 +3283,7 @@ def build_grid_orders(
                 max_position_value,
                 policy,
                 min_position_value,
+                position_value_is_signed=policy == "limit",
             ):
                 continue
             reduce_only = grid_order_should_reduce_only(position_size, is_buy, policy)
@@ -3290,7 +3305,9 @@ def build_grid_orders(
             plan["grid_avg_favored_side"] = avg_favored_side
             plan["grid_avg_current_value"] = avg_current_value
             plans.append(plan)
-            if grid_order_would_add_risk(position_size, is_buy):
+            if policy == "limit":
+                projected_position_values[side] += notional if is_buy else -notional
+            elif grid_order_would_add_risk(position_size, is_buy):
                 projected_position_values[side] += notional
             else:
                 projected_position_values[side] = max(Decimal("0"), projected_position_value - notional)
@@ -3307,6 +3324,32 @@ def status_order_oid(status: dict[str, Any] | None) -> int | None:
         if isinstance(payload, dict) and payload.get("oid") is not None:
             return int(payload["oid"])
     return None
+
+
+def status_resting_oid(status: dict[str, Any] | None) -> int | None:
+    if not isinstance(status, dict):
+        return None
+    resting = status.get("resting")
+    if not isinstance(resting, dict) or resting.get("oid") is None:
+        return None
+    return int(resting["oid"])
+
+
+def successful_cancel_oids(result: dict[str, Any], requests: list[dict[str, Any]]) -> tuple[set[int], list[str]]:
+    statuses = result.get("response", {}).get("data", {}).get("statuses")
+    if not isinstance(statuses, list):
+        return set(), ["cancel response did not include statuses"]
+    if len(statuses) != len(requests):
+        return set(), [f"cancel response statuses length {len(statuses)} did not match requests length {len(requests)}"]
+
+    successful: set[int] = set()
+    errors: list[str] = []
+    for request, status in zip(requests, statuses):
+        if status == "success":
+            successful.add(int(request["oid"]))
+        else:
+            errors.append(str(status.get("error") if isinstance(status, dict) and status.get("error") else status))
+    return successful, errors
 
 
 def is_post_only_reject_text(text: str) -> bool:
@@ -3709,6 +3752,45 @@ def append_server_batch(row: dict[str, Any], path: Path = SERVER_BATCH_PATH) -> 
     save_server_batch(rows, path)
 
 
+def append_server_batch_or_cancel_orders(
+    row: dict[str, Any],
+    exchange: Exchange,
+    coin: str,
+    oids: set[int],
+) -> None:
+    try:
+        append_server_batch(row)
+        return
+    except Exception as persist_error:
+        requests = [{"coin": coin, "oid": oid} for oid in sorted(oids) if oid > 0]
+        if not requests:
+            raise RuntimeError(f"Failed to persist server batch after order submission: {persist_error}") from persist_error
+
+        try:
+            cancel_result = exchange.bulk_cancel(requests)
+            log_event(
+                "server_batch_persist_compensation",
+                {"requests": requests, "persist_error": str(persist_error), "cancel_result": cancel_result},
+            )
+            cancelled_oids, cancel_errors = successful_cancel_oids(cancel_result, requests)
+        except Exception as cancel_error:
+            raise RuntimeError(
+                f"Failed to persist server batch after order submission ({persist_error}); "
+                f"compensation cancel failed and orders may still be active: {sorted(oids)} ({cancel_error})"
+            ) from persist_error
+
+        unresolved_oids = sorted(oids - cancelled_oids)
+        if unresolved_oids:
+            detail = "; ".join(cancel_errors) if cancel_errors else "cancel was not confirmed"
+            raise RuntimeError(
+                f"Failed to persist server batch after order submission ({persist_error}); "
+                f"orders may still be active: {unresolved_oids} ({detail})"
+            ) from persist_error
+        raise RuntimeError(
+            f"Failed to persist server batch after order submission ({persist_error}); submitted orders were cancelled"
+        ) from persist_error
+
+
 def batch_row_matches_coin(row: dict[str, Any], coin: str | None) -> bool:
     if coin is None:
         return True
@@ -3903,25 +3985,24 @@ def cancel_trail_batch_orders(
         print_account_metrics(info, account)
         print("error:", result)
         return
-    statuses = result.get("response", {}).get("data", {}).get("statuses", [])
-    status_errors = [status.get("error") for status in statuses if isinstance(status, dict) and status.get("error")]
-    if status_errors:
-        print_account_metrics(info, account)
-        print("error:", status_errors)
-        return
+    cancelled_oids, cancel_errors = successful_cancel_oids(result, cancel_requests)
 
     now = int(time.time())
-    for index in matching_indexes:
+    cancelled_indexes = [index for index, request in zip(matching_indexes, cancel_requests) if int(request["oid"]) in cancelled_oids]
+    for index in cancelled_indexes:
         batch_rows[index]["status"] = "cancelled"
         batch_rows[index]["cancelled_at"] = now
         batch_rows[index]["updated_at"] = now
         batch_rows[index]["note"] = "cancelled by --cancel trail"
-    save_server_batch(batch_rows)
+    if cancelled_indexes:
+        save_server_batch(batch_rows)
 
     clear_info_cache(info)
     print_account_metrics(info, account)
-    print_box("Cancel", [("coin", coin), ("filter", "trail"), ("cancelled", str(len(matching_indexes)))])
-    print_server_batch([batch_rows[index] for index in matching_indexes], network, account, coin)
+    if cancel_errors:
+        print("error:", cancel_errors)
+    print_box("Cancel", [("coin", coin), ("filter", "trail"), ("cancelled", str(len(cancelled_indexes)))])
+    print_server_batch([batch_rows[index] for index in cancelled_indexes], network, account, coin)
 
 
 def cancel_grid_batch_orders(
@@ -3959,21 +4040,17 @@ def cancel_grid_batch_orders(
         print_account_metrics(info, account)
         print("error:", result)
         return
-    statuses = result.get("response", {}).get("data", {}).get("statuses", [])
-    status_errors = [status.get("error") for status in statuses if isinstance(status, dict) and status.get("error")]
-    if status_errors:
-        print_account_metrics(info, account)
-        print("error:", status_errors)
-        return
+    cancelled_oids, cancel_errors = successful_cancel_oids(result, cancel_requests)
 
     now = int(time.time())
-    cancelled_oids = {int(request["oid"]) for request in cancel_requests}
     for index in matching_indexes:
         row = batch_rows[index]
-        row["status"] = "cancelled"
-        row["cancelled_at"] = now
+        row_fully_cancelled = grid_batch_open_oids(row) <= cancelled_oids
+        if row_fully_cancelled:
+            row["status"] = "cancelled"
+            row["cancelled_at"] = now
         row["updated_at"] = now
-        row["note"] = "cancelled by --cancel grid"
+        row["note"] = "cancelled by --cancel grid" if row_fully_cancelled else "partial --cancel grid; retry required"
         for level in row.get("levels") or []:
             if not isinstance(level, dict):
                 continue
@@ -3997,11 +4074,14 @@ def cancel_grid_batch_orders(
                 if oid in cancelled_oids:
                     order["status"] = "cancelled"
                     order["cancelled_at"] = now
-    save_server_batch(batch_rows)
+    if cancelled_oids:
+        save_server_batch(batch_rows)
 
     clear_info_cache(info)
     print_account_metrics(info, account)
-    print_box("Cancel", [("coin", coin), ("filter", "grid"), ("cancelled", str(len(cancel_requests)))])
+    if cancel_errors:
+        print("error:", cancel_errors)
+    print_box("Cancel", [("coin", coin), ("filter", "grid"), ("cancelled", str(len(cancelled_oids)))])
     print_server_batch([batch_rows[index] for index in matching_indexes], network, account, coin)
 
 
@@ -4410,7 +4490,7 @@ def submit_trail_stop_order(
         tpsl="sl",
     )
     if args.dry_run:
-        return 0, {"dryRun": True, "plan": plan}
+        return 0, {"dryRun": True, "plan": plan}, False
     result = exchange.order(
         coin,
         is_buy,
@@ -4427,9 +4507,9 @@ def submit_trail_stop_order(
         if "error" in status:
             raise RuntimeError(f"Failed to submit trail stop: {status['error']}")
         if "resting" in status:
-            return int(status["resting"]["oid"]), plan
+            return int(status["resting"]["oid"]), plan, True
         if "filled" in status:
-            return int(status["filled"].get("oid", 0)), plan
+            return int(status["filled"].get("oid", 0)), plan, False
     raise RuntimeError(f"Trail stop response did not include an order id: {result}")
 
 
@@ -4491,7 +4571,9 @@ def run_trailing_order(
         )
         return
 
-    stop_oid, plan = submit_trail_stop_order(args, exchange, info, account, coin, asset, is_buy, amount, stop_px, slippage)
+    stop_oid, plan, stop_is_resting = submit_trail_stop_order(
+        args, exchange, info, account, coin, asset, is_buy, amount, stop_px, slippage
+    )
     row = {
         "id": f"{int(time.time())}-{stop_oid}",
         "type": "trail",
@@ -4516,7 +4598,7 @@ def run_trailing_order(
         "updated_at": int(time.time()),
         "plan": plan,
     }
-    append_server_batch(row)
+    append_server_batch_or_cancel_orders(row, exchange, coin, {stop_oid} if stop_is_resting else set())
     print_trail_status(coin, is_buy, current_mid, best_px, stop_px, stop_oid, "batched", price_rate)
 
 
@@ -5126,7 +5208,8 @@ def place_order(args: argparse.Namespace) -> None:
         )
         if statuses is not None:
             row = build_grid_batch_row(args, account, coin, dex, asset, plans, statuses, amount, slippage)
-            append_server_batch(row)
+            submitted_oids = {oid for status in statuses if (oid := status_resting_oid(status)) is not None and oid > 0}
+            append_server_batch_or_cancel_orders(row, exchange, coin, submitted_oids)
             print_grid_batch_status(row, price_rate)
         return
 

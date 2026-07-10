@@ -5,6 +5,21 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+User=root
+Group=root
 WorkingDirectory=/opt/simple-hyper
-ExecStart=/opt/simple-hyper/scripts/simple-hyper-sync.sh
-
+ExecStartPre=/usr/bin/chown -R root:root /opt/simple-hyper
+ExecStartPre=/usr/bin/chmod -R go-w /opt/simple-hyper
+Environment=PROJECT_DIR=/opt/simple-hyper
+Environment=SIMPLE_HYPER_SYNC_LOCK_FILE=/run/simple-hyper-sync/sync.lock
+ExecStart=/usr/local/sbin/simple-hyper-sync.sh
+UMask=0027
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RuntimeDirectory=simple-hyper-sync
+RuntimeDirectoryMode=0750
+StateDirectory=simple-hyper simple-hyper-sync
+StateDirectoryMode=0750
+ReadOnlyPaths=/usr/local/sbin/simple-hyper-sync.sh
+ReadWritePaths=/opt/simple-hyper -/var/lib/simple-hyper -/var/lib/simple-hyper-sync /run/simple-hyper-sync
