@@ -595,6 +595,36 @@ def account_margin_ratio(
     return ratio
 
 
+def account_spot_withdrawable(
+    info: Any,
+    account: str,
+    network: str,
+    cache: dict[str, Any],
+) -> tuple[Decimal, Decimal] | None:
+    states = cache.setdefault("spot_user_states", {})
+    cache_key = (network, account)
+    if cache_key not in states:
+        try:
+            states[cache_key] = info.spot_user_state(account)
+        except Exception as exc:
+            log_event("spot_user_state_error", {"type": type(exc).__name__, "message": str(exc)})
+            states[cache_key] = None
+    state = states[cache_key]
+    if not isinstance(state, dict):
+        return None
+    for balance in state.get("balances", []):
+        if not isinstance(balance, dict):
+            continue
+        if balance.get("token") != 0 and str(balance.get("coin", "")).upper() != "USDC":
+            continue
+        total = decimal_or_none(balance.get("total"))
+        hold = decimal_or_none(balance.get("hold"))
+        if total is None or hold is None:
+            return None
+        return max(Decimal("0"), total - hold), total
+    return None
+
+
 def grid_reduce_only_capacity_available(
     row: dict[str, Any],
     order: dict[str, Any],
@@ -3350,19 +3380,34 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         row.get("effective_gap_rate"),
     )
     margin_ratio = account_margin_ratio(info, account, network, cache)
-    withdrawable = decimal_or_none(user_state_cache[user_state_key].get("withdrawable"))
-    withdrawable_zero = withdrawable is not None and withdrawable <= 0
+    spot_withdrawable_state = account_spot_withdrawable(info, account, network, cache)
+    if spot_withdrawable_state is None:
+        withdrawable = None
+        total_usdc = None
+        withdrawable_ratio = None
+    else:
+        withdrawable, total_usdc = spot_withdrawable_state
+        withdrawable_ratio = withdrawable / total_usdc if total_usdc > 0 else Decimal("0")
+    withdrawable_reduce_only = (
+        withdrawable is not None
+        and total_usdc is not None
+        and (withdrawable < Decimal("10") or withdrawable_ratio < Decimal("0.1"))
+    )
     account_margin_protected = (
         (margin_ratio is not None and margin_ratio < GRID_ACCOUNT_MARGIN_RATIO_THRESHOLD)
-        or withdrawable_zero
+        or withdrawable_reduce_only
     )
     margin_gap_multiplier = grid_margin_gap_multiplier(margin_ratio)
     margin_gap_multiplier_text = decimal_to_plain(margin_gap_multiplier)
     margin_state_changed = row.get("margin_gap_multiplier") != margin_gap_multiplier_text
     row["margin_gap_multiplier"] = margin_gap_multiplier_text
     row["margin_gap_soft_threshold"] = decimal_to_plain(GRID_ACCOUNT_MARGIN_RATIO_SOFT_THRESHOLD)
-    row["withdrawable"] = decimal_to_plain(withdrawable) if withdrawable is not None else None
-    row["withdrawable_zero_reduce_only_only"] = withdrawable_zero
+    row["account_usdc_total"] = decimal_to_plain(total_usdc) if total_usdc is not None else None
+    row["account_usdc_withdrawable"] = decimal_to_plain(withdrawable) if withdrawable is not None else None
+    row["account_usdc_withdrawable_ratio"] = (
+        decimal_to_plain(withdrawable_ratio) if withdrawable_ratio is not None else None
+    )
+    row["account_usdc_reduce_only_only"] = withdrawable_reduce_only
     brake_state_pruned = prune_add_risk_brake_state(row, now)
     mark_phase("margin")
 
