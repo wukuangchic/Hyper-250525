@@ -1811,7 +1811,7 @@ class GridAvgTests(unittest.TestCase):
         paused_oids = [entry["oid"] for entry in candidates]
         self.assertEqual(paused_oids, [2, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18])
 
-    def test_active_cap_pauses_logarithmically_beyond_thirty_two_active_orders(self) -> None:
+    def test_active_cap_pauses_logarithmically_beyond_sixteen_active_orders(self) -> None:
         row = {
             "levels": [
                 {
@@ -1828,8 +1828,11 @@ class GridAvgTests(unittest.TestCase):
 
         candidates, allowed = grid_active_cap_pause_candidates(row, "sell")
 
-        self.assertEqual(allowed, 32)
-        self.assertEqual([entry["oid"] for entry in candidates], [29, 30, 32, 33, 34, 36, 37, 38])
+        self.assertEqual(allowed, 16)
+        self.assertEqual(
+            [entry["oid"] for entry in candidates],
+            [10, 12, 13, 15, 16, 17, 19, 20, 21, 22, 24, 25, 26, 27, 28, 29, 31, 32, 33, 34, 35, 36, 37, 38],
+        )
 
     def test_active_cap_keeps_replacement_before_regular_orders(self) -> None:
         row = {
@@ -1842,7 +1845,7 @@ class GridAvgTests(unittest.TestCase):
                     "price": str(100 + oid),
                     "size": "1",
                 }
-                for oid in range(32)
+                for oid in range(16)
             ]
         }
         row["levels"].append(
@@ -1859,8 +1862,9 @@ class GridAvgTests(unittest.TestCase):
 
         candidates, allowed = grid_active_cap_pause_candidates(row, "sell")
 
-        self.assertEqual(allowed, 32)
-        self.assertEqual([entry["oid"] for entry in candidates], [30])
+        self.assertEqual(allowed, 16)
+        self.assertNotIn(999, [entry["oid"] for entry in candidates])
+        self.assertEqual(len(candidates), 1)
 
     def test_risk_density_restore_uses_logarithmic_distribution(self) -> None:
         row = {
@@ -1890,7 +1894,7 @@ class GridAvgTests(unittest.TestCase):
         )
 
     def test_active_cap_restore_uses_logarithmic_distribution(self) -> None:
-        keep_active = set(range(29)) | {31, 35}
+        keep_active = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 14, 18, 23, 30}
         row = {
             "levels": [
                 {
@@ -1904,13 +1908,13 @@ class GridAvgTests(unittest.TestCase):
                 for oid in range(40)
             ],
         }
-        should_wait = row["levels"][29]
+        should_wait = row["levels"][10]
         should_restore = row["levels"][39]
 
         self.assertFalse(grid_active_cap_restore_allowed(row, should_wait, "sell"))
         self.assertTrue(grid_active_cap_restore_allowed(row, should_restore, "sell"))
 
-    def test_replacement_waits_until_active_side_is_at_most_64(self) -> None:
+    def test_replacement_waits_until_active_side_is_at_most_32(self) -> None:
         row = {
             "levels": [
                 {
@@ -1921,7 +1925,7 @@ class GridAvgTests(unittest.TestCase):
                     "price": str(100 + oid),
                     "size": "1",
                 }
-                for oid in range(65)
+                for oid in range(33)
             ]
         }
 
