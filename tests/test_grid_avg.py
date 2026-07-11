@@ -85,6 +85,7 @@ from trail_worker import (
     pause_grid_margin_side,
     pause_grid_margin_side_entries,
     pending_cancel_rate,
+    pending_cancel_overflow_candidates,
     prepare_grid_cancel_entries,
     pause_skipped_account_margin_replacement,
     precheck_action_limit,
@@ -1959,6 +1960,25 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(pending_cancel_rate(1), Decimal("0.20"))
         self.assertEqual(pending_cancel_rate(100), Decimal("0.02"))
         self.assertEqual(pending_cancel_rate(1000000), Decimal("0.01"))
+
+    def test_pending_cancel_overflow_selects_farthest_live_orders_above_thirty_two(self) -> None:
+        row = {
+            "levels": [
+                {
+                    "side": "sell",
+                    "status": GRID_PENDING_CANCEL_STATUS if oid >= 30 else "active",
+                    "oid": oid,
+                    "price": str(100 + oid),
+                    "size": "1",
+                }
+                for oid in range(35)
+            ]
+        }
+
+        candidates = pending_cancel_overflow_candidates(row, set(range(35)))
+
+        self.assertEqual([entry["oid"] for entry in candidates], [34, 33, 32])
+        self.assertEqual(pending_cancel_overflow_candidates(row, set(range(32))), [])
 
     def test_far_cancel_becomes_pending_without_exchange_request(self) -> None:
         row = {"coin": "BTC", "levels": []}

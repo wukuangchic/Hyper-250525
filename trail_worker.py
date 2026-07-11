@@ -2353,6 +2353,39 @@ def replacement_active_cap_submit_allowed(
     return len(active_grid_entries(row, side)) <= threshold
 
 
+def pending_cancel_overflow_candidates(
+    row: dict[str, Any],
+    open_oids: set[int],
+    threshold: int = GRID_REPLACEMENT_ACTIVE_CAP_SUBMIT_THRESHOLD,
+) -> list[dict[str, Any]]:
+    side_candidates: list[tuple[int, str, list[dict[str, Any]]]] = []
+    for side in ("buy", "sell"):
+        live_entries: list[dict[str, Any]] = []
+        for entry in active_grid_entries(row, side):
+            try:
+                oid = int(entry["oid"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if oid in open_oids:
+                live_entries.append(entry)
+        overflow = len(live_entries) - threshold
+        if overflow <= 0:
+            continue
+        pending = [
+            entry
+            for entry in live_entries
+            if str(entry.get("status")) == GRID_PENDING_CANCEL_STATUS
+        ]
+        pending.sort(
+            key=lambda entry: decimal_or_none(entry.get("price", entry.get("limit_px"))) or Decimal("0"),
+            reverse=side == "sell",
+        )
+        if pending:
+            side_candidates.append((overflow, side, pending[:overflow]))
+    side_candidates.sort(key=lambda item: (-item[0], item[1]))
+    return [entry for _overflow, _side, entries in side_candidates for entry in entries]
+
+
 def grid_missing_recovery_allowed(
     row: dict[str, Any],
     side: str,
@@ -4025,6 +4058,25 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         if limit_paused:
             changed = True
     paused_limit_ids = {id(entry) for entry in to_pause_limit}
+    pending_overflow = pending_cancel_overflow_candidates(row, open_oids)
+    if pending_overflow:
+        overflow_cancelled = cancel_grid_entries_with_p1_budget(
+            exchange,
+            coin,
+            pending_overflow,
+            now,
+            GRID_ACTIVE_CAP_PAUSE_STATUS,
+            cache,
+        )
+        paused += overflow_cancelled
+        for entry in pending_overflow:
+            if str(entry.get("status")) != GRID_ACTIVE_CAP_PAUSE_STATUS or entry.get("cancelled_at") != now:
+                continue
+            entry["active_cap_allowed"] = GRID_REPLACEMENT_ACTIVE_CAP_SUBMIT_THRESHOLD
+            entry["active_cap_paused_at"] = now
+            entry["active_cap_pending_overflow"] = True
+        if overflow_cancelled:
+            changed = True
     to_pause_post_replacement_cap: list[dict[str, Any]] = []
     for side in ("buy", "sell"):
         candidates, _allowed = grid_active_cap_pause_candidates(row, side)
