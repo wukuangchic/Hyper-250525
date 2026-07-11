@@ -855,6 +855,33 @@ def grid_order_status_name(order_status: Any) -> str:
     return ""
 
 
+def grid_order_status_is_cancelled(order_status: Any) -> bool:
+    status_name = grid_order_status_name(order_status).strip().lower()
+    return status_name.endswith(("cancel", "canceled", "cancelled"))
+
+
+def mark_pending_cancel_confirmed_cancelled(
+    entry: dict[str, Any],
+    old_oid: int,
+    now: int,
+    order_status: Any,
+) -> bool:
+    if str(entry.get("status")) != GRID_PENDING_CANCEL_STATUS:
+        return False
+    if not grid_order_status_is_cancelled(order_status):
+        return False
+    entry["status"] = "cancelled"
+    entry["oid"] = None
+    entry["cancelled_oid"] = old_oid
+    entry["cancelled_at"] = now
+    entry["exchange_cancel_status"] = grid_order_status_name(order_status)
+    entry.pop("pending_cancel_reason", None)
+    entry.pop("pending_cancel_at", None)
+    entry.pop("pending_cancel_mid", None)
+    entry.pop("pending_cancel_rate", None)
+    return True
+
+
 def grid_entry_age_seconds(entry: dict[str, Any], now: int) -> int:
     for key in ("submitted_at", "recovered_at", "filled_at", "cancelled_at", "skipped_at", "paused_at"):
         try:
@@ -3300,7 +3327,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         books_cache[books_key] = best_bid_ask(info, coin)
     best_bid, best_ask = books_cache[books_key]
     mark_phase("book")
-    pending_restored = restore_pending_cancel_entries(row, current_mid, cache, now)
+    pending_restored = 0
     user_state_cache = cache.setdefault("user_states", {})
     user_state_key = (network, account, dex)
     if user_state_key not in user_state_cache:
@@ -3619,7 +3646,11 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     for entry in (levels if allow_latest_replacement else []):
         if not isinstance(entry, dict) or not entry.get("side"):
             continue
-        if str(entry.get("status", "active")) not in {"active", "recovery_deferred"}:
+        if str(entry.get("status", "active")) not in {
+            "active",
+            "recovery_deferred",
+            GRID_PENDING_CANCEL_STATUS,
+        }:
             continue
         try:
             oid = int(entry["oid"])
@@ -3642,6 +3673,9 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 continue
             if status_name == "reduceOnlyCanceled":
                 pause_reduce_only_canceled_entry(entry, old_oid, now)
+                changed = True
+                continue
+            if mark_pending_cancel_confirmed_cancelled(entry, old_oid, now, order_status):
                 changed = True
                 continue
             if skip_unknown_oid_grid_recovery(entry, old_oid, now, order_status):
@@ -3677,6 +3711,9 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         entry["fill"] = fill
         entry["replacement_pending"] = True
         newly_filled.append(entry)
+        changed = True
+    pending_restored = restore_pending_cancel_entries(row, current_mid, cache, now)
+    if pending_restored:
         changed = True
     mark_phase("missing_scan")
 

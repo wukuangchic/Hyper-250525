@@ -56,6 +56,7 @@ from trail_worker import (
     replacement_active_cap_submit_allowed,
     grid_margin_gap_multiplier,
     grid_margin_pause_active,
+    grid_order_status_is_cancelled,
     find_current_position_from_state,
     is_cumulative_action_limit_text,
     is_min_order_value_error_text,
@@ -68,6 +69,7 @@ from trail_worker import (
     grid_risk_density_pause_candidates,
     grid_risk_density_restore_allowed,
     maintain_grid,
+    mark_pending_cancel_confirmed_cancelled,
     modify_trail_stop,
     move_grid_order_away_from_active,
     near_grid_orders_if_stale,
@@ -1975,6 +1977,40 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(restored, 1)
         self.assertEqual(row["levels"][0]["status"], "active")
         self.assertNotIn("pending_cancel_reason", row["levels"][0])
+
+    def test_pending_cancel_confirmed_cancelled_becomes_history(self) -> None:
+        entry = {
+            "side": "sell",
+            "status": GRID_PENDING_CANCEL_STATUS,
+            "oid": 123,
+            "price": "120",
+            "pending_cancel_reason": "paused_limit",
+            "pending_cancel_at": 1,
+        }
+
+        changed = mark_pending_cancel_confirmed_cancelled(
+            entry,
+            123,
+            10,
+            {"order": {"status": "canceled"}},
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(entry["status"], "cancelled")
+        self.assertIsNone(entry["oid"])
+        self.assertEqual(entry["cancelled_oid"], 123)
+        self.assertEqual(entry["exchange_cancel_status"], "canceled")
+        self.assertNotIn("pending_cancel_reason", entry)
+
+    def test_pending_cancel_does_not_treat_filled_or_unknown_as_cancelled(self) -> None:
+        self.assertTrue(grid_order_status_is_cancelled({"status": "reduceOnlyCanceled"}))
+        self.assertTrue(grid_order_status_is_cancelled({"status": "scheduledCancel"}))
+        self.assertFalse(grid_order_status_is_cancelled({"status": "filled"}))
+        self.assertFalse(grid_order_status_is_cancelled({"status": "unknownOid"}))
+
+        entry = {"status": GRID_PENDING_CANCEL_STATUS, "oid": 123}
+        self.assertFalse(mark_pending_cancel_confirmed_cancelled(entry, 123, 10, {"status": "filled"}))
+        self.assertEqual(entry["status"], GRID_PENDING_CANCEL_STATUS)
 
     def test_replacement_rebalance_swaps_toward_logarithmic_distribution(self) -> None:
         row = {
