@@ -56,6 +56,7 @@ from trail_worker import (
     replacement_active_cap_submit_allowed,
     grid_margin_gap_multiplier,
     grid_margin_pause_active,
+    grid_missing_recovery_allowed,
     grid_order_status_is_cancelled,
     find_current_position_from_state,
     is_cumulative_action_limit_text,
@@ -1932,6 +1933,26 @@ class GridAvgTests(unittest.TestCase):
         self.assertFalse(replacement_active_cap_submit_allowed(row, "sell"))
         row["levels"].pop()
         self.assertTrue(replacement_active_cap_submit_allowed(row, "sell"))
+
+    def test_missing_recovery_requires_fewer_than_sixteen_active_orders(self) -> None:
+        row = {
+            "levels": [
+                {
+                    "side": "sell",
+                    "status": "active",
+                    "oid": oid,
+                    "is_buy": False,
+                    "price": str(100 + oid),
+                    "size": "1",
+                }
+                for oid in range(16)
+            ]
+        }
+
+        self.assertFalse(grid_missing_recovery_allowed(row, "sell", set(range(16))))
+        self.assertTrue(grid_missing_recovery_allowed(row, "sell", set(range(15))))
+        row["levels"].pop()
+        self.assertTrue(grid_missing_recovery_allowed(row, "sell", set(range(15))))
 
     def test_pending_cancel_rate_uses_special_one_and_deficit_floor(self) -> None:
         self.assertIsNone(pending_cancel_rate(0))

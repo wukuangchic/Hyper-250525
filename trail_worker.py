@@ -2353,6 +2353,23 @@ def replacement_active_cap_submit_allowed(
     return len(active_grid_entries(row, side)) <= threshold
 
 
+def grid_missing_recovery_allowed(
+    row: dict[str, Any],
+    side: str,
+    open_oids: set[int],
+    max_active_per_side: int = GRID_MAX_ACTIVE_ORDERS_PER_SIDE,
+) -> bool:
+    live_active = 0
+    for entry in active_grid_entries(row, side):
+        try:
+            oid = int(entry["oid"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if oid in open_oids:
+            live_active += 1
+    return live_active < max_active_per_side
+
+
 def next_depth_order(
     row: dict[str, Any],
     coin: str,
@@ -3682,6 +3699,15 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 changed = True
                 continue
             side = str(entry.get("side"))
+            if not grid_missing_recovery_allowed(row, side, open_oids):
+                entry["status"] = "recovery_deferred"
+                entry["oid"] = old_oid
+                entry["recovery_deferred_status"] = GRID_ACTIVE_CAP_PAUSE_STATUS
+                entry["recovery_deferred_reason"] = "active_cap"
+                entry["recovery_deferred_at"] = now
+                entry["recovery_active_cap_allowed"] = GRID_MAX_ACTIVE_ORDERS_PER_SIDE
+                changed = True
+                continue
             if grid_margin_pause_active(row, side, now, position_value, position_size):
                 changed = True
                 continue
