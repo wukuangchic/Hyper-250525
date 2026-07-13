@@ -684,6 +684,21 @@ def compact_status(status: dict[str, Any] | None) -> str:
     return str(status)
 
 
+def post_only_immediate_match_error(result: dict[str, Any]) -> str | None:
+    """Return the exchange error when a single ALO was rejected for crossing."""
+    statuses = result.get("response", {}).get("data", {}).get("statuses")
+    if not isinstance(statuses, list) or len(statuses) != 1:
+        return None
+    status = statuses[0]
+    if not isinstance(status, dict) or "error" not in status:
+        return None
+    error = str(status["error"])
+    normalized = error.lower().replace("-", " ")
+    if "post only" in normalized and "immediately match" in normalized:
+        return error
+    return None
+
+
 def format_rate_percent(value: Any, decimals: int = 4) -> str:
     decimal = decimal_or_none(value)
     if decimal is None:
@@ -5533,6 +5548,55 @@ def place_order(args: argparse.Namespace) -> None:
         ),
         f"order {coin}",
     )
+    alo_reject = post_only_immediate_match_error(result)
+    if order_type == {"limit": {"tif": "Alo"}} and alo_reject is not None:
+        first_price = price
+        retry_price = price
+        if not args.price:
+            retry_price = same_side_book_price(info, coin, is_buy, args.book_level)
+            retry_plan = build_limit_order_plan(
+                coin,
+                is_buy,
+                amount,
+                asset,
+                retry_price,
+                args.reduce_only,
+                "Alo",
+                current_mid,
+                label="entry",
+                price_source=f"refreshed same-side book level {args.book_level}",
+            )
+            retry_price = retry_plan["limit_px"]
+            size = retry_plan["size"]
+            price = retry_price
+            notional = retry_plan["notional"]
+            target_notional = retry_plan["target_notional"]
+            worst_notional = retry_plan["worst_notional"]
+            min_value_price = retry_plan["min_value_price"]
+            minimum_value_notional = retry_plan["minimum_value_notional"]
+            entry_plan = retry_plan
+        log_event(
+            "order_alo_retry",
+            {
+                "coin": coin,
+                "side": side,
+                "first_error": alo_reject,
+                "first_price": decimal_to_plain(Decimal(str(first_price))),
+                "retry_price": decimal_to_plain(Decimal(str(retry_price))),
+                "refreshed_book": not bool(args.price),
+            },
+        )
+        result = submit_with_action_limit_retry(
+            lambda: exchange.order(
+                coin,
+                is_buy,
+                float(size),
+                float(retry_price),
+                order_type,
+                reduce_only=args.reduce_only,
+            ),
+            f"ALO retry order {coin}",
+        )
     if args.verbose:
         print("order_result:", result)
     log_event("order_result", result)

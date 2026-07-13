@@ -4,7 +4,7 @@ from contextlib import redirect_stderr
 from io import StringIO
 from unittest.mock import patch
 
-from hl_order import parse_args
+from hl_order import parse_args, post_only_immediate_match_error
 from simple_hyper.order_specs import canonical_coin_input, normalize_coin_input, parse_side
 
 
@@ -42,6 +42,23 @@ class StrictInputTests(unittest.TestCase):
 
     def test_book_level_alias_is_removed(self) -> None:
         self.assert_cli_rejected("BTC", "buy", "10", "--book-level", "3", "--dry-run")
+
+    def test_post_only_immediate_match_error_matches_only_single_alo_cross_reject(self) -> None:
+        rejected = {
+            "status": "ok",
+            "response": {"data": {"statuses": [{"error": "Post only would immediately match"}]}},
+        }
+        self.assertEqual(post_only_immediate_match_error(rejected), "Post only would immediately match")
+        self.assertIsNone(
+            post_only_immediate_match_error(
+                {"status": "ok", "response": {"data": {"statuses": [{"error": "Insufficient margin"}]}}}
+            )
+        )
+        self.assertIsNone(
+            post_only_immediate_match_error(
+                {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 1}}]}}}
+            )
+        )
 
     def test_coin_input_no_longer_expands_suffix_shorthands(self) -> None:
         self.assertEqual(canonical_coin_input("xyz:gold"), "xyz:GOLD")

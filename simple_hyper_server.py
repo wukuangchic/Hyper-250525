@@ -1826,6 +1826,7 @@ README_HTML = r"""<!doctype html>
         <li>A coin-only command such as <code>BTC</code> returns the 24h trend, high, low, turnover, and current position if any.</li>
         <li>Use <code>--dry-run</code> to preview without submitting.</li>
         <li>Limit orders default to <code>ALO</code> unless you pass <code>--tif</code>.</li>
+        <li>A plain <code>buy</code> / <code>sell</code> ALO retries once only when the exchange rejects it because post-only would immediately match. Auto-priced orders refresh the selected same-side book level before retrying.</li>
         <li>Commands without <code>--dry-run</code> can place or cancel real orders, except read-only commands like <code>query</code> or <code>BTC</code>.</li>
         <li><code>--cancel</code> cancels all open orders for the coin by default. Use <code>--cancel up</code> / <code>down</code> for orders above / below the current mid, add <code>--price</code> to use a fixed threshold, use <code>buy</code> / <code>sell</code> for side filters, <code>tp</code> / <code>sl</code> for take-profit / stop-loss trigger filters, use <code>hour</code> / <code>day</code> / <code>week</code> for orders older than 1 unit by default, add <code>--range 3 5</code> for an age range or <code>--range 3</code> for age 3+ units, or pass an OID.</li>
         <li>Market orders use <code>--market</code> and Hyperliquid IOC behavior.</li>
