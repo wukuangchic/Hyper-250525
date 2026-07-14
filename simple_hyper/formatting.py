@@ -8,8 +8,8 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Optional
 
 
-def decimal_to_plain(value: Decimal) -> str:
-    text = format(value, "f")
+def decimal_to_plain(value: Decimal | str) -> str:
+    text = format(Decimal(str(value)), "f")
     if "." in text:
         text = text.rstrip("0").rstrip(".")
     return text or "0"
