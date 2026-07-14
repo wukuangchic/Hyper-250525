@@ -81,6 +81,7 @@ GRID_PANIC_REDUCE_MIN_NOTIONAL = MIN_NOTIONAL * Decimal("1.10")
 GRID_PENDING_CANCEL_STATUS = "pending_cancel"
 GRID_PENDING_CANCEL_MIN_RATE_PERCENT = Decimal("1")
 GRID_PENDING_CANCEL_SPECIAL_RATE = Decimal("0.20")
+GRID_ROE_MIN_POSITION_VALUE = Decimal("100")
 GRID_ROE_DENSITY_THRESHOLD = Decimal("-0.10")
 GRID_ROE_STOP_THRESHOLD = Decimal("-0.40")
 GRID_PANIC_RATIO_LEGACY_DEFAULT_THRESHOLDS = {
@@ -2072,6 +2073,12 @@ def grid_roe_add_risk_allowed(target_per_side: int, roe: Decimal | None) -> int:
     return max(1, min(target_per_side, allowed))
 
 
+def grid_roe_for_position_value(position_value: Decimal, roe: Decimal | None) -> Decimal | None:
+    if abs(position_value) <= GRID_ROE_MIN_POSITION_VALUE:
+        return None
+    return roe
+
+
 def grid_roe_pause_candidates(
     row: dict[str, Any],
     side: str,
@@ -2079,6 +2086,8 @@ def grid_roe_pause_candidates(
     target_per_side: int,
     roe: Decimal | None,
 ) -> tuple[list[dict[str, Any]], int]:
+    if roe is None or roe >= GRID_ROE_DENSITY_THRESHOLD:
+        return [], target_per_side
     is_buy = side == "buy"
     if not grid_order_would_add_risk(position_size, is_buy):
         return [], target_per_side
@@ -3515,6 +3524,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             position_value = abs(position_value)
         liquidation_px = decimal_or_none(current_position.get("liquidationPx"))
         position_roe = decimal_or_none(current_position.get("returnOnEquity"))
+    position_roe_for_controls = grid_roe_for_position_value(position_value, position_roe)
     previous_avg_state = (
         row.get("topup_buy_size"),
         row.get("topup_sell_size"),
@@ -3939,7 +3949,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             side,
             position_size,
             target_per_side,
-            position_roe,
+            position_roe_for_controls,
         )
         roe_allowed[side] = allowed
         to_pause_roe.extend(
@@ -3990,6 +4000,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         row.get("roe_stop_threshold"),
         row.get("roe_add_risk_allowed_buy"),
         row.get("roe_add_risk_allowed_sell"),
+        row.get("roe_min_position_value"),
     )
     panic_ratio = grid_panic_ratio(row, position_size, current_mid, liquidation_px)
     panic_threshold = grid_panic_ratio_threshold(row)
@@ -4002,6 +4013,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     row["roe_stop_threshold"] = decimal_to_plain(GRID_ROE_STOP_THRESHOLD)
     row["roe_add_risk_allowed_buy"] = roe_allowed.get("buy", target_per_side)
     row["roe_add_risk_allowed_sell"] = roe_allowed.get("sell", target_per_side)
+    row["roe_min_position_value"] = decimal_to_plain(GRID_ROE_MIN_POSITION_VALUE)
     if previous_panic_state != (
         row.get("panic_ratio"),
         row.get("panic_ratio_threshold"),
@@ -4014,6 +4026,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         row.get("roe_stop_threshold"),
         row.get("roe_add_risk_allowed_buy"),
         row.get("roe_add_risk_allowed_sell"),
+        row.get("roe_min_position_value"),
     ):
         changed = True
     if allow_p0 and panic_ratio is not None and panic_ratio < panic_threshold:
@@ -4093,11 +4106,11 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             replacement_side,
             position_size,
             target_per_side,
-            position_roe,
+            position_roe_for_controls,
         ):
             replacement["status"] = GRID_ROE_PAUSE_STATUS
             replacement["paused_at"] = now
-            replacement["roe_allowed"] = grid_roe_add_risk_allowed(target_per_side, position_roe)
+            replacement["roe_allowed"] = grid_roe_add_risk_allowed(target_per_side, position_roe_for_controls)
             preserve_replacement_order(levels, replacement, now, GRID_ROE_PAUSE_STATUS)
             changed = True
             continue
@@ -4319,7 +4332,14 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             margin_gap_multiplier,
         ):
             continue
-        if not grid_roe_restore_allowed(row, entry, side, position_size, target_per_side, position_roe):
+        if not grid_roe_restore_allowed(
+            row,
+            entry,
+            side,
+            position_size,
+            target_per_side,
+            position_roe_for_controls,
+        ):
             continue
         if grid_margin_pause_active(row, side, now, position_value, position_size):
             continue
@@ -4360,7 +4380,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         if grid_margin_pause_active(row, side, now, position_value, position_size):
             continue
         if grid_order_would_add_risk(position_size, side == "buy"):
-            allowed = grid_roe_add_risk_allowed(target_per_side, position_roe)
+            allowed = grid_roe_add_risk_allowed(target_per_side, position_roe_for_controls)
             active_add_risk = [
                 active
                 for active in active_grid_entries(row, side)
@@ -4462,7 +4482,14 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             continue
         if status == GRID_ACTIVE_CAP_PAUSE_STATUS and not grid_active_cap_restore_allowed(row, entry, side):
             continue
-        if not grid_roe_restore_allowed(row, entry, side, position_size, target_per_side, position_roe):
+        if not grid_roe_restore_allowed(
+            row,
+            entry,
+            side,
+            position_size,
+            target_per_side,
+            position_roe_for_controls,
+        ):
             continue
         if not is_replacement_order:
             if status == GRID_RISK_DENSITY_PAUSE_STATUS and grid_order_would_add_risk(position_size, bool(entry.get("is_buy"))):

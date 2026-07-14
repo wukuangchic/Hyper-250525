@@ -66,6 +66,7 @@ from trail_worker import (
     grid_replacement_rebalance_pair,
     grid_reduce_only_canceled_restore_without_reduce_only,
     grid_roe_add_risk_allowed,
+    grid_roe_for_position_value,
     grid_latest_replacement_roe_allowed,
     grid_roe_pause_candidates,
     grid_roe_restore_allowed,
@@ -1747,6 +1748,15 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(grid_roe_add_risk_allowed(10, Decimal("-0.399")), 1)
         self.assertEqual(grid_roe_add_risk_allowed(10, Decimal("-0.40")), 0)
 
+    def test_roe_controls_require_position_value_strictly_above_one_hundred(self) -> None:
+        roe = Decimal("-0.50")
+
+        self.assertIsNone(grid_roe_for_position_value(Decimal("99.99"), roe))
+        self.assertIsNone(grid_roe_for_position_value(Decimal("100"), roe))
+        self.assertIsNone(grid_roe_for_position_value(Decimal("-100"), roe))
+        self.assertEqual(grid_roe_for_position_value(Decimal("100.01"), roe), roe)
+        self.assertEqual(grid_roe_for_position_value(Decimal("-100.01"), roe), roe)
+
     def test_roe_pause_candidates_limit_only_add_risk_side(self) -> None:
         row = {
             "levels": [
@@ -1769,6 +1779,33 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(len(buy_candidates), 5)
         self.assertEqual(sell_allowed, 10)
         self.assertEqual(sell_candidates, [])
+
+    def test_roe_pause_candidates_do_not_pause_without_compressed_roe(self) -> None:
+        row = {
+            "levels": [
+                {
+                    "side": "buy",
+                    "status": "active",
+                    "oid": oid,
+                    "is_buy": True,
+                    "price": str(price),
+                    "size": "1",
+                }
+                for oid, price in enumerate(range(100, 88, -1), start=1)
+            ]
+        }
+
+        without_value_candidates, without_value_allowed = grid_roe_pause_candidates(
+            row, "buy", Decimal("2"), 10, None
+        )
+        positive_candidates, positive_allowed = grid_roe_pause_candidates(
+            row, "buy", Decimal("2"), 10, Decimal("0.15")
+        )
+
+        self.assertEqual(without_value_candidates, [])
+        self.assertEqual(without_value_allowed, 10)
+        self.assertEqual(positive_candidates, [])
+        self.assertEqual(positive_allowed, 10)
 
     def test_roe_restore_respects_stop_and_keep_distribution(self) -> None:
         row = {

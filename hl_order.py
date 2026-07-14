@@ -1917,6 +1917,7 @@ def query_grid(args: argparse.Namespace) -> None:
             ("margin_gap", format_optional_decimal(row.get("margin_gap_multiplier"))),
             ("roe", format_optional_percent(row.get("roe"))),
             ("roe_limit", (
+                f"value>{format_optional_decimal(row.get('roe_min_position_value', '100'))} "
                 f"active<{format_optional_percent(row.get('roe_density_threshold'))} "
                 f"stop<{format_optional_percent(row.get('roe_stop_threshold'))}"
             )),
