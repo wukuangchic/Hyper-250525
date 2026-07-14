@@ -2059,6 +2059,9 @@ class GridAvgTests(unittest.TestCase):
         self.assertFalse(grid_active_cap_restore_allowed(row, should_wait, "sell"))
         self.assertTrue(grid_active_cap_restore_allowed(row, should_restore, "sell"))
 
+        should_wait["near_far_rebalance_target_at"] = 123
+        self.assertTrue(grid_active_cap_restore_allowed(row, should_wait, "sell"))
+
     def test_replacement_waits_until_active_side_is_at_most_32(self) -> None:
         row = {
             "levels": [
@@ -2277,6 +2280,38 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertEqual(pause_entry["price"], "102")
         self.assertEqual(restore_entry["price"], "106")
+
+    def test_near_far_restore_target_still_respects_risk_slot_count(self) -> None:
+        paused = {
+            "side": "buy",
+            "status": "paused_risk_density",
+            "oid": None,
+            "is_buy": True,
+            "price": "99",
+            "size": "1",
+            "near_far_rebalance_target_at": 123,
+        }
+        row = {
+            "avg_multiplier": "2",
+            "avg_favored_side": "sell",
+            "levels": [
+                {
+                    "side": "buy",
+                    "status": "active",
+                    "oid": oid,
+                    "is_buy": True,
+                    "price": str(99 - oid),
+                    "size": "1",
+                }
+                for oid in range(1, 9)
+            ]
+            + [paused],
+        }
+
+        self.assertFalse(grid_risk_density_restore_allowed(row, paused, "buy", Decimal("1"), 16, Decimal("1")))
+        row["levels"][0]["status"] = "paused_action_limit"
+        row["levels"][0]["oid"] = None
+        self.assertTrue(grid_risk_density_restore_allowed(row, paused, "buy", Decimal("1"), 16, Decimal("1")))
 
     def test_prune_keeps_regular_near_far_restore_target(self) -> None:
         target = {

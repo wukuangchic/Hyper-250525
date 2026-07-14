@@ -2387,6 +2387,8 @@ def grid_risk_density_restore_allowed(
         grid_risk_density_multiplier(row, side, margin_gap_multiplier),
     ):
         return False
+    if entry.get("near_far_rebalance_target_at") is not None:
+        return True
     paused_add_risk = [
         paused
         for paused in row.get("levels") or []
@@ -2427,6 +2429,8 @@ def grid_roe_restore_allowed(
     ]
     if len(active_add_risk) >= allowed:
         return False
+    if entry.get("near_far_rebalance_target_at") is not None:
+        return True
     paused_add_risk = [
         paused
         for paused in row.get("levels") or []
@@ -2467,6 +2471,8 @@ def grid_active_cap_restore_allowed(
     active = active_grid_entries(row, side)
     if len(active) >= max_active_per_side:
         return False
+    if entry.get("near_far_rebalance_target_at") is not None:
+        return True
     paused = [
         paused_entry
         for paused_entry in row.get("levels") or []
@@ -4374,6 +4380,23 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 paused_candidates,
             )
             if pause_entry is None or restore_entry is None:
+                continue
+            prospective_active = [
+                entry for entry in active_grid_entries(row, side) if id(entry) != id(pause_entry)
+            ] + [restore_entry]
+            prospective_add_risk = sum(
+                1
+                for entry in prospective_active
+                if grid_order_would_add_risk(position_size, bool(entry.get("is_buy")))
+            )
+            prospective_add_risk_allowed = min(
+                grid_risk_density_allowed(
+                    target_per_side,
+                    grid_risk_density_multiplier(row, side, margin_gap_multiplier),
+                ),
+                grid_roe_add_risk_allowed(target_per_side, position_roe_for_controls),
+            )
+            if prospective_add_risk > prospective_add_risk_allowed:
                 continue
             pause_status = (
                 GRID_REPLACEMENT_PAUSE_STATUS
