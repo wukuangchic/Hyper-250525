@@ -206,10 +206,10 @@ BTC grid --limit -300 0
 - worker 补齐每侧子单时，交易所一旦接受提交，本轮就视为已补一个名额；即使订单随后很快成交，也不会在同一轮为了凑够 10 张活跃单连续追单。
 - 每轮每侧最多向交易所提交 1 张新 grid 单；成交对向单、常规补档和历史档位恢复共用这一额度。
 - 遇到地址 action limit 紧张时，worker 会把维护动作分级执行：
-  - P0：必要安全动作，不占共享 P1 预算。当前包括 `panic_ratio` 触发的 IOC reduce-only 减仓、`paused_risk_density` 必要撤单、`paused_roe` 必要撤单；panic 后的反向普通挂单也在这段流程内，但仍会经过自身的 ALO、仓位和保证金判断。
+  - P0：必要安全动作，不占共享 P1 预算。当前包括 `panic_ratio` 触发的 IOC reduce-only 减仓、`paused_risk_density` 必要撤单、`paused_roe` 必要撤单；panic 后的反向普通挂单也在这段流程内，但仍会经过自身的 ALO、仓位和保证金判断。P0 不会因 headroom 不足而拦截，但每个交易所 action 都会在提交前预扣 headroom，并立即压缩后续 P1/P2 可用量。
   - P1：共享预算动作。当前包括成交后的 replacement 提交、`paused_limit` 撤单、`paused_active_cap` 撤单、`refresh_reduce_only` 撤单、普通补档和 paused 恢复；同一轮所有 P1 动作共用 `action_limit_p1_budget`。
   - P2：非关键整理动作。当前包括 dense regrid 和 replacement rebalance；只有执行完 P0/P1 后预估 action headroom 仍大于 `100` 才会运行。
-- P1 预算每轮都会预先计算，不等到确认超限后才计算。未超限时本轮共享 P1 预算为 `max(1, headroom - 1)`，即至少放行 1 次，headroom 足够时预留 1 个 action headroom；已超限时若 `deficit < 3` 仍给 1 次，若 `deficit >= 3` 则按 `1 / ln(deficit)` 的概率给 1 次，否则本轮 P1 为 0。这样 deficit 回到限额内时会按剩余 headroom 逐步恢复。
+- P1 预算每轮都会预先计算，不等到确认超限后才计算。未超限时本轮共享 P1 预算为 `max(1, headroom - 1)`，即至少放行 1 次，headroom 足够时预留 1 个 action headroom；已超限时若 `deficit < 3` 仍给 1 次，若 `deficit >= 3` 则按 `1 / ln(deficit)` 的概率给 1 次，否则本轮 P1 为 0。P0、P1、P2 的挂单、撤单、必要杠杆更新和重试都会在调用交易所前按实际 action 数预扣 headroom；P0 或前序 P1 消耗后，剩余 P1 预算会实时压缩为不超过 `max(0, remaining_headroom - 1)`，失败或被拒但已经发往交易所的 action 也保守计入。这样 deficit 刚转负时不会继续按轮初旧预算集中挂单。
 - Worker 每轮会先把币种顺序打乱，再按全局动作优先级分桶扫描所有 grid：`P0` > 最新成交 `replacement_pending` > 旧 `replacement_order` 恢复 > P1 撤单 > topup > 普通 paused 恢复 > `P2`。每个桶都会跨所有币种扫完后才进入下一桶，因此单个币种的 topup 不会抢在其他币种的 replacement 前面消耗共享 P1 预算；最终 note 记录整轮累计动作数。
 - P1 因 action limit 没有执行时，worker 只记录 `action_limit_deferred_at` / `last_error`，保留原 `status` 和 `oid`，不会再把订单改成 `paused_action_limit` 或 `paused_action_rate_limit`；历史保存的旧状态仍按兼容逻辑识别。
 - paused 档位恢复提交前会先用当前 best bid/ask（读取失败时用 mid）判断限价是否会立即成交；会穿盘口的 paused 单只本轮延后恢复，不提交给交易所，避免反复触发 ALO 拒单。

@@ -32,6 +32,7 @@ from hl_order import (
     user_action_rate_limit_metrics,
 )
 from trail_worker import (
+    GridActionBudgetUnavailable,
     active_grid_oids,
     action_limit_p1_budget_for_deficit,
     action_limit_p1_budget_for_headroom,
@@ -93,6 +94,7 @@ from trail_worker import (
     preserve_replacement_order,
     prune_grid_levels,
     regrid_dense_entries,
+    reserve_grid_exchange_actions,
     replacement_order_from_fill,
     restore_pending_cancel_entries,
     run_once,
@@ -412,6 +414,73 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertEqual(cache["action_limit_headroom"], 100)
         self.assertFalse(noncritical_grid_work_allowed(cache))
+
+    def test_p0_reservation_pre_deducts_headroom_and_clamps_p1_budget(self) -> None:
+        cache = {
+            "action_limit_headroom": 5,
+            "action_limit_p1_budget_remaining": 4,
+            "action_limit_p1_enabled": True,
+        }
+
+        reserve_grid_exchange_actions(cache)
+
+        self.assertEqual(cache["action_limit_headroom"], 4)
+        self.assertEqual(action_limit_p1_budget_remaining(cache), 3)
+
+    def test_p1_reservation_pre_deducts_both_budgets_once(self) -> None:
+        cache = {
+            "action_limit_headroom": 5,
+            "action_limit_p1_budget_remaining": 4,
+            "action_limit_p1_enabled": True,
+        }
+
+        reserve_grid_exchange_actions(cache, consume_p1_budget=True)
+
+        self.assertEqual(cache["action_limit_headroom"], 4)
+        self.assertEqual(action_limit_p1_budget_remaining(cache), 3)
+
+    def test_p1_reservation_rejects_before_exchange_when_budget_is_empty(self) -> None:
+        cache = {
+            "action_limit_headroom": 5,
+            "action_limit_p1_budget_remaining": 0,
+            "action_limit_p1_enabled": True,
+        }
+
+        with self.assertRaises(GridActionBudgetUnavailable):
+            reserve_grid_exchange_actions(cache, consume_p1_budget=True)
+
+        self.assertEqual(cache["action_limit_headroom"], 5)
+        self.assertEqual(action_limit_p1_budget_remaining(cache), 0)
+
+    def test_bulk_cancel_pre_deducts_every_address_action(self) -> None:
+        class FakeExchange:
+            def bulk_cancel(self, requests: list[dict]) -> dict:
+                return {
+                    "status": "ok",
+                    "response": {"data": {"statuses": ["success"] * len(requests)}},
+                }
+
+        entries = [{"oid": 1, "status": "active"}, {"oid": 2, "status": "active"}]
+        cache = {
+            "action_limit_headroom": 5,
+            "action_limit_p1_budget_remaining": 4,
+            "action_limit_p1_enabled": True,
+        }
+
+        self.assertEqual(
+            cancel_grid_entries(
+                FakeExchange(),
+                "BTC",
+                entries,
+                123,
+                "paused_limit",
+                cache=cache,
+            ),
+            2,
+        )
+
+        self.assertEqual(cache["action_limit_headroom"], 3)
+        self.assertEqual(action_limit_p1_budget_remaining(cache), 2)
 
     def test_cumulative_action_limit_text_is_recognized(self) -> None:
         text = (

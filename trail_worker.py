@@ -155,6 +155,10 @@ class GridPostOnlyRejected(Exception):
     """A post-only grid child became marketable before submission."""
 
 
+class GridActionBudgetUnavailable(Exception):
+    """A P1 exchange action has no remaining pre-reserved request budget."""
+
+
 def audit_grid_action(action: str, **payload: Any) -> None:
     record = {"ts": int(time.time()), "action": action, **payload}
     ACTION_AUDIT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -304,7 +308,39 @@ def consume_action_limit_headroom(cache: dict[str, Any] | None, count: int = 1) 
         headroom = int(cache.get("action_limit_headroom") or 0)
     except (TypeError, ValueError):
         headroom = 0
-    cache["action_limit_headroom"] = max(0, headroom - max(0, count))
+    remaining_headroom = max(0, headroom - max(0, count))
+    cache["action_limit_headroom"] = remaining_headroom
+    if "action_limit_p1_budget_remaining" in cache:
+        try:
+            p1_remaining = max(0, int(cache.get("action_limit_p1_budget_remaining") or 0))
+        except (TypeError, ValueError):
+            p1_remaining = 0
+        cache["action_limit_p1_budget_remaining"] = min(
+            p1_remaining,
+            max(0, remaining_headroom - 1),
+        )
+
+
+def reserve_grid_exchange_actions(
+    cache: dict[str, Any] | None,
+    count: int = 1,
+    *,
+    consume_p1_budget: bool = False,
+) -> None:
+    """Reserve address action capacity immediately before an exchange call."""
+    count = max(0, count)
+    if count == 0 or not isinstance(cache, dict):
+        return
+    if consume_p1_budget and p1_budget_tracked(cache):
+        if not action_limit_p1_enabled(cache):
+            raise GridActionBudgetUnavailable("P1 action budget is not enabled")
+        remaining = action_limit_p1_budget_remaining(cache) or 0
+        if remaining < count:
+            raise GridActionBudgetUnavailable(
+                f"P1 action budget exhausted before exchange submit: required={count} remaining={remaining}"
+            )
+        cache["action_limit_p1_budget_remaining"] = remaining - count
+    consume_action_limit_headroom(cache, count)
 
 
 def enable_action_limit_p1_budget(cache: dict[str, Any] | None) -> None:
@@ -1092,10 +1128,18 @@ def recent_fills_by_oid(
     return by_oid
 
 
-def submit_grid_child_order(exchange: Any, coin: str, order: dict[str, Any]) -> tuple[int | None, str, dict[str, Any] | None]:
+def submit_grid_child_order(
+    exchange: Any,
+    coin: str,
+    order: dict[str, Any],
+    cache: dict[str, Any] | None = None,
+    *,
+    consume_p1_budget: bool = False,
+) -> tuple[int | None, str, dict[str, Any] | None]:
     plan = order.get("plan")
     if not isinstance(plan, dict):
         raise ValueError("grid child order is missing its saved plan")
+    reserve_grid_exchange_actions(cache, consume_p1_budget=consume_p1_budget)
     result = exchange.order(
         coin,
         bool(plan["is_buy"]),
@@ -1858,6 +1902,7 @@ def regrid_dense_entries(
             isolated_leverage_ready,
             retry_alo_reject=True,
             margin_blocked_sides=margin_blocked_sides,
+            cache=cache,
         )
         if submitted:
             regridded += 1
@@ -2469,6 +2514,8 @@ def submit_grid_order_entry(
     retry_alo_reject: bool = False,
     margin_blocked_sides: set[tuple[str, str]] | None = None,
     open_orders: list[dict[str, Any]] | None = None,
+    cache: dict[str, Any] | None = None,
+    consume_p1_budget: bool = False,
 ) -> bool:
     restore_without_reduce_only = grid_reduce_only_canceled_restore_without_reduce_only(order)
     refresh_grid_order_reduce_only(order, position_size, policy)
@@ -2513,6 +2560,11 @@ def submit_grid_order_entry(
         and asset_requires_isolated_margin(asset)
         and coin not in isolated_leverage_ready
     ):
+        try:
+            reserve_grid_exchange_actions(cache, consume_p1_budget=consume_p1_budget)
+        except GridActionBudgetUnavailable as exc:
+            pause_grid_order_for_action_limit(order, now, str(exc))
+            return False
         leverage, leverage_result = update_isolated_opening_leverage(
             exchange,
             int(asset["maxLeverage"]),
@@ -2556,8 +2608,17 @@ def submit_grid_order_entry(
         try:
             if adopt_matching_open_grid_order(open_orders, coin, order, now, row):
                 return {"adopted": True}
-            retry_oid, retry_state, retry_status = submit_grid_child_order(exchange, coin, order)
+            retry_oid, retry_state, retry_status = submit_grid_child_order(
+                exchange,
+                coin,
+                order,
+                cache,
+                consume_p1_budget=consume_p1_budget,
+            )
             return {"submitted": True, "oid": retry_oid, "state": retry_state, "status": retry_status}
+        except GridActionBudgetUnavailable as retry_exc:
+            pause_grid_order_for_action_limit(order, now, str(retry_exc))
+            return {"handled": True}
         except GridPostOnlyRejected as retry_exc:
             order["status"] = "skipped_post_only"
             order["oid"] = None
@@ -2577,7 +2638,16 @@ def submit_grid_order_entry(
             raise
 
     try:
-        oid, state, status = submit_grid_child_order(exchange, coin, order)
+        oid, state, status = submit_grid_child_order(
+            exchange,
+            coin,
+            order,
+            cache,
+            consume_p1_budget=consume_p1_budget,
+        )
+    except GridActionBudgetUnavailable as exc:
+        pause_grid_order_for_action_limit(order, now, str(exc))
+        return False
     except GridPostOnlyRejected as exc:
         if not retry_alo_reject:
             order["status"] = "skipped_post_only"
@@ -2620,8 +2690,17 @@ def submit_grid_order_entry(
             if adopt_matching_open_grid_order(open_orders, coin, order, now, row):
                 return True
             try:
-                oid, state, status = submit_grid_child_order(exchange, coin, order)
+                oid, state, status = submit_grid_child_order(
+                    exchange,
+                    coin,
+                    order,
+                    cache,
+                    consume_p1_budget=consume_p1_budget,
+                )
                 break
+            except GridActionBudgetUnavailable as retry_exc:
+                pause_grid_order_for_action_limit(order, now, str(retry_exc))
+                return False
             except GridPostOnlyRejected as retry_exc:
                 alo_rejects += 1
                 order["last_error"] = str(retry_exc)
@@ -2671,7 +2750,17 @@ def submit_grid_order_entry(
                     raise
                 bump_grid_order_size_one_step(asset, order)
                 order["resized_min_retry_at"] = now
-                oid, state, status = submit_grid_child_order(exchange, coin, order)
+                try:
+                    oid, state, status = submit_grid_child_order(
+                        exchange,
+                        coin,
+                        order,
+                        cache,
+                        consume_p1_budget=consume_p1_budget,
+                    )
+                except GridActionBudgetUnavailable as retry_exc:
+                    pause_grid_order_for_action_limit(order, now, str(retry_exc))
+                    return False
                 break
         else:
             order["status"] = "skipped_post_only"
@@ -2729,7 +2818,16 @@ def submit_grid_order_entry(
         bump_grid_order_size_one_step(asset, order)
         order["resized_min_retry_at"] = now
         try:
-            oid, state, status = submit_grid_child_order(exchange, coin, order)
+            oid, state, status = submit_grid_child_order(
+                exchange,
+                coin,
+                order,
+                cache,
+                consume_p1_budget=consume_p1_budget,
+            )
+        except GridActionBudgetUnavailable as retry_exc:
+            pause_grid_order_for_action_limit(order, now, str(retry_exc))
+            return False
         except GridPostOnlyRejected as exc:
             order["status"] = "skipped_post_only"
             order["oid"] = None
@@ -2820,10 +2918,12 @@ def submit_grid_panic_reduce(
     order: dict[str, Any],
     now: int,
     row: dict[str, Any],
+    cache: dict[str, Any] | None = None,
 ) -> bool:
     plan = order.get("plan")
     if not isinstance(plan, dict):
         return False
+    reserve_grid_exchange_actions(cache)
     result = exchange.order(
         coin,
         bool(plan["is_buy"]),
@@ -2921,6 +3021,7 @@ def cancel_grid_entries(
     current_mid: Decimal | None = None,
     cache: dict[str, Any] | None = None,
     raise_on_unconfirmed: bool = False,
+    consume_p1_budget: bool = False,
 ) -> int:
     entries, deferred = prepare_grid_cancel_entries(row, entries, now, note, current_mid, cache)
     if deferred and isinstance(cache, dict):
@@ -2933,6 +3034,11 @@ def cancel_grid_entries(
             continue
     if not requests:
         return 0
+    reserve_grid_exchange_actions(
+        cache,
+        len(requests),
+        consume_p1_budget=consume_p1_budget,
+    )
     result = exchange.bulk_cancel(requests)
     audit_grid_action(
         "grid_cancel",
@@ -2998,12 +3104,8 @@ def cancel_grid_entries_with_p1_budget(
         row=row,
         current_mid=current_mid,
         cache=cache,
+        consume_p1_budget=budget_tracked,
     )
-    if cancelled and budget_tracked:
-        for _ in range(cancelled):
-            consume_action_limit_p1_budget(cache)
-    if cancelled:
-        consume_action_limit_headroom(cache, cancelled)
     return cancelled
 
 
@@ -3577,6 +3679,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 isolated_leverage_ready,
                 margin_blocked_sides=margin_blocked_sides,
                 open_orders=current_open_orders,
+                cache=cache,
+                consume_p1_budget=True,
             )
         except RuntimeError as exc:
             error_text = str(exc)
@@ -3586,9 +3690,6 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             pause_grid_order_for_action_limit(order, now, error_text)
             return False
         if submitted:
-            if budget_tracked:
-                consume_action_limit_p1_budget(cache)
-            consume_action_limit_headroom(cache)
             submissions_by_side[side] = submissions_by_side.get(side, 0) + 1
             if str(order.get("status")) == "filled":
                 filled_submission_sides.add(side)
@@ -3625,6 +3726,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 True,
                 margin_blocked_sides=margin_blocked_sides,
                 open_orders=current_open_orders,
+                cache=cache,
+                consume_p1_budget=True,
             )
         except RuntimeError as exc:
             error_text = str(exc)
@@ -3634,9 +3737,6 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             pause_grid_order_for_action_limit(order, now, error_text)
             return False
         if submitted:
-            if budget_tracked:
-                consume_action_limit_p1_budget(cache)
-            consume_action_limit_headroom(cache)
             submissions_by_side[side] = submissions_by_side.get(side, 0) + 1
             replacement_quota_sides.add(side)
         return submitted
@@ -3658,6 +3758,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 True,
                 margin_blocked_sides=None,
                 open_orders=current_open_orders,
+                cache=cache,
             )
 
         try:
@@ -3688,7 +3789,6 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 order["panic_reversal_action_limit_retry_error"] = retry_error_text
                 return False
         if submitted:
-            consume_action_limit_headroom(cache)
             side = str(order.get("side") or "")
             submissions_by_side[side] = submissions_by_side.get(side, 0) + 1
         return submitted
@@ -3810,7 +3910,6 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             row=row, current_mid=current_mid, cache=cache,
         )
         paused += paused_density
-        consume_action_limit_headroom(cache, paused_density)
         for entry in to_pause_density:
             entry["risk_density_allowed"] = risk_density_allowed.get(str(entry.get("side") or ""), target_per_side)
             entry["risk_density_multiplier"] = decimal_to_plain(
@@ -3840,7 +3939,6 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             row=row, current_mid=current_mid, cache=cache,
         )
         paused += paused_roe
-        consume_action_limit_headroom(cache, paused_roe)
         for entry in to_pause_roe:
             side = str(entry.get("side") or "")
             entry["roe_allowed"] = roe_allowed.get(side, target_per_side)
@@ -3909,9 +4007,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         if panic_order is not None:
             panic_order["panic_ratio"] = decimal_to_plain(panic_ratio)
             panic_order["panic_ratio_threshold"] = decimal_to_plain(panic_threshold)
-            submitted = submit_grid_panic_reduce(exchange, coin, panic_order, now, row)
+            submitted = submit_grid_panic_reduce(exchange, coin, panic_order, now, row, cache)
             if submitted:
-                consume_action_limit_headroom(cache)
                 panic_reduced = 1
                 row["panic_reduce_at"] = now
                 row["panic_reduce_count"] = int(row.get("panic_reduce_count") or 0) + 1
