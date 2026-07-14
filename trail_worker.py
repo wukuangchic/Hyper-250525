@@ -2369,6 +2369,20 @@ def grid_roe_restore_allowed(
     return id(entry) in keep_ids
 
 
+def grid_latest_replacement_roe_allowed(
+    row: dict[str, Any],
+    entry: dict[str, Any],
+    side: str,
+    position_size: Decimal,
+    target_per_side: int,
+    roe: Decimal | None,
+) -> bool:
+    """Do not apply the normal target-side density cap to fresh replacements."""
+    if roe is None or roe >= GRID_ROE_DENSITY_THRESHOLD:
+        return True
+    return grid_roe_restore_allowed(row, entry, side, position_size, target_per_side, roe)
+
+
 def grid_active_cap_restore_allowed(
     row: dict[str, Any],
     entry: dict[str, Any],
@@ -4073,7 +4087,14 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             preserve_replacement_order(levels, replacement, now, "margin_pause_active")
             changed = True
             continue
-        if not grid_roe_restore_allowed(row, replacement, replacement_side, position_size, target_per_side, position_roe):
+        if not grid_latest_replacement_roe_allowed(
+            row,
+            replacement,
+            replacement_side,
+            position_size,
+            target_per_side,
+            position_roe,
+        ):
             replacement["status"] = GRID_ROE_PAUSE_STATUS
             replacement["paused_at"] = now
             replacement["roe_allowed"] = grid_roe_add_risk_allowed(target_per_side, position_roe)

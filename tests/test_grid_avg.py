@@ -66,6 +66,7 @@ from trail_worker import (
     grid_replacement_rebalance_pair,
     grid_reduce_only_canceled_restore_without_reduce_only,
     grid_roe_add_risk_allowed,
+    grid_latest_replacement_roe_allowed,
     grid_roe_pause_candidates,
     grid_roe_restore_allowed,
     grid_risk_density_pause_candidates,
@@ -1787,6 +1788,33 @@ class GridAvgTests(unittest.TestCase):
         self.assertFalse(grid_roe_restore_allowed(row, paused, "buy", Decimal("2"), 10, Decimal("-0.40")))
         self.assertFalse(grid_roe_restore_allowed(row, paused, "buy", Decimal("2"), 10, Decimal("-0.37")))
         self.assertTrue(grid_roe_restore_allowed(open_slot_row, open_slot_row["levels"][0], "buy", Decimal("2"), 10, Decimal("-0.37")))
+
+    def test_latest_replacement_bypasses_target_side_cap_when_roe_is_not_compressed(self) -> None:
+        row = {
+            "levels": [
+                {
+                    "side": "buy",
+                    "status": "active",
+                    "oid": oid,
+                    "is_buy": True,
+                    "price": str(price),
+                    "size": "1",
+                }
+                for oid, price in enumerate(range(100, 90, -1), start=1)
+            ]
+        }
+        replacement = {"side": "buy", "is_buy": True, "price": "90", "size": "1", "replacement_order": True}
+
+        self.assertFalse(grid_roe_restore_allowed(row, replacement, "buy", Decimal("2"), 10, Decimal("0.15")))
+        self.assertTrue(
+            grid_latest_replacement_roe_allowed(row, replacement, "buy", Decimal("2"), 10, Decimal("0.15"))
+        )
+        self.assertTrue(
+            grid_latest_replacement_roe_allowed(row, replacement, "buy", Decimal("2"), 10, Decimal("-0.10"))
+        )
+        self.assertFalse(
+            grid_latest_replacement_roe_allowed(row, replacement, "buy", Decimal("2"), 10, Decimal("-0.25"))
+        )
 
     def test_margin_gap_multiplier_only_widens_add_risk_far_topup(self) -> None:
         row = {
