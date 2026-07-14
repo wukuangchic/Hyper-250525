@@ -1757,7 +1757,7 @@ README_HTML = r"""<!doctype html>
       <h2>Command Shape</h2>
       <ul>
         <li><code>coin</code>, for example <code>BTC</code></li>
-        <li><code>buy/sell</code>, <code>both</code>, or <code>query</code>. For ladder orders, use explicit options like <code>--for 5 -1000</code> or <code>--while 85000 +1000</code>.</li>
+        <li><code>buy/sell</code>, position-relative <code>open/close</code>, <code>both</code>, or <code>query</code>. <code>open</code> follows the current position direction and <code>close</code> uses the opposite direction; both fail when that coin has no position. For ladder orders, use explicit options like <code>--for 5 -1000</code> or <code>--while 85000 +1000</code>.</li>
         <li><code>amount</code>, default <code>10</code>; use <code>--total</code> for total notional.</li>
         <li><code>entry/exec</code> options: <code>--market</code>, <code>--price</code>, <code>--offset</code>, <code>--stop</code>, <code>--stop-limit</code>, <code>--take</code>, <code>--take-limit</code>, <code>--level</code>, <code>--range</code>, <code>--for</code>, <code>--while</code>, <code>--tif</code>, <code>--slippage</code></li>
         <li><code>tp/sl</code>: <code>--tp</code>, <code>--sl</code></li>
@@ -1775,6 +1775,8 @@ README_HTML = r"""<!doctype html>
         <li><code>BTC</code></li>
         <li><code>query</code></li>
         <li><code>BTC buy 10 --dry-run</code></li>
+        <li><code>BTC open 10 --dry-run</code></li>
+        <li><code>BTC close 10 --dry-run</code></li>
         <li><code>BTC buy 10 --market --dry-run</code></li>
         <li><code>BTC buy 10 --price 75000 --dry-run</code></li>
         <li><code>BTC both 100 --price 75000 --offset 2% --dry-run</code></li>

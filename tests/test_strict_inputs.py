@@ -1,10 +1,11 @@
 import sys
 import unittest
 from contextlib import redirect_stderr
+from decimal import Decimal
 from io import StringIO
 from unittest.mock import patch
 
-from hl_order import parse_args, post_only_immediate_match_error
+from hl_order import parse_args, position_relative_order_side, post_only_immediate_match_error
 from simple_hyper.order_specs import canonical_coin_input, normalize_coin_input, parse_side
 
 
@@ -30,6 +31,18 @@ class StrictInputTests(unittest.TestCase):
         for side in ("b", "s", "long", "short", "多", "空"):
             with self.subTest(side=side):
                 self.assert_cli_rejected("BTC", side, "10", "--dry-run")
+
+    def test_cli_accepts_position_relative_sides(self) -> None:
+        self.assertEqual(self.parse_cli("BTC", "open", "10", "--dry-run").side, "open")
+        self.assertEqual(self.parse_cli("BTC", "close", "10", "--dry-run").side, "close")
+
+    def test_position_relative_side_follows_or_opposes_current_position(self) -> None:
+        self.assertEqual(position_relative_order_side("open", Decimal("1")), "buy")
+        self.assertEqual(position_relative_order_side("close", Decimal("1")), "sell")
+        self.assertEqual(position_relative_order_side("open", Decimal("-1")), "sell")
+        self.assertEqual(position_relative_order_side("close", Decimal("-1")), "buy")
+        with self.assertRaisesRegex(ValueError, "without a current position"):
+            position_relative_order_side("open", Decimal("0"))
 
     def test_symmetric_orders_require_both_literal(self) -> None:
         args = self.parse_cli("BTC", "both", "--total", "20", "--offset", "2%", "--dry-run")

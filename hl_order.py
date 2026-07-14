@@ -843,6 +843,18 @@ def format_position_side(size: Decimal) -> str:
     return "flat"
 
 
+def position_relative_order_side(requested_side: str, position_size: Decimal) -> str:
+    normalized_side = requested_side.strip().lower()
+    if normalized_side not in {"open", "close"}:
+        raise ValueError("Position-relative side must be open or close")
+    if position_size == 0:
+        raise ValueError("Cannot use open/close without a current position")
+    same_side = "buy" if position_size > 0 else "sell"
+    if normalized_side == "open":
+        return same_side
+    return "sell" if same_side == "buy" else "buy"
+
+
 def format_position_leverage(position: dict[str, Any]) -> str:
     leverage = position.get("leverage") or {}
     value = leverage.get("value")
@@ -5147,6 +5159,18 @@ def place_order(args: argparse.Namespace) -> None:
         )
         return
 
+    relative_side = args.side if args.side in {"open", "close"} else None
+    if relative_side is not None:
+        position = find_current_position(info, account, coin, dex)
+        if position is None:
+            raise ValueError(f"Cannot use {relative_side} for {coin}: current position is flat")
+        position_size = Decimal(str(position.get("szi", "0")))
+        args.side = position_relative_order_side(relative_side, position_size)
+        if args.verbose:
+            print("requested_side:", relative_side)
+            print("current_position_side:", format_position_side(position_size))
+            print("resolved_side:", args.side)
+
     amount = Decimal(args.amount)
     if amount <= 0:
         raise ValueError("amount must be positive")
@@ -5640,7 +5664,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "side",
         nargs="?",
-        help="buy, sell, both, or grid. Not needed with --cancel.",
+        help="buy, sell, open, close, both, or grid. open/close require a current position. Not needed with --cancel.",
     )
     parser.add_argument("amount", nargs="?", help="USD notional. Default: 10.")
     parser.add_argument("--total", dest="total_amount", help="Total USD notional. Ladder and symmetric orders divide it across legs.")
@@ -5864,6 +5888,8 @@ def parse_args() -> argparse.Namespace:
         elif normalized_side in SYMMETRIC_SIDE_ALIASES:
             args.side = "both"
             args.symmetric = True
+        elif normalized_side in {"open", "close"}:
+            args.side = normalized_side
         else:
             try:
                 is_buy = parse_side(args.side)
