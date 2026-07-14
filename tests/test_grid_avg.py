@@ -59,6 +59,7 @@ from trail_worker import (
     grid_margin_gap_multiplier,
     grid_margin_pause_active,
     grid_missing_recovery_allowed,
+    grid_near_far_rebalance_pair,
     grid_order_status_is_cancelled,
     find_current_position_from_state,
     is_cumulative_action_limit_text,
@@ -2238,6 +2239,76 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertEqual(pause_entry["price"], "102")
         self.assertEqual(restore_entry["price"], "106")
+
+    def test_near_far_rebalance_treats_regular_paused_orders_like_replacements(self) -> None:
+        row = {
+            "levels": [
+                {
+                    "side": "buy",
+                    "status": "paused_action_limit",
+                    "oid": None,
+                    "is_buy": True,
+                    "price": price,
+                    "size": "1",
+                }
+                for price in ("106", "105", "101")
+            ]
+            + [
+                {
+                    "side": "buy",
+                    "status": "active",
+                    "oid": oid,
+                    "is_buy": True,
+                    "price": price,
+                    "size": "1",
+                }
+                for oid, price in ((1, "104"), (2, "103"), (3, "102"))
+            ]
+        }
+
+        pause_entry, restore_entry = grid_near_far_rebalance_pair(
+            row,
+            "buy",
+            Decimal("0"),
+            Decimal("0"),
+            Decimal("400"),
+            "abs",
+        )
+
+        self.assertEqual(pause_entry["price"], "102")
+        self.assertEqual(restore_entry["price"], "106")
+
+    def test_prune_keeps_regular_near_far_restore_target(self) -> None:
+        target = {
+            "side": "buy",
+            "status": "paused_action_limit",
+            "oid": None,
+            "price": "106",
+            "size": "1",
+            "near_far_rebalance_target_at": 123,
+        }
+        newer_history = {
+            "side": "buy",
+            "status": "paused_action_limit",
+            "oid": None,
+            "price": "105",
+            "size": "1",
+            "paused_at": 122,
+        }
+        row = {
+            "type": "grid",
+            "target_orders_per_side": 3,
+            "levels": [
+                {"side": "buy", "status": "active", "oid": 1, "price": "104", "size": "1"},
+                {"side": "buy", "status": "active", "oid": 2, "price": "103", "size": "1"},
+                newer_history,
+                target,
+            ],
+        }
+
+        self.assertTrue(prune_grid_levels(row))
+        self.assertIn(target, row["levels"])
+        self.assertNotIn(newer_history, row["levels"])
 
     def test_side_cap_clear_removes_paused_before_active(self) -> None:
         class FakeExchange:
