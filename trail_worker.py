@@ -2031,6 +2031,13 @@ def grid_risk_density_allowed(target_per_side: int, multiplier: Decimal) -> int:
     return max(1, min(target_per_side, allowed))
 
 
+def grid_target_orders_per_side(row: dict[str, Any]) -> int:
+    saved_target = int(row.get("target_orders_per_side") or GRID_TARGET_ORDERS_PER_SIDE)
+    if saved_target in {5, 10}:
+        return GRID_TARGET_ORDERS_PER_SIDE
+    return saved_target
+
+
 def grid_risk_density_pause_candidates(
     row: dict[str, Any],
     side: str,
@@ -3906,7 +3913,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     }
     replacement_quota_sides.update(pending_replacement_sides)
     saved_target_per_side = int(row.get("target_orders_per_side") or GRID_TARGET_ORDERS_PER_SIDE)
-    target_per_side = GRID_TARGET_ORDERS_PER_SIDE if saved_target_per_side == 5 else saved_target_per_side
+    target_per_side = grid_target_orders_per_side(row)
     if target_per_side != saved_target_per_side:
         row["target_orders_per_side"] = target_per_side
         changed = True

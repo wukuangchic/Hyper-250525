@@ -168,9 +168,9 @@ JPY both 20 --offset 2% --tp 1% --sl 0.7%
 
 ## 服务器真实网格单
 
-`grid` 是本工具维护的真实挂单网格：下到交易所的是普通 ALO limit 单，不是 Hyperliquid 原生网格。服务器 worker 每分钟检查一次，目标是让买卖两边各至少补到 10 张活跃子单；成交后按原子单提交限价和 `gap` 补下一张反向 limit 单。成交反向单或恢复单可能让一侧超过 10 张，worker 不会仅因超过 10 张而主动撤单。
+`grid` 是本工具维护的真实挂单网格：下到交易所的是普通 ALO limit 单，不是 Hyperliquid 原生网格。服务器 worker 每分钟检查一次，目标是让买卖两边各至少补到 16 张活跃子单；成交后按原子单提交限价和 `gap` 补下一张反向 limit 单。成交反向单或恢复单可能让一侧超过 16 张，worker 不会仅因超过 16 张而主动撤单。
 
-旧任务中保存的默认每侧 5 张会由 worker 自动迁移为每侧 10 张；每轮每侧最多提交 1 张，因此会分多轮逐步补齐。
+旧任务中保存的默认每侧 5 张或 10 张会由 worker 自动迁移为每侧 16 张；每轮每侧最多提交 1 张，因此会分多轮逐步补齐。
 
 ### 创建
 
@@ -203,7 +203,7 @@ BTC grid --limit -300 0
 - `--total`、旧 `--max` 和旧 `--long` / `--short` / `--abs` 都不再作为推荐 grid 参数；新命令使用 `--limit MIN MAX`。
 - grid 子单使用 ALO，目标是只挂 maker 单；网格档位仍按提交限价推进，不因实际成交价更优而漂移。
 - 成交反向单如果 ALO 因会立即成交被拒，会先确认同侧前后 `0.95 * gap` 内没有已有活跃或可恢复 paused grid 档位；若不太近，会先向远离盘口方向移动一个 `gap`，若太近才优先插入外移方向上间距大于 `1.95 * gap` 的相邻两格中间，最多 20 次。其他 grid 子单 ALO 被拒时只跳过本轮，不换价重试。
-- worker 补齐每侧子单时，交易所一旦接受提交，本轮就视为已补一个名额；即使订单随后很快成交，也不会在同一轮为了凑够 10 张活跃单连续追单。
+- worker 补齐每侧子单时，交易所一旦接受提交，本轮就视为已补一个名额；即使订单随后很快成交，也不会在同一轮为了凑够 16 张活跃单连续追单。
 - 每轮每侧最多向交易所提交 1 张新 grid 单；成交对向单、常规补档和历史档位恢复共用这一额度。
 - 遇到地址 action limit 紧张时，worker 会把维护动作分级执行：
   - P0：必要安全动作，不占共享 P1 预算。当前包括 `panic_ratio` 触发的 IOC reduce-only 减仓、`paused_risk_density` 必要撤单、`paused_roe` 必要撤单；panic 后的反向普通挂单也在这段流程内，但仍会经过自身的 ALO、仓位和保证金判断。P0 不会因 headroom 不足而拦截，但每个交易所 action 都会在提交前预扣 headroom，并立即压缩后续 P1/P2 可用量。
@@ -242,16 +242,16 @@ BTC grid --query
 BTC --cancel grid
 ```
 
-- `BTC grid --recover --limit -300 300 --gap 0.5%` 会从当前该币普通 limit open orders 里按近侧最多每边 10 张接管到 `server_batch.json`，用于服务器断点或 JSON 丢失后的人工恢复。
+- `BTC grid --recover --limit -300 300 --gap 0.5%` 会从当前该币普通 limit open orders 里按近侧最多每边 16 张接管到 `server_batch.json`，用于服务器断点或 JSON 丢失后的人工恢复。
 - `BTC grid --query` 会展示该币 grid 的 limit/min/gap/仓位、买卖两边 active 数量、每张子单的 oid/价格/状态/live 情况和最近成交。
 - `BTC --cancel grid` 会取消服务器维护的网格和所有活跃子单。
 
 ### Worker 行为
 
 - 到达持仓上限后，worker 会撤销继续加仓方向的 grid 单，只保留/恢复减仓方向。
-- 仓位降到能容纳下一张加仓单后，worker 再把加仓方向补回到最多 10 张。
+- 仓位降到能容纳下一张加仓单后，worker 再把加仓方向补回到最多 16 张。
 - 补缺失子单时优先参考盘口 best bid/ask，而不是只参考 mid；盘口读取失败时才退回 mid。
-- 加风险方向 active 单超过当前风险密度预算时，worker 会按 `avg_multiplier` / `margin_gap_multiplier` 把允许数量压缩为 `floor(10 / multiplier)`，最低保留 1 张；超过部分按价格近远用等比/自然对数分布抽稀暂停为 `paused_risk_density`，近侧保留更密、远侧更疏。系数下降后，`paused_risk_density` 会优先于常规补档恢复。
+- 加风险方向 active 单超过当前风险密度预算时，worker 会按 `avg_multiplier` / `margin_gap_multiplier` 把允许数量压缩为 `floor(16 / multiplier)`，最低保留 1 张；超过部分按价格近远用等比/自然对数分布抽稀暂停为 `paused_risk_density`，近侧保留更密、远侧更疏。系数下降后，`paused_risk_density` 会优先于常规补档恢复。
 - 持仓 ROE 由 Hyperliquid `position.returnOnEquity` 直接返回；低于 -10% 时，worker 会按 -10% 到 -40% 的线性区间压缩加仓侧 active 数量，超出部分暂停为 `paused_roe`；低于 -40% 时，加仓侧允许 active 数归零。强制减仓仍只由 `panic_ratio` 触发。
 - 为减少挂单保证金占用并避免 1 分钟内盘口被打穿，每侧 active grid 单最多保留 16 张；普通补档、缺单恢复和 paused 恢复都要求该侧 active 少于 16 张。成交反向单优先提交，提交后若超过 16 张，再按近密远疏的等比/自然对数分布优先保留成交反向单并暂停其他旧 active 为 `paused_active_cap`，之后在 active 少于 16 张时也按同一分布逐步恢复。若单侧实际 open active 超过 32 张，成交反向单暂缓提交，worker 会优先从最远侧 live `pending_cancel` 开始撤单，即使该价格原本因 action limit 距离规则而暂缓撤单，逐步把 active 压回 32 张以内。
 - 如果同侧反向单受 `limit abs` 等上限约束，worker 会每轮每侧最多做一组 `active <-> paused_replacement` 渐进式互换，把应当保留的近密远疏档位逐步换回 active，而不是一直沿用历史先恢复成功的那批单。
@@ -270,7 +270,7 @@ BTC --cancel grid
 - 如果 worker 发现 grid oid 消失但最近成交记录里找不到对应 fill，会按该记录原来的 side、price、size 重新挂回，并在任务 note 里记录 `recovered_missing`。
 - grid oid 从 open orders 消失而成交查询尚未更新时，worker 会再查订单状态；已 `filled` 的直接补对向单。若恢复挂单因保证金保护等条件暂缓，会保留原 OID 供下一轮继续核实，避免漏掉稍后才可见的成交。
 - 恢复历史暂停档位前会检查当前 best bid/ask；已经穿过盘口的旧价格不再恢复，下一轮改按当前盘口重新补档，避免旧档批量立即成交。
-- 普通 paused 档位会按 side、price、size 和 reduce-only 去重；每侧只保留填补当前活跃档位缺口所需的最新记录。成交反向单产生的 paused replacement 不受每侧 10 张目标限制，会一直保留等待恢复。其他 grid 历史仍最多保留最近 120 条。
+- 普通 paused 档位会按 side、price、size 和 reduce-only 去重；每侧只保留填补当前活跃档位缺口所需的最新记录。成交反向单产生的 paused replacement 不受每侧 16 张目标限制，会一直保留等待恢复。其他 grid 历史仍最多保留最近 120 条。
 - 如果服务器断电或 worker 重启，只要 `server_batch.json` 还在，下一轮会继续按已有 oid 和最近成交接续维护。
 
 ## 服务器 Trail 单

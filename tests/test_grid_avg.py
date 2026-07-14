@@ -4,6 +4,7 @@ from decimal import Decimal
 from unittest.mock import patch
 
 from hl_order import (
+    GRID_TARGET_ORDERS_PER_SIDE,
     append_server_batch_or_cancel_orders,
     asset_requires_isolated_margin,
     build_grid_batch_row,
@@ -72,6 +73,7 @@ from trail_worker import (
     grid_roe_restore_allowed,
     grid_risk_density_pause_candidates,
     grid_risk_density_restore_allowed,
+    grid_target_orders_per_side,
     maintain_grid,
     mark_pending_cancel_confirmed_cancelled,
     modify_trail_stop,
@@ -112,6 +114,12 @@ from trail_worker import (
 
 
 class GridAvgTests(unittest.TestCase):
+    def test_grid_target_is_sixteen_and_migrates_old_defaults(self) -> None:
+        self.assertEqual(GRID_TARGET_ORDERS_PER_SIDE, 16)
+        self.assertEqual(grid_target_orders_per_side({"target_orders_per_side": 5}), 16)
+        self.assertEqual(grid_target_orders_per_side({"target_orders_per_side": 10}), 16)
+        self.assertEqual(grid_target_orders_per_side({"target_orders_per_side": 12}), 12)
+
     def test_batch_persist_failure_cancels_submitted_orders(self) -> None:
         class FakeExchange:
             def __init__(self) -> None:
