@@ -247,9 +247,11 @@ BTC grid --modify --gap 0
 BTC grid --modify --trend 0
 BTC grid --modify --avg 200
 BTC grid --modify --min 20
+xyz:SPCX grid --reverse
 ```
 
 - 所有 `--modify` 都只更新策略配置，不会主动撤销或重铺现有 grid 子单；新参数从以后生成的新单开始生效。
+- `grid --reverse` 会原地翻转当前策略的 signed 仓位范围和 `avg`，不会主动撤销或重铺现有子单。例如 `--limit -25 500 --avg 50` 会变为 `--limit -500 25 --avg -50`；未设置 `avg` 时仍保持未设置。
 - 模式、仓位范围或最低下单额变化后，如果现有订单违反新的方向、仓位上下限、保证金保护或 reduce-only 要求，Worker 仍会按安全规则单独撤销相关订单。
 - 从 `avg` 模式切回无方向的普通网格可使用 `--modify --trend 0`。
 - `--modify` 只改变命令中明确提供的参数；例如只传 `--trend` 时会沿用原来的 gap，只传 `--gap` 时也会沿用原来的 trend。`--modify --gap 0` 会按当前价格和费率重算默认 gap。

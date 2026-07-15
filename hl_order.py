@@ -2635,6 +2635,15 @@ def grid_limit_display(row: dict[str, Any]) -> str:
     return f"limit {decimal_to_plain(lower)} {decimal_to_plain(upper)}"
 
 
+def reversed_grid_strategy_values(row: dict[str, Any]) -> tuple[Decimal, Decimal, Decimal | None]:
+    policy = grid_limit_policy_from_row(row)
+    minimum = Decimal(str(row.get("min_position_value") or "0"))
+    maximum = Decimal(str(row.get("max_position_value", "0")))
+    lower, upper = grid_position_bounds(policy, minimum, maximum)
+    avg = decimal_or_none(row.get("avg"))
+    return -upper, -lower, -avg if avg is not None else None
+
+
 def grid_limit_arg(args: argparse.Namespace) -> tuple[str | None, str | None, str | None]:
     explicit_limit = getattr(args, "grid_limit", None)
     if explicit_limit is not None:
@@ -4127,11 +4136,12 @@ def modify_grid_batch_order(
     slippage: Decimal,
     price_rate: Decimal | None,
 ) -> None:
+    reversing = bool(getattr(args, "grid_reverse", False))
     batch_rows = load_server_batch()
     matching_indexes = grid_batch_indexes(batch_rows, args.network, account, coin, {"active", "error"})
     if not matching_indexes:
         print_account_metrics(info, account)
-        print_box("Grid Modify", [("coin", coin), ("matched", "0")])
+        print_box("Grid Reverse" if reversing else "Grid Modify", [("coin", coin), ("matched", "0")])
         return
     if len(matching_indexes) > 1:
         raise ValueError(f"multiple active grid batches found for {coin}; cancel extras before modifying")
@@ -4141,22 +4151,31 @@ def modify_grid_batch_order(
     now = int(time.time())
     old_limit_mode = grid_limit_policy_from_row(row)
     old_min_position_value = Decimal(str(row.get("min_position_value") or "0"))
-    new_limit_mode = str(args.grid_position_limit_mode) if args.grid_position_limit_value is not None else old_limit_mode
-    new_min_position_value = (
-        Decimal(str(args.grid_position_min_value or "0"))
-        if args.grid_position_limit_value is not None
-        else old_min_position_value
-    )
+    reversed_avg: Decimal | None = None
+    if reversing:
+        new_min_position_value, new_max_position_value, reversed_avg = reversed_grid_strategy_values(row)
+        new_limit_mode = "limit"
+    else:
+        new_limit_mode = str(args.grid_position_limit_mode) if args.grid_position_limit_value is not None else old_limit_mode
+        new_min_position_value = (
+            Decimal(str(args.grid_position_min_value or "0"))
+            if args.grid_position_limit_value is not None
+            else old_min_position_value
+        )
+        new_max_position_value = Decimal(str(args.grid_position_limit_value or row.get("max_position_value")))
     gap_changed = bool(args.gap)
     avg_changed = args.grid_avg is not None
     updates: list[tuple[str, str]] = []
-    if args.grid_position_limit_value is not None:
+    if reversing or args.grid_position_limit_value is not None:
         row["position_limit_mode"] = new_limit_mode
         row["min_position_value"] = decimal_to_plain(new_min_position_value)
-        row["max_position_value"] = decimal_to_plain(Decimal(str(args.grid_position_limit_value)))
+        row["max_position_value"] = decimal_to_plain(new_max_position_value)
         updates.append(("limit", grid_limit_display(row)))
         if new_limit_mode != old_limit_mode:
             updates.append(("mode_change", f"{old_limit_mode}->{new_limit_mode}"))
+    if reversing and reversed_avg is not None:
+        row["avg"] = decimal_to_plain(reversed_avg)
+        updates.append(("avg", row["avg"]))
     if args.grid_min is not None:
         row["min_order_value"] = decimal_to_plain(grid_min_notional(args))
         updates.append(("min", row["min_order_value"]))
@@ -4218,7 +4237,7 @@ def modify_grid_batch_order(
     if args.explain or args.dry_run:
         print_account_metrics(info, account)
         print_box(
-            "Grid Modify",
+            "Grid Reverse" if reversing else "Grid Modify",
             [
                 ("dry_run", "1" if args.dry_run else "0"),
                 ("coin", coin),
@@ -4231,7 +4250,11 @@ def modify_grid_batch_order(
 
     row["status"] = "active"
     row["updated_at"] = now
-    row["note"] = "modified grid config; existing orders kept"
+    row["note"] = (
+        "reversed grid limit and avg; existing orders kept"
+        if reversing
+        else "modified grid config; existing orders kept"
+    )
     batch_rows[index] = row
     save_server_batch(batch_rows)
     print_grid_batch_status(row, price_rate)
@@ -5212,7 +5235,7 @@ def place_order(args: argparse.Namespace) -> None:
                 price_rate,
             )
             return
-        if args.grid_modify:
+        if args.grid_modify or args.grid_reverse:
             modify_grid_batch_order(
                 args,
                 exchange,
@@ -5691,6 +5714,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--abs", dest="grid_abs", help=argparse.SUPPRESS)
     parser.add_argument("--min", dest="grid_min", help="Grid minimum value per child order in USD. Default: exchange minimum.")
     parser.add_argument("--modify", dest="grid_modify", action="store_true", help="Modify an active server grid for this coin.")
+    parser.add_argument(
+        "--reverse",
+        dest="grid_reverse",
+        action="store_true",
+        help="Reverse an active grid's signed limit range and avg target without replacing existing orders.",
+    )
     parser.add_argument("--recover", dest="grid_recover", action="store_true", help="Recover a server grid from current open limit orders for this coin.")
     parser.add_argument("--price", help="Limit price. Defaults to same-side book level 10.")
     parser.add_argument("--offset", dest="symmetric_offset", help="Symmetric order distance from base price, e.g. 2%% or 1500.")
@@ -5978,13 +6007,25 @@ def parse_args() -> argparse.Namespace:
         args.range_spec = [decimal_to_plain(start_px), decimal_to_plain(args.ladder_end), args.ladder_step]
     if args.symmetric_offset and not args.symmetric:
         parser.error("--offset requires side both")
-    if (args.trend or args.grid_avg is not None or args.gap or args.grid_min) and not args.grid:
-        parser.error("--trend, --avg, --gap, and --min require side grid")
+    if (args.trend or args.grid_avg is not None or args.gap or args.grid_min or args.grid_reverse) and not args.grid:
+        parser.error("--trend, --avg, --gap, --min, and --reverse require side grid")
     if args.grid:
         if args.trend is not None and args.grid_avg is not None:
             parser.error("--avg and --trend are mutually exclusive")
-        if args.grid_modify and args.grid_recover:
-            parser.error("grid --modify and --recover are mutually exclusive")
+        if sum(bool(value) for value in (args.grid_modify, args.grid_reverse, args.grid_recover)) > 1:
+            parser.error("grid --modify, --reverse, and --recover are mutually exclusive")
+        if args.grid_reverse and (
+            args.query
+            or args.grid_limit is not None
+            or args.grid_long is not None
+            or args.grid_short is not None
+            or args.grid_abs is not None
+            or args.trend is not None
+            or args.grid_avg is not None
+            or args.gap
+            or args.grid_min is not None
+        ):
+            parser.error("grid --reverse cannot be combined with query or other grid strategy changes")
         if args.total_amount is not None:
             parser.error("grid no longer uses --total; use --limit MIN MAX")
         if args.amount and args.amount != "10":
@@ -5996,7 +6037,7 @@ def parse_args() -> argparse.Namespace:
         ]
         if len(selected_grid_limits) > 1:
             parser.error("grid accepts only one position range option; use --limit MIN MAX")
-        if not args.query and not args.grid_modify and not selected_grid_limits:
+        if not args.query and not args.grid_modify and not args.grid_reverse and not selected_grid_limits:
             parser.error("grid orders require --limit MIN MAX")
         if args.grid_recover and not selected_grid_limits:
             parser.error("grid --recover requires --limit MIN MAX")

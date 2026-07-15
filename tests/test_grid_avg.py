@@ -24,8 +24,10 @@ from hl_order import (
     grid_query_rows,
     is_cumulative_action_limit_text as hl_order_is_cumulative_action_limit_text,
     is_auto_grid_gap,
+    modify_grid_batch_order,
     order_result_is_retryable_action_limit,
     refresh_grid_row_strategy_params,
+    reversed_grid_strategy_values,
     resolve_grid_spacing,
     submit_with_action_limit_retry,
     successful_cancel_oids,
@@ -117,6 +119,90 @@ from trail_worker import (
 
 
 class GridAvgTests(unittest.TestCase):
+    def test_reverse_grid_strategy_negates_signed_limit_and_avg(self) -> None:
+        lower, upper, avg = reversed_grid_strategy_values(
+            {
+                "position_limit_mode": "limit",
+                "min_position_value": "-25",
+                "max_position_value": "500",
+                "avg": "50",
+            }
+        )
+
+        self.assertEqual(lower, Decimal("-500"))
+        self.assertEqual(upper, Decimal("25"))
+        self.assertEqual(avg, Decimal("-50"))
+
+    def test_reverse_grid_strategy_preserves_missing_avg(self) -> None:
+        lower, upper, avg = reversed_grid_strategy_values(
+            {
+                "position_limit_mode": "limit",
+                "min_position_value": "-300",
+                "max_position_value": "0",
+                "avg": None,
+            }
+        )
+
+        self.assertEqual(lower, Decimal("0"))
+        self.assertEqual(upper, Decimal("300"))
+        self.assertIsNone(avg)
+
+    def test_reverse_grid_command_persists_reversed_limit_and_avg(self) -> None:
+        row = {
+            "type": "grid",
+            "status": "active",
+            "network": "mainnet",
+            "account": "0xabc",
+            "coin": "xyz:SPCX",
+            "position_limit_mode": "limit",
+            "min_position_value": "-25",
+            "max_position_value": "500",
+            "avg": "50",
+            "trend": "0",
+            "gap": "0.5%",
+            "gap_rate": "0.005",
+            "levels": [],
+        }
+        args = Namespace(
+            network="mainnet",
+            grid_reverse=True,
+            grid_position_limit_mode=None,
+            grid_position_min_value=None,
+            grid_position_limit_value=None,
+            grid_min=None,
+            gap=None,
+            trend=None,
+            grid_avg=None,
+            explain=False,
+            dry_run=False,
+        )
+
+        with patch("hl_order.load_server_batch", return_value=[row]), \
+             patch("hl_order.current_position_size_value", return_value=(Decimal("0"), Decimal("0"))), \
+             patch("hl_order.refresh_grid_row_strategy_params"), \
+             patch("hl_order.save_server_batch") as save_batch, \
+             patch("hl_order.print_grid_batch_status"):
+            modify_grid_batch_order(
+                args,
+                exchange=object(),
+                info=object(),
+                account="0xabc",
+                coin="xyz:SPCX",
+                dex="xyz",
+                asset={},
+                max_leverage=5,
+                current_mid=Decimal("1"),
+                slippage=Decimal("0.05"),
+                price_rate=None,
+            )
+
+        self.assertEqual(row["position_limit_mode"], "limit")
+        self.assertEqual(row["min_position_value"], "-500")
+        self.assertEqual(row["max_position_value"], "25")
+        self.assertEqual(row["avg"], "-50")
+        self.assertEqual(row["note"], "reversed grid limit and avg; existing orders kept")
+        save_batch.assert_called_once()
+
     def test_grid_target_is_sixteen_and_migrates_old_defaults(self) -> None:
         self.assertEqual(GRID_TARGET_ORDERS_PER_SIDE, 16)
         self.assertEqual(grid_target_orders_per_side({"target_orders_per_side": 5}), 16)

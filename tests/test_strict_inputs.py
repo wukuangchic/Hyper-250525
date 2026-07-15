@@ -112,6 +112,28 @@ class StrictInputTests(unittest.TestCase):
         self.assertEqual(args.grid_position_min_value, "-400")
         self.assertEqual(args.grid_position_limit_value, "-50")
 
+    def test_grid_reverse_routes_to_grid_config_update_without_limit(self) -> None:
+        args = self.parse_cli("xyz:SPCX", "grid", "--reverse")
+        self.assertTrue(args.grid_reverse)
+        self.assertIsNone(args.grid_position_limit_value)
+
+        info = Mock()
+        info.all_mids.return_value = {"xyz:SPCX": "1"}
+        asset = {"maxLeverage": 5}
+
+        with patch("hl_order.build_clients", return_value=(info, Mock(), "account", "signer", "agent")), \
+             patch("hl_order.resolve_perp_asset", return_value=("xyz:SPCX", asset)), \
+             patch("hl_order.coin_dex", return_value="xyz"), \
+             patch("hl_order.coin_display_rate", return_value=None), \
+             patch("hl_order.modify_grid_batch_order") as modify_grid:
+            place_order(args)
+
+        modify_grid.assert_called_once()
+
+    def test_grid_reverse_rejects_explicit_strategy_changes(self) -> None:
+        self.assert_cli_rejected("BTC", "grid", "--reverse", "--limit", "-500", "500")
+        self.assert_cli_rejected("BTC", "grid", "--reverse", "--avg", "0")
+
     def test_grid_requires_limit_range(self) -> None:
         self.assert_cli_rejected("BTC", "grid", "--dry-run")
         self.assert_cli_rejected("BTC", "grid", "--limit", "400", "200", "--dry-run")
