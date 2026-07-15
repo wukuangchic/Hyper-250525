@@ -62,6 +62,7 @@ from trail_worker import (
     grid_near_far_rebalance_pair,
     grid_order_status_is_cancelled,
     find_current_position_from_state,
+    is_cancel_terminal_race_text,
     is_cumulative_action_limit_text,
     is_min_order_value_error_text,
     grid_order_entry,
@@ -3503,6 +3504,60 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(dense["oid"], 2)
         self.assertEqual(dense["price"], "99.5")
         self.assertEqual(exchange.orders, [])
+
+    def test_dense_grid_defers_terminal_cancel_race_for_exchange_reconciliation(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.orders = []
+
+            def bulk_cancel(self, requests):
+                return {
+                    "status": "ok",
+                    "response": {
+                        "data": {
+                            "statuses": [
+                                {"error": "Order was never placed, already canceled, or filled. asset=110076"}
+                            ]
+                        }
+                    },
+                }
+
+            def order(self, *args, **kwargs):
+                self.orders.append((args, kwargs))
+                raise AssertionError("replacement must wait for terminal-state reconciliation")
+
+        row = {"gap_rate": "0.01", "min_order_value": "10", "base_buy_size": "1", "base_sell_size": "1", "levels": []}
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        keep = grid_order_entry(row, "BTC", asset, True, Decimal("100"), False)
+        keep.update({"status": "active", "oid": 1})
+        dense = grid_order_entry(row, "BTC", asset, True, Decimal("99.5"), False)
+        dense.update({"status": "active", "oid": 2})
+        row["levels"] = [keep, dense]
+        exchange = FakeExchange()
+
+        self.assertEqual(
+            regrid_dense_entries(
+                exchange, "BTC", row, asset, 123, Decimal("0"), Decimal("0"), "abs", False, set()
+            ),
+            0,
+        )
+
+        self.assertEqual(dense["status"], "pending_cancel")
+        self.assertEqual(dense["oid"], 2)
+        self.assertEqual(dense["price"], "99.5")
+        self.assertEqual(dense["pending_cancel_reason"], "dense_regrid")
+        self.assertTrue(dense["dense_regrid_pending"])
+        self.assertEqual(exchange.orders, [])
+
+    def test_terminal_cancel_race_is_recoverable_grid_error(self) -> None:
+        error = "Order was never placed, already canceled, or filled. asset=110076"
+
+        self.assertTrue(is_cancel_terminal_race_text(error))
+        self.assertTrue(
+            grid_row_recoverable_from_error(
+                {"type": "grid", "status": "error", "coin": "xyz:SPCX", "error": error}
+            )
+        )
 
     def test_grid_order_moves_away_from_near_active_price_before_submit(self) -> None:
         row = {

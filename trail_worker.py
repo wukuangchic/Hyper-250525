@@ -522,6 +522,7 @@ def grid_row_recoverable_from_error(row: dict[str, Any]) -> bool:
         or is_min_order_value_error_text(error_text)
         or is_reduce_only_would_increase_text(error_text)
         or is_insufficient_margin_text(error_text)
+        or is_cancel_terminal_race_text(error_text)
         or is_isolated_opening_leverage_error_text(error_text)
         or (
             "unknown perp coin" in error_text.lower()
@@ -548,6 +549,18 @@ def is_reduce_only_would_increase_text(text: str) -> bool:
 
 def is_insufficient_margin_text(text: str) -> bool:
     return "insufficient margin" in text.lower()
+
+
+def is_cancel_terminal_race_text(text: str) -> bool:
+    """Return whether a cancel lost a race to an exchange terminal state."""
+    lowered = text.lower()
+    return (
+        "order was never placed, already canceled, or filled" in lowered
+        or "order was never placed, already cancelled, or filled" in lowered
+        or "order was already filled" in lowered
+        or "order was already canceled" in lowered
+        or "order was already cancelled" in lowered
+    )
 
 
 def is_grid_child_order_reject_text(text: str) -> bool:
@@ -1867,9 +1880,20 @@ def regrid_dense_entries(
                 cache=cache,
                 raise_on_unconfirmed=True,
             )
-        except RuntimeError:
+        except RuntimeError as exc:
             entry.clear()
             entry.update(old_snapshot)
+            if is_cancel_terminal_race_text(str(exc)):
+                # The order disappeared between the open-order snapshot and
+                # this cancel. Keep the original oid so the next missing-order
+                # scan can distinguish a fill from a cancellation before any
+                # replacement is submitted.
+                entry["status"] = GRID_PENDING_CANCEL_STATUS
+                entry["pending_cancel_reason"] = "dense_regrid"
+                entry["pending_cancel_at"] = now
+                entry["dense_regrid_pending"] = True
+                entry["last_error"] = str(exc)
+                continue
             raise
         if not cancelled:
             if str(entry.get("status")) != GRID_PENDING_CANCEL_STATUS:
