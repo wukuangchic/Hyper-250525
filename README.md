@@ -10,6 +10,27 @@
 
 > 真实下单默认会提交到 Hyperliquid。新命令建议先加 `--dry-run` 预演。
 
+## 飞书历史同步（本地子程序）
+
+`sync_history_to_feishu.py` 使用 `.env` 中的飞书自建应用凭据，把 Hyperliquid 历史增量同步到指定多维表格：
+
+- 交易历史：`tblNp0SCcZkyk5Sf`
+- 资金费历史：`tbl3ER99oeYGE2kI`
+- 当前仓位：`tblk0aXeGF0TtJ4p`（每次成功获取后清空并重写 `coin`、`szi`、`markPx`）
+
+先预览，再正式同步：
+
+```bash
+python3 sync_history_to_feishu.py --dry-run
+python3 sync_history_to_feishu.py
+# 忽略表内最新时间，保留旧记录并从交易所全量追加
+python3 sync_history_to_feishu.py --full-refresh
+```
+
+每次启动时先删除两张表中由公式标记为 `唯一值=FALSE` 的记录；资金费表当前通过 API 将公式 FALSE 暴露为空白，程序会自动兼容。随后默认从表内最新 `timestamp_ms` 向前回溯 24 小时并直接追加交易所历史，不再逐条扫描去重，从而容忍时间偏差。程序只写入交易所原始毫秒字段 `timestamp_ms`，日期字段 `time` 由飞书公式生成。两张表分别执行 50,000 条上限保护：若现有记录加本轮新增将超限，会先按 `timestamp_ms` 删除最旧记录；可用 `--max-records` 调整上限。可用 `--overlap-hours 48` 调整回溯窗口。首次同步空表时默认从 `2023-01-01 UTC` 开始，也可通过 `--start 2026-07-01` 指定起点。应用密钥只保存在已被 Git 忽略的 `.env` 中。
+
+交易历史同时写入 `oid`（订单 ID）和 `tid`（成交 ID）。一个订单可能产生多笔部分成交并共享 `oid`，因此需要稳定唯一键时优先使用 `tid`；资金费没有成交 ID，使用 `timestamp_ms + coin` 作为唯一键。
+
 ## 快速开始
 
 首次安装：
