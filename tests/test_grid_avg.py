@@ -96,6 +96,7 @@ from trail_worker import (
     prepare_grid_cancel_entries,
     pause_skipped_account_margin_replacement,
     precheck_action_limit,
+    prune_cancelled_grid_rows,
     prune_add_risk_brake_state,
     preserve_replacement_order,
     prune_grid_levels,
@@ -3307,6 +3308,33 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertTrue(changed)
         self.assertEqual([entry["price"] for entry in row["levels"]], ["99", "98"])
+
+    def test_prune_removes_cancelled_grid_levels_but_keeps_other_terminal_state(self) -> None:
+        row = {
+            "type": "grid",
+            "target_orders_per_side": 2,
+            "levels": [
+                {"side": "buy", "status": "cancelled", "oid": None, "price": "97", "size": "1"},
+                {"side": "buy", "status": "pending_cancel", "oid": 2, "price": "98", "size": "1"},
+                {"side": "buy", "status": "filled", "oid": 3, "price": "99", "size": "1"},
+            ],
+        }
+
+        self.assertTrue(prune_grid_levels(row))
+        self.assertEqual(
+            [(entry["status"], entry["oid"]) for entry in row["levels"]],
+            [("pending_cancel", 2), ("filled", 3)],
+        )
+
+    def test_prune_removes_cancelled_grid_rows_only(self) -> None:
+        active_grid = {"type": "grid", "status": "active", "coin": "BTC"}
+        cancelled_grid = {"type": "grid", "status": "cancelled", "coin": "ETH"}
+        cancelled_trail = {"type": "trail", "status": "cancelled", "coin": "SOL"}
+
+        rows, changed = prune_cancelled_grid_rows([active_grid, cancelled_grid, cancelled_trail])
+
+        self.assertTrue(changed)
+        self.assertEqual(rows, [active_grid, cancelled_trail])
 
     def test_duplicate_paused_replacement_keeps_canonical_status(self) -> None:
         row = {

@@ -322,6 +322,7 @@ BTC --cancel trail
 - `reduce_only` 默认是 `False`，允许开仓、减仓或反手；要保护已有仓位时请加 `--reduce-only`。
 - 如果原 stop 单已经成交或不再 open，worker 会把任务标记为 `done`。
 - `done` 记录最多保留 7 天或 500 条，避免历史记录无限膨胀。
+- 已确认 `cancelled` 的整条 grid 和 grid level 不再保留在 `server_batch.json`；`pending_cancel`、`filled` 和 paused 状态仍按原逻辑跟踪或裁剪。
 
 服务器定时和负载：
 

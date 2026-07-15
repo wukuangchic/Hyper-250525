@@ -4801,6 +4801,19 @@ def prune_done_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], b
     return pruned, len(pruned) != len(rows)
 
 
+def prune_cancelled_grid_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
+    pruned = [
+        row
+        for row in rows
+        if not (
+            isinstance(row, dict)
+            and row.get("type") == "grid"
+            and row.get("status") == "cancelled"
+        )
+    ]
+    return pruned, len(pruned) != len(rows)
+
+
 def grid_level_updated_at(entry: dict[str, Any]) -> int:
     for key in (
         "near_far_rebalance_target_at",
@@ -4880,6 +4893,8 @@ def prune_grid_levels(row: dict[str, Any]) -> bool:
             passthrough.append(entry)
             continue
         status = str(entry.get("status", "active"))
+        if status == "cancelled":
+            continue
         if status in live_statuses:
             live_levels.append(entry)
         elif status in GRID_PAUSED_STATUSES:
@@ -4977,6 +4992,10 @@ def reconcile_cached_grid_open_orders(
 
 def run_once() -> None:
     rows = load_server_batch()
+    rows, cancelled_grids_pruned = prune_cancelled_grid_rows(rows)
+    cancelled_levels_pruned = prune_grid_level_history(rows)
+    if cancelled_grids_pruned or cancelled_levels_pruned:
+        save_server_batch(rows)
     active_trail_indexes = [
         index
         for index, row in enumerate(rows)
