@@ -5172,7 +5172,7 @@ def place_order(args: argparse.Namespace) -> None:
             print("resolved_side:", args.side)
 
     amount = Decimal(args.amount)
-    if amount <= 0:
+    if amount <= 0 and not args.grid:
         raise ValueError("amount must be positive")
     slippage = parse_slippage(args.slippage)
     has_tpsl = bool(args.take_profit or args.stop_loss)

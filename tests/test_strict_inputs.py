@@ -3,9 +3,9 @@ import unittest
 from contextlib import redirect_stderr
 from decimal import Decimal
 from io import StringIO
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from hl_order import parse_args, position_relative_order_side, post_only_immediate_match_error
+from hl_order import parse_args, place_order, position_relative_order_side, post_only_immediate_match_error
 from simple_hyper.order_specs import canonical_coin_input, normalize_coin_input, parse_side
 
 
@@ -83,6 +83,34 @@ class StrictInputTests(unittest.TestCase):
         self.assertEqual(args.grid_position_limit_mode, "limit")
         self.assertEqual(args.grid_position_min_value, "-200")
         self.assertEqual(args.grid_position_limit_value, "400")
+
+    def test_grid_modify_accepts_all_negative_signed_limit(self) -> None:
+        args = self.parse_cli(
+            "xyz:JPY",
+            "grid",
+            "--modify",
+            "--limit",
+            "-400",
+            "-50",
+            "--avg",
+            "-150",
+            "--min",
+            "20",
+        )
+        info = Mock()
+        info.all_mids.return_value = {"xyz:JPY": "1"}
+        asset = {"maxLeverage": 5}
+
+        with patch("hl_order.build_clients", return_value=(info, Mock(), "account", "signer", "agent")), \
+             patch("hl_order.resolve_perp_asset", return_value=("xyz:JPY", asset)), \
+             patch("hl_order.coin_dex", return_value="xyz"), \
+             patch("hl_order.coin_display_rate", return_value=None), \
+             patch("hl_order.modify_grid_batch_order") as modify_grid:
+            place_order(args)
+
+        modify_grid.assert_called_once()
+        self.assertEqual(args.grid_position_min_value, "-400")
+        self.assertEqual(args.grid_position_limit_value, "-50")
 
     def test_grid_requires_limit_range(self) -> None:
         self.assert_cli_rejected("BTC", "grid", "--dry-run")
