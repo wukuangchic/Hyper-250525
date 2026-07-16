@@ -45,6 +45,7 @@ from hl_order import (  # noqa: E402
     load_server_batch,
     log_event,
     mask,
+    order_plan_request,
     position_matches_coin,
     signed_position_value,
     successful_cancel_oids,
@@ -1400,7 +1401,21 @@ def set_grid_order_tif(order: dict[str, Any], tif: str) -> None:
 
 
 def refresh_grid_order_tif(order: dict[str, Any]) -> None:
-    set_grid_order_tif(order, "Alo")
+    set_grid_order_tif(order, "Gtc" if bool(order.get("panic_reversal_order")) else "Alo")
+
+
+def set_grid_order_size_exact(order: dict[str, Any], size: Decimal) -> None:
+    size_text = decimal_to_plain(size)
+    order["size"] = size_text
+    plan = order.get("plan")
+    if not isinstance(plan, dict):
+        return
+    plan["size"] = size
+    price = decimal_or_none(plan.get("limit_px")) or decimal_or_none(order.get("price")) or Decimal("0")
+    notional = size * price
+    plan["notional"] = notional
+    plan["target_notional"] = notional
+    plan["worst_notional"] = notional
 
 
 def set_grid_order_price(order: dict[str, Any], price: Decimal) -> None:
@@ -1662,6 +1677,7 @@ def panic_reversal_order_from_reduce(
     if isinstance(plan, dict):
         plan["label"] = "grid-panic-reversal"
         plan["panic_reversal_gap_multiplier"] = GRID_PANIC_REVERSAL_GAP_MULTIPLIER
+        plan["order_type"] = {"limit": {"tif": "Gtc"}}
     return order
 
 
@@ -3165,6 +3181,204 @@ def submit_grid_panic_reduce(
     return False
 
 
+def apply_panic_reversal_submit_status(order: dict[str, Any], status: Any, now: int) -> bool:
+    order["last_submit_status"] = status
+    if not isinstance(status, dict):
+        order["status"] = GRID_REPLACEMENT_PAUSE_STATUS
+        order["oid"] = None
+        order["last_error"] = f"panic reversal response was invalid: {status}"
+        order["paused_at"] = now
+        return False
+    if status.get("error"):
+        order["status"] = GRID_REPLACEMENT_PAUSE_STATUS
+        order["oid"] = None
+        order["last_error"] = str(status["error"])
+        order["paused_at"] = now
+        return False
+    resting = status.get("resting")
+    if isinstance(resting, dict):
+        order["oid"] = int(resting.get("oid", 0))
+        order["status"] = "active"
+        order["submitted_at"] = now
+        return True
+    filled = status.get("filled")
+    if isinstance(filled, dict):
+        order["oid"] = int(filled.get("oid", 0))
+        order["status"] = "filled"
+        order["filled_at"] = now
+        order["replacement_pending"] = True
+        return True
+    order["status"] = GRID_REPLACEMENT_PAUSE_STATUS
+    order["oid"] = None
+    order["last_error"] = f"panic reversal response did not include an order id: {status}"
+    order["paused_at"] = now
+    return False
+
+
+def cancel_unbacked_panic_reversal(
+    exchange: Any,
+    coin: str,
+    order: dict[str, Any],
+    now: int,
+    cache: dict[str, Any] | None,
+) -> bool:
+    if str(order.get("status")) != "active" or not order.get("oid"):
+        return True
+    order.pop("replace_never_cancel", None)
+    try:
+        cancelled = cancel_grid_entries(
+            exchange,
+            coin,
+            [order],
+            now,
+            "cancelled_panic_unbacked",
+            cache=cache,
+            raise_on_unconfirmed=True,
+        )
+    except (GridActionBudgetUnavailable, RuntimeError) as exc:
+        order["status"] = GRID_PENDING_CANCEL_STATUS
+        order["panic_reversal_unbacked"] = True
+        order["panic_reversal_cancel_error"] = str(exc)
+        order["pending_cancel_at"] = now
+        return False
+    return cancelled == 1
+
+
+def resize_active_panic_reversal(
+    exchange: Any,
+    coin: str,
+    order: dict[str, Any],
+    size: Decimal,
+    now: int,
+    cache: dict[str, Any] | None,
+) -> bool:
+    plan = order.get("plan")
+    if not isinstance(plan, dict) or str(order.get("status")) != "active" or not order.get("oid"):
+        set_grid_order_size_exact(order, size)
+        return False
+    reserve_grid_exchange_actions(cache)
+    result = exchange.modify_order(
+        int(order["oid"]),
+        coin,
+        bool(plan["is_buy"]),
+        float(size),
+        float(plan["limit_px"]),
+        {"limit": {"tif": "Gtc"}},
+        reduce_only=bool(plan.get("reduce_only", False)),
+    )
+    audit_grid_action(
+        "panic_reversal_resize",
+        coin=coin,
+        oid=order.get("oid"),
+        size=decimal_to_plain(size),
+        result=result,
+    )
+    statuses = result.get("response", {}).get("data", {}).get("statuses", []) if isinstance(result, dict) else []
+    status = statuses[0] if result.get("status") == "ok" and statuses else None
+    if status is not None and not (isinstance(status, dict) and status.get("error")):
+        set_grid_order_size_exact(order, size)
+        order["panic_reversal_resized_at"] = now
+        return apply_panic_reversal_submit_status(order, status, now)
+    order["panic_reversal_resize_error"] = str(result)
+    old_oid = order.get("oid")
+    if cancel_unbacked_panic_reversal(exchange, coin, order, now, cache):
+        order["replace_never_cancel"] = True
+        order["status"] = GRID_REPLACEMENT_PAUSE_STATUS
+        order["oid"] = None
+        order["paused_at"] = now
+        order["panic_reversal_resubmit_after_resize_oid"] = old_oid
+        set_grid_order_size_exact(order, size)
+    return False
+
+
+def submit_grid_panic_pair(
+    exchange: Any,
+    coin: str,
+    panic_order: dict[str, Any],
+    reversal_order: dict[str, Any],
+    now: int,
+    row: dict[str, Any],
+    cache: dict[str, Any] | None = None,
+) -> tuple[bool, bool]:
+    panic_plan = panic_order.get("plan")
+    reversal_plan = reversal_order.get("plan")
+    if not isinstance(panic_plan, dict) or not isinstance(reversal_plan, dict):
+        return False, False
+    set_grid_order_tif(reversal_order, "Gtc")
+    reserve_grid_exchange_actions(cache, 2)
+    requests = [order_plan_request(panic_plan), order_plan_request(reversal_plan)]
+    result = exchange.bulk_orders(requests, grouping="na")
+    audit_grid_action(
+        "panic_pair_submit",
+        coin=coin,
+        panic_price=panic_order.get("price"),
+        reversal_price=reversal_order.get("price"),
+        size=panic_order.get("size"),
+        result=result,
+    )
+    log_event("grid_panic_pair_orders", {"coin": coin, "requests": requests, "result": result})
+    if result.get("status") != "ok":
+        row["panic_reduce_error"] = str(result)
+        row["panic_reduce_error_at"] = now
+        return False, False
+    statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+    if not isinstance(statuses, list) or len(statuses) != 2:
+        row["panic_reduce_error"] = f"panic pair response statuses mismatch: {result}"
+        row["panic_reduce_error_at"] = now
+        return False, False
+
+    reversal_submitted = apply_panic_reversal_submit_status(reversal_order, statuses[1], now)
+    panic_status = statuses[0]
+    if not isinstance(panic_status, dict) or panic_status.get("error") or not isinstance(panic_status.get("filled"), dict):
+        row["panic_reduce_error"] = str(
+            panic_status.get("error") if isinstance(panic_status, dict) and panic_status.get("error") else panic_status
+        )
+        row["panic_reduce_error_at"] = now
+        if reversal_submitted and str(reversal_order.get("status")) == "active":
+            cancelled = cancel_unbacked_panic_reversal(exchange, coin, reversal_order, now, cache)
+            return False, not cancelled
+        if reversal_submitted and str(reversal_order.get("status")) == "filled":
+            reversal_order["panic_reversal_panic_retry_at"] = now
+            if submit_grid_panic_reduce(exchange, coin, panic_order, now, row, cache):
+                reversal_order["panic_reversal_panic_retry_succeeded"] = True
+                return True, True
+            reversal_order.pop("replace_never_cancel", None)
+            reversal_order["panic_reversal_unbacked_filled"] = True
+            return False, True
+        return False, False
+
+    filled = panic_status["filled"]
+    panic_order["oid"] = int(filled.get("oid", 0))
+    panic_order["status"] = "filled"
+    panic_order["filled_at"] = now
+    panic_order["last_submit_status"] = panic_status
+    filled_size = decimal_or_none(filled.get("totalSz", filled.get("sz"))) or decimal_or_none(panic_order.get("size"))
+    if filled_size is None or filled_size <= 0:
+        row["panic_reduce_error"] = f"panic pair fill did not include a positive size: {panic_status}"
+        row["panic_reduce_error_at"] = now
+        return False, reversal_submitted
+    panic_order["filled_size"] = decimal_to_plain(filled_size)
+    requested_size = decimal_or_none(reversal_order.get("size"))
+    if requested_size != filled_size:
+        if reversal_submitted and str(reversal_order.get("status")) == "active":
+            reversal_submitted = resize_active_panic_reversal(
+                exchange,
+                coin,
+                reversal_order,
+                filled_size,
+                now,
+                cache,
+            )
+        elif reversal_submitted and str(reversal_order.get("status")) == "filled":
+            reversal_order["panic_reversal_partial_fill_mismatch"] = {
+                "panic_filled_size": decimal_to_plain(filled_size),
+                "reversal_size": decimal_to_plain(requested_size or Decimal("0")),
+            }
+        else:
+            set_grid_order_size_exact(reversal_order, filled_size)
+    return True, True
+
+
 def prepare_grid_cancel_entries(
     row: dict[str, Any] | None,
     entries: list[dict[str, Any]],
@@ -4226,7 +4440,30 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         if panic_order is not None:
             panic_order["panic_ratio"] = decimal_to_plain(panic_ratio)
             panic_order["panic_ratio_threshold"] = decimal_to_plain(panic_threshold)
-            submitted = submit_grid_panic_reduce(exchange, coin, panic_order, now, row, cache)
+            panic_reversal = panic_reversal_order_from_reduce(
+                row,
+                coin,
+                asset,
+                current_mid,
+                bool(panic_order.get("is_buy")),
+                Decimal(str(panic_order["size"])),
+                position_size,
+                policy,
+            )
+            pair_submitted = panic_reversal is not None and callable(getattr(exchange, "bulk_orders", None))
+            keep_paired_reversal = False
+            if pair_submitted:
+                submitted, keep_paired_reversal = submit_grid_panic_pair(
+                    exchange,
+                    coin,
+                    panic_order,
+                    panic_reversal,
+                    now,
+                    row,
+                    cache,
+                )
+            else:
+                submitted = submit_grid_panic_reduce(exchange, coin, panic_order, now, row, cache)
             if submitted:
                 panic_reduced = 1
                 row["panic_reduce_at"] = now
@@ -4238,17 +4475,22 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 row.pop("panic_reduce_error", None)
                 row.pop("panic_reduce_error_at", None)
                 changed = True
-                panic_reversal = panic_reversal_order_from_reduce(
-                    row,
-                    coin,
-                    asset,
-                    current_mid,
-                    bool(panic_order.get("is_buy")),
-                    Decimal(str(panic_order.get("filled_size") or panic_order["size"])),
-                    position_size,
-                    policy,
-                )
-                if panic_reversal is not None:
+                if pair_submitted and panic_reversal is not None:
+                    if keep_paired_reversal:
+                        levels.append(panic_reversal)
+                    changed = True
+                else:
+                    panic_reversal = panic_reversal_order_from_reduce(
+                        row,
+                        coin,
+                        asset,
+                        current_mid,
+                        bool(panic_order.get("is_buy")),
+                        Decimal(str(panic_order.get("filled_size") or panic_order["size"])),
+                        position_size,
+                        policy,
+                    )
+                if panic_reversal is not None and not pair_submitted:
                     reversal_side = str(panic_reversal.get("side") or "")
                     order_notional = Decimal(str(panic_reversal["size"])) * Decimal(str(panic_reversal["price"]))
                     if not submit_panic_reversal(panic_reversal):
@@ -4268,6 +4510,24 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                                 projected_position_value - order_notional,
                             )
                     changed = True
+                elif panic_reversal is not None and pair_submitted and str(panic_reversal.get("status")) in {"active", "filled"}:
+                    reversal_side = str(panic_reversal.get("side") or "")
+                    order_notional = Decimal(str(panic_reversal["size"])) * Decimal(str(panic_reversal["price"]))
+                    projected_position_value = projected_position_values.get(reversal_side, Decimal("0"))
+                    if policy == "limit":
+                        projected_position_values[reversal_side] += (
+                            order_notional if bool(panic_reversal["is_buy"]) else -order_notional
+                        )
+                    elif grid_order_would_add_risk(position_size, bool(panic_reversal["is_buy"])):
+                        projected_position_values[reversal_side] = projected_position_value + order_notional
+                    else:
+                        projected_position_values[reversal_side] = max(
+                            Decimal("0"),
+                            projected_position_value - order_notional,
+                        )
+            elif pair_submitted and keep_paired_reversal and panic_reversal is not None:
+                levels.append(panic_reversal)
+                changed = True
     mark_phase("panic")
     enable_action_limit_p1_budget(cache)
     replacements = 0
