@@ -934,6 +934,24 @@ def mark_pending_cancel_confirmed_cancelled(
     return True
 
 
+def mark_missing_order_confirmed_open(
+    entry: dict[str, Any],
+    old_oid: int,
+    now: int,
+    order_status: Any,
+    open_orders: list[dict[str, Any]] | None,
+    coin: str,
+) -> bool:
+    if grid_order_status_name(order_status).strip().lower() != "open":
+        return False
+    entry["status"] = "active"
+    entry["oid"] = old_oid
+    entry["confirmed_open_oid"] = old_oid
+    entry["confirmed_open_at"] = now
+    record_submitted_open_grid_order(open_orders, coin, entry, old_oid, now)
+    return True
+
+
 def grid_entry_age_seconds(entry: dict[str, Any], now: int) -> int:
     for key in ("submitted_at", "recovered_at", "filled_at", "cancelled_at", "skipped_at", "paused_at"):
         try:
@@ -3374,6 +3392,7 @@ def submit_grid_panic_pair(
     now: int,
     row: dict[str, Any],
     cache: dict[str, Any] | None = None,
+    open_orders: list[dict[str, Any]] | None = None,
 ) -> tuple[bool, bool]:
     panic_plan = panic_order.get("plan")
     reversal_plan = reversal_order.get("plan")
@@ -3451,6 +3470,14 @@ def submit_grid_panic_pair(
             }
         else:
             set_grid_order_size_exact(reversal_order, filled_size)
+    if reversal_submitted and str(reversal_order.get("status")) == "active":
+        record_submitted_open_grid_order(
+            open_orders,
+            coin,
+            reversal_order,
+            int(reversal_order.get("oid") or 0),
+            now,
+        )
     return True, True
 
 
@@ -4307,6 +4334,17 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             old_oid = oid
             order_status = info.query_order_by_oid(account, old_oid)
             status_name = grid_order_status_name(order_status)
+            if mark_missing_order_confirmed_open(
+                entry,
+                old_oid,
+                now,
+                order_status,
+                current_open_orders,
+                coin,
+            ):
+                open_oids.add(old_oid)
+                changed = True
+                continue
             if status_name == "filled":
                 entry["status"] = "filled"
                 entry["filled_at"] = now
@@ -4565,6 +4603,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                     now,
                     row,
                     cache,
+                    current_open_orders,
                 )
             else:
                 submitted = submit_grid_panic_reduce(exchange, coin, panic_order, now, row, cache)

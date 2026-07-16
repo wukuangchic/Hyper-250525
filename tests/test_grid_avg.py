@@ -82,6 +82,7 @@ from trail_worker import (
     grid_target_orders_per_side,
     grid_survival_slot_available,
     maintain_grid,
+    mark_missing_order_confirmed_open,
     mark_pending_cancel_confirmed_cancelled,
     modify_trail_stop,
     move_grid_order_away_from_active,
@@ -1325,8 +1326,9 @@ class GridAvgTests(unittest.TestCase):
             ],
         }
 
+        cache = {"now": 123, "grid_action_phase": "p0"}
         with patch("trail_worker.build_clients", return_value=(info, exchange, "acct", "signer", {})):
-            updated, changed = maintain_grid(row, {"now": 123, "grid_action_phase": "p0"})
+            updated, changed = maintain_grid(row, cache)
 
         self.assertTrue(changed)
         self.assertEqual(exchange.bulk_calls, 1)
@@ -1344,6 +1346,42 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(reversal["oid"], 12)
         self.assertEqual(reversal["size"], "0.4")
         self.assertTrue(reversal["replace_never_cancel"])
+        cached_open_orders = cache["open_orders"][("mainnet", "acct", "")]
+        self.assertTrue(any(int(order["oid"]) == 12 for order in cached_open_orders))
+
+    def test_missing_scan_keeps_exchange_open_oid_without_resubmitting(self) -> None:
+        entry = {
+            "side": "buy",
+            "status": "active",
+            "oid": 123,
+            "price": "62.338",
+            "size": "0.19",
+            "is_buy": True,
+            "reduce_only": False,
+            "plan": {
+                "coin": "HYPE",
+                "is_buy": True,
+                "size": Decimal("0.19"),
+                "limit_px": Decimal("62.338"),
+                "reduce_only": False,
+            },
+        }
+        open_orders = []
+
+        confirmed = mark_missing_order_confirmed_open(
+            entry,
+            123,
+            456,
+            {"status": "order", "order": {"status": "open"}},
+            open_orders,
+            "HYPE",
+        )
+
+        self.assertTrue(confirmed)
+        self.assertEqual(entry["status"], "active")
+        self.assertEqual(entry["confirmed_open_oid"], 123)
+        self.assertEqual(entry["confirmed_open_at"], 456)
+        self.assertEqual([order["oid"] for order in open_orders], [123])
 
     def test_panic_pair_cancels_gtc_when_ioc_fails(self) -> None:
         class FakeExchange:
