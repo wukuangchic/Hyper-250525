@@ -2684,6 +2684,7 @@ def submit_grid_order_entry(
     cache: dict[str, Any] | None = None,
     consume_p1_budget: bool = False,
 ) -> bool:
+    preserve_panic_reversal_price = grid_order_is_never_cancel(order)
     restore_without_reduce_only = grid_reduce_only_canceled_restore_without_reduce_only(order)
     refresh_grid_order_reduce_only(order, position_size, policy)
     refresh_grid_order_tif(order)
@@ -2742,7 +2743,11 @@ def submit_grid_order_entry(
                 f"Failed to set isolated opening leverage to {leverage}x for {coin}; order was not submitted."
             )
         isolated_leverage_ready.add(coin)
-    if retry_alo_reject and not move_grid_order_away_from_active(row, asset, order):
+    if (
+        retry_alo_reject
+        and not preserve_panic_reversal_price
+        and not move_grid_order_away_from_active(row, asset, order)
+    ):
         order["status"] = "skipped_alo_price_search"
         order["oid"] = None
         order["skipped_at"] = now
@@ -2821,6 +2826,13 @@ def submit_grid_order_entry(
             order["oid"] = None
             order["last_error"] = str(exc)
             order["skipped_at"] = now
+            return False
+        if preserve_panic_reversal_price:
+            order["status"] = "skipped_post_only"
+            order["oid"] = None
+            order["last_error"] = str(exc)
+            order["skipped_at"] = now
+            order["panic_reversal_price_preserved"] = True
             return False
         order["last_error"] = str(exc)
         oid = None

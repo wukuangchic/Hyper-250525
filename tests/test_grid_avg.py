@@ -1095,6 +1095,126 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(order["plan"]["label"], "grid-panic-reversal")
         self.assertEqual(order["plan"]["grid_gap"], Decimal("0.01"))
 
+    def test_panic_reversal_submit_ignores_occupied_prices_and_keeps_trigger_price(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.prices = []
+
+            def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
+                self.prices.append(Decimal(str(limit_px)))
+                return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 123}}]}}}
+
+        row = {
+            "gap_rate": "0.0005",
+            "min_order_value": "10",
+            "base_buy_size": "0.18",
+            "base_sell_size": "0.18",
+            "levels": [
+                {"side": "buy", "status": "active", "oid": 1, "price": "65.11", "size": "0.18"},
+                {"side": "buy", "status": "paused_replacement", "oid": None, "price": "65.08", "size": "0.18"},
+            ],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        order = panic_reversal_order_from_reduce(
+            row,
+            "HYPE",
+            asset,
+            Decimal("65.2"),
+            False,
+            Decimal("0.18"),
+            Decimal("4"),
+            "abs",
+        )
+        self.assertIsNotNone(order)
+        original_price = order["price"]
+        exchange = FakeExchange()
+
+        submitted = submit_grid_order_entry(
+            exchange,
+            "HYPE",
+            order,
+            123,
+            row,
+            asset,
+            Decimal("4"),
+            Decimal("260.8"),
+            "abs",
+            False,
+            set(),
+            retry_alo_reject=True,
+            open_orders=[],
+        )
+
+        self.assertTrue(submitted)
+        self.assertEqual(original_price, "65.112")
+        self.assertEqual(order["price"], original_price)
+        self.assertEqual(exchange.prices, [Decimal(original_price)])
+
+    def test_panic_reversal_post_only_failure_retries_later_without_moving_price(self) -> None:
+        class FakeExchange:
+            def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
+                return {
+                    "status": "ok",
+                    "response": {"data": {"statuses": [{"error": "Post only would immediately match"}]}},
+                }
+
+        row = {
+            "gap_rate": "0.0005",
+            "min_order_value": "10",
+            "base_buy_size": "0.18",
+            "base_sell_size": "0.18",
+            "levels": [],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        order = panic_reversal_order_from_reduce(
+            row,
+            "HYPE",
+            asset,
+            Decimal("65.2"),
+            False,
+            Decimal("0.18"),
+            Decimal("4"),
+            "abs",
+        )
+        self.assertIsNotNone(order)
+        original_price = order["price"]
+
+        submitted = submit_grid_order_entry(
+            FakeExchange(),
+            "HYPE",
+            order,
+            123,
+            row,
+            asset,
+            Decimal("4"),
+            Decimal("260.8"),
+            "abs",
+            False,
+            set(),
+            retry_alo_reject=True,
+            open_orders=[],
+        )
+
+        self.assertFalse(submitted)
+        self.assertEqual(order["status"], "skipped_post_only")
+        self.assertEqual(order["price"], original_price)
+        self.assertTrue(order["panic_reversal_price_preserved"])
+
+        next_order = replacement_order_from_fill(
+            row,
+            "HYPE",
+            asset,
+            Decimal(original_price),
+            True,
+            Decimal("4"),
+            Decimal("260.8"),
+            Decimal("500"),
+            "abs",
+        )
+        self.assertIsNotNone(next_order)
+        self.assertNotIn("replace_never_cancel", next_order)
+        self.assertNotIn("panic_reversal_order", next_order)
+
     def test_panic_reversal_submits_without_restore_limit_checks(self) -> None:
         class FakeInfo:
             def post(self, path, payload):
