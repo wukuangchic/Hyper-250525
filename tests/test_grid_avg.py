@@ -1048,6 +1048,7 @@ class GridAvgTests(unittest.TestCase):
             asset,
             Decimal("100"),
             True,
+            Decimal("0.37"),
             Decimal("-4"),
             "abs",
         )
@@ -1055,9 +1056,11 @@ class GridAvgTests(unittest.TestCase):
         self.assertIsNotNone(order)
         self.assertEqual(order["side"], "sell")
         self.assertEqual(order["price"], "102.71")
+        self.assertEqual(order["size"], "0.37")
         self.assertFalse(order["reduce_only"])
         self.assertTrue(order["replacement_order"])
         self.assertTrue(order["panic_reversal_order"])
+        self.assertTrue(order["replace_never_cancel"])
         self.assertEqual(order["plan"]["label"], "grid-panic-reversal")
         self.assertEqual(order["plan"]["grid_gap"], Decimal("0.01"))
 
@@ -1076,6 +1079,7 @@ class GridAvgTests(unittest.TestCase):
             asset,
             Decimal("100"),
             False,
+            Decimal("0.43"),
             Decimal("4"),
             "abs",
         )
@@ -1083,9 +1087,11 @@ class GridAvgTests(unittest.TestCase):
         self.assertIsNotNone(order)
         self.assertEqual(order["side"], "buy")
         self.assertEqual(order["price"], "97.29")
+        self.assertEqual(order["size"], "0.43")
         self.assertFalse(order["reduce_only"])
         self.assertTrue(order["replacement_order"])
         self.assertTrue(order["panic_reversal_order"])
+        self.assertTrue(order["replace_never_cancel"])
         self.assertEqual(order["plan"]["label"], "grid-panic-reversal")
         self.assertEqual(order["plan"]["grid_gap"], Decimal("0.01"))
 
@@ -1139,10 +1145,13 @@ class GridAvgTests(unittest.TestCase):
                 return Decimal(str(reference_price)) * side_factor
 
             def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
-                self.orders.append((coin, is_buy, Decimal(str(limit_px)), order_type, reduce_only))
+                self.orders.append((coin, is_buy, Decimal(str(limit_px)), order_type, reduce_only, Decimal(str(size))))
                 oid = 10 if len(self.orders) == 1 else 11
                 status_key = "filled" if len(self.orders) == 1 else "resting"
-                return {"status": "ok", "response": {"data": {"statuses": [{status_key: {"oid": oid}}]}}}
+                status = {"oid": oid}
+                if status_key == "filled":
+                    status["totalSz"] = "0.4"
+                return {"status": "ok", "response": {"data": {"statuses": [{status_key: status}]}}}
 
         info = FakeInfo()
         exchange = FakeExchange()
@@ -1171,9 +1180,167 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(exchange.orders[1][1], False)
         self.assertFalse(exchange.orders[1][4])
         self.assertEqual(exchange.orders[1][2], Decimal("102.71"))
+        self.assertEqual(exchange.orders[1][5], Decimal("0.4"))
         reversal = next(entry for entry in updated["levels"] if entry.get("panic_reversal_order"))
         self.assertEqual(reversal["status"], "active")
         self.assertEqual(reversal["oid"], 11)
+        self.assertEqual(reversal["size"], "0.4")
+        self.assertTrue(reversal["replace_never_cancel"])
+
+    def test_failed_panic_reversal_is_preserved_and_retried_with_filled_size(self) -> None:
+        class FakeInfo:
+            def post(self, path, payload):
+                return {"nRequestsUsed": 0, "nRequestsCap": 1000}
+
+            def meta(self, dex=""):
+                return {"universe": [{"name": "BTC", "szDecimals": 2, "maxLeverage": 20}]}
+
+            def all_mids(self, dex=""):
+                return {"BTC": "100"}
+
+            def l2_snapshot(self, coin):
+                return {"levels": [[{"px": "99"}], [{"px": "101"}]]}
+
+            def user_state(self, account, dex=""):
+                return {
+                    "assetPositions": [
+                        {
+                            "position": {
+                                "coin": "BTC",
+                                "szi": "-4",
+                                "positionValue": "400",
+                                "liquidationPx": "130",
+                                "returnOnEquity": "-0.50",
+                            }
+                        }
+                    ]
+                }
+
+            def spot_user_state(self, account):
+                return {
+                    "balances": [{"token": 0, "coin": "USDC", "total": "100"}],
+                    "tokenToAvailableAfterMaintenance": [[0, "100"]],
+                }
+
+            def frontend_open_orders(self, account, dex=""):
+                return [{"coin": "BTC", "oid": 1}]
+
+            def user_fills_by_time(self, account, start_ms, end_ms):
+                return []
+
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.orders = []
+
+            def _slippage_price(self, coin, is_buy, slippage, reference_price):
+                return Decimal(str(reference_price)) * (Decimal("1.001") if is_buy else Decimal("0.999"))
+
+            def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
+                self.orders.append((is_buy, Decimal(str(size)), Decimal(str(limit_px)), reduce_only))
+                if len(self.orders) == 1:
+                    return {
+                        "status": "ok",
+                        "response": {"data": {"statuses": [{"filled": {"oid": 10, "totalSz": "0.4"}}]}},
+                    }
+                if len(self.orders) == 2:
+                    return {"status": "err", "response": "temporary exchange failure"}
+                return {
+                    "status": "ok",
+                    "response": {"data": {"statuses": [{"resting": {"oid": 11}}]}},
+                }
+
+        info = FakeInfo()
+        exchange = FakeExchange()
+        row = {
+            "coin": "BTC",
+            "network": "mainnet",
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "max_position_value": "1",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+            "slippage": "0.001",
+            "sz_decimals": 2,
+            "levels": [
+                {"side": "buy", "status": "active", "oid": 1, "price": "90", "size": "1", "reduce_only": True}
+            ],
+        }
+
+        with patch("trail_worker.build_clients", return_value=(info, exchange, "acct", "signer", {})):
+            updated, changed = maintain_grid(row, {"now": 123, "grid_action_phase": "p0"})
+            self.assertTrue(changed)
+            reversal = next(entry for entry in updated["levels"] if entry.get("panic_reversal_order"))
+            self.assertEqual(reversal["status"], "paused_replacement")
+            self.assertEqual(reversal["size"], "0.4")
+            self.assertTrue(reversal["replace_never_cancel"])
+
+            updated, changed = maintain_grid(
+                updated,
+                {"now": 124, "grid_action_phase": "p1_paused_replacement"},
+            )
+
+        self.assertTrue(changed)
+        reversal = next(entry for entry in updated["levels"] if entry.get("panic_reversal_order"))
+        self.assertEqual(reversal["status"], "active")
+        self.assertEqual(reversal["oid"], 11)
+        self.assertEqual(reversal["size"], "0.4")
+        self.assertEqual([order[1] for order in exchange.orders], [Decimal("1"), Decimal("0.4"), Decimal("0.4")])
+
+    def test_never_cancel_replacement_is_excluded_from_worker_cancellations(self) -> None:
+        class FakeExchange:
+            def bulk_cancel(self, requests):
+                raise AssertionError("protected panic reversal must not be cancelled")
+
+        protected = {
+            "side": "sell",
+            "is_buy": False,
+            "status": "active",
+            "oid": 99,
+            "price": "120",
+            "size": "1",
+            "replacement_order": True,
+            "panic_reversal_order": True,
+            "replace_never_cancel": True,
+        }
+        row = {"levels": [protected]}
+
+        self.assertEqual(cancel_grid_entries(FakeExchange(), "BTC", [protected], 123, "paused_roe"), 0)
+        self.assertEqual(protected["status"], "active")
+
+        roe_candidates, _allowed = grid_roe_pause_candidates(
+            row,
+            "sell",
+            Decimal("-1"),
+            16,
+            Decimal("-0.50"),
+        )
+        self.assertEqual(roe_candidates, [])
+
+        regular = [
+            {
+                "side": "sell",
+                "is_buy": False,
+                "status": "active",
+                "oid": oid,
+                "price": str(100 + oid),
+                "size": "1",
+            }
+            for oid in range(1, 17)
+        ]
+        row["levels"] = regular + [protected]
+        cap_candidates, _allowed = grid_active_cap_pause_candidates(row, "sell", 16)
+        self.assertNotIn(protected, cap_candidates)
+        self.assertEqual(len(cap_candidates), 1)
+
+        first_paused = dict(protected, status="paused_replacement", oid=None, paused_at=1)
+        second_paused = dict(protected, status="paused_replacement", oid=None, paused_at=2)
+        paused_row = {
+            "type": "grid",
+            "target_orders_per_side": 16,
+            "levels": [first_paused, second_paused],
+        }
+        prune_grid_levels(paused_row)
+        self.assertEqual(paused_row["levels"], [first_paused, second_paused])
 
     def test_panic_reversal_waits_and_retries_action_limit_once(self) -> None:
         class FakeInfo:

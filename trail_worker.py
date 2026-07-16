@@ -1305,6 +1305,8 @@ def record_submitted_open_grid_order(
 
 
 def ensure_grid_order_min_notional(row: dict[str, Any], asset: dict[str, Any], order: dict[str, Any]) -> None:
+    if bool(order.get("replace_never_cancel")):
+        return
     plan = order.get("plan")
     if not isinstance(plan, dict):
         return
@@ -1327,6 +1329,8 @@ def ensure_grid_order_min_notional(row: dict[str, Any], asset: dict[str, Any], o
 
 
 def bump_grid_order_size_one_step(asset: dict[str, Any], order: dict[str, Any]) -> None:
+    if bool(order.get("replace_never_cancel")):
+        return
     plan = order.get("plan")
     if not isinstance(plan, dict):
         return
@@ -1565,6 +1569,7 @@ def grid_order_entry(
     reduce_only: bool,
     size: Decimal | None = None,
     gap: Decimal | None = None,
+    preserve_size: bool = False,
 ) -> dict[str, Any]:
     ensure_grid_base_sizes(row)
     size_key = "base_buy_size" if is_buy else "base_sell_size"
@@ -1573,7 +1578,8 @@ def grid_order_entry(
     if size <= 0:
         raise ValueError(f"grid row is missing {size_key}")
     min_notional = Decimal(str(row.get("min_order_value") or "10"))
-    size = grid_size_for_min_notional(size, price, int(asset["szDecimals"]), min_notional)
+    if not preserve_size:
+        size = grid_size_for_min_notional(size, price, int(asset["szDecimals"]), min_notional)
     side = "buy" if is_buy else "sell"
     plan = build_grid_limit_order_plan(coin, is_buy, size, price, asset, reduce_only, side)
     plan["grid_gap"] = gap if gap is not None else Decimal(str(row["gap_rate"]))
@@ -1621,6 +1627,7 @@ def panic_reversal_order_from_reduce(
     asset: dict[str, Any],
     current_mid: Decimal,
     reduced_is_buy: bool,
+    reduced_size: Decimal,
     position_size: Decimal,
     policy: str,
 ) -> dict[str, Any] | None:
@@ -1635,9 +1642,22 @@ def panic_reversal_order_from_reduce(
     if next_px <= 0:
         return None
     reduce_only = grid_order_should_reduce_only(position_size, next_is_buy, policy)
-    order = grid_order_entry(row, coin, asset, next_is_buy, next_px, reduce_only, gap=gap)
+    if reduced_size <= 0:
+        return None
+    order = grid_order_entry(
+        row,
+        coin,
+        asset,
+        next_is_buy,
+        next_px,
+        reduce_only,
+        size=reduced_size,
+        gap=gap,
+        preserve_size=True,
+    )
     order["replacement_order"] = True
     order["panic_reversal_order"] = True
+    order["replace_never_cancel"] = True
     plan = order.get("plan")
     if isinstance(plan, dict):
         plan["label"] = "grid-panic-reversal"
@@ -1690,6 +1710,10 @@ def active_grid_entries(row: dict[str, Any], side: str | None = None) -> list[di
         and (side is None or str(entry.get("side")) == side)
     ]
     return entries
+
+
+def grid_order_is_never_cancel(entry: dict[str, Any]) -> bool:
+    return bool(entry.get("replace_never_cancel"))
 
 
 def grid_price_occupancy_entries(row: dict[str, Any], side: str | None = None) -> list[dict[str, Any]]:
@@ -1814,6 +1838,7 @@ def dense_grid_entries(row: dict[str, Any]) -> list[dict[str, Any]]:
         entries = [
             entry
             for entry in active_grid_entries(row, side)
+            if not grid_order_is_never_cancel(entry)
             if (decimal_or_none(entry.get("price", entry.get("limit_px"))) or Decimal("0")) > 0
         ]
         reverse = side == "buy"
@@ -1971,6 +1996,7 @@ def grid_side_cap_clear_candidates(row: dict[str, Any], max_per_side: int = GRID
             if isinstance(entry, dict)
             and str(entry.get("side") or "") == side
             and str(entry.get("status") or "") in capped_statuses
+            and not grid_order_is_never_cancel(entry)
         ]
         overflow = len(side_entries) - max_per_side
         if overflow <= 0:
@@ -2126,6 +2152,7 @@ def grid_roe_pause_candidates(
         entry
         for entry in active_grid_entries(row, side)
         if grid_order_would_add_risk(position_size, bool(entry.get("is_buy")))
+        and not grid_order_is_never_cancel(entry)
     ]
     allowed = grid_roe_add_risk_allowed(target_per_side, roe)
     if len(active_add_risk) <= allowed:
@@ -2151,16 +2178,28 @@ def grid_active_cap_pause_candidates(
 def grid_active_cap_keep_ids(entries: list[dict[str, Any]], side: str, max_active_per_side: int) -> set[int]:
     if len(entries) <= max_active_per_side:
         return {id(entry) for entry in entries}
-    replacements = [entry for entry in entries if bool(entry.get("replacement_order"))]
-    regular = [entry for entry in entries if not bool(entry.get("replacement_order"))]
+    protected = [entry for entry in entries if grid_order_is_never_cancel(entry)]
+    replacements = [
+        entry
+        for entry in entries
+        if bool(entry.get("replacement_order")) and not grid_order_is_never_cancel(entry)
+    ]
+    regular = [
+        entry
+        for entry in entries
+        if not bool(entry.get("replacement_order")) and not grid_order_is_never_cancel(entry)
+    ]
     replacements.sort(key=lambda entry: grid_entry_near_to_far_key(entry, side))
     regular.sort(key=lambda entry: grid_entry_near_to_far_key(entry, side))
-    if len(replacements) >= max_active_per_side:
-        keep_indexes = logarithmic_keep_indexes(len(replacements), max_active_per_side)
-        return {id(entry) for index, entry in enumerate(replacements) if index in keep_indexes}
-    regular_keep_count = max_active_per_side - len(replacements)
+    keep_ids = {id(entry) for entry in protected}
+    remaining_capacity = max(0, max_active_per_side - len(protected))
+    if len(replacements) >= remaining_capacity:
+        keep_indexes = logarithmic_keep_indexes(len(replacements), remaining_capacity)
+        keep_ids.update(id(entry) for index, entry in enumerate(replacements) if index in keep_indexes)
+        return keep_ids
+    regular_keep_count = remaining_capacity - len(replacements)
     keep_indexes = logarithmic_keep_indexes(len(regular), regular_keep_count)
-    keep_ids = {id(entry) for entry in replacements}
+    keep_ids.update(id(entry) for entry in replacements)
     keep_ids.update(id(entry) for index, entry in enumerate(regular) if index in keep_indexes)
     return keep_ids
 
@@ -2325,7 +2364,9 @@ def grid_replacement_rebalance_pair(
         (
             entry
             for entry in reversed(combined)
-            if id(entry) in active_ids and id(entry) not in keep_ids
+            if id(entry) in active_ids
+            and id(entry) not in keep_ids
+            and not grid_order_is_never_cancel(entry)
         ),
         None,
     )
@@ -2385,7 +2426,13 @@ def grid_near_far_rebalance_pair(
         None,
     )
     pause_entry = next(
-        (entry for entry in reversed(combined) if id(entry) in active_ids and id(entry) not in keep_ids),
+        (
+            entry
+            for entry in reversed(combined)
+            if id(entry) in active_ids
+            and id(entry) not in keep_ids
+            and not grid_order_is_never_cancel(entry)
+        ),
         None,
     )
     return pause_entry, restore_entry
@@ -2539,6 +2586,7 @@ def pending_cancel_overflow_candidates(
             entry
             for entry in live_entries
             if str(entry.get("status")) == GRID_PENDING_CANCEL_STATUS
+            and not grid_order_is_never_cancel(entry)
         ]
         pending.sort(
             key=lambda entry: decimal_or_none(entry.get("price", entry.get("limit_px"))) or Decimal("0"),
@@ -2865,6 +2913,12 @@ def submit_grid_order_entry(
                     raise RuntimeError(error_text)
                 if skip_grid_exchange_reject(order, error_text, now):
                     return False
+                if is_min_order_value_error_text(error_text) and grid_order_is_never_cancel(order):
+                    order["status"] = GRID_REPLACEMENT_PAUSE_STATUS
+                    order["oid"] = None
+                    order["last_error"] = error_text
+                    order["paused_at"] = now
+                    return False
                 if not is_min_order_value_error_text(error_text) or order.get("resized_min_retry_at"):
                     raise
                 bump_grid_order_size_one_step(asset, order)
@@ -2931,6 +2985,12 @@ def submit_grid_order_entry(
         if is_cumulative_action_limit_text(error_text):
             raise RuntimeError(error_text)
         if skip_grid_exchange_reject(order, error_text, now):
+            return False
+        if is_min_order_value_error_text(error_text) and grid_order_is_never_cancel(order):
+            order["status"] = GRID_REPLACEMENT_PAUSE_STATUS
+            order["oid"] = None
+            order["last_error"] = error_text
+            order["paused_at"] = now
             return False
         if not is_min_order_value_error_text(error_text) or order.get("resized_min_retry_at"):
             raise
@@ -3073,10 +3133,14 @@ def submit_grid_panic_reduce(
             row["panic_reduce_error_at"] = now
             return False
         if isinstance(status.get("filled"), dict):
-            order["oid"] = int(status["filled"].get("oid", 0))
+            filled = status["filled"]
+            order["oid"] = int(filled.get("oid", 0))
             order["status"] = "filled"
             order["filled_at"] = now
             order["last_submit_status"] = status
+            filled_size = decimal_or_none(filled.get("totalSz", filled.get("sz")))
+            if filled_size is not None and filled_size > 0:
+                order["filled_size"] = decimal_to_plain(filled_size)
             return True
         if isinstance(status.get("resting"), dict):
             order["oid"] = int(status["resting"].get("oid", 0))
@@ -3142,6 +3206,7 @@ def cancel_grid_entries(
     raise_on_unconfirmed: bool = False,
     consume_p1_budget: bool = False,
 ) -> int:
+    entries = [entry for entry in entries if not grid_order_is_never_cancel(entry)]
     entries, deferred = prepare_grid_cancel_entries(row, entries, now, note, current_mid, cache)
     if deferred and isinstance(cache, dict):
         cache["pending_cancel_changed"] = True
@@ -3203,6 +3268,7 @@ def cancel_grid_entries_with_p1_budget(
 ) -> int:
     if isinstance(cache, dict) and cache.get("grid_action_phase") not in (None, GRID_ACTION_PHASE_P1_CANCELS):
         return 0
+    entries = [entry for entry in entries if not grid_order_is_never_cancel(entry)]
     entries, deferred = prepare_grid_cancel_entries(row, entries, now, note, current_mid, cache)
     if deferred and isinstance(cache, dict):
         cache["pending_cancel_changed"] = True
@@ -3279,6 +3345,7 @@ def nearest_add_risk_grid_entry(row: dict[str, Any], side: str, position_size: D
         entry
         for entry in active_grid_entries(row, side)
         if grid_order_would_add_risk(position_size, bool(entry.get("is_buy")))
+        and not grid_order_is_never_cancel(entry)
     ]
     if not entries:
         return None
@@ -3817,7 +3884,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
 
     def submit_replacement(order: dict[str, Any]) -> bool:
         side = str(order.get("side") or "")
-        if not replacement_active_cap_submit_allowed(row, side):
+        if not grid_order_is_never_cancel(order) and not replacement_active_cap_submit_allowed(row, side):
             return False
         existing_action_limit = action_limit_error(cache)
         budget_tracked = p1_budget_tracked(cache)
@@ -3886,7 +3953,9 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         except RuntimeError as exc:
             error_text = str(exc)
             if not is_cumulative_action_limit_text(error_text):
-                raise
+                order["panic_reversal_retry_error"] = error_text
+                order["panic_reversal_retry_at"] = now
+                return False
             wait_seconds = GRID_PANIC_REVERSAL_ACTION_LIMIT_WAIT_SECONDS
             order["panic_reversal_action_limit_wait_seconds"] = wait_seconds
             order["panic_reversal_action_limit_wait_at"] = now
@@ -3903,7 +3972,9 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             except RuntimeError as retry_exc:
                 retry_error_text = str(retry_exc)
                 if not is_cumulative_action_limit_text(retry_error_text):
-                    raise
+                    order["panic_reversal_retry_error"] = retry_error_text
+                    order["panic_reversal_retry_at"] = now
+                    return False
                 mark_action_limit_hit(cache, retry_error_text, now)
                 pause_grid_order_for_action_limit(order, now, retry_error_text)
                 order["panic_reversal_action_limit_retry_error"] = retry_error_text
@@ -3948,11 +4019,12 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             if mark_pending_cancel_confirmed_cancelled(entry, old_oid, now, order_status):
                 changed = True
                 continue
-            if skip_unknown_oid_grid_recovery(entry, old_oid, now, order_status):
+            protected_replacement = grid_order_is_never_cancel(entry)
+            if not protected_replacement and skip_unknown_oid_grid_recovery(entry, old_oid, now, order_status):
                 changed = True
                 continue
             side = str(entry.get("side"))
-            if not grid_missing_recovery_allowed(row, side, open_oids):
+            if not protected_replacement and not grid_missing_recovery_allowed(row, side, open_oids):
                 entry["status"] = "recovery_deferred"
                 entry["oid"] = old_oid
                 entry["recovery_deferred_status"] = GRID_ACTIVE_CAP_PAUSE_STATUS
@@ -3964,10 +4036,17 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             if grid_margin_pause_active(row, side, now, position_value, position_size):
                 changed = True
                 continue
-            if skip_stale_grid_recovery(entry, old_oid, now, current_mid, best_bid, best_ask):
+            if not protected_replacement and skip_stale_grid_recovery(
+                entry, old_oid, now, current_mid, best_bid, best_ask
+            ):
                 changed = True
                 continue
-            if submit_tracked(entry):
+            submitted_missing = (
+                submit_panic_reversal(entry)
+                if protected_replacement
+                else submit_tracked(entry)
+            )
+            if submitted_missing:
                 entry["recovered_missing_oid"] = old_oid
                 entry["recovered_missing_at"] = now
                 missing_without_fill.append(oid)
@@ -3975,6 +4054,11 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 if entry.get("replacement_pending"):
                     newly_filled.append(entry)
             else:
+                if protected_replacement:
+                    entry["panic_reversal_missing_oid"] = old_oid
+                    preserve_replacement_order(levels, entry, now, "missing_submit_retry")
+                    changed = True
+                    continue
                 deferred_status = str(entry.get("status") or "recovery_deferred")
                 if entry.get("action_limit_deferred_at") == now:
                     entry["action_limit_deferred_oid"] = old_oid
@@ -4136,7 +4220,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 row["panic_reduce_at"] = now
                 row["panic_reduce_count"] = int(row.get("panic_reduce_count") or 0) + 1
                 row["panic_reduce_side"] = panic_order.get("side")
-                row["panic_reduce_size"] = panic_order.get("size")
+                row["panic_reduce_size"] = panic_order.get("filled_size") or panic_order.get("size")
                 row["panic_reduce_price"] = panic_order.get("price")
                 row["panic_reduce_ratio"] = decimal_to_plain(panic_ratio)
                 row.pop("panic_reduce_error", None)
@@ -4148,6 +4232,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                     asset,
                     current_mid,
                     bool(panic_order.get("is_buy")),
+                    Decimal(str(panic_order.get("filled_size") or panic_order["size"])),
                     position_size,
                     policy,
                 )
@@ -4256,6 +4341,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         for entry in entries:
             if id(entry) in high_priority_pause_ids:
                 continue
+            if grid_order_is_never_cancel(entry):
+                continue
             is_buy = bool(entry.get("is_buy"))
             order_notional = Decimal(str(entry.get("size"))) * Decimal(str(entry.get("price", entry.get("limit_px"))))
             if not grid_order_allowed_by_max(
@@ -4336,6 +4423,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     to_refresh: list[dict[str, Any]] = []
     if not account_margin_protected:
         for entry in active_grid_entries(row):
+            if grid_order_is_never_cancel(entry):
+                continue
             desired_reduce_only = grid_order_should_reduce_only(position_size, bool(entry.get("is_buy")), policy)
             if bool(entry.get("reduce_only", False)) == desired_reduce_only:
                 plan = entry.get("plan")
@@ -4609,6 +4698,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             continue
         side = str(entry["side"])
         is_replacement_order = bool(entry.get("replacement_order"))
+        protected_replacement = grid_order_is_never_cancel(entry)
         if allow_p1_paused_replacement and not is_replacement_order:
             continue
         if allow_p1_restore and is_replacement_order:
@@ -4621,9 +4711,13 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             continue
         if not side_submission_allowed(side):
             continue
-        if status == GRID_ACTIVE_CAP_PAUSE_STATUS and not grid_active_cap_restore_allowed(row, entry, side):
+        if (
+            not protected_replacement
+            and status == GRID_ACTIVE_CAP_PAUSE_STATUS
+            and not grid_active_cap_restore_allowed(row, entry, side)
+        ):
             continue
-        if not grid_roe_restore_allowed(
+        if not protected_replacement and not grid_roe_restore_allowed(
             row,
             entry,
             side,
@@ -4658,11 +4752,13 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 continue
         if grid_margin_pause_active(row, side, now, position_value, position_size):
             continue
-        if defer_paused_grid_restore_if_crossing(entry, now, current_mid, best_bid, best_ask):
+        if not protected_replacement and defer_paused_grid_restore_if_crossing(
+            entry, now, current_mid, best_bid, best_ask
+        ):
             continue
         projected_position_value = projected_position_values[side]
         order_notional = Decimal(str(entry.get("size"))) * Decimal(str(entry.get("price", entry.get("limit_px"))))
-        if not grid_order_allowed_by_max(
+        if not protected_replacement and not grid_order_allowed_by_max(
             position_size,
             projected_position_value,
             bool(entry.get("is_buy")),
@@ -4863,11 +4959,18 @@ def replacement_pause_keep_score(entry: dict[str, Any]) -> tuple[int, int]:
 def dedupe_paused_replacement_orders(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     kept_by_key: dict[tuple[str, str, str, bool], dict[str, Any]] = {}
     for entry in entries:
+        if grid_order_is_never_cancel(entry):
+            continue
         key = grid_paused_dedupe_key(entry)
         current = kept_by_key.get(key)
         if current is None or replacement_pause_keep_score(entry) > replacement_pause_keep_score(current):
             kept_by_key[key] = entry
-    return [entry for entry in entries if kept_by_key.get(grid_paused_dedupe_key(entry)) is entry]
+    return [
+        entry
+        for entry in entries
+        if grid_order_is_never_cancel(entry)
+        or kept_by_key.get(grid_paused_dedupe_key(entry)) is entry
+    ]
 
 
 def prune_grid_levels(row: dict[str, Any]) -> bool:
