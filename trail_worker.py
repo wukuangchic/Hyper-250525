@@ -85,6 +85,7 @@ GRID_PENDING_CANCEL_SPECIAL_RATE = Decimal("0.20")
 GRID_ROE_MIN_POSITION_VALUE = Decimal("100")
 GRID_ROE_DENSITY_THRESHOLD = Decimal("-0.10")
 GRID_ROE_STOP_THRESHOLD = Decimal("-0.40")
+GRID_SURVIVAL_ACTIVE_ORDERS_PER_SIDE = 1
 GRID_PANIC_RATIO_LEGACY_DEFAULT_THRESHOLDS = {
     Decimal("10"),
     Decimal("20"),
@@ -2139,11 +2140,45 @@ def grid_roe_add_risk_allowed(target_per_side: int, roe: Decimal | None) -> int:
     if roe is None or roe >= GRID_ROE_DENSITY_THRESHOLD:
         return target_per_side
     if roe <= GRID_ROE_STOP_THRESHOLD:
-        return 0
+        return min(target_per_side, GRID_SURVIVAL_ACTIVE_ORDERS_PER_SIDE)
     span = GRID_ROE_DENSITY_THRESHOLD - GRID_ROE_STOP_THRESHOLD
     remaining = (roe - GRID_ROE_STOP_THRESHOLD) / span
     allowed = int((Decimal(target_per_side) * remaining).to_integral_value(rounding=ROUND_FLOOR))
     return max(1, min(target_per_side, allowed))
+
+
+def grid_survival_slot_available(row: dict[str, Any], side: str) -> bool:
+    return len(active_grid_entries(row, side)) < GRID_SURVIVAL_ACTIVE_ORDERS_PER_SIDE
+
+
+def grid_order_allowed_by_max_or_survival(
+    row: dict[str, Any],
+    entry: dict[str, Any],
+    side: str,
+    position_size: Decimal,
+    projected_position_value: Decimal,
+    order_notional: Decimal,
+    max_position_value: Decimal,
+    policy: str,
+    min_position_value: Decimal,
+) -> bool:
+    allowed = grid_order_allowed_by_max(
+        position_size,
+        projected_position_value,
+        bool(entry.get("is_buy")),
+        order_notional,
+        max_position_value,
+        policy,
+        min_position_value,
+        position_value_is_signed=policy == "limit",
+    )
+    if allowed:
+        entry.pop("limit_survival_slot", None)
+        return True
+    if not grid_survival_slot_available(row, side):
+        return False
+    entry["limit_survival_slot"] = True
+    return True
 
 
 def grid_roe_for_position_value(position_value: Decimal, roe: Decimal | None) -> Decimal | None:
@@ -2177,6 +2212,35 @@ def grid_roe_pause_candidates(
     keep_indexes = logarithmic_keep_indexes(len(active_add_risk), allowed)
     to_pause = [entry for index, entry in enumerate(active_add_risk) if index not in keep_indexes]
     return to_pause, allowed
+
+
+def grid_bypassed_replacement_margin_pause_candidates(
+    row: dict[str, Any],
+    position_size: Decimal,
+    account_margin_protected: bool,
+    account_margin_hard_stop: bool,
+    now: int,
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for side in ("buy", "sell"):
+        active_add_risk = [
+            entry
+            for entry in active_grid_entries(row, side)
+            if grid_order_would_add_risk(position_size, bool(entry.get("is_buy")))
+        ]
+        active_add_risk.sort(key=lambda entry: grid_entry_near_to_far_key(entry, side))
+        keep_count = 0 if account_margin_hard_stop else GRID_SURVIVAL_ACTIVE_ORDERS_PER_SIDE
+        keep_ids = {id(entry) for entry in active_add_risk[:keep_count]}
+        for entry in active_add_risk:
+            bypassed_at = int(entry.get("immediate_control_bypass_at") or 0)
+            if not bypassed_at or bypassed_at >= now:
+                continue
+            if not account_margin_protected or id(entry) in keep_ids:
+                entry.pop("immediate_control_bypass_at", None)
+                continue
+            if not grid_order_is_never_cancel(entry):
+                candidates.append(entry)
+    return candidates
 
 
 def grid_active_cap_pause_candidates(
@@ -2699,6 +2763,8 @@ def submit_grid_order_entry(
     open_orders: list[dict[str, Any]] | None = None,
     cache: dict[str, Any] | None = None,
     consume_p1_budget: bool = False,
+    account_margin_hard_stop: bool = True,
+    bypass_margin_controls: bool = False,
 ) -> bool:
     preserve_panic_reversal_price = grid_order_is_never_cancel(order)
     restore_without_reduce_only = grid_reduce_only_canceled_restore_without_reduce_only(order)
@@ -2706,7 +2772,12 @@ def submit_grid_order_entry(
     refresh_grid_order_tif(order)
     side = str(order.get("side") or "")
     margin_side_key = (coin, side)
-    if side and margin_blocked_sides is not None and margin_side_key in margin_blocked_sides:
+    if (
+        not bypass_margin_controls
+        and side
+        and margin_blocked_sides is not None
+        and margin_side_key in margin_blocked_sides
+    ):
         error_text = "same-run insufficient margin pause"
         order["status"] = "paused_margin"
         order["oid"] = None
@@ -2714,20 +2785,24 @@ def submit_grid_order_entry(
         order["paused_at"] = now
         pause_grid_margin_side_entries(row, side, now, error_text)
         return False
-    if account_margin_protected:
+    if account_margin_protected and not bypass_margin_controls:
         if grid_order_would_add_risk(position_size, bool(order.get("is_buy"))):
-            if bool(order.get("replacement_order")):
+            if not account_margin_hard_stop and grid_survival_slot_available(row, side):
+                order["account_margin_survival_slot"] = True
+            elif bool(order.get("replacement_order")):
                 order["status"] = "paused_account_margin"
                 order["oid"] = None
                 order["paused_at"] = now
                 return False
-            # Account protection skips this price entirely. Once protection clears,
-            # the regular top-up pass builds a fresh level from the live market.
-            order["status"] = "skipped_account_margin"
-            order["oid"] = None
-            order["skipped_at"] = now
-            return False
-        set_grid_order_reduce_only(order, True)
+            else:
+                # Account protection skips this price entirely. Once protection clears,
+                # the regular top-up pass builds a fresh level from the live market.
+                order["status"] = "skipped_account_margin"
+                order["oid"] = None
+                order["skipped_at"] = now
+                return False
+        else:
+            set_grid_order_reduce_only(order, True)
     elif restore_without_reduce_only:
         set_grid_order_reduce_only(order, False)
         order["reduce_only_canceled_restore_without_reduce_only_at"] = now
@@ -3993,10 +4068,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         and total_usdc is not None
         and (withdrawable < Decimal("10") or withdrawable_ratio < Decimal("0.1"))
     )
-    account_margin_protected = (
-        (margin_ratio is not None and margin_ratio < GRID_ACCOUNT_MARGIN_RATIO_THRESHOLD)
-        or withdrawable_reduce_only
-    )
+    account_margin_hard_stop = margin_ratio is not None and margin_ratio < GRID_ACCOUNT_MARGIN_RATIO_THRESHOLD
+    account_margin_protected = account_margin_hard_stop or withdrawable_reduce_only
     margin_gap_multiplier = grid_margin_gap_multiplier(margin_ratio)
     margin_gap_multiplier_text = decimal_to_plain(margin_gap_multiplier)
     margin_state_changed = row.get("margin_gap_multiplier") != margin_gap_multiplier_text
@@ -4008,6 +4081,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         decimal_to_plain(withdrawable_ratio) if withdrawable_ratio is not None else None
     )
     row["account_usdc_reduce_only_only"] = withdrawable_reduce_only
+    row["account_margin_hard_stop"] = account_margin_hard_stop
     brake_state_pruned = prune_add_risk_brake_state(row, now)
     mark_phase("margin")
 
@@ -4094,6 +4168,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 open_orders=current_open_orders,
                 cache=cache,
                 consume_p1_budget=True,
+                account_margin_hard_stop=account_margin_hard_stop,
             )
         except RuntimeError as exc:
             error_text = str(exc)
@@ -4108,7 +4183,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 filled_submission_sides.add(side)
         return submitted
 
-    def submit_replacement(order: dict[str, Any]) -> bool:
+    def submit_replacement(order: dict[str, Any], *, bypass_current_controls: bool = False) -> bool:
         side = str(order.get("side") or "")
         if not grid_order_is_never_cancel(order) and not replacement_active_cap_submit_allowed(row, side):
             return False
@@ -4141,6 +4216,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 open_orders=current_open_orders,
                 cache=cache,
                 consume_p1_budget=True,
+                account_margin_hard_stop=account_margin_hard_stop,
+                bypass_margin_controls=bypass_current_controls,
             )
         except RuntimeError as exc:
             error_text = str(exc)
@@ -4318,8 +4395,35 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         changed = True
 
     add_risk_braked = 0
-
     paused = 0
+
+    to_pause_bypassed_margin = (
+        grid_bypassed_replacement_margin_pause_candidates(
+            row,
+            position_size,
+            account_margin_protected,
+            account_margin_hard_stop,
+            now,
+        )
+        if allow_p0
+        else []
+    )
+    if to_pause_bypassed_margin:
+        paused_bypassed_margin = cancel_grid_entries(
+            exchange,
+            coin,
+            to_pause_bypassed_margin,
+            now,
+            "paused_account_margin",
+            row=row,
+            current_mid=current_mid,
+            cache=cache,
+        )
+        paused += paused_bypassed_margin
+        if paused_bypassed_margin:
+            changed = True
+    paused_bypassed_margin_ids = {id(entry) for entry in to_pause_bypassed_margin}
+
     to_pause_density: list[dict[str, Any]] = []
     risk_density_allowed: dict[str, int] = {}
     risk_density_multiplier: dict[str, Decimal] = {}
@@ -4549,47 +4653,16 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         replacement_side = str(replacement["side"])
         entry["replacement_pending"] = False
         entry["replacement_processed_at"] = now
-        if grid_margin_pause_active(row, replacement_side, now, position_value, position_size):
-            preserve_replacement_order(levels, replacement, now, "margin_pause_active")
-            changed = True
-            continue
-        if not grid_latest_replacement_roe_allowed(
-            row,
-            replacement,
-            replacement_side,
-            position_size,
-            target_per_side,
-            position_roe_for_controls,
-        ):
-            replacement["status"] = GRID_ROE_PAUSE_STATUS
-            replacement["paused_at"] = now
-            replacement["roe_allowed"] = grid_roe_add_risk_allowed(target_per_side, position_roe_for_controls)
-            preserve_replacement_order(levels, replacement, now, GRID_ROE_PAUSE_STATUS)
-            changed = True
-            continue
         projected_position_value = projected_position_values[replacement_side]
         order_notional = Decimal(str(replacement["size"])) * Decimal(str(replacement["price"]))
-        if not grid_order_allowed_by_max(
-            position_size,
-            projected_position_value,
-            bool(replacement["is_buy"]),
-            order_notional,
-            max_position_value,
-            policy,
-            min_position_value,
-            position_value_is_signed=policy == "limit",
-        ):
-            replacement["status"] = "paused_limit"
-            replacement["paused_at"] = now
-            preserve_replacement_order(levels, replacement, now)
-            changed = True
-            continue
-        submitted = submit_replacement(replacement)
+        replacement["immediate_control_bypass_at"] = now
+        submitted = submit_replacement(replacement, bypass_current_controls=True)
         if not submitted:
             preserve_replacement_order(levels, replacement, now)
             changed = True
             continue
         levels.append(replacement)
+        cache.setdefault("immediate_control_bypass_entry_ids", set()).add(id(replacement))
         order_notional = Decimal(str(replacement["size"])) * Decimal(str(replacement["price"]))
         if policy == "limit":
             projected_position_values[replacement_side] += order_notional if bool(replacement["is_buy"]) else -order_notional
@@ -4602,7 +4675,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     mark_phase("replacements")
 
     to_pause_limit: list[dict[str, Any]] = []
-    high_priority_pause_ids = paused_density_ids | paused_roe_ids
+    high_priority_pause_ids = paused_bypassed_margin_ids | paused_density_ids | paused_roe_ids
     for side in ("buy", "sell"):
         entries = active_grid_entries(row, side)
         entries.sort(
@@ -4610,6 +4683,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             reverse=side == "buy",
         )
         projected_side_value = signed_position_value(position_size, position_value) if policy == "limit" else position_value
+        limit_survival_kept = False
         for entry in entries:
             if id(entry) in high_priority_pause_ids:
                 continue
@@ -4617,7 +4691,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 continue
             is_buy = bool(entry.get("is_buy"))
             order_notional = Decimal(str(entry.get("size"))) * Decimal(str(entry.get("price", entry.get("limit_px"))))
-            if not grid_order_allowed_by_max(
+            bypassed_this_run = id(entry) in cache.get("immediate_control_bypass_entry_ids", set())
+            if not bypassed_this_run and not grid_order_allowed_by_max(
                 position_size,
                 projected_side_value,
                 is_buy,
@@ -4627,8 +4702,15 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 min_position_value,
                 position_value_is_signed=policy == "limit",
             ):
-                to_pause_limit.append(entry)
-                continue
+                if not limit_survival_kept:
+                    entry["limit_survival_slot"] = True
+                    limit_survival_kept = True
+                else:
+                    entry.pop("limit_survival_slot", None)
+                    to_pause_limit.append(entry)
+                    continue
+            else:
+                entry.pop("limit_survival_slot", None)
             if policy == "limit":
                 projected_side_value += order_notional if is_buy else -order_notional
             elif grid_order_would_add_risk(position_size, is_buy):
@@ -4849,15 +4931,16 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             continue
         projected_position_value = projected_position_values[side]
         order_notional = Decimal(str(entry.get("size"))) * Decimal(str(entry.get("price", entry.get("limit_px"))))
-        if not grid_order_allowed_by_max(
+        if not grid_order_allowed_by_max_or_survival(
+            row,
+            entry,
+            side,
             position_size,
             projected_position_value,
-            bool(entry.get("is_buy")),
             order_notional,
             max_position_value,
             policy,
             min_position_value,
-            position_value_is_signed=policy == "limit",
         ):
             continue
         if not submit_tracked(entry):
@@ -4913,15 +4996,16 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             if topup is None:
                 break
             order_notional = Decimal(str(topup["size"])) * Decimal(str(topup["price"]))
-            if not grid_order_allowed_by_max(
+            if not grid_order_allowed_by_max_or_survival(
+                row,
+                topup,
+                side,
                 position_size,
                 projected_position_value,
-                bool(topup["is_buy"]),
                 order_notional,
                 max_position_value,
                 policy,
                 min_position_value,
-                position_value_is_signed=policy == "limit",
             ):
                 topup["status"] = "paused_limit"
                 topup["paused_at"] = now
@@ -5030,15 +5114,16 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             continue
         projected_position_value = projected_position_values[side]
         order_notional = Decimal(str(entry.get("size"))) * Decimal(str(entry.get("price", entry.get("limit_px"))))
-        if not protected_replacement and not grid_order_allowed_by_max(
+        if not protected_replacement and not grid_order_allowed_by_max_or_survival(
+            row,
+            entry,
+            side,
             position_size,
             projected_position_value,
-            bool(entry.get("is_buy")),
             order_notional,
             max_position_value,
             policy,
             min_position_value,
-            position_value_is_signed=policy == "limit",
         ):
             if is_replacement_order:
                 preserve_replacement_order(levels, entry, now, "limit_still_blocked", normalize_margin=True)

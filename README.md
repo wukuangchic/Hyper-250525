@@ -271,18 +271,19 @@ BTC --cancel grid
 
 ### Worker 行为
 
-- 到达持仓上限后，worker 会撤销继续加仓方向的 grid 单，只保留/恢复减仓方向。
+- 到达持仓上下限后，worker 会压缩越界方向的 grid 单，但最靠近盘口的一张作为保活单继续保留/恢复；因此实际持仓最多可能越过配置边界一个子单金额，保活单成交后不会继续叠加第二张越界单。
 - 仓位降到能容纳下一张加仓单后，worker 再把加仓方向补回到最多 16 张。
 - 补缺失子单时优先参考盘口 best bid/ask，而不是只参考 mid；盘口读取失败时才退回 mid。
 - 加风险方向 active 单超过当前风险密度预算时，worker 会按 `avg_multiplier` / `margin_gap_multiplier` 把允许数量压缩为 `floor(16 / multiplier)`，最低保留 1 张；超过部分按价格近远用等比/自然对数分布抽稀暂停为 `paused_risk_density`，近侧保留更密、远侧更疏。系数下降后，`paused_risk_density` 会优先于常规补档恢复。
-- 持仓 ROE 由 Hyperliquid `position.returnOnEquity` 直接返回；低于 -10% 时，worker 会按 -10% 到 -40% 的线性区间压缩加仓侧 active 数量，超出部分暂停为 `paused_roe`；低于 -40% 时，加仓侧允许 active 数归零。强制减仓仍只由 `panic_ratio` 触发。
+- 持仓 ROE 由 Hyperliquid `position.returnOnEquity` 直接返回；低于 -10% 时，worker 会按 -10% 到 -40% 的线性区间压缩加仓侧 active 数量，超出部分暂停为 `paused_roe`；低于 -40% 时，加仓侧仍最低保留 1 张保活单。强制减仓仍只由 `panic_ratio` 触发。
 - 为减少挂单保证金占用并避免 1 分钟内盘口被打穿，每侧 active grid 单最多保留 16 张；普通补档、缺单恢复和 paused 恢复都要求该侧 active 少于 16 张。成交反向单优先提交，提交后若超过 16 张，再按近密远疏的等比/自然对数分布优先保留成交反向单并暂停其他旧 active 为 `paused_active_cap`，之后在 active 少于 16 张时也按同一分布逐步恢复。若单侧实际 open active 超过 32 张，成交反向单暂缓提交，worker 会优先从最远侧 live `pending_cancel` 开始撤单，即使该价格原本因 action limit 距离规则而暂缓撤单，逐步把 active 压回 32 张以内。
 - P2 额度充足时，worker 会把同侧 active 与所有当前可恢复的 paused 档位一视同仁地按“近密远疏”重新计算，每轮每侧最多做一组 `active <-> paused` 渐进式互换。P2 撤销不应保留的远侧 active 并提升目标 paused 的恢复优先级，实际重新挂单仍由下一轮 P1 执行。会立即穿过盘口或仍受仓位上下限、ROE、保证金、reduce-only 容量约束的 paused 档位不参与本轮互换。
 - 为避免异常循环无限堆积可恢复记录，`levels` 内同侧 active、pending、recovery_deferred 和 paused 合计最多保留 1024 张；历史记录不占这个名额，仍由独立历史裁剪控制。超过时会优先清理普通 paused，必要时先撤交易所 active 挂单再从本地清除，`replacement_order` 最后才会被清。
 - 全仓或逐仓的加仓方向若被交易所以保证金不足拒绝，worker 会对该方向冷却 10 分钟，本轮不再继续试单；减仓方向照常维护。仓位缩小会提前解除冷却，否则到期后探测一次。
 - reduce-only 子单的活动数量总和不会超过当前可减仓数量；交易所因可减仓数量不足自动取消的 `reduceOnlyCanceled` 不会被当作手动撤单反复补回。
 - 单边漂移接近爆仓时会主动泄压：空仓用 `(liqPx - mid) / (mid - 最近active买入减仓价)`，多仓用 `(mid - liqPx) / (最近active卖出减仓价 - mid)` 计算 `panic_ratio`；若低于 `panic_ratio_threshold`（默认 `100`），Worker 会把 IOC + 滑点保护的 reduce-only panic 单与当轮 `mid +/- 2 * gap` 的反向 GTC 回补单按此顺序放进同一个 `bulk_orders` 请求，二者使用相同的请求 size，从而省掉减仓响应后再发回补单的一次 API 往返。IOC 全额成交时保留 GTC；部分成交时立即把仍在挂单的 GTC size 缩到 IOC 实际成交量；IOC 失败时立即撤销没有减仓成交支撑的 GTC，撤销异常则标记为待撤并持续清理；整批请求失败时不会留下单独的回补单。回补提交失败会按实际减仓成交量、原价格、GTC 持续重试。这张 panic 回补单保持 `status=active` 并带 `replace_never_cancel=true`：除非成交或用户明确取消整条 grid，否则不会被 ROE、风险密度、仓位范围、active cap、reduce-only 刷新、dense regrid、P2 近远重排、连续加仓刹车或历史裁剪撤销；需要压缩 active 数量时普通单先让位。它从首次提交开始就固定使用触发价格，不参与 active/paused 价格占位检查，且不会因最小名义金额重试而放大 size。panic 减仓本身不作为普通 fill 近距离回补，永久回补单成交后生成的下一张普通反向单不继承 `replace_never_cancel`，恢复为一般 grid OID。
-- 每轮只查询一次账户 USDC 的“维护保证金后余量 / 总余额”。比例低于 `70%` 时不修改已有挂单，但所有新 grid 子单必须减少当前净仓位并强制使用 reduce-only；会加仓或反手的新单直接跳过该价格。比例恢复到 `70%` 后，Worker 按当时盘口重新计算缺失档位，并保持每轮每方向最多新增一张，不恢复保护期间的旧价格。
+- 每轮只查询一次账户 USDC 的“维护保证金后余量 / 总余额”。比例低于 `70%` 时，普通维护仍不新增加风险单；比例不低于 `70%`、只是可提余额保护触发时，加风险方向允许最低 1 张保活单。交易所实际返回保证金不足后仍进入同侧冷却。保护解除后，Worker 按当时盘口重新计算缺失档位，并保持每轮每方向最多新增一张，不恢复保护期间的旧价格。
+- 普通成交产生的即时 replacement 在生成当轮绕过 `limit`、ROE 和账户保证金预拦截，优先尝试把反向单挂出；它仍受 active cap、action limit 和交易所真实拒单约束。下一轮起重新纳入全部控制：不满足条件时正常 pause，满足保活条件时最多留下 1 张。
 - grid/trail 创建、修改和取消与 Worker 共用 `server_batch.lock`；命令执行期间 Worker 会跳过该轮，避免旧任务快照覆盖刚完成的修改，不需要手动暂停定时器。
 - 旧版保存的非 ALO grid 子单在 Worker 再次提交时会自动刷新为 ALO；历史 post-only 拒绝仍按可恢复状态兼容处理。
 

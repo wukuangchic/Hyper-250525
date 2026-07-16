@@ -60,6 +60,7 @@ from trail_worker import (
     replacement_active_cap_submit_allowed,
     grid_margin_gap_multiplier,
     grid_margin_pause_active,
+    grid_bypassed_replacement_margin_pause_candidates,
     grid_missing_recovery_allowed,
     grid_near_far_rebalance_pair,
     grid_order_status_is_cancelled,
@@ -68,6 +69,7 @@ from trail_worker import (
     is_cumulative_action_limit_text,
     is_min_order_value_error_text,
     grid_order_entry,
+    grid_order_allowed_by_max_or_survival,
     grid_replacement_rebalance_pair,
     grid_reduce_only_canceled_restore_without_reduce_only,
     grid_roe_add_risk_allowed,
@@ -78,6 +80,7 @@ from trail_worker import (
     grid_risk_density_pause_candidates,
     grid_risk_density_restore_allowed,
     grid_target_orders_per_side,
+    grid_survival_slot_available,
     maintain_grid,
     mark_pending_cancel_confirmed_cancelled,
     modify_trail_stop,
@@ -2233,7 +2236,8 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(grid_roe_add_risk_allowed(10, Decimal("-0.10")), 10)
         self.assertEqual(grid_roe_add_risk_allowed(10, Decimal("-0.25")), 5)
         self.assertEqual(grid_roe_add_risk_allowed(10, Decimal("-0.399")), 1)
-        self.assertEqual(grid_roe_add_risk_allowed(10, Decimal("-0.40")), 0)
+        self.assertEqual(grid_roe_add_risk_allowed(10, Decimal("-0.40")), 1)
+        self.assertEqual(grid_roe_add_risk_allowed(10, Decimal("-0.80")), 1)
 
     def test_roe_controls_require_position_value_strictly_above_one_hundred(self) -> None:
         roe = Decimal("-0.50")
@@ -2338,6 +2342,89 @@ class GridAvgTests(unittest.TestCase):
         )
         self.assertFalse(
             grid_latest_replacement_roe_allowed(row, replacement, "buy", Decimal("2"), 10, Decimal("-0.25"))
+        )
+
+    def test_limit_survival_allows_only_one_blocked_order_per_empty_side(self) -> None:
+        row = {"levels": []}
+        first = {"side": "buy", "is_buy": True, "status": "pending", "price": "100", "size": "1"}
+
+        self.assertTrue(
+            grid_order_allowed_by_max_or_survival(
+                row,
+                first,
+                "buy",
+                Decimal("1"),
+                Decimal("50"),
+                Decimal("10"),
+                Decimal("50"),
+                "limit",
+                Decimal("-50"),
+            )
+        )
+        self.assertTrue(first["limit_survival_slot"])
+        first.update({"status": "active", "oid": 1})
+        row["levels"].append(first)
+        self.assertFalse(grid_survival_slot_available(row, "buy"))
+
+        second = {"side": "buy", "is_buy": True, "status": "pending", "price": "99", "size": "1"}
+        self.assertFalse(
+            grid_order_allowed_by_max_or_survival(
+                row,
+                second,
+                "buy",
+                Decimal("1"),
+                Decimal("50"),
+                Decimal("10"),
+                Decimal("50"),
+                "limit",
+                Decimal("-50"),
+            )
+        )
+
+    def test_next_round_margin_review_pauses_only_bypassed_order_outside_survival_slot(self) -> None:
+        closest = {
+            "side": "buy", "is_buy": True, "status": "active", "oid": 1, "price": "100", "size": "1"
+        }
+        bypassed = {
+            "side": "buy",
+            "is_buy": True,
+            "status": "active",
+            "oid": 2,
+            "price": "90",
+            "size": "1",
+            "replacement_order": True,
+            "immediate_control_bypass_at": 7,
+        }
+        row = {"levels": [closest, bypassed]}
+
+        self.assertEqual(
+            grid_bypassed_replacement_margin_pause_candidates(
+                row, Decimal("1"), True, False, 8
+            ),
+            [bypassed],
+        )
+
+        bypassed["price"] = "110"
+        self.assertEqual(
+            grid_bypassed_replacement_margin_pause_candidates(
+                row, Decimal("1"), True, False, 8
+            ),
+            [],
+        )
+        self.assertNotIn("immediate_control_bypass_at", bypassed)
+
+        bypassed["immediate_control_bypass_at"] = 8
+        self.assertEqual(
+            grid_bypassed_replacement_margin_pause_candidates(
+                row, Decimal("1"), True, True, 8
+            ),
+            [],
+        )
+        self.assertEqual(
+            grid_bypassed_replacement_margin_pause_candidates(
+                row, Decimal("1"), True, True, 9
+            ),
+            [bypassed],
         )
 
     def test_margin_gap_multiplier_only_widens_add_risk_far_topup(self) -> None:
@@ -3267,6 +3354,89 @@ class GridAvgTests(unittest.TestCase):
         self.assertIsNone(order["oid"])
         self.assertEqual(order["skipped_at"], 7)
         self.assertNotIn("paused_at", order)
+
+    def test_soft_account_margin_protection_allows_one_survival_order(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.orders = []
+
+            def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
+                self.orders.append((coin, is_buy, Decimal(str(limit_px)), order_type, reduce_only))
+                return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 123}}]}}}
+
+        exchange = FakeExchange()
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+            "levels": [],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        order = grid_order_entry(row, "BTC", asset, True, Decimal("100"), False)
+
+        submitted = submit_grid_order_entry(
+            exchange,
+            "BTC",
+            order,
+            7,
+            row,
+            asset,
+            Decimal("1"),
+            Decimal("100"),
+            "abs",
+            True,
+            set(),
+            account_margin_hard_stop=False,
+        )
+
+        self.assertTrue(submitted)
+        self.assertTrue(order["account_margin_survival_slot"])
+        self.assertEqual(order["status"], "active")
+        self.assertEqual(len(exchange.orders), 1)
+
+    def test_immediate_replacement_bypasses_margin_prechecks(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.orders = []
+
+            def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
+                self.orders.append((coin, is_buy, Decimal(str(limit_px)), order_type, reduce_only))
+                return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 456}}]}}}
+
+        exchange = FakeExchange()
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+            "levels": [],
+            "margin_pauses": {"buy": {"paused_at": 7, "position_value": "100"}},
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        order = grid_order_entry(row, "BTC", asset, True, Decimal("100"), False)
+        order["replacement_order"] = True
+
+        submitted = submit_grid_order_entry(
+            exchange,
+            "BTC",
+            order,
+            7,
+            row,
+            asset,
+            Decimal("1"),
+            Decimal("100"),
+            "abs",
+            True,
+            set(),
+            margin_blocked_sides={("BTC", "buy")},
+            account_margin_hard_stop=True,
+            bypass_margin_controls=True,
+        )
+
+        self.assertTrue(submitted)
+        self.assertEqual(order["status"], "active")
+        self.assertEqual(len(exchange.orders), 1)
 
     def test_same_run_insufficient_margin_pauses_later_same_side_without_submit(self) -> None:
         class FakeExchange:
