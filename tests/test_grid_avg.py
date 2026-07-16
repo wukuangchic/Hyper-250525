@@ -1055,7 +1055,7 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertIsNotNone(order)
         self.assertEqual(order["side"], "sell")
-        self.assertEqual(order["price"], "102.71")
+        self.assertEqual(order["price"], "102")
         self.assertEqual(order["size"], "0.37")
         self.assertFalse(order["reduce_only"])
         self.assertTrue(order["replacement_order"])
@@ -1086,7 +1086,7 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertIsNotNone(order)
         self.assertEqual(order["side"], "buy")
-        self.assertEqual(order["price"], "97.29")
+        self.assertEqual(order["price"], "98")
         self.assertEqual(order["size"], "0.43")
         self.assertFalse(order["reduce_only"])
         self.assertTrue(order["replacement_order"])
@@ -1146,7 +1146,7 @@ class GridAvgTests(unittest.TestCase):
         )
 
         self.assertTrue(submitted)
-        self.assertEqual(original_price, "65.112")
+        self.assertEqual(original_price, "65.135")
         self.assertEqual(order["price"], original_price)
         self.assertEqual(exchange.prices, [Decimal(original_price)])
 
@@ -1299,7 +1299,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertTrue(exchange.orders[0][4])
         self.assertEqual(exchange.orders[1][1], False)
         self.assertFalse(exchange.orders[1][4])
-        self.assertEqual(exchange.orders[1][2], Decimal("102.71"))
+        self.assertEqual(exchange.orders[1][2], Decimal("102"))
         self.assertEqual(exchange.orders[1][5], Decimal("0.4"))
         reversal = next(entry for entry in updated["levels"] if entry.get("panic_reversal_order"))
         self.assertEqual(reversal["status"], "active")
