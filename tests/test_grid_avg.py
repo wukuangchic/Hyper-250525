@@ -41,6 +41,7 @@ from trail_worker import (
     action_limit_p1_budget_for_headroom,
     action_limit_p1_budget_remaining,
     account_withdrawable_reduce_only,
+    claim_withdrawable_pause_entry,
     batch_row_raw_coin,
     build_grid_panic_reduce_order,
     cancel_grid_entries_with_p1_budget,
@@ -90,6 +91,7 @@ from trail_worker import (
     near_grid_orders_if_stale,
     next_depth_order,
     noncritical_grid_work_allowed,
+    oldest_active_non_reduce_only_grid_entry,
     normalize_margin_paused_replacement,
     panic_reversal_order_from_reduce,
     pause_refresh_reduce_only_replacement,
@@ -130,6 +132,78 @@ class GridAvgTests(unittest.TestCase):
         self.assertFalse(account_withdrawable_reduce_only(Decimal("10")))
         self.assertFalse(account_withdrawable_reduce_only(Decimal("50")))
         self.assertFalse(account_withdrawable_reduce_only(None))
+
+    def test_withdrawable_pause_selects_oldest_active_non_reduce_only_order_across_account(self) -> None:
+        account = "0xAbC"
+        protected = {
+            "side": "buy",
+            "status": "active",
+            "oid": 1,
+            "reduce_only": False,
+            "replace_never_cancel": True,
+        }
+        reduce_only = {"side": "sell", "status": "active", "oid": 2, "reduce_only": True}
+        paused = {"side": "buy", "status": "paused_active_cap", "oid": 3, "reduce_only": False}
+        oldest_eligible = {"side": "sell", "status": "active", "oid": "4", "reduce_only": False}
+        newer_eligible = {"side": "buy", "status": "active", "oid": 8, "reduce_only": False}
+        other_account = {"side": "buy", "status": "active", "oid": 0, "reduce_only": False}
+        first_row = {
+            "type": "grid",
+            "status": "active",
+            "network": "mainnet",
+            "account": account,
+            "levels": [protected, reduce_only, paused, newer_eligible],
+        }
+        second_row = {
+            "type": "grid",
+            "status": "active",
+            "network": "mainnet",
+            "account": account.lower(),
+            "levels": [oldest_eligible],
+        }
+        rows = [
+            first_row,
+            second_row,
+            {
+                "type": "grid",
+                "status": "active",
+                "network": "mainnet",
+                "account": "0xdef",
+                "levels": [other_account],
+            },
+        ]
+
+        self.assertEqual(
+            oldest_active_non_reduce_only_grid_entry(rows, "mainnet", account),
+            (second_row, oldest_eligible),
+        )
+
+    def test_withdrawable_pause_is_claimed_once_per_account_per_run(self) -> None:
+        account = "0xabc"
+        first_row = {
+            "type": "grid",
+            "status": "active",
+            "network": "mainnet",
+            "account": account,
+            "levels": [{"side": "buy", "status": "active", "oid": 9, "reduce_only": False}],
+        }
+        second_entry = {"side": "sell", "status": "active", "oid": 4, "reduce_only": False}
+        second_row = {
+            "type": "grid",
+            "status": "active",
+            "network": "mainnet",
+            "account": account,
+            "levels": [second_entry],
+        }
+        rows = [first_row, second_row]
+        cache = {}
+
+        self.assertIsNone(claim_withdrawable_pause_entry(first_row, rows, "mainnet", account, cache))
+        self.assertIs(
+            claim_withdrawable_pause_entry(second_row, rows, "mainnet", account, cache),
+            second_entry,
+        )
+        self.assertIsNone(claim_withdrawable_pause_entry(second_row, rows, "mainnet", account, cache))
 
     def test_reverse_grid_strategy_negates_signed_limit_and_avg(self) -> None:
         lower, upper, avg = reversed_grid_strategy_values(

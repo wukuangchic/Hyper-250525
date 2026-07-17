@@ -102,6 +102,7 @@ GRID_REPLACEMENT_PAUSE_STATUS = "paused_replacement"
 GRID_RISK_DENSITY_PAUSE_STATUS = "paused_risk_density"
 GRID_ROE_PAUSE_STATUS = "paused_roe"
 GRID_ACTIVE_CAP_PAUSE_STATUS = "paused_active_cap"
+GRID_WITHDRAWABLE_PAUSE_STATUS = "paused_withdrawable"
 GRID_ACTION_LIMIT_PAUSE_STATUS = "paused_action_limit"
 GRID_ACTION_LIMIT_P1_BUDGET_PER_RUN = 1
 GRID_ACTION_LIMIT_P2_HEADROOM_THRESHOLD = 100
@@ -134,6 +135,7 @@ GRID_PAUSED_STATUSES = {
     GRID_RISK_DENSITY_PAUSE_STATUS,
     GRID_ROE_PAUSE_STATUS,
     GRID_ACTIVE_CAP_PAUSE_STATUS,
+    GRID_WITHDRAWABLE_PAUSE_STATUS,
 }
 GRID_PRICE_OCCUPANCY_STATUSES = {
     "active",
@@ -1749,6 +1751,60 @@ def active_grid_entries(row: dict[str, Any], side: str | None = None) -> list[di
         and (side is None or str(entry.get("side")) == side)
     ]
     return entries
+
+
+def oldest_active_non_reduce_only_grid_entry(
+    rows: list[dict[str, Any]],
+    network: str,
+    account: str,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    account_key = account.lower()
+    candidates: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
+    for candidate_row in rows:
+        if not isinstance(candidate_row, dict) or candidate_row.get("type") != "grid":
+            continue
+        if str(candidate_row.get("status") or "") != "active":
+            continue
+        if str(candidate_row.get("network") or "mainnet") != network:
+            continue
+        if str(candidate_row.get("account") or "").lower() != account_key:
+            continue
+        for entry in candidate_row.get("levels") or []:
+            if not isinstance(entry, dict) or str(entry.get("status") or "") != "active":
+                continue
+            if bool(entry.get("reduce_only")) or grid_order_is_never_cancel(entry):
+                continue
+            try:
+                oid = int(entry["oid"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            candidates.append((oid, candidate_row, entry))
+    if not candidates:
+        return None
+    _oid, candidate_row, entry = min(candidates, key=lambda item: item[0])
+    return candidate_row, entry
+
+
+def claim_withdrawable_pause_entry(
+    row: dict[str, Any],
+    rows: list[dict[str, Any]],
+    network: str,
+    account: str,
+    cache: dict[str, Any],
+) -> dict[str, Any] | None:
+    account_key = (network, account.lower())
+    attempted = cache.setdefault("withdrawable_pause_attempted_accounts", set())
+    if account_key in attempted:
+        return None
+    candidate = oldest_active_non_reduce_only_grid_entry(rows, network, account)
+    if candidate is None:
+        attempted.add(account_key)
+        return None
+    candidate_row, entry = candidate
+    if candidate_row is not row:
+        return None
+    attempted.add(account_key)
+    return entry
 
 
 def grid_order_is_never_cancel(entry: dict[str, Any]) -> bool:
@@ -4868,6 +4924,10 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 if isinstance(entry, dict)
                 and str(entry.get("side") or "") == side
                 and str(entry.get("status") or "") in GRID_PAUSED_STATUSES
+                and not (
+                    withdrawable_reduce_only
+                    and str(entry.get("status") or "") == GRID_WITHDRAWABLE_PAUSE_STATUS
+                )
                 and not grid_recovery_price_would_cross_market(entry, current_mid, best_bid, best_ask)
                 and (
                     not grid_order_would_add_risk(position_size, bool(entry.get("is_buy")))
@@ -4929,6 +4989,33 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 replacement_rebalanced += 1
             changed = True
     mark_phase("replacement_rebalance")
+
+    if allow_p2 and withdrawable_reduce_only and noncritical_grid_work_allowed(cache):
+        withdrawable_pause_entry = claim_withdrawable_pause_entry(
+            row,
+            cache.get("grid_rows") if isinstance(cache.get("grid_rows"), list) else [row],
+            network,
+            account,
+            cache,
+        )
+        if withdrawable_pause_entry is not None:
+            withdrawable_paused = cancel_grid_entries(
+                exchange,
+                coin,
+                [withdrawable_pause_entry],
+                now,
+                GRID_WITHDRAWABLE_PAUSE_STATUS,
+                row=row,
+                current_mid=current_mid,
+                cache=cache,
+            )
+            if withdrawable_paused:
+                withdrawable_pause_entry["paused_at"] = now
+                withdrawable_pause_entry["withdrawable_paused_at"] = now
+                withdrawable_pause_entry["withdrawable_paused_oid"] = withdrawable_pause_entry.get("oid")
+                paused += withdrawable_paused
+                changed = True
+    mark_phase("withdrawable_pause")
 
     restored = 0
     for entry in (levels if allow_p1_restore else []):
@@ -5099,6 +5186,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         if allow_p1_restore and is_replacement_order:
             continue
         status = str(entry.get("status"))
+        if status == GRID_WITHDRAWABLE_PAUSE_STATUS and withdrawable_reduce_only:
+            continue
         if normalize_margin_paused_replacement(entry, now):
             status = str(entry.get("status"))
             changed = True
@@ -5511,7 +5600,7 @@ def run_once() -> None:
         return
 
     mids_cache: dict[tuple[str, str], dict[str, Any]] = {}
-    grid_cache: dict[str, Any] = {}
+    grid_cache: dict[str, Any] = {"grid_rows": rows}
     changed = False
     for index in active_trail_indexes:
         row = rows[index]
