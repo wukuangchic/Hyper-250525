@@ -2554,24 +2554,50 @@ def grid_near_far_rebalance_pair(
 
     combined = active + paused
     combined.sort(key=lambda entry: grid_entry_near_to_far_key(entry, side))
+    keep_count = min(len(active), len(combined))
+    keep_ids: set[int] = set()
+    while keep_count > 0:
+        keep_indexes = logarithmic_keep_indexes(len(combined), keep_count)
+        keep_entries = [entry for index, entry in enumerate(combined) if index in keep_indexes]
+        if (
+            grid_entries_fit_within_max(
+                keep_entries,
+                side,
+                position_size,
+                position_value,
+                max_position_value,
+                policy,
+                min_position_value,
+            )
+            is not None
+        ):
+            keep_ids = {id(entry) for entry in keep_entries}
+            break
+        keep_count -= 1
+    if not keep_ids:
+        return None, None
+
     active_ids = {id(entry) for entry in active}
     paused_ids = {id(entry) for entry in paused}
+    pause_entry = next(
+        (
+            entry
+            for entry in reversed(combined)
+            if id(entry) in active_ids
+            and id(entry) not in keep_ids
+            and not grid_order_is_never_cancel(entry)
+        ),
+        None,
+    )
+    if pause_entry is None:
+        return None, None
+    pause_key = grid_entry_near_to_far_key(pause_entry, side)
     for restore_entry in combined:
         if id(restore_entry) not in paused_ids:
             continue
         restore_key = grid_entry_near_to_far_key(restore_entry, side)
-        pause_entry = next(
-            (
-                entry
-                for entry in reversed(combined)
-                if id(entry) in active_ids
-                and grid_entry_near_to_far_key(entry, side) > restore_key
-                and not grid_order_is_never_cancel(entry)
-            ),
-            None,
-        )
-        if pause_entry is None:
-            continue
+        if restore_key >= pause_key:
+            break
         prospective_active = [
             entry for entry in active if id(entry) != id(pause_entry)
         ] + [restore_entry]
