@@ -277,7 +277,7 @@ BTC --cancel grid
 - 加风险方向 active 单超过当前风险密度预算时，worker 会按 `avg_multiplier` / `margin_gap_multiplier` 把允许数量压缩为 `floor(16 / multiplier)`，最低保留 1 张；超过部分按价格近远用等比/自然对数分布抽稀暂停为 `paused_risk_density`，近侧保留更密、远侧更疏。系数下降后，`paused_risk_density` 会优先于常规补档恢复。
 - 持仓 ROE 由 Hyperliquid `position.returnOnEquity` 直接返回；低于 -10% 时，worker 会按 -10% 到 -40% 的线性区间压缩加仓侧 active 数量，超出部分暂停为 `paused_roe`；低于 -40% 时，加仓侧仍最低保留 1 张保活单。强制减仓仍只由 `panic_ratio` 触发。
 - 为减少挂单保证金占用并避免 1 分钟内盘口被打穿，每侧 active grid 单最多保留 16 张；普通补档、缺单恢复和 paused 恢复都要求该侧 active 少于 16 张。成交反向单优先提交，提交后若超过 16 张，再按近密远疏的等比/自然对数分布优先保留成交反向单并暂停其他旧 active 为 `paused_active_cap`，之后在 active 少于 16 张时也按同一分布逐步恢复。若单侧实际 open active 超过 32 张，成交反向单暂缓提交，worker 会优先从最远侧 live `pending_cancel` 开始撤单，即使该价格原本因 action limit 距离规则而暂缓撤单，逐步把 active 压回 32 张以内。
-- P2 额度充足时，worker 会把同侧 active 与所有当前可恢复的 paused 档位一视同仁地按“近密远疏”重新计算，每轮每侧最多做一组 `active <-> paused` 渐进式互换。P2 撤销不应保留的远侧 active 并提升目标 paused 的恢复优先级，实际重新挂单仍由下一轮 P1 执行。会立即穿过盘口或仍受仓位上下限、ROE、保证金、reduce-only 容量约束的 paused 档位不参与本轮互换。
+- P2 额度充足时，worker 会把同侧 active 与所有当前可恢复的 paused 档位一视同仁地按“近密远疏”重新计算，每轮每侧最多做一组 `active <-> paused` 渐进式互换。只要最近的可恢复 paused 比某张普通 active 更靠近盘口，P2 就优先撤销最远的这张 active，并提升该最近 paused 的恢复优先级，不能因远侧抽稀分布而跳过更近档位；实际重新挂单仍由下一轮 P1 执行。会立即穿过盘口或仍受仓位上下限、ROE、保证金、reduce-only 容量约束的 paused 档位不参与本轮互换。
 - 为避免异常循环无限堆积可恢复记录，`levels` 内同侧 active、pending、recovery_deferred 和 paused 合计最多保留 1024 张；历史记录不占这个名额，仍由独立历史裁剪控制。超过时会优先清理普通 paused，必要时先撤交易所 active 挂单再从本地清除，`replacement_order` 最后才会被清。
 - 全仓或逐仓的加仓方向若被交易所以保证金不足拒绝，worker 会对该方向冷却 10 分钟，本轮不再继续试单；减仓方向照常维护。仓位缩小会提前解除冷却，否则到期后探测一次。
 - reduce-only 子单的活动数量总和不会超过当前可减仓数量；交易所因可减仓数量不足自动取消的 `reduceOnlyCanceled` 不会被当作手动撤单反复补回。

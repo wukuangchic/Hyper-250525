@@ -2986,6 +2986,44 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(pause_entry["price"], "102")
         self.assertEqual(restore_entry["price"], "106")
 
+    def test_near_far_rebalance_never_skips_closest_paused_for_log_slot(self) -> None:
+        row = {
+            "levels": [
+                {
+                    "side": "buy",
+                    "status": "active",
+                    "oid": oid,
+                    "is_buy": True,
+                    "price": price,
+                    "size": "1",
+                }
+                for oid, price in ((1, "106"), (2, "105"), (3, "103"))
+            ]
+            + [
+                {
+                    "side": "buy",
+                    "status": "paused_action_limit",
+                    "oid": None,
+                    "is_buy": True,
+                    "price": price,
+                    "size": "1",
+                }
+                for price in ("104", "102", "101")
+            ],
+        }
+
+        pause_entry, restore_entry = grid_near_far_rebalance_pair(
+            row,
+            "buy",
+            Decimal("0"),
+            Decimal("0"),
+            Decimal("400"),
+            "abs",
+        )
+
+        self.assertEqual(pause_entry["price"], "103")
+        self.assertEqual(restore_entry["price"], "104")
+
     def test_near_far_restore_target_still_respects_risk_slot_count(self) -> None:
         paused = {
             "side": "buy",
