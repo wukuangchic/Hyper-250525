@@ -30,6 +30,7 @@ from hl_order import (
     reversed_grid_strategy_values,
     resolve_grid_spacing,
     submit_with_action_limit_retry,
+    spot_usdc_withdrawable,
     successful_cancel_oids,
     update_order_leverage,
     user_action_rate_limit_metrics,
@@ -127,6 +128,25 @@ from trail_worker import (
 
 
 class GridAvgTests(unittest.TestCase):
+    def test_spot_usdc_withdrawable_matches_worker_total_minus_hold(self) -> None:
+        self.assertEqual(
+            spot_usdc_withdrawable(
+                {
+                    "balances": [
+                        {"token": 0, "coin": "USDC", "total": "123.45", "hold": "23.4"},
+                    ]
+                }
+            ),
+            Decimal("100.05"),
+        )
+        self.assertEqual(
+            spot_usdc_withdrawable(
+                {"balances": [{"token": 0, "coin": "USDC", "total": "5", "hold": "8"}]}
+            ),
+            Decimal("0"),
+        )
+        self.assertIsNone(spot_usdc_withdrawable({"balances": []}))
+
     def test_withdrawable_protection_uses_absolute_balance_only(self) -> None:
         self.assertTrue(account_withdrawable_reduce_only(Decimal("9.99")))
         self.assertFalse(account_withdrawable_reduce_only(Decimal("10")))

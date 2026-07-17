@@ -599,6 +599,7 @@ journalctl -u simple-hyper-sync.service -n 80 --no-pager
 ```text
 +- Account ----------------+
 | 账户安全余量率: 47.64%     |
+| withdrawable(USDC): 0   |
 | Grid保护(<70%): 开启       |
 | 统一账户比率: 0.19%        |
 | 统一账户杠杆: 0.09x        |
@@ -705,6 +706,7 @@ reduce_only=True：只允许减仓 / 平仓，不允许反手
 统一账户指标口径：
 
 - 账户安全余量率：`tokenToAvailableAfterMaintenance[USDC] / balances[USDC].total`；低于 `70%` 时，新 grid 子单只允许 reduce-only 减仓。
+- `withdrawable(USDC)`：`balances[USDC].total - balances[USDC].hold`，与 Worker 的可提余额保护使用同一口径。
 - 统一账户比率：将各 DEX 的 maintenance margin 按 collateral token 聚合，再除以对应 spot 抵押品余额，取风险最高的一组。
 - 统一账户杠杆：当前总名义仓位 / 活跃抵押品余额。
 

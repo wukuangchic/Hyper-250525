@@ -483,12 +483,28 @@ def all_dex_names(info: Info) -> list[str]:
     return names
 
 
+def spot_usdc_withdrawable(spot_state: dict[str, Any]) -> Optional[Decimal]:
+    for balance in spot_state.get("balances", []):
+        if not isinstance(balance, dict):
+            continue
+        if balance.get("token") != 0 and str(balance.get("coin", "")).upper() != "USDC":
+            continue
+        try:
+            total = Decimal(str(balance["total"]))
+            hold = Decimal(str(balance["hold"]))
+        except (KeyError, TypeError, ValueError, InvalidOperation):
+            return None
+        return max(Decimal("0"), total - hold)
+    return None
+
+
 def unified_account_metrics(
     info: Info,
     account: str,
-) -> tuple[Optional[Decimal], Optional[Decimal], Optional[Decimal]]:
+) -> tuple[Optional[Decimal], Optional[Decimal], Optional[Decimal], Optional[Decimal]]:
     spot_state = info.spot_user_state(account)
     log_event("spot_state", spot_state)
+    usdc_withdrawable = spot_usdc_withdrawable(spot_state)
     spot_totals: dict[int, Decimal] = {}
     skipped_balances = []
     for balance in spot_state.get("balances", []):
@@ -566,13 +582,16 @@ def unified_account_metrics(
         "unified_ratio": unified_ratio,
         "unified_leverage": unified_leverage,
         "account_safety_margin_ratio": account_safety_margin_ratio,
+        "usdc_withdrawable": usdc_withdrawable,
     }
     log_event("unified_metrics", metrics)
-    return unified_ratio, unified_leverage, account_safety_margin_ratio
+    return unified_ratio, unified_leverage, account_safety_margin_ratio, usdc_withdrawable
 
 
 def print_account_metrics(info: Info, account: str) -> None:
-    unified_ratio, unified_leverage, account_safety_margin_ratio = unified_account_metrics(info, account)
+    unified_ratio, unified_leverage, account_safety_margin_ratio, usdc_withdrawable = unified_account_metrics(
+        info, account
+    )
     action_rate = user_action_rate_limit_metrics(info, account)
     protection_status = "未知"
     if account_safety_margin_ratio is not None:
@@ -581,6 +600,7 @@ def print_account_metrics(info: Info, account: str) -> None:
         "Account",
         [
             ("账户安全余量率", format_percent(account_safety_margin_ratio)),
+            ("withdrawable(USDC)", format_optional_decimal(usdc_withdrawable)),
             ("Grid保护(<70%)", protection_status),
             ("统一账户比率", format_percent(unified_ratio)),
             ("统一账户杠杆", format_leverage(unified_leverage)),
