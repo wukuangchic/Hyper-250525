@@ -3912,6 +3912,29 @@ def prioritize_grid_entry_for_restore(levels: list[dict[str, Any]], entry: dict[
     return False
 
 
+def paused_replacement_restore_entries_near_first(
+    levels: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Scan restorable replacements near-to-far without changing side fairness."""
+    ordered = list(levels)
+    for side in ("buy", "sell"):
+        indexes = [
+            index
+            for index, entry in enumerate(ordered)
+            if isinstance(entry, dict)
+            and str(entry.get("side") or "") == side
+            and bool(entry.get("replacement_order"))
+            and str(entry.get("status") or "") in GRID_PAUSED_STATUSES
+        ]
+        side_entries = sorted(
+            (ordered[index] for index in indexes),
+            key=lambda entry: grid_entry_near_to_far_key(entry, side),
+        )
+        for index, entry in zip(indexes, side_entries):
+            ordered[index] = entry
+    return ordered
+
+
 def reduce_side_for_position(position_size: Decimal) -> str | None:
     if position_size > 0:
         return "sell"
@@ -5157,7 +5180,10 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             changed = True
     mark_phase("topups")
 
-    for entry in (levels if (allow_p1_restore or allow_p1_paused_replacement) else []):
+    restore_scan_entries = levels
+    if allow_p1_paused_replacement:
+        restore_scan_entries = paused_replacement_restore_entries_near_first(levels)
+    for entry in (restore_scan_entries if (allow_p1_restore or allow_p1_paused_replacement) else []):
         if isinstance(entry, dict) and pause_refresh_reduce_only_replacement(entry, now):
             changed = True
             continue

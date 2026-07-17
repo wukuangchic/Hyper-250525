@@ -105,6 +105,7 @@ from trail_worker import (
     pending_cancel_overflow_candidates,
     prepare_grid_cancel_entries,
     pause_skipped_account_margin_replacement,
+    paused_replacement_restore_entries_near_first,
     precheck_action_limit,
     prune_cancelled_grid_rows,
     prune_add_risk_brake_state,
@@ -4022,6 +4023,39 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(order["status"], "paused_replacement")
         self.assertEqual(order["replacement_pause_reason"], "paused_margin")
         self.assertEqual(order["last_error"], "Insufficient margin")
+
+    def test_paused_replacement_restore_entries_are_near_first_per_side(self) -> None:
+        buy_far = {
+            "side": "buy",
+            "status": "paused_replacement",
+            "price": "90",
+            "replacement_order": True,
+        }
+        sell_far = {
+            "side": "sell",
+            "status": "paused_replacement",
+            "price": "110",
+            "replacement_order": True,
+        }
+        regular = {"side": "buy", "status": "paused_limit", "price": "99"}
+        buy_near = {
+            "side": "buy",
+            "status": "paused_replacement",
+            "price": "98",
+            "replacement_order": True,
+        }
+        sell_near = {
+            "side": "sell",
+            "status": "paused_replacement",
+            "price": "102",
+            "replacement_order": True,
+        }
+        levels = [buy_far, sell_far, regular, buy_near, sell_near]
+
+        ordered = paused_replacement_restore_entries_near_first(levels)
+
+        self.assertEqual(ordered, [buy_near, sell_near, regular, buy_far, sell_far])
+        self.assertEqual(levels, [buy_far, sell_far, regular, buy_near, sell_near])
 
     def test_skipped_account_margin_replacement_is_migrated_to_paused_replacement(self) -> None:
         levels = [
