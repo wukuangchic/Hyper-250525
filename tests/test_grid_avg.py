@@ -40,6 +40,7 @@ from trail_worker import (
     action_limit_p1_budget_for_deficit,
     action_limit_p1_budget_for_headroom,
     action_limit_p1_budget_remaining,
+    account_withdrawable_reduce_only,
     batch_row_raw_coin,
     build_grid_panic_reduce_order,
     cancel_grid_entries_with_p1_budget,
@@ -124,6 +125,12 @@ from trail_worker import (
 
 
 class GridAvgTests(unittest.TestCase):
+    def test_withdrawable_protection_uses_absolute_balance_only(self) -> None:
+        self.assertTrue(account_withdrawable_reduce_only(Decimal("9.99")))
+        self.assertFalse(account_withdrawable_reduce_only(Decimal("10")))
+        self.assertFalse(account_withdrawable_reduce_only(Decimal("50")))
+        self.assertFalse(account_withdrawable_reduce_only(None))
+
     def test_reverse_grid_strategy_negates_signed_limit_and_avg(self) -> None:
         lower, upper, avg = reversed_grid_strategy_values(
             {

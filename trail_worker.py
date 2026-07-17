@@ -677,6 +677,10 @@ def account_spot_withdrawable(
     return None
 
 
+def account_withdrawable_reduce_only(withdrawable: Decimal | None) -> bool:
+    return withdrawable is not None and withdrawable < Decimal("10")
+
+
 def grid_reduce_only_capacity_available(
     row: dict[str, Any],
     order: dict[str, Any],
@@ -4090,11 +4094,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     else:
         withdrawable, total_usdc = spot_withdrawable_state
         withdrawable_ratio = withdrawable / total_usdc if total_usdc > 0 else Decimal("0")
-    withdrawable_reduce_only = (
-        withdrawable is not None
-        and total_usdc is not None
-        and (withdrawable < Decimal("10") or withdrawable_ratio < Decimal("0.1"))
-    )
+    withdrawable_reduce_only = account_withdrawable_reduce_only(withdrawable)
     account_margin_hard_stop = margin_ratio is not None and margin_ratio < GRID_ACCOUNT_MARGIN_RATIO_THRESHOLD
     account_margin_protected = account_margin_hard_stop or withdrawable_reduce_only
     margin_gap_multiplier = grid_margin_gap_multiplier(margin_ratio)
