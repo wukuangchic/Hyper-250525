@@ -115,6 +115,7 @@ GRID_ACTION_PHASE_P1_PAUSED_REPLACEMENT = "p1_paused_replacement"
 GRID_ACTION_PHASE_P1_CANCELS = "p1_cancels"
 GRID_ACTION_PHASE_P1_TOPUP = "p1_topup"
 GRID_ACTION_PHASE_P1_RESTORE = "p1_restore"
+GRID_ACTION_PHASE_P1_WITHDRAWABLE = "p1_withdrawable"
 GRID_ACTION_PHASE_P2 = "p2"
 GRID_ACTION_PHASES = (
     GRID_ACTION_PHASE_P0,
@@ -123,6 +124,7 @@ GRID_ACTION_PHASES = (
     GRID_ACTION_PHASE_P1_CANCELS,
     GRID_ACTION_PHASE_P1_TOPUP,
     GRID_ACTION_PHASE_P1_RESTORE,
+    GRID_ACTION_PHASE_P1_WITHDRAWABLE,
     GRID_ACTION_PHASE_P2,
 )
 GRID_MAX_LEVELS_PER_SIDE = 1024
@@ -687,6 +689,16 @@ def account_withdrawable_reduce_only(withdrawable: Decimal | None) -> bool:
 
 def account_withdrawable_pause_active(withdrawable: Decimal | None) -> bool:
     return withdrawable is not None and withdrawable < GRID_WITHDRAWABLE_PAUSE_THRESHOLD
+
+
+def account_withdrawable_pause_phase(withdrawable: Decimal | None) -> str | None:
+    if withdrawable is None or withdrawable >= GRID_WITHDRAWABLE_PAUSE_THRESHOLD:
+        return None
+    if withdrawable == 0:
+        return GRID_ACTION_PHASE_P0
+    if withdrawable < GRID_WITHDRAWABLE_REDUCE_ONLY_THRESHOLD:
+        return GRID_ACTION_PHASE_P1_WITHDRAWABLE
+    return GRID_ACTION_PHASE_P2
 
 
 def grid_reduce_only_capacity_available(
@@ -3681,7 +3693,11 @@ def cancel_grid_entries_with_p1_budget(
     row: dict[str, Any] | None = None,
     current_mid: Decimal | None = None,
 ) -> int:
-    if isinstance(cache, dict) and cache.get("grid_action_phase") not in (None, GRID_ACTION_PHASE_P1_CANCELS):
+    if isinstance(cache, dict) and cache.get("grid_action_phase") not in (
+        None,
+        GRID_ACTION_PHASE_P1_CANCELS,
+        GRID_ACTION_PHASE_P1_WITHDRAWABLE,
+    ):
         return 0
     entries = [entry for entry in entries if not grid_order_is_never_cancel(entry)]
     entries, deferred = prepare_grid_cancel_entries(row, entries, now, note, current_mid, cache)
@@ -4202,6 +4218,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         withdrawable_ratio = withdrawable / total_usdc if total_usdc > 0 else Decimal("0")
     withdrawable_reduce_only = account_withdrawable_reduce_only(withdrawable)
     withdrawable_pause_active = account_withdrawable_pause_active(withdrawable)
+    withdrawable_pause_phase = account_withdrawable_pause_phase(withdrawable)
     account_margin_hard_stop = margin_ratio is not None and margin_ratio < GRID_ACCOUNT_MARGIN_RATIO_THRESHOLD
     account_margin_protected = account_margin_hard_stop or withdrawable_reduce_only
     margin_gap_multiplier = grid_margin_gap_multiplier(margin_ratio)
@@ -4216,6 +4233,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     )
     row["account_usdc_reduce_only_only"] = withdrawable_reduce_only
     row["account_usdc_withdrawable_pause_active"] = withdrawable_pause_active
+    row["account_usdc_withdrawable_pause_phase"] = withdrawable_pause_phase
     row["account_margin_hard_stop"] = account_margin_hard_stop
     brake_state_pruned = prune_add_risk_brake_state(row, now)
     mark_phase("margin")
@@ -5047,7 +5065,13 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             changed = True
     mark_phase("replacement_rebalance")
 
-    if allow_p2 and withdrawable_pause_active and noncritical_grid_work_allowed(cache):
+    withdrawable_pause_due = withdrawable_pause_phase is not None and (
+        not phase_limited or grid_action_phase == withdrawable_pause_phase
+    )
+    withdrawable_pause_headroom_available = (
+        withdrawable_pause_phase != GRID_ACTION_PHASE_P2 or noncritical_grid_work_allowed(cache)
+    )
+    if withdrawable_pause_due and withdrawable_pause_headroom_available:
         withdrawable_pause_entry = claim_withdrawable_pause_entry(
             row,
             cache.get("grid_rows") if isinstance(cache.get("grid_rows"), list) else [row],
@@ -5056,16 +5080,28 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             cache,
         )
         if withdrawable_pause_entry is not None:
-            withdrawable_paused = cancel_grid_entries(
-                exchange,
-                coin,
-                [withdrawable_pause_entry],
-                now,
-                GRID_WITHDRAWABLE_PAUSE_STATUS,
-                row=row,
-                current_mid=current_mid,
-                cache=cache,
-            )
+            if withdrawable_pause_phase == GRID_ACTION_PHASE_P1_WITHDRAWABLE:
+                withdrawable_paused = cancel_grid_entries_with_p1_budget(
+                    exchange,
+                    coin,
+                    [withdrawable_pause_entry],
+                    now,
+                    GRID_WITHDRAWABLE_PAUSE_STATUS,
+                    cache,
+                    row=row,
+                    current_mid=current_mid,
+                )
+            else:
+                withdrawable_paused = cancel_grid_entries(
+                    exchange,
+                    coin,
+                    [withdrawable_pause_entry],
+                    now,
+                    GRID_WITHDRAWABLE_PAUSE_STATUS,
+                    row=row,
+                    current_mid=current_mid,
+                    cache=cache,
+                )
             if withdrawable_paused:
                 withdrawable_pause_entry["paused_at"] = now
                 withdrawable_pause_entry["withdrawable_paused_at"] = now

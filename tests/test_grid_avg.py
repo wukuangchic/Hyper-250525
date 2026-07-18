@@ -42,6 +42,7 @@ from trail_worker import (
     action_limit_p1_budget_for_headroom,
     action_limit_p1_budget_remaining,
     account_withdrawable_pause_active,
+    account_withdrawable_pause_phase,
     account_withdrawable_reduce_only,
     claim_withdrawable_pause_entry,
     batch_row_raw_coin,
@@ -125,6 +126,9 @@ from trail_worker import (
     GRID_ACTION_LIMIT_PAUSE_STATUS,
     GRID_PENDING_CANCEL_STATUS,
     GRID_ROE_PAUSE_STATUS,
+    GRID_ACTION_PHASE_P0,
+    GRID_ACTION_PHASE_P1_WITHDRAWABLE,
+    GRID_ACTION_PHASE_P2,
     grid_entries_fit_within_max,
 )
 
@@ -162,6 +166,21 @@ class GridAvgTests(unittest.TestCase):
         self.assertTrue(account_withdrawable_pause_active(Decimal("9.99")))
         self.assertFalse(account_withdrawable_pause_active(Decimal("10")))
         self.assertFalse(account_withdrawable_pause_active(None))
+
+    def test_withdrawable_pause_phase_escalates_at_five_and_zero(self) -> None:
+        self.assertEqual(account_withdrawable_pause_phase(Decimal("0")), GRID_ACTION_PHASE_P0)
+        self.assertEqual(
+            account_withdrawable_pause_phase(Decimal("0.01")),
+            GRID_ACTION_PHASE_P1_WITHDRAWABLE,
+        )
+        self.assertEqual(
+            account_withdrawable_pause_phase(Decimal("4.99")),
+            GRID_ACTION_PHASE_P1_WITHDRAWABLE,
+        )
+        self.assertEqual(account_withdrawable_pause_phase(Decimal("5")), GRID_ACTION_PHASE_P2)
+        self.assertEqual(account_withdrawable_pause_phase(Decimal("9.99")), GRID_ACTION_PHASE_P2)
+        self.assertIsNone(account_withdrawable_pause_phase(Decimal("10")))
+        self.assertIsNone(account_withdrawable_pause_phase(None))
 
     def test_withdrawable_pause_selects_oldest_active_non_reduce_only_order_across_account(self) -> None:
         account = "0xAbC"
@@ -447,6 +466,8 @@ class GridAvgTests(unittest.TestCase):
                 ("BTC", "p1_topup"),
                 ("ETH", "p1_restore"),
                 ("BTC", "p1_restore"),
+                ("ETH", "p1_withdrawable"),
+                ("BTC", "p1_withdrawable"),
                 ("ETH", "p2"),
                 ("BTC", "p2"),
             ],
@@ -488,7 +509,7 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertEqual(seen[0], (None, None, None))
         self.assertEqual(seen[1], ({"stale": True}, {"shared": True}, 3))
-        self.assertEqual(info.clear_calls, 7)
+        self.assertEqual(info.clear_calls, 8)
 
     def test_precheck_action_limit_initializes_shared_p1_budget_below_cap_once(self) -> None:
         class FakeInfo:
@@ -537,6 +558,39 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(exchange.requests, [[{"coin": "BTC", "oid": 1}]])
         self.assertEqual(entries[0]["status"], "paused_limit")
         self.assertEqual(entries[1]["status"], "active")
+        self.assertEqual(action_limit_p1_budget_remaining(cache), 0)
+
+    def test_withdrawable_p1_tail_cancel_uses_p1_budget(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.requests = []
+
+            def bulk_cancel(self, requests: list[dict]) -> dict:
+                self.requests.append(requests)
+                return {"status": "ok", "response": {"data": {"statuses": ["success"]}}}
+
+        exchange = FakeExchange()
+        entry = {"oid": 1, "status": "active", "reduce_only": False}
+        cache = {
+            "grid_action_phase": GRID_ACTION_PHASE_P1_WITHDRAWABLE,
+            "action_limit_p1_budget_remaining": 1,
+            "action_limit_p1_budget_initialized": True,
+        }
+        enable_action_limit_p1_budget(cache)
+
+        self.assertEqual(
+            cancel_grid_entries_with_p1_budget(
+                exchange,
+                "BTC",
+                [entry],
+                123,
+                "paused_withdrawable",
+                cache,
+            ),
+            1,
+        )
+        self.assertEqual(exchange.requests, [[{"coin": "BTC", "oid": 1}]])
+        self.assertEqual(entry["status"], "paused_withdrawable")
         self.assertEqual(action_limit_p1_budget_remaining(cache), 0)
 
     def test_cancel_grid_entries_marks_only_item_successes(self) -> None:
