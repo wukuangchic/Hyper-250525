@@ -41,6 +41,7 @@ from trail_worker import (
     action_limit_p1_budget_for_deficit,
     action_limit_p1_budget_for_headroom,
     action_limit_p1_budget_remaining,
+    account_withdrawable_pause_active,
     account_withdrawable_reduce_only,
     claim_withdrawable_pause_entry,
     batch_row_raw_coin,
@@ -148,11 +149,19 @@ class GridAvgTests(unittest.TestCase):
         )
         self.assertIsNone(spot_usdc_withdrawable({"balances": []}))
 
-    def test_withdrawable_protection_uses_absolute_balance_only(self) -> None:
-        self.assertTrue(account_withdrawable_reduce_only(Decimal("9.99")))
-        self.assertFalse(account_withdrawable_reduce_only(Decimal("10")))
+    def test_withdrawable_reduce_only_starts_below_five(self) -> None:
+        self.assertTrue(account_withdrawable_reduce_only(Decimal("4.99")))
+        self.assertFalse(account_withdrawable_reduce_only(Decimal("5")))
+        self.assertFalse(account_withdrawable_reduce_only(Decimal("9.99")))
         self.assertFalse(account_withdrawable_reduce_only(Decimal("50")))
         self.assertFalse(account_withdrawable_reduce_only(None))
+
+    def test_withdrawable_pause_remains_active_below_ten(self) -> None:
+        self.assertTrue(account_withdrawable_pause_active(Decimal("4.99")))
+        self.assertTrue(account_withdrawable_pause_active(Decimal("5")))
+        self.assertTrue(account_withdrawable_pause_active(Decimal("9.99")))
+        self.assertFalse(account_withdrawable_pause_active(Decimal("10")))
+        self.assertFalse(account_withdrawable_pause_active(None))
 
     def test_withdrawable_pause_selects_oldest_active_non_reduce_only_order_across_account(self) -> None:
         account = "0xAbC"

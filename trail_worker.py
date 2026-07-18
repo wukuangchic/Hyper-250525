@@ -86,6 +86,8 @@ GRID_ROE_MIN_POSITION_VALUE = Decimal("100")
 GRID_ROE_DENSITY_THRESHOLD = Decimal("-0.10")
 GRID_ROE_STOP_THRESHOLD = Decimal("-0.40")
 GRID_SURVIVAL_ACTIVE_ORDERS_PER_SIDE = 1
+GRID_WITHDRAWABLE_REDUCE_ONLY_THRESHOLD = Decimal("5")
+GRID_WITHDRAWABLE_PAUSE_THRESHOLD = Decimal("10")
 GRID_PANIC_RATIO_LEGACY_DEFAULT_THRESHOLDS = {
     Decimal("10"),
     Decimal("20"),
@@ -680,7 +682,11 @@ def account_spot_withdrawable(
 
 
 def account_withdrawable_reduce_only(withdrawable: Decimal | None) -> bool:
-    return withdrawable is not None and withdrawable < Decimal("10")
+    return withdrawable is not None and withdrawable < GRID_WITHDRAWABLE_REDUCE_ONLY_THRESHOLD
+
+
+def account_withdrawable_pause_active(withdrawable: Decimal | None) -> bool:
+    return withdrawable is not None and withdrawable < GRID_WITHDRAWABLE_PAUSE_THRESHOLD
 
 
 def grid_reduce_only_capacity_available(
@@ -4195,6 +4201,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         withdrawable, total_usdc = spot_withdrawable_state
         withdrawable_ratio = withdrawable / total_usdc if total_usdc > 0 else Decimal("0")
     withdrawable_reduce_only = account_withdrawable_reduce_only(withdrawable)
+    withdrawable_pause_active = account_withdrawable_pause_active(withdrawable)
     account_margin_hard_stop = margin_ratio is not None and margin_ratio < GRID_ACCOUNT_MARGIN_RATIO_THRESHOLD
     account_margin_protected = account_margin_hard_stop or withdrawable_reduce_only
     margin_gap_multiplier = grid_margin_gap_multiplier(margin_ratio)
@@ -4208,6 +4215,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         decimal_to_plain(withdrawable_ratio) if withdrawable_ratio is not None else None
     )
     row["account_usdc_reduce_only_only"] = withdrawable_reduce_only
+    row["account_usdc_withdrawable_pause_active"] = withdrawable_pause_active
     row["account_margin_hard_stop"] = account_margin_hard_stop
     brake_state_pruned = prune_add_risk_brake_state(row, now)
     mark_phase("margin")
@@ -4969,7 +4977,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 and str(entry.get("side") or "") == side
                 and str(entry.get("status") or "") in GRID_PAUSED_STATUSES
                 and not (
-                    withdrawable_reduce_only
+                    withdrawable_pause_active
                     and str(entry.get("status") or "") == GRID_WITHDRAWABLE_PAUSE_STATUS
                 )
                 and not grid_recovery_price_would_cross_market(entry, current_mid, best_bid, best_ask)
@@ -5034,7 +5042,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             changed = True
     mark_phase("replacement_rebalance")
 
-    if allow_p2 and withdrawable_reduce_only and noncritical_grid_work_allowed(cache):
+    if allow_p2 and withdrawable_pause_active and noncritical_grid_work_allowed(cache):
         withdrawable_pause_entry = claim_withdrawable_pause_entry(
             row,
             cache.get("grid_rows") if isinstance(cache.get("grid_rows"), list) else [row],
@@ -5233,7 +5241,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         if allow_p1_restore and is_replacement_order:
             continue
         status = str(entry.get("status"))
-        if status == GRID_WITHDRAWABLE_PAUSE_STATUS and withdrawable_reduce_only:
+        if status == GRID_WITHDRAWABLE_PAUSE_STATUS and withdrawable_pause_active:
             continue
         if normalize_margin_paused_replacement(entry, now):
             status = str(entry.get("status"))
