@@ -3663,7 +3663,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(order["status"], "active")
         self.assertEqual(len(exchange.orders), 1)
 
-    def test_immediate_replacement_bypasses_active_cap_action_limit_and_side_quota(self) -> None:
+    def test_immediate_replacement_bypasses_limits_but_consumes_side_quota(self) -> None:
         active_sells = [
             {
                 "side": "sell",
@@ -3766,7 +3766,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(replacement["status"], "active")
         self.assertEqual(replacement["oid"], 2000)
         self.assertEqual(action_limit_p1_budget_remaining(cache), 0)
-        self.assertIn("submissions=buy:0,sell:0", updated["note"])
+        self.assertIn("submissions=buy:0,sell:1", updated["note"])
 
     def test_same_run_insufficient_margin_pauses_later_same_side_without_submit(self) -> None:
         class FakeExchange:

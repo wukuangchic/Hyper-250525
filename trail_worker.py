@@ -4366,7 +4366,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             mark_action_limit_hit(cache, error_text, now)
             pause_grid_order_for_action_limit(order, now, error_text)
             return False
-        if submitted and not bypass_current_controls:
+        if submitted:
             submissions_by_side[side] = submissions_by_side.get(side, 0) + 1
             replacement_quota_sides.add(side)
         return submitted
