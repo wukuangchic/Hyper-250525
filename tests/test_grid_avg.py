@@ -3663,6 +3663,111 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(order["status"], "active")
         self.assertEqual(len(exchange.orders), 1)
 
+    def test_immediate_replacement_bypasses_active_cap_action_limit_and_side_quota(self) -> None:
+        active_sells = [
+            {
+                "side": "sell",
+                "is_buy": False,
+                "status": "active",
+                "oid": oid,
+                "price": str(110 + oid),
+                "size": "1",
+                "reduce_only": False,
+            }
+            for oid in range(1, 34)
+        ]
+        filled = {
+            "side": "buy",
+            "is_buy": True,
+            "status": "filled",
+            "oid": 999,
+            "price": "100",
+            "size": "1",
+            "replacement_pending": True,
+        }
+
+        class FakeInfo:
+            def meta(self, dex=""):
+                return {"universe": [{"name": "BTC", "szDecimals": 2, "maxLeverage": 20}]}
+
+            def all_mids(self, dex=""):
+                return {"BTC": "100"}
+
+            def l2_snapshot(self, coin):
+                return {"levels": [[{"px": "99"}], [{"px": "101"}]]}
+
+            def user_state(self, account, dex=""):
+                return {
+                    "assetPositions": [
+                        {
+                            "position": {
+                                "coin": "BTC",
+                                "szi": "-1",
+                                "positionValue": "100",
+                                "returnOnEquity": "0",
+                            }
+                        }
+                    ]
+                }
+
+            def spot_user_state(self, account):
+                return {
+                    "balances": [{"token": 0, "coin": "USDC", "total": "100", "hold": "96"}],
+                    "tokenToAvailableAfterMaintenance": [[0, "100"]],
+                }
+
+            def frontend_open_orders(self, account, dex=""):
+                return [{"coin": "BTC", "oid": entry["oid"]} for entry in active_sells]
+
+            def user_fills_by_time(self, account, start_ms, end_ms):
+                return []
+
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.orders = []
+
+            def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
+                self.orders.append((coin, is_buy, Decimal(str(limit_px)), order_type, reduce_only))
+                return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 2000}}]}}}
+
+        row = {
+            "type": "grid",
+            "status": "active",
+            "coin": "BTC",
+            "network": "mainnet",
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "min_position_value": "0",
+            "max_position_value": "10000",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+            "sz_decimals": 2,
+            "levels": [*active_sells, filled],
+        }
+        cache = {
+            "now": 123,
+            "grid_action_phase": "p1_latest_replacement",
+            "action_limit_error": "cached cumulative action limit",
+            "action_limit_p1_budget_remaining": 0,
+            "action_limit_p1_enabled": True,
+            "action_limit_headroom": 0,
+        }
+        exchange = FakeExchange()
+
+        with (
+            patch("trail_worker.build_clients", return_value=(FakeInfo(), exchange, "acct", "signer", {})),
+            patch("trail_worker.precheck_action_limit"),
+        ):
+            updated, changed = maintain_grid(row, cache)
+
+        self.assertTrue(changed)
+        self.assertEqual(len(exchange.orders), 1)
+        replacement = next(entry for entry in updated["levels"] if entry.get("replacement_order"))
+        self.assertEqual(replacement["status"], "active")
+        self.assertEqual(replacement["oid"], 2000)
+        self.assertEqual(action_limit_p1_budget_remaining(cache), 0)
+        self.assertIn("submissions=buy:0,sell:0", updated["note"])
+
     def test_same_run_insufficient_margin_pauses_later_same_side_without_submit(self) -> None:
         class FakeExchange:
             def __init__(self) -> None:

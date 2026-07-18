@@ -4320,17 +4320,22 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
 
     def submit_replacement(order: dict[str, Any], *, bypass_current_controls: bool = False) -> bool:
         side = str(order.get("side") or "")
-        if not grid_order_is_never_cancel(order) and not replacement_active_cap_submit_allowed(row, side):
+        if (
+            not bypass_current_controls
+            and not grid_order_is_never_cancel(order)
+            and not replacement_active_cap_submit_allowed(row, side)
+        ):
             return False
-        existing_action_limit = action_limit_error(cache)
-        budget_tracked = p1_budget_tracked(cache)
-        if action_limit_p1_enabled(cache) and budget_tracked and not p1_budget_available(cache):
-            if existing_action_limit:
+        if not bypass_current_controls:
+            existing_action_limit = action_limit_error(cache)
+            budget_tracked = p1_budget_tracked(cache)
+            if action_limit_p1_enabled(cache) and budget_tracked and not p1_budget_available(cache):
+                if existing_action_limit:
+                    pause_grid_order_for_action_limit(order, now, existing_action_limit)
+                return False
+            if existing_action_limit and not action_limit_p1_enabled(cache):
                 pause_grid_order_for_action_limit(order, now, existing_action_limit)
-            return False
-        if existing_action_limit and not action_limit_p1_enabled(cache):
-            pause_grid_order_for_action_limit(order, now, existing_action_limit)
-            return False
+                return False
         try:
             order["audit_phase"] = grid_action_phase
             order["audit_deficit"] = action_limit_deficit(cache)
@@ -4350,7 +4355,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 margin_blocked_sides=margin_blocked_sides,
                 open_orders=current_open_orders,
                 cache=cache,
-                consume_p1_budget=True,
+                consume_p1_budget=not bypass_current_controls,
                 account_margin_hard_stop=account_margin_hard_stop,
                 bypass_margin_controls=bypass_current_controls,
             )
@@ -4361,7 +4366,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             mark_action_limit_hit(cache, error_text, now)
             pause_grid_order_for_action_limit(order, now, error_text)
             return False
-        if submitted:
+        if submitted and not bypass_current_controls:
             submissions_by_side[side] = submissions_by_side.get(side, 0) + 1
             replacement_quota_sides.add(side)
         return submitted
