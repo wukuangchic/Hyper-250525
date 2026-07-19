@@ -108,6 +108,7 @@ from trail_worker import (
     prepare_grid_cancel_entries,
     pause_skipped_account_margin_replacement,
     paused_replacement_restore_entries_near_first,
+    shift_paused_grid_entries_outward_for_replacement,
     precheck_action_limit,
     prune_cancelled_grid_rows,
     prune_add_risk_brake_state,
@@ -4761,6 +4762,117 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertTrue(moved)
         self.assertEqual(order["price"], "96.06")
+
+    def test_fresh_replacement_keeps_target_and_shifts_paused_marker_outward(self) -> None:
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+            "levels": [],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        paused = grid_order_entry(row, "BTC", asset, True, Decimal("99.1"), False)
+        paused.update({"status": "paused_replacement", "oid": None, "replacement_order": True})
+        row["levels"] = [paused]
+        order = grid_order_entry(row, "BTC", asset, True, Decimal("100"), False)
+        order["replacement_order"] = True
+
+        moved = move_grid_order_away_from_active(row, asset, order)
+
+        self.assertTrue(moved)
+        self.assertEqual(order["price"], "100")
+        self.assertEqual(paused["price"], "98.109")
+        self.assertEqual(paused["limit_px"], "98.109")
+        self.assertEqual(paused["plan"]["limit_px"], Decimal("98.109"))
+
+    def test_fresh_replacement_pushes_a_paused_chain_outward(self) -> None:
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+            "levels": [],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        inner = grid_order_entry(row, "BTC", asset, False, Decimal("100.9"), False)
+        inner.update({"status": "paused_limit", "oid": None})
+        outer = grid_order_entry(row, "BTC", asset, False, Decimal("101.909"), False)
+        outer.update({"status": "paused_replacement", "oid": None, "replacement_order": True})
+        row["levels"] = [inner, outer]
+        order = grid_order_entry(row, "BTC", asset, False, Decimal("100"), False)
+        order["replacement_order"] = True
+
+        shifted = shift_paused_grid_entries_outward_for_replacement(row, asset, order)
+
+        self.assertTrue(shifted)
+        self.assertEqual(order["price"], "100")
+        self.assertEqual(inner["price"], "101.91")
+        self.assertEqual(outer["price"], "102.93")
+
+    def test_fresh_replacement_does_not_shift_paused_when_live_order_also_blocks(self) -> None:
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+            "levels": [
+                {"side": "buy", "status": "active", "oid": 1, "price": "99.2", "size": "1"},
+                {"side": "buy", "status": "paused_limit", "oid": None, "price": "99.1", "size": "1"},
+            ],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        order = grid_order_entry(row, "BTC", asset, True, Decimal("100"), False)
+        order["replacement_order"] = True
+
+        shifted = shift_paused_grid_entries_outward_for_replacement(row, asset, order)
+
+        self.assertFalse(shifted)
+        self.assertEqual(row["levels"][1]["price"], "99.1")
+
+    def test_fresh_replacement_submits_at_target_after_paused_marker_yields(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.prices = []
+
+            def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
+                self.prices.append(Decimal(str(limit_px)))
+                return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 456}}]}}}
+
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "1",
+            "base_sell_size": "1",
+            "levels": [],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        paused = grid_order_entry(row, "BTC", asset, True, Decimal("99.1"), False)
+        paused.update({"status": "paused_limit", "oid": None})
+        row["levels"] = [paused]
+        order = grid_order_entry(row, "BTC", asset, True, Decimal("100"), False)
+        order["replacement_order"] = True
+        exchange = FakeExchange()
+
+        submitted = submit_grid_order_entry(
+            exchange,
+            "BTC",
+            order,
+            1,
+            row,
+            asset,
+            Decimal("0"),
+            Decimal("0"),
+            "abs",
+            False,
+            set(),
+            True,
+        )
+
+        self.assertTrue(submitted)
+        self.assertEqual(exchange.prices, [Decimal("100.0")])
+        self.assertEqual(order["price"], "100")
+        self.assertEqual(paused["price"], "98.109")
 
     def test_replacement_alo_reject_inserts_between_wide_active_gap_before_moving_farther(self) -> None:
         class FakeExchange:
