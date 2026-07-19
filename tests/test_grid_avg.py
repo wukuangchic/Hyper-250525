@@ -130,6 +130,7 @@ from trail_worker import (
     GRID_ACTION_PHASE_P1_WITHDRAWABLE,
     GRID_ACTION_PHASE_P2,
     grid_entries_fit_within_max,
+    grid_entry_timestamp_ms,
 )
 
 
@@ -193,8 +194,20 @@ class GridAvgTests(unittest.TestCase):
         }
         reduce_only = {"side": "sell", "status": "active", "oid": 2, "reduce_only": True}
         paused = {"side": "buy", "status": "paused_active_cap", "oid": 3, "reduce_only": False}
-        oldest_eligible = {"side": "sell", "status": "active", "oid": "4", "reduce_only": False}
-        newer_eligible = {"side": "buy", "status": "active", "oid": 8, "reduce_only": False}
+        oldest_eligible = {
+            "side": "sell",
+            "status": "active",
+            "oid": "8",
+            "timestamp": 1000,
+            "reduce_only": False,
+        }
+        newer_eligible = {
+            "side": "buy",
+            "status": "active",
+            "oid": 4,
+            "timestamp": 2000,
+            "reduce_only": False,
+        }
         other_account = {"side": "buy", "status": "active", "oid": 0, "reduce_only": False}
         first_row = {
             "type": "grid",
@@ -227,6 +240,45 @@ class GridAvgTests(unittest.TestCase):
             (second_row, oldest_eligible),
         )
 
+    def test_withdrawable_pause_timestamp_falls_back_to_submitted_at(self) -> None:
+        self.assertEqual(grid_entry_timestamp_ms({"timestamp": 123456}), 123456)
+        self.assertEqual(grid_entry_timestamp_ms({"submitted_at": 123}), 123000)
+        self.assertIsNone(grid_entry_timestamp_ms({}))
+
+        account = "0xabc"
+        timestamped = {
+            "side": "buy",
+            "status": "active",
+            "oid": 20,
+            "timestamp": 2000,
+            "reduce_only": False,
+        }
+        legacy_older = {
+            "side": "sell",
+            "status": "active",
+            "oid": 30,
+            "submitted_at": 1,
+            "reduce_only": False,
+        }
+        missing_time = {
+            "side": "buy",
+            "status": "active",
+            "oid": 1,
+            "reduce_only": False,
+        }
+        row = {
+            "type": "grid",
+            "status": "active",
+            "network": "mainnet",
+            "account": account,
+            "levels": [timestamped, legacy_older, missing_time],
+        }
+
+        self.assertEqual(
+            oldest_active_non_reduce_only_grid_entry([row], "mainnet", account),
+            (row, legacy_older),
+        )
+
     def test_withdrawable_pause_is_claimed_once_per_account_per_run(self) -> None:
         account = "0xabc"
         first_row = {
@@ -234,9 +286,23 @@ class GridAvgTests(unittest.TestCase):
             "status": "active",
             "network": "mainnet",
             "account": account,
-            "levels": [{"side": "buy", "status": "active", "oid": 9, "reduce_only": False}],
+            "levels": [
+                {
+                    "side": "buy",
+                    "status": "active",
+                    "oid": 9,
+                    "timestamp": 9000,
+                    "reduce_only": False,
+                }
+            ],
         }
-        second_entry = {"side": "sell", "status": "active", "oid": 4, "reduce_only": False}
+        second_entry = {
+            "side": "sell",
+            "status": "active",
+            "oid": 4,
+            "timestamp": 4000,
+            "reduce_only": False,
+        }
         second_row = {
             "type": "grid",
             "status": "active",

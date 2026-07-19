@@ -1771,13 +1771,23 @@ def active_grid_entries(row: dict[str, Any], side: str | None = None) -> list[di
     return entries
 
 
+def grid_entry_timestamp_ms(entry: dict[str, Any]) -> int | None:
+    timestamp = decimal_or_none(entry.get("timestamp"))
+    if timestamp is not None and timestamp >= 0:
+        return int(timestamp)
+    submitted_at = decimal_or_none(entry.get("submitted_at"))
+    if submitted_at is not None and submitted_at >= 0:
+        return int(submitted_at * Decimal("1000"))
+    return None
+
+
 def oldest_active_non_reduce_only_grid_entry(
     rows: list[dict[str, Any]],
     network: str,
     account: str,
 ) -> tuple[dict[str, Any], dict[str, Any]] | None:
     account_key = account.lower()
-    candidates: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
+    candidates: list[tuple[int, int, dict[str, Any], dict[str, Any]]] = []
     for candidate_row in rows:
         if not isinstance(candidate_row, dict) or candidate_row.get("type") != "grid":
             continue
@@ -1796,10 +1806,13 @@ def oldest_active_non_reduce_only_grid_entry(
                 oid = int(entry["oid"])
             except (KeyError, TypeError, ValueError):
                 continue
-            candidates.append((oid, candidate_row, entry))
+            timestamp = grid_entry_timestamp_ms(entry)
+            if timestamp is None:
+                continue
+            candidates.append((timestamp, oid, candidate_row, entry))
     if not candidates:
         return None
-    _oid, candidate_row, entry = min(candidates, key=lambda item: item[0])
+    _timestamp, _oid, candidate_row, entry = min(candidates, key=lambda item: (item[0], item[1]))
     return candidate_row, entry
 
 
