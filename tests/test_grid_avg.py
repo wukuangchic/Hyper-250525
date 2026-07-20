@@ -2760,6 +2760,40 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(reduce_risk_topup["price"], "111.1")
         self.assertEqual(reduce_risk_topup["plan"]["grid_gap"], Decimal("0.01"))
 
+    def test_far_topup_skips_when_avg_gap_would_make_buy_price_nonpositive(self) -> None:
+        row = {
+            "gap_rate": "0.0002",
+            "min_order_value": "20",
+            "sz_decimals": 2,
+            "base_buy_size": "0.13",
+            "topup_buy_size": "0.13",
+            "topup_buy_gap": "200000",
+            "levels": [
+                {
+                    "side": "buy",
+                    "status": "active",
+                    "oid": 1,
+                    "is_buy": True,
+                    "price": "161.96",
+                    "size": "0.13",
+                }
+            ],
+        }
+
+        self.assertIsNone(
+            next_depth_order(
+                row,
+                "xyz:JPY",
+                {"szDecimals": 2},
+                "buy",
+                Decimal("162.47"),
+                Decimal("-0.01"),
+                Decimal("1.63"),
+                Decimal("50"),
+                "limit",
+            )
+        )
+
     def test_risk_density_pauses_logarithmically_across_add_risk_orders(self) -> None:
         row = {
             "gap_rate": "0.01",
@@ -4714,6 +4748,13 @@ class GridAvgTests(unittest.TestCase):
         self.assertTrue(
             grid_row_recoverable_from_error(
                 {"type": "grid", "status": "error", "coin": "xyz:SPCX", "error": error}
+            )
+        )
+
+    def test_nonpositive_dynamic_grid_price_is_recoverable(self) -> None:
+        self.assertTrue(
+            grid_row_recoverable_from_error(
+                {"type": "grid", "status": "error", "coin": "xyz:JPY", "error": "price must be positive"}
             )
         )
 

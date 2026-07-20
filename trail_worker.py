@@ -510,6 +510,11 @@ def is_isolated_opening_leverage_error_text(text: str) -> bool:
     )
 
 
+def is_grid_nonpositive_price_error_text(text: str) -> bool:
+    """Return whether a dynamic grid gap temporarily produced no valid price."""
+    return "price must be positive" in text.lower()
+
+
 def grid_row_recoverable_from_error(row: dict[str, Any]) -> bool:
     if row.get("type") != "grid":
         return False
@@ -532,6 +537,7 @@ def grid_row_recoverable_from_error(row: dict[str, Any]) -> bool:
         or is_insufficient_margin_text(error_text)
         or is_cancel_terminal_race_text(error_text)
         or is_isolated_opening_leverage_error_text(error_text)
+        or is_grid_nonpositive_price_error_text(error_text)
         or (
             "unknown perp coin" in error_text.lower()
             and batch_row_raw_coin(row) != str(row.get("raw_coin") or row.get("coin") or "")
@@ -2962,7 +2968,10 @@ def next_depth_order(
     if next_px is None:
         base_px = farthest_active_price(row, side, reference_px or current_mid)
         multiplier = Decimal("1") - gap if is_buy else Decimal("1") + gap
-        next_px = rounded_perp_price(base_px * multiplier, sz_decimals)
+        raw_next_px = base_px * multiplier
+        if raw_next_px <= 0:
+            return None
+        next_px = rounded_perp_price(raw_next_px, sz_decimals)
     if next_px <= 0 or grid_price_would_cross_market(side, next_px, current_mid, best_bid, best_ask):
         return None
     reduce_only = grid_order_should_reduce_only(position_size, is_buy, policy)
