@@ -80,6 +80,7 @@ GRID_PANIC_RATIO_THRESHOLD = Decimal("100")
 GRID_PANIC_REVERSAL_GAP_MULTIPLIER = Decimal("2")
 GRID_PANIC_REVERSAL_ACTION_LIMIT_WAIT_SECONDS = 10
 GRID_PANIC_REDUCE_MIN_NOTIONAL = MIN_NOTIONAL * Decimal("1.10")
+GRID_LIMIT_CHASE_MIN_NOTIONAL_MULTIPLIER = Decimal("1.10")
 GRID_PENDING_CANCEL_STATUS = "pending_cancel"
 GRID_PENDING_CANCEL_MIN_RATE_PERCENT = Decimal("1")
 GRID_PENDING_CANCEL_SPECIAL_RATE = Decimal("0.20")
@@ -2072,6 +2073,11 @@ def build_grid_limit_chase_market_order(
     size = (size / step).to_integral_value(rounding=ROUND_FLOOR) * step
     if size <= 0:
         return None
+    row_min_notional = decimal_or_none(row.get("min_order_value")) or MIN_NOTIONAL
+    min_notional = max(MIN_NOTIONAL, row_min_notional) * GRID_LIMIT_CHASE_MIN_NOTIONAL_MULTIPLIER
+    size = grid_size_for_min_notional(size, current_mid, sz_decimals, min_notional)
+    if size * current_mid < min_notional:
+        return None
     slippage = Decimal(str(row.get("slippage") or DEFAULT_SLIPPAGE))
     limit_px = Decimal(str(exchange._slippage_price(coin, is_buy, float(slippage), float(current_mid))))
     limit_px = rounded_perp_price(limit_px, sz_decimals)
@@ -2099,6 +2105,8 @@ def build_grid_limit_chase_market_order(
             "target_notional": notional,
             "worst_notional": notional,
             "reference_price": current_mid,
+            "reference_notional": size * current_mid,
+            "min_notional_buffer": min_notional,
             "price_source": f"mid with {slippage} slippage protection",
         },
     }

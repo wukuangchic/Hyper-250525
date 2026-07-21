@@ -1523,6 +1523,40 @@ class GridAvgTests(unittest.TestCase):
         self.assertTrue(replacement["limit_chase_replacement"])
         self.assertEqual(replacement["plan"]["order_type"], {"limit": {"tif": "Gtc"}})
 
+    def test_limit_chase_market_size_uses_buffered_min_notional_at_current_mid(self) -> None:
+        class FakeExchange:
+            def _slippage_price(self, coin, is_buy, slippage, reference_price):
+                return Decimal("172.48")
+
+        row = {
+            "gap_rate": "0.01",
+            "base_buy_size": "0.06",
+            "base_sell_size": "0.06",
+            "sz_decimals": 2,
+            "min_order_value": "10",
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+
+        market = build_grid_limit_chase_market_order(
+            FakeExchange(), row, "xyz:SKHY", asset, Decimal("164.27"), True
+        )
+        replacement = limit_chase_replacement_order_from_market(
+            row,
+            "xyz:SKHY",
+            asset,
+            Decimal("164.27"),
+            True,
+            Decimal(str(market["size"])),
+        )
+
+        self.assertIsNotNone(market)
+        self.assertEqual(market["size"], "0.07")
+        self.assertGreaterEqual(market["plan"]["reference_notional"], Decimal("11"))
+        self.assertEqual(market["plan"]["min_notional_buffer"], Decimal("11.00"))
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement["size"], "0.07")
+
+
     def test_panic_reduce_order_uses_min_notional_buffer(self) -> None:
         class FakeExchange:
             def _slippage_price(self, coin, is_buy, slippage, reference_price):
