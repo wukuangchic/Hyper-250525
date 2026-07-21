@@ -47,6 +47,7 @@ from trail_worker import (
     claim_withdrawable_pause_entry,
     batch_row_raw_coin,
     build_grid_panic_reduce_order,
+    build_grid_limit_chase_market_order,
     cancel_grid_entries_with_p1_budget,
     cancel_grid_entries,
     clear_stale_grid_margin_pauses,
@@ -64,6 +65,7 @@ from trail_worker import (
     grid_active_cap_pause_candidates,
     replacement_active_cap_submit_allowed,
     grid_margin_gap_multiplier,
+    grid_limit_chase_direction,
     grid_margin_pause_active,
     grid_bypassed_replacement_margin_pause_candidates,
     grid_missing_recovery_allowed,
@@ -98,6 +100,7 @@ from trail_worker import (
     oldest_active_non_reduce_only_grid_entry,
     normalize_margin_paused_replacement,
     panic_reversal_order_from_reduce,
+    limit_chase_replacement_order_from_market,
     pause_refresh_reduce_only_replacement,
     pause_reduce_only_canceled_entry,
     pause_refreshed_reduce_only_entries,
@@ -120,6 +123,7 @@ from trail_worker import (
     replacement_order_from_fill,
     restore_pending_cancel_entries,
     run_once,
+    run_grid_limit_chase_p3,
     skip_stale_grid_recovery,
     skip_unknown_oid_grid_recovery,
     submit_grid_panic_pair,
@@ -184,6 +188,25 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(account_withdrawable_pause_phase(Decimal("9.99")), GRID_ACTION_PHASE_P2)
         self.assertIsNone(account_withdrawable_pause_phase(Decimal("10")))
         self.assertIsNone(account_withdrawable_pause_phase(None))
+
+    def test_limit_chase_direction_uses_signed_limit_bounds_without_reduce_only_assumptions(self) -> None:
+        row = {
+            "position_limit_mode": "limit",
+            "min_position_value": "100",
+            "max_position_value": "500",
+        }
+
+        self.assertTrue(grid_limit_chase_direction(row, Decimal("1"), Decimal("50")))
+        self.assertFalse(grid_limit_chase_direction(row, Decimal("1"), Decimal("550")))
+        self.assertIsNone(grid_limit_chase_direction(row, Decimal("1"), Decimal("100")))
+        self.assertIsNone(grid_limit_chase_direction(row, Decimal("1"), Decimal("500")))
+        self.assertIsNone(
+            grid_limit_chase_direction(
+                {**row, "position_limit_mode": "abs"},
+                Decimal("1"),
+                Decimal("550"),
+            )
+        )
 
     def test_withdrawable_pause_selects_oldest_active_non_reduce_only_order_across_account(self) -> None:
         account = "0xAbC"
@@ -509,9 +532,14 @@ class GridAvgTests(unittest.TestCase):
             calls.append((row["coin"], cache.get("grid_action_phase")))
             return row, False
 
+        def fake_limit_chase_p3(cache: dict) -> bool:
+            calls.append(("P3", cache.get("grid_action_phase")))
+            return False
+
         with (
             patch("trail_worker.load_server_batch", return_value=rows),
             patch("trail_worker.maintain_grid", side_effect=fake_maintain_grid),
+            patch("trail_worker.run_grid_limit_chase_p3", side_effect=fake_limit_chase_p3),
             patch("trail_worker.random.shuffle", side_effect=lambda indexes: indexes.reverse()),
             patch("trail_worker.prune_done_rows", return_value=(rows, False)),
             patch("trail_worker.prune_grid_level_history", return_value=False),
@@ -538,6 +566,7 @@ class GridAvgTests(unittest.TestCase):
                 ("BTC", "p1_withdrawable"),
                 ("ETH", "p2"),
                 ("BTC", "p2"),
+                ("P3", None),
             ],
         )
         save_server_batch.assert_not_called()
@@ -578,6 +607,145 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(seen[0], (None, None, None))
         self.assertEqual(seen[1], ({"stale": True}, {"shared": True}, 3))
         self.assertEqual(info.clear_calls, 8)
+
+    def test_limit_chase_p3_requeries_and_submits_one_market_then_permanent_replacement(self) -> None:
+        class FakeInfo:
+            def all_mids(self, dex):
+                return {"BTC": "100"}
+
+            def user_state(self, account, dex=""):
+                return {
+                    "assetPositions": [
+                        {"position": {"coin": "BTC", "szi": "2", "positionValue": "200"}}
+                    ]
+                }
+
+            def spot_user_state(self, account):
+                return {
+                    "balances": [
+                        {"token": 0, "coin": "USDC", "total": "30", "hold": "5"}
+                    ]
+                }
+
+        class FakeExchange:
+            def __init__(self):
+                self.orders = []
+
+            def _slippage_price(self, coin, is_buy, slippage, reference_price):
+                return Decimal(str(reference_price)) * (Decimal("1.001") if is_buy else Decimal("0.999"))
+
+            def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
+                self.orders.append((coin, is_buy, size, limit_px, order_type, reduce_only))
+                if len(self.orders) == 1:
+                    return {
+                        "status": "ok",
+                        "response": {"data": {"statuses": [{"filled": {"oid": 11, "totalSz": "0.3"}}]}},
+                    }
+                return {
+                    "status": "ok",
+                    "response": {"data": {"statuses": [{"resting": {"oid": 12}}]}},
+                }
+
+        row = {
+            "type": "grid",
+            "status": "active",
+            "network": "mainnet",
+            "account": "0xabc",
+            "coin": "BTC",
+            "dex": "",
+            "position_limit_mode": "limit",
+            "min_position_value": "-100",
+            "max_position_value": "150",
+            "gap_rate": "0.01",
+            "base_buy_size": "0.3",
+            "base_sell_size": "0.3",
+            "min_order_value": "10",
+            "sz_decimals": 2,
+            "levels": [],
+        }
+        info = FakeInfo()
+        exchange = FakeExchange()
+        cache = {
+            "now": 123,
+            "action_limit_headroom": 200,
+            "clients": {("mainnet", 20.0, ""): (info, exchange, "0xabc", None, None)},
+            "limit_chase_candidates": [
+                {"row": row, "startup_position_value": "180", "startup_is_buy": False}
+            ],
+        }
+
+        with (
+            patch("trail_worker.clear_info_cache"),
+            patch("trail_worker.resolve_perp_asset", return_value=("BTC", {"szDecimals": 2, "maxLeverage": 20})),
+        ):
+            self.assertTrue(run_grid_limit_chase_p3(cache))
+
+        self.assertEqual(len(exchange.orders), 2)
+        self.assertEqual(exchange.orders[0][1], False)
+        self.assertEqual(exchange.orders[0][4], {"limit": {"tif": "Ioc"}})
+        self.assertFalse(exchange.orders[0][5])
+        self.assertEqual(exchange.orders[1][1], True)
+        self.assertEqual(exchange.orders[1][3], 98.0)
+        self.assertEqual(exchange.orders[1][4], {"limit": {"tif": "Gtc"}})
+        self.assertFalse(exchange.orders[1][5])
+        replacement = row["levels"][0]
+        self.assertEqual(replacement["oid"], 12)
+        self.assertTrue(replacement["replace_never_cancel"])
+        self.assertEqual(row["limit_chase_withdrawable"], "25")
+        self.assertEqual(row["limit_chase_status"], "submitted")
+
+    def test_limit_chase_p3_requires_withdrawable_strictly_above_ten(self) -> None:
+        class FakeInfo:
+            def all_mids(self, dex):
+                return {"BTC": "100"}
+
+            def user_state(self, account, dex=""):
+                return {
+                    "assetPositions": [
+                        {"position": {"coin": "BTC", "szi": "2", "positionValue": "200"}}
+                    ]
+                }
+
+            def spot_user_state(self, account):
+                return {
+                    "balances": [
+                        {"token": 0, "coin": "USDC", "total": "20", "hold": "10"}
+                    ]
+                }
+
+        class FakeExchange:
+            def order(self, *args, **kwargs):
+                raise AssertionError("P3 must not submit when withdrawable equals 10")
+
+        row = {
+            "type": "grid",
+            "status": "active",
+            "network": "mainnet",
+            "account": "0xabc",
+            "coin": "BTC",
+            "position_limit_mode": "limit",
+            "min_position_value": "-100",
+            "max_position_value": "150",
+            "gap_rate": "0.01",
+            "base_buy_size": "0.3",
+            "base_sell_size": "0.3",
+            "levels": [],
+        }
+        cache = {
+            "now": 123,
+            "action_limit_headroom": 200,
+            "clients": {("mainnet", 20.0, ""): (FakeInfo(), FakeExchange(), "0xabc", None, None)},
+            "limit_chase_candidates": [{"row": row, "startup_position_value": "180"}],
+        }
+
+        with (
+            patch("trail_worker.clear_info_cache"),
+            patch("trail_worker.resolve_perp_asset", return_value=("BTC", {"szDecimals": 2, "maxLeverage": 20})),
+        ):
+            self.assertTrue(run_grid_limit_chase_p3(cache))
+
+        self.assertEqual(row["limit_chase_status"], "skipped_withdrawable")
+        self.assertEqual(row["levels"], [])
 
     def test_precheck_action_limit_initializes_shared_p1_budget_below_cap_once(self) -> None:
         class FakeInfo:
@@ -1245,6 +1413,42 @@ class GridAvgTests(unittest.TestCase):
         self.assertTrue(order["reduce_only"])
         self.assertEqual(order["plan"]["order_type"], {"limit": {"tif": "Ioc"}})
         self.assertTrue(order["plan"]["reduce_only"])
+
+    def test_limit_chase_market_and_replacement_use_base_size_normal_orders_and_two_gaps(self) -> None:
+        class FakeExchange:
+            def _slippage_price(self, coin, is_buy, slippage, reference_price):
+                return Decimal(str(reference_price)) * (Decimal("1.001") if is_buy else Decimal("0.999"))
+
+        row = {
+            "gap_rate": "0.01",
+            "base_buy_size": "0.20",
+            "base_sell_size": "0.30",
+            "slippage": "0.001",
+            "sz_decimals": 2,
+            "min_order_value": "10",
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+
+        market = build_grid_limit_chase_market_order(
+            FakeExchange(), row, "HYPE", asset, Decimal("100"), False
+        )
+        replacement = limit_chase_replacement_order_from_market(
+            row, "HYPE", asset, Decimal("100"), False, Decimal("0.30")
+        )
+
+        self.assertIsNotNone(market)
+        self.assertEqual(market["side"], "sell")
+        self.assertEqual(market["size"], "0.3")
+        self.assertFalse(market["reduce_only"])
+        self.assertEqual(market["plan"]["order_type"], {"limit": {"tif": "Ioc"}})
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement["side"], "buy")
+        self.assertEqual(replacement["price"], "98")
+        self.assertEqual(replacement["size"], "0.3")
+        self.assertFalse(replacement["reduce_only"])
+        self.assertTrue(replacement["replace_never_cancel"])
+        self.assertTrue(replacement["limit_chase_replacement"])
+        self.assertEqual(replacement["plan"]["order_type"], {"limit": {"tif": "Gtc"}})
 
     def test_panic_reduce_order_uses_min_notional_buffer(self) -> None:
         class FakeExchange:

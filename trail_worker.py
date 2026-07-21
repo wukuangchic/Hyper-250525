@@ -88,6 +88,7 @@ GRID_ROE_STOP_THRESHOLD = Decimal("-0.40")
 GRID_SURVIVAL_ACTIVE_ORDERS_PER_SIDE = 1
 GRID_WITHDRAWABLE_REDUCE_ONLY_THRESHOLD = Decimal("5")
 GRID_WITHDRAWABLE_PAUSE_THRESHOLD = Decimal("10")
+GRID_LIMIT_CHASE_WITHDRAWABLE_THRESHOLD = Decimal("10")
 GRID_PANIC_RATIO_LEGACY_DEFAULT_THRESHOLDS = {
     Decimal("10"),
     Decimal("20"),
@@ -705,6 +706,51 @@ def account_withdrawable_pause_phase(withdrawable: Decimal | None) -> str | None
     if withdrawable < GRID_WITHDRAWABLE_REDUCE_ONLY_THRESHOLD:
         return GRID_ACTION_PHASE_P1_WITHDRAWABLE
     return GRID_ACTION_PHASE_P2
+
+
+def grid_limit_chase_direction(
+    row: dict[str, Any],
+    position_size: Decimal,
+    position_value: Decimal,
+) -> bool | None:
+    """Return the market-chase direction for a signed --limit breach."""
+    if grid_limit_policy_from_row(row) != "limit":
+        return None
+    minimum = Decimal(str(row.get("min_position_value") or "0"))
+    maximum = Decimal(str(row.get("max_position_value") or "0"))
+    lower_bound, upper_bound = grid_position_bounds("limit", minimum, maximum)
+    signed_value = signed_position_value(position_size, position_value)
+    if signed_value < lower_bound:
+        return True
+    if signed_value > upper_bound:
+        return False
+    return None
+
+
+def record_grid_limit_chase_candidate(
+    cache: dict[str, Any],
+    row: dict[str, Any],
+    position_size: Decimal,
+    position_value: Decimal,
+) -> None:
+    is_buy = grid_limit_chase_direction(row, position_size, position_value)
+    if is_buy is None:
+        return
+    seen = cache.setdefault("limit_chase_candidate_ids", set())
+    row_id = id(row)
+    if row_id in seen:
+        return
+    seen.add(row_id)
+    cache.setdefault("limit_chase_candidates", []).append(
+        {
+            "row": row,
+            "startup_is_buy": is_buy,
+            "startup_position_size": decimal_to_plain(position_size),
+            "startup_position_value": decimal_to_plain(
+                signed_position_value(position_size, position_value)
+            ),
+        }
+    )
 
 
 def grid_reduce_only_capacity_available(
@@ -1400,6 +1446,9 @@ def bump_grid_order_size_one_step(asset: dict[str, Any], order: dict[str, Any]) 
 
 
 def refresh_grid_order_reduce_only(order: dict[str, Any], position_size: Decimal, policy: str) -> None:
+    if bool(order.get("limit_chase_replacement")):
+        set_grid_order_reduce_only(order, False)
+        return
     reduce_only = grid_order_should_reduce_only(position_size, bool(order.get("is_buy")), policy)
     order["reduce_only"] = reduce_only
     plan = order.get("plan")
@@ -1450,7 +1499,10 @@ def set_grid_order_tif(order: dict[str, Any], tif: str) -> None:
 
 
 def refresh_grid_order_tif(order: dict[str, Any]) -> None:
-    set_grid_order_tif(order, "Gtc" if bool(order.get("panic_reversal_order")) else "Alo")
+    permanent_replacement = bool(order.get("panic_reversal_order")) or bool(
+        order.get("limit_chase_replacement")
+    )
+    set_grid_order_tif(order, "Gtc" if permanent_replacement else "Alo")
 
 
 def set_grid_order_size_exact(order: dict[str, Any], size: Decimal) -> None:
@@ -1823,6 +1875,98 @@ def panic_reversal_order_from_reduce(
     if isinstance(plan, dict):
         plan["label"] = "grid-panic-reversal"
         plan["panic_reversal_gap_multiplier"] = GRID_PANIC_REVERSAL_GAP_MULTIPLIER
+        plan["order_type"] = {"limit": {"tif": "Gtc"}}
+    return order
+
+
+def build_grid_limit_chase_market_order(
+    exchange: Any,
+    row: dict[str, Any],
+    coin: str,
+    asset: dict[str, Any],
+    current_mid: Decimal,
+    is_buy: bool,
+) -> dict[str, Any] | None:
+    if current_mid <= 0:
+        return None
+    size_key = "base_buy_size" if is_buy else "base_sell_size"
+    size = decimal_or_none(row.get(size_key))
+    if size is None or size <= 0:
+        return None
+    sz_decimals = int(row.get("sz_decimals") or asset["szDecimals"])
+    step = Decimal(1).scaleb(-sz_decimals)
+    size = (size / step).to_integral_value(rounding=ROUND_FLOOR) * step
+    if size <= 0:
+        return None
+    slippage = Decimal(str(row.get("slippage") or DEFAULT_SLIPPAGE))
+    limit_px = Decimal(str(exchange._slippage_price(coin, is_buy, float(slippage), float(current_mid))))
+    limit_px = rounded_perp_price(limit_px, sz_decimals)
+    if limit_px <= 0:
+        return None
+    notional = size * limit_px
+    return {
+        "side": "buy" if is_buy else "sell",
+        "is_buy": is_buy,
+        "size": decimal_to_plain(size),
+        "price": decimal_to_plain(limit_px),
+        "limit_px": decimal_to_plain(limit_px),
+        "reduce_only": False,
+        "limit_chase_order": True,
+        "plan": {
+            "label": "grid-limit-chase",
+            "coin": coin,
+            "is_buy": is_buy,
+            "size": size,
+            "limit_px": limit_px,
+            "order_type": {"limit": {"tif": "Ioc"}},
+            "reduce_only": False,
+            "mode": "market",
+            "notional": notional,
+            "target_notional": notional,
+            "worst_notional": notional,
+            "reference_price": current_mid,
+            "price_source": f"mid with {slippage} slippage protection",
+        },
+    }
+
+
+def limit_chase_replacement_order_from_market(
+    row: dict[str, Any],
+    coin: str,
+    asset: dict[str, Any],
+    current_mid: Decimal,
+    market_is_buy: bool,
+    size: Decimal,
+) -> dict[str, Any] | None:
+    gap = Decimal(str(row["gap_rate"]))
+    if current_mid <= 0 or gap <= 0 or size <= 0:
+        return None
+    replacement_is_buy = not market_is_buy
+    chase_gap = gap * GRID_PANIC_REVERSAL_GAP_MULTIPLIER
+    multiplier = Decimal("1") - chase_gap if replacement_is_buy else Decimal("1") + chase_gap
+    sz_decimals = int(row.get("sz_decimals") or asset["szDecimals"])
+    replacement_px = rounded_perp_price(current_mid * multiplier, sz_decimals)
+    if replacement_px <= 0:
+        return None
+    order = grid_order_entry(
+        row,
+        coin,
+        asset,
+        replacement_is_buy,
+        replacement_px,
+        False,
+        size=size,
+        gap=gap,
+        preserve_size=True,
+    )
+    order["replacement_order"] = True
+    order["limit_chase_replacement"] = True
+    order["replace_never_cancel"] = True
+    set_grid_order_reduce_only(order, False)
+    plan = order.get("plan")
+    if isinstance(plan, dict):
+        plan["label"] = "grid-limit-chase-replacement"
+        plan["limit_chase_gap_multiplier"] = GRID_PANIC_REVERSAL_GAP_MULTIPLIER
         plan["order_type"] = {"limit": {"tif": "Gtc"}}
     return order
 
@@ -3046,7 +3190,7 @@ def submit_grid_order_entry(
                 order["oid"] = None
                 order["skipped_at"] = now
                 return False
-        else:
+        elif not bool(order.get("limit_chase_replacement")):
             set_grid_order_reduce_only(order, True)
     elif restore_without_reduce_only:
         set_grid_order_reduce_only(order, False)
@@ -3094,7 +3238,7 @@ def submit_grid_order_entry(
         return True
 
     def try_reduce_only_after_margin_reject(error_text: str) -> dict[str, Any] | None:
-        if restore_without_reduce_only:
+        if restore_without_reduce_only or bool(order.get("limit_chase_replacement")):
             return None
         if grid_order_would_add_risk(position_size, bool(order.get("is_buy"))):
             return None
@@ -4278,6 +4422,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             position_value = abs(position_value)
         liquidation_px = decimal_or_none(current_position.get("liquidationPx"))
         position_roe = decimal_or_none(current_position.get("returnOnEquity"))
+    if grid_action_phase == GRID_ACTION_PHASE_P0:
+        record_grid_limit_chase_candidate(cache, row, position_size, position_value)
     position_roe_for_controls = grid_roe_for_position_value(position_value, position_roe)
     previous_avg_state = (
         row.get("topup_buy_size"),
@@ -5820,6 +5966,210 @@ def reconcile_cached_grid_open_orders(
     grid_cache["tracked_grid_open_oids"] = current_tracked_oids
 
 
+def submit_grid_limit_chase_market(
+    exchange: Any,
+    coin: str,
+    order: dict[str, Any],
+    now: int,
+    row: dict[str, Any],
+    cache: dict[str, Any] | None = None,
+) -> bool:
+    plan = order.get("plan")
+    if not isinstance(plan, dict):
+        return False
+    reserve_grid_exchange_actions(cache)
+    result = exchange.order(
+        coin,
+        bool(plan["is_buy"]),
+        float(plan["size"]),
+        float(plan["limit_px"]),
+        plan["order_type"],
+        reduce_only=False,
+    )
+    audit_grid_action(
+        "limit_chase_market_submit",
+        coin=coin,
+        side=order.get("side"),
+        price=order.get("price"),
+        size=order.get("size"),
+        result=result,
+    )
+    if not isinstance(result, dict) or result.get("status") != "ok":
+        row["limit_chase_error"] = str(result)
+        row["limit_chase_error_at"] = now
+        return False
+    statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+    for status in statuses:
+        if not isinstance(status, dict):
+            continue
+        if status.get("error"):
+            row["limit_chase_error"] = str(status["error"])
+            row["limit_chase_error_at"] = now
+            return False
+        filled = status.get("filled")
+        if not isinstance(filled, dict):
+            continue
+        order["oid"] = int(filled.get("oid", 0))
+        order["status"] = "filled"
+        order["filled_at"] = now
+        order["last_submit_status"] = status
+        filled_size = decimal_or_none(filled.get("totalSz", filled.get("sz")))
+        if filled_size is not None and filled_size > 0:
+            order["filled_size"] = decimal_to_plain(filled_size)
+        return True
+    row["limit_chase_error"] = f"limit chase market response did not include a fill: {result}"
+    row["limit_chase_error_at"] = now
+    return False
+
+
+def run_grid_limit_chase_p3(cache: dict[str, Any]) -> bool:
+    candidates = cache.get("limit_chase_candidates")
+    if not isinstance(candidates, list) or not candidates or not noncritical_grid_work_allowed(cache):
+        return False
+    candidate = random.choice(candidates)
+    row = candidate.get("row") if isinstance(candidate, dict) else None
+    if not isinstance(row, dict) or not grid_row_recoverable_from_error(row):
+        return False
+
+    network = str(row.get("network") or "mainnet")
+    timeout = float(row.get("timeout") or 20)
+    raw_coin = batch_row_raw_coin(row)
+    dex = str(row.get("dex") or "")
+    client_key = (network, timeout, dex)
+    client_cache = cache.setdefault("clients", {})
+    if client_key not in client_cache:
+        client_cache[client_key] = build_clients(network, timeout, raw_coin)
+    info, exchange, account, _signer, _role = client_cache[client_key]
+    clear_info_cache(info)
+    coin, asset = resolve_perp_asset(info, raw_coin)
+    mids = info.all_mids(dex)
+    current_mid = Decimal(str(mids[coin]))
+
+    user_state = info.user_state(account, dex=dex)
+    cache.setdefault("user_states", {})[(network, account, dex)] = user_state
+    current_position = find_current_position_from_state(user_state, coin)
+    if current_position is None:
+        position_size = Decimal("0")
+        position_value = Decimal("0")
+    else:
+        position_size = Decimal(str(current_position.get("szi", "0")))
+        position_value = decimal_or_none(current_position.get("positionValue"))
+        if position_value is None:
+            position_value = abs(position_size * current_mid)
+        else:
+            position_value = abs(position_value)
+
+    spot_states = cache.setdefault("spot_user_states", {})
+    spot_states.pop((network, account), None)
+    spot_withdrawable_state = account_spot_withdrawable(info, account, network, cache)
+    withdrawable = spot_withdrawable_state[0] if spot_withdrawable_state is not None else None
+    row["limit_chase_checked_at"] = int(time.time())
+    row["limit_chase_startup_position_value"] = candidate.get("startup_position_value")
+    row["limit_chase_position_value"] = decimal_to_plain(
+        signed_position_value(position_size, position_value)
+    )
+    row["limit_chase_withdrawable"] = decimal_to_plain(withdrawable) if withdrawable is not None else None
+    if withdrawable is None or withdrawable <= GRID_LIMIT_CHASE_WITHDRAWABLE_THRESHOLD:
+        row["limit_chase_status"] = "skipped_withdrawable"
+        return True
+
+    is_buy = grid_limit_chase_direction(row, position_size, position_value)
+    if is_buy is None:
+        row["limit_chase_status"] = "skipped_back_within_limit"
+        return True
+    if not noncritical_grid_work_allowed(cache):
+        row["limit_chase_status"] = "skipped_action_headroom"
+        return True
+
+    market_order = build_grid_limit_chase_market_order(
+        exchange,
+        row,
+        coin,
+        asset,
+        current_mid,
+        is_buy,
+    )
+    if market_order is None:
+        row["limit_chase_status"] = "skipped_invalid_market_order"
+        return True
+
+    isolated_leverage_ready: set[str] = set()
+    if position_size == 0 and asset_requires_isolated_margin(asset):
+        reserve_grid_exchange_actions(cache)
+        leverage, leverage_result = update_isolated_opening_leverage(
+            exchange,
+            int(asset["maxLeverage"]),
+            coin,
+        )
+        if leverage_result.get("status") != "ok":
+            row["limit_chase_status"] = "failed_leverage"
+            row["limit_chase_error"] = (
+                f"Failed to set isolated opening leverage to {leverage}x for {coin}: {leverage_result}"
+            )
+            row["limit_chase_error_at"] = row["limit_chase_checked_at"]
+            return True
+        isolated_leverage_ready.add(coin)
+
+    now = int(row["limit_chase_checked_at"])
+    if not submit_grid_limit_chase_market(exchange, coin, market_order, now, row, cache):
+        row["limit_chase_status"] = "failed_market"
+        return True
+
+    filled_size = decimal_or_none(market_order.get("filled_size")) or decimal_or_none(market_order.get("size"))
+    replacement = limit_chase_replacement_order_from_market(
+        row,
+        coin,
+        asset,
+        current_mid,
+        is_buy,
+        filled_size or Decimal("0"),
+    )
+    if replacement is None:
+        row["limit_chase_status"] = "market_filled_replacement_invalid"
+        return True
+
+    levels = row.setdefault("levels", [])
+    open_orders = cache.setdefault("open_orders", {}).setdefault((network, account, dex), [])
+    try:
+        replacement_submitted = submit_grid_order_entry(
+            exchange,
+            coin,
+            replacement,
+            now,
+            row,
+            asset,
+            position_size,
+            position_value,
+            "limit",
+            False,
+            isolated_leverage_ready,
+            True,
+            margin_blocked_sides=None,
+            open_orders=open_orders,
+            cache=cache,
+            account_margin_hard_stop=False,
+            bypass_margin_controls=True,
+        )
+    except Exception as exc:
+        replacement["last_error"] = str(exc)
+        replacement["limit_chase_replacement_error_at"] = now
+        replacement_submitted = False
+    if not replacement_submitted:
+        preserve_replacement_order(levels, replacement, now, "limit_chase_submit_failed")
+    elif replacement not in levels:
+        levels.append(replacement)
+
+    row["limit_chase_status"] = "submitted" if replacement_submitted else "market_filled_replacement_paused"
+    row["limit_chase_side"] = market_order["side"]
+    row["limit_chase_size"] = market_order["size"]
+    row["limit_chase_price"] = market_order["price"]
+    row["limit_chase_replacement_price"] = replacement["price"]
+    row["limit_chase_at"] = now
+    row["updated_at"] = now
+    row["note"] = f"{row.get('note') or 'grid maintained'}; limit_chase={row['limit_chase_status']}"
+    return True
+
+
 def run_once() -> None:
     rows = load_server_batch()
     rows, cancelled_grids_pruned = prune_cancelled_grid_rows(rows)
@@ -5915,6 +6265,13 @@ def run_once() -> None:
         # fresh, while our in-memory open-order delta stays authoritative for
         # duplicate detection inside this run.
     grid_cache.pop("grid_action_phase", None)
+    try:
+        p3_changed = run_grid_limit_chase_p3(grid_cache)
+        changed = changed or p3_changed
+        if p3_changed:
+            changed = save_worker_progress(rows, changed)
+    except Exception as exc:
+        print(f"trail_worker: grid p3 limit-chase error: {type(exc).__name__}: {exc}")
 
     rows, pruned = prune_done_rows(rows)
     grid_history_pruned = prune_grid_level_history(rows)
