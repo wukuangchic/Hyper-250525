@@ -2525,6 +2525,28 @@ def grid_entry_near_to_far_key(entry: dict[str, Any], side: str) -> Decimal:
     return -price if side == "buy" else price
 
 
+def grid_entries_near_first_per_side(entries: list[Any]) -> list[Any]:
+    """Give each side's nearest order first, then continue near-to-far fairly."""
+    grid_entries = [entry for entry in entries if isinstance(entry, dict)]
+    by_side = {
+        side: sorted(
+            [entry for entry in grid_entries if str(entry.get("side") or "") == side],
+            key=lambda entry: grid_entry_near_to_far_key(entry, side),
+        )
+        for side in ("buy", "sell")
+    }
+    ordered: list[Any] = []
+    index = 0
+    while index < max((len(side_entries) for side_entries in by_side.values()), default=0):
+        for side in ("buy", "sell"):
+            if index < len(by_side[side]):
+                ordered.append(by_side[side][index])
+        index += 1
+    ordered_ids = {id(entry) for entry in ordered}
+    ordered.extend(entry for entry in entries if id(entry) not in ordered_ids)
+    return ordered
+
+
 def grid_level_side_cap_clear_key(entry: dict[str, Any]) -> tuple[int, int, Decimal]:
     status = str(entry.get("status") or "")
     replacement_order = bool(entry.get("replacement_order"))
@@ -2580,12 +2602,16 @@ def clear_grid_side_cap_entries(exchange: Any, coin: str, row: dict[str, Any], n
         if str(entry.get("status") or "") == "active" and entry.get("oid") is not None
     ]
     if active_to_cancel:
-        cancel_grid_entries(exchange, coin, active_to_cancel, now, "cleared_side_cap")
-    clear_ids = {id(entry) for entry in to_clear}
+        cancel_grid_entries(exchange, coin, active_to_cancel, now, "cleared_side_cap", row=row)
+    clear_ids = {
+        id(entry)
+        for entry in to_clear
+        if str(entry.get("status") or "") not in {"active", GRID_PENDING_CANCEL_STATUS}
+    }
     row["levels"] = [entry for entry in levels if id(entry) not in clear_ids]
     row["side_cap_cleared_at"] = now
-    row["side_cap_cleared_count"] = int(row.get("side_cap_cleared_count") or 0) + len(to_clear)
-    return len(to_clear)
+    row["side_cap_cleared_count"] = int(row.get("side_cap_cleared_count") or 0) + len(clear_ids)
+    return len(clear_ids)
 
 
 def logarithmic_keep_indexes(count: int, keep_count: int) -> set[int]:
@@ -2782,7 +2808,7 @@ def grid_bypassed_replacement_margin_pause_candidates(
             if grid_order_would_add_risk(position_size, bool(entry.get("is_buy")))
         ]
         active_add_risk.sort(key=lambda entry: grid_entry_near_to_far_key(entry, side))
-        keep_count = 0 if account_margin_hard_stop else GRID_SURVIVAL_ACTIVE_ORDERS_PER_SIDE
+        keep_count = GRID_SURVIVAL_ACTIVE_ORDERS_PER_SIDE
         keep_ids = {id(entry) for entry in active_add_risk[:keep_count]}
         for entry in active_add_risk:
             bypassed_at = int(entry.get("immediate_control_bypass_at") or 0)
@@ -3364,7 +3390,7 @@ def submit_grid_order_entry(
         return False
     if account_margin_protected and not bypass_margin_controls:
         if grid_order_would_add_risk(position_size, bool(order.get("is_buy"))):
-            if not account_margin_hard_stop and grid_survival_slot_available(row, side):
+            if grid_survival_slot_available(row, side):
                 order["account_margin_survival_slot"] = True
             elif bool(order.get("replacement_order")):
                 order["status"] = "paused_account_margin"
@@ -3898,6 +3924,7 @@ def cancel_unbacked_panic_reversal(
             "cancelled_panic_unbacked",
             cache=cache,
             raise_on_unconfirmed=True,
+            preserve_active_floor=False,
         )
     except (GridActionBudgetUnavailable, RuntimeError) as exc:
         order["status"] = GRID_PENDING_CANCEL_STATUS
@@ -4093,6 +4120,35 @@ def prepare_grid_cancel_entries(
     return immediate, deferred
 
 
+def preserve_grid_active_floor(
+    row: dict[str, Any] | None,
+    entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Never let worker maintenance cancel the last active order on a side."""
+    if row is None:
+        return entries
+    allowed_ids: set[int] = {
+        id(entry)
+        for entry in entries
+        if str(entry.get("side") or "") not in {"buy", "sell"}
+    }
+    for side in ("buy", "sell"):
+        active = active_grid_entries(row, side)
+        candidates = [
+            entry
+            for entry in entries
+            if str(entry.get("side") or "") == side and id(entry) in {id(item) for item in active}
+        ]
+        allowed_count = max(0, len(active) - GRID_SURVIVAL_ACTIVE_ORDERS_PER_SIDE)
+        if len(candidates) <= allowed_count:
+            allowed_ids.update(id(entry) for entry in candidates)
+            continue
+        # When a bulk rule targets the whole side, retain the nearest candidate.
+        candidates.sort(key=lambda entry: grid_entry_near_to_far_key(entry, side))
+        allowed_ids.update(id(entry) for entry in candidates[len(candidates) - allowed_count :])
+    return [entry for entry in entries if id(entry) in allowed_ids]
+
+
 def cancel_grid_entries(
     exchange: Any,
     coin: str,
@@ -4104,8 +4160,11 @@ def cancel_grid_entries(
     cache: dict[str, Any] | None = None,
     raise_on_unconfirmed: bool = False,
     consume_p1_budget: bool = False,
+    preserve_active_floor: bool = True,
 ) -> int:
     entries = [entry for entry in entries if not grid_order_is_never_cancel(entry)]
+    if preserve_active_floor:
+        entries = preserve_grid_active_floor(row, entries)
     entries, deferred = prepare_grid_cancel_entries(row, entries, now, note, current_mid, cache)
     if deferred and isinstance(cache, dict):
         cache["pending_cancel_changed"] = True
@@ -4359,7 +4418,7 @@ def apply_grid_add_risk_brake(
         event["status"] = "skipped_no_active_add_risk_order"
     else:
         try:
-            cancelled = cancel_grid_entries(exchange, coin, [target], now, "brake_near_add_risk")
+            cancelled = cancel_grid_entries(exchange, coin, [target], now, "brake_near_add_risk", row=row)
         except RuntimeError as exc:
             target["brake_cancel_failed_at"] = now
             target["brake_cancel_error"] = str(exc)
@@ -4919,7 +4978,10 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             submissions_by_side[side] = submissions_by_side.get(side, 0) + 1
         return submitted
 
-    for entry in (levels if allow_latest_replacement else []):
+    recovery_scan_entries = grid_entries_near_first_per_side(
+        [entry for entry in levels if isinstance(entry, dict)]
+    )
+    for entry in (recovery_scan_entries if allow_latest_replacement else []):
         if not isinstance(entry, dict) or not entry.get("side"):
             continue
         if str(entry.get("status", "active")) not in {
@@ -5583,7 +5645,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     mark_phase("withdrawable_pause")
 
     restored = 0
-    for entry in (levels if allow_p1_restore else []):
+    for entry in (grid_entries_near_first_per_side(levels) if allow_p1_restore else []):
         if (
             not isinstance(entry, dict)
             or str(entry.get("status")) != GRID_RISK_DENSITY_PAUSE_STATUS
@@ -5592,13 +5654,14 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         ):
             continue
         side = str(entry["side"])
-        if panic_reduced and grid_order_would_add_risk(position_size, side == "buy"):
+        survival_needed = grid_survival_slot_available(row, side)
+        if panic_reduced and grid_order_would_add_risk(position_size, side == "buy") and not survival_needed:
             continue
         if not side_submission_allowed(side):
             continue
         if len(active_grid_oids(row, side)) >= GRID_MAX_ACTIVE_ORDERS_PER_SIDE:
             continue
-        if not grid_risk_density_restore_allowed(
+        if not survival_needed and not grid_risk_density_restore_allowed(
             row,
             entry,
             side,
@@ -5607,7 +5670,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             margin_gap_multiplier,
         ):
             continue
-        if not grid_roe_restore_allowed(
+        if not survival_needed and not grid_roe_restore_allowed(
             row,
             entry,
             side,
@@ -5649,7 +5712,11 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
 
     topped_up = 0
     for side in (("buy", "sell") if allow_p1_topup else ()):
-        if panic_reduced and grid_order_would_add_risk(position_size, side == "buy"):
+        if (
+            panic_reduced
+            and grid_order_would_add_risk(position_size, side == "buy")
+            and not grid_survival_slot_available(row, side)
+        ):
             continue
         if not side_submission_allowed(side):
             continue
@@ -5722,9 +5789,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             changed = True
     mark_phase("topups")
 
-    restore_scan_entries = levels
-    if allow_p1_paused_replacement:
-        restore_scan_entries = paused_replacement_restore_entries_near_first(levels)
+    restore_scan_entries = grid_entries_near_first_per_side(levels)
     for entry in (restore_scan_entries if (allow_p1_restore or allow_p1_paused_replacement) else []):
         if isinstance(entry, dict) and pause_refresh_reduce_only_replacement(entry, now):
             changed = True
@@ -5747,6 +5812,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         if not isinstance(entry, dict) or entry.get("side") is None or str(entry.get("status")) not in GRID_PAUSED_STATUSES:
             continue
         side = str(entry["side"])
+        survival_needed = grid_survival_slot_available(row, side)
         is_replacement_order = bool(entry.get("replacement_order"))
         protected_replacement = grid_order_is_never_cancel(entry)
         if allow_p1_paused_replacement and not is_replacement_order:
@@ -5759,7 +5825,12 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         if normalize_margin_paused_replacement(entry, now):
             status = str(entry.get("status"))
             changed = True
-        if panic_reduced and not is_replacement_order and grid_order_would_add_risk(position_size, side == "buy"):
+        if (
+            panic_reduced
+            and not is_replacement_order
+            and grid_order_would_add_risk(position_size, side == "buy")
+            and not survival_needed
+        ):
             continue
         if not side_submission_allowed(side):
             continue
@@ -5769,7 +5840,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             and not grid_active_cap_restore_allowed(row, entry, side)
         ):
             continue
-        if not protected_replacement and not grid_roe_restore_allowed(
+        if not protected_replacement and not survival_needed and not grid_roe_restore_allowed(
             row,
             entry,
             side,
@@ -5778,7 +5849,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             position_roe_for_controls,
         ):
             continue
-        if not is_replacement_order:
+        if not is_replacement_order and not survival_needed:
             if status == GRID_RISK_DENSITY_PAUSE_STATUS and grid_order_would_add_risk(position_size, bool(entry.get("is_buy"))):
                 if not grid_risk_density_restore_allowed(
                     row,

@@ -225,6 +225,7 @@ BTC grid --limit -300 0
 - grid 子单使用 ALO，目标是只挂 maker 单；网格档位仍按提交限价推进，不因实际成交价更优而漂移。
 - 最新成交反向单的目标价若只被同侧可恢复 `paused_*` 档位挡住，会保留目标价并把这些 paused 标记逐级向外顺推（buy 向低价、sell 向高价），同步更新完整价格计划；若同时有 active、pending、pending_cancel 等真实占位，则不移动 paused。成交反向单如果 ALO 因会立即成交被拒，会先确认同侧前后 `0.95 * gap` 内没有真实占位；若不太近，会先向远离盘口方向移动一个 `gap`，若太近才优先插入外移方向上间距大于 `1.95 * gap` 的相邻两格中间，最多 20 次。其他 grid 子单 ALO 被拒时只跳过本轮，不换价重试。
 - worker 补齐每侧子单时，交易所一旦接受提交，本轮就视为已补一个名额；即使订单随后很快成交，也不会在同一轮为了凑够 16 张活跃单连续追单。
+- Worker 的主动撤单统一保留每侧至少 `1` 张 active 单；当某侧需要从 paused / recovery 状态恢复时，buy 按高价优先、sell 按低价优先，让离当前盘口最近的候选先恢复。唯一安全例外是 panic 成对动作失败后清理没有减仓成交支撑的裸反转单。
 - 每轮每侧最多向交易所提交 1 张普通新 grid 单；成交生成当轮的即时 replacement 可绕过提交前的方向额度检查，但成功后会占用该侧本轮额度，因此同侧常规补档和历史档位恢复留到后续轮次。
 - 遇到地址 action limit 紧张时，worker 会把维护动作分级执行：
   - P0：必要安全动作，不占共享 P1 预算。当前包括 `panic_ratio` 触发的 IOC reduce-only 减仓、`paused_risk_density` 必要撤单、`paused_roe` 必要撤单；panic 后的反向普通挂单也在这段流程内，但仍会经过自身的 ALO、仓位和保证金判断。P0 不会因 headroom 不足而拦截，但每个交易所 action 都会在提交前预扣 headroom，并立即压缩后续 P1/P2 可用量。
@@ -707,7 +708,7 @@ reduce_only=True：只允许减仓 / 平仓，不允许反手
 
 统一账户指标口径：
 
-- 账户安全余量率：`tokenToAvailableAfterMaintenance[USDC] / balances[USDC].total`；低于 `70%` 时，新 grid 子单只允许 reduce-only 减仓。
+- 账户安全余量率：`tokenToAvailableAfterMaintenance[USDC] / balances[USDC].total`；低于 `70%` 时，Grid 每侧仍保留离市场最近的 `1` 张 active survival 单，其余新增风险子单被拦截，减风险方向使用 reduce-only。
 - `withdrawable(USDC)`：`balances[USDC].total - balances[USDC].hold`，与 Worker 的可提余额保护使用同一口径。
 - 统一账户比率：将各 DEX 的 maintenance margin 按 collateral token 聚合，再除以对应 spot 抵押品余额，取风险最高的一组。
 - 统一账户杠杆：当前总名义仓位 / 活跃抵押品余额。

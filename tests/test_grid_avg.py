@@ -142,6 +142,7 @@ from trail_worker import (
     GRID_ACTION_PHASE_P1_WITHDRAWABLE,
     GRID_ACTION_PHASE_P2,
     grid_entries_fit_within_max,
+    grid_entries_near_first_per_side,
     grid_entry_timestamp_ms,
 )
 
@@ -2564,6 +2565,7 @@ class GridAvgTests(unittest.TestCase):
         row = {
             "levels": [
                 {"side": "buy", "status": "active", "oid": 1, "price": "99", "size": "1", "is_buy": True},
+                {"side": "buy", "status": "active", "oid": 2, "price": "98", "size": "1", "is_buy": True},
                 {"side": "buy", "status": "filled", "oid": 10, "is_buy": True, "fill": {"time": 1000, "dir": "Open Long", "oid": 10}},
                 {"side": "buy", "status": "filled", "oid": 11, "is_buy": True, "fill": {"time": 2000, "dir": "Open Long", "oid": 11}},
             ]
@@ -3045,7 +3047,7 @@ class GridAvgTests(unittest.TestCase):
             grid_bypassed_replacement_margin_pause_candidates(
                 row, Decimal("1"), True, True, 9
             ),
-            [bypassed],
+            [],
         )
 
     def test_margin_gap_multiplier_only_widens_add_risk_far_topup(self) -> None:
@@ -4027,7 +4029,9 @@ class GridAvgTests(unittest.TestCase):
             "min_order_value": "10",
             "base_buy_size": "1",
             "base_sell_size": "1",
-            "levels": [],
+            "levels": [
+                {"side": "buy", "is_buy": True, "status": "active", "oid": 1, "price": "99", "size": "1"}
+            ],
         }
         asset = {"szDecimals": 2, "maxLeverage": 20}
         order = grid_order_entry(row, "BTC", asset, True, Decimal("100"), False)
@@ -4069,7 +4073,9 @@ class GridAvgTests(unittest.TestCase):
             "min_order_value": "10",
             "base_buy_size": "1",
             "base_sell_size": "1",
-            "levels": [],
+            "levels": [
+                {"side": "buy", "is_buy": True, "status": "active", "oid": 1, "price": "99", "size": "1"}
+            ],
         }
         asset = {"szDecimals": 2, "maxLeverage": 20}
         order = grid_order_entry(row, "BTC", asset, True, Decimal("100"), False)
@@ -4095,7 +4101,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(order["skipped_at"], 7)
         self.assertNotIn("paused_at", order)
 
-    def test_soft_account_margin_protection_allows_one_survival_order(self) -> None:
+    def test_hard_account_margin_protection_allows_one_survival_order(self) -> None:
         class FakeExchange:
             def __init__(self) -> None:
                 self.orders = []
@@ -4127,13 +4133,48 @@ class GridAvgTests(unittest.TestCase):
             "abs",
             True,
             set(),
-            account_margin_hard_stop=False,
+            account_margin_hard_stop=True,
         )
 
         self.assertTrue(submitted)
         self.assertTrue(order["account_margin_survival_slot"])
         self.assertEqual(order["status"], "active")
         self.assertEqual(len(exchange.orders), 1)
+
+    def test_cancel_grid_entries_keeps_last_active_order_per_side(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.cancelled = []
+
+            def bulk_cancel(self, requests):
+                self.cancelled.extend(requests)
+                return {"status": "ok", "response": {"data": {"statuses": ["success"] * len(requests)}}}
+
+        buy = {"side": "buy", "status": "active", "oid": 1, "price": "99", "size": "1"}
+        sell = {"side": "sell", "status": "active", "oid": 2, "price": "101", "size": "1"}
+        row = {"levels": [buy, sell]}
+        exchange = FakeExchange()
+
+        cancelled = cancel_grid_entries(exchange, "BTC", [buy, sell], 7, "paused_test", row=row)
+
+        self.assertEqual(cancelled, 0)
+        self.assertEqual(exchange.cancelled, [])
+        self.assertEqual([buy["status"], sell["status"]], ["active", "active"])
+
+    def test_recovery_scan_orders_each_side_nearest_first(self) -> None:
+        entries = [
+            {"side": "buy", "price": "90"},
+            {"side": "sell", "price": "120"},
+            {"side": "buy", "price": "99"},
+            {"side": "sell", "price": "101"},
+        ]
+
+        ordered = grid_entries_near_first_per_side(entries)
+
+        self.assertEqual(
+            [(entry["side"], entry["price"]) for entry in ordered],
+            [("buy", "99"), ("sell", "101"), ("buy", "90"), ("sell", "120")],
+        )
 
     def test_immediate_replacement_bypasses_margin_prechecks(self) -> None:
         class FakeExchange:
