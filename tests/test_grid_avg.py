@@ -709,7 +709,13 @@ class GridAvgTests(unittest.TestCase):
                 if len(self.orders) == 1:
                     return {
                         "status": "ok",
-                        "response": {"data": {"statuses": [{"filled": {"oid": 11, "totalSz": "0.3"}}]}},
+                        "response": {
+                            "data": {
+                                "statuses": [
+                                    {"filled": {"oid": 11, "totalSz": "0.3", "avgPx": "101"}}
+                                ]
+                            }
+                        },
                     }
                 return {
                     "status": "ok",
@@ -759,7 +765,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(exchange.orders[0][4], {"limit": {"tif": "Ioc"}})
         self.assertFalse(exchange.orders[0][5])
         self.assertEqual(exchange.orders[1][1], True)
-        self.assertEqual(exchange.orders[1][3], 98.0)
+        self.assertEqual(exchange.orders[1][3], 98.98)
         self.assertEqual(exchange.orders[1][4], {"limit": {"tif": "Gtc"}})
         self.assertFalse(exchange.orders[1][5])
         replacement = row["levels"][0]
@@ -767,6 +773,8 @@ class GridAvgTests(unittest.TestCase):
         self.assertTrue(replacement["replace_never_cancel"])
         self.assertEqual(row["limit_chase_withdrawable"], "25")
         self.assertEqual(row["limit_chase_status"], "submitted")
+        self.assertEqual(row["limit_chase_fill_price"], "101")
+        self.assertEqual(row["limit_chase_replacement_anchor_source"], "market_fill")
         self.assertNotIn("limit_chase_error", row)
         self.assertNotIn("limit_chase_error_at", row)
 
@@ -1527,6 +1535,29 @@ class GridAvgTests(unittest.TestCase):
         self.assertTrue(replacement["limit_chase_replacement"])
         self.assertEqual(replacement["plan"]["order_type"], {"limit": {"tif": "Gtc"}})
 
+    def test_limit_chase_replacement_uses_spcx_fill_price_and_actual_gap(self) -> None:
+        row = {
+            "gap_rate": "0.0002449353399065905552672548002",
+            "base_buy_size": "0.09",
+            "base_sell_size": "0.09",
+            "min_order_value": "10",
+        }
+
+        replacement = limit_chase_replacement_order_from_market(
+            row,
+            "xyz:SPCX",
+            {"szDecimals": 2, "maxLeverage": 20},
+            Decimal("127.96"),
+            True,
+            Decimal("0.09"),
+        )
+
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement["side"], "sell")
+        self.assertEqual(replacement["price"], "128.02")
+        self.assertEqual(replacement["plan"]["limit_chase_anchor_price"], Decimal("127.96"))
+        self.assertEqual(replacement["plan"]["limit_chase_anchor_source"], "market_fill")
+
     def test_limit_chase_market_size_uses_buffered_min_notional_at_current_mid(self) -> None:
         class FakeExchange:
             def _slippage_price(self, coin, is_buy, slippage, reference_price):
@@ -1816,7 +1847,6 @@ class GridAvgTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.orders = []
                 self.bulk_calls = 0
-                self.modifies = []
 
             def _slippage_price(self, coin, is_buy, slippage, reference_price):
                 side_factor = Decimal("1.001") if is_buy else Decimal("0.999")
@@ -1824,37 +1854,39 @@ class GridAvgTests(unittest.TestCase):
 
             def bulk_orders(self, requests, grouping="na"):
                 self.bulk_calls += 1
-                self.orders.extend(
+                raise AssertionError("panic flow must wait for IOC avgPx before submitting reversal")
+
+            def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
+                self.orders.append(
                     (
-                        request["coin"],
-                        request["is_buy"],
-                        Decimal(str(request["limit_px"])),
-                        request["order_type"],
-                        request["reduce_only"],
-                        Decimal(str(request["sz"])),
+                        coin,
+                        is_buy,
+                        Decimal(str(limit_px)),
+                        order_type,
+                        reduce_only,
+                        Decimal(str(size)),
                     )
-                    for request in requests
                 )
+                if len(self.orders) == 1:
+                    return {
+                        "status": "ok",
+                        "response": {
+                            "data": {
+                                "statuses": [
+                                    {
+                                        "filled": {
+                                            "oid": 10,
+                                            "totalSz": "0.4",
+                                            "avgPx": "101",
+                                        }
+                                    }
+                                ]
+                            }
+                        },
+                    }
                 return {
                     "status": "ok",
-                    "response": {
-                        "data": {
-                            "statuses": [
-                                {"filled": {"oid": 10, "totalSz": "0.4"}},
-                                {"resting": {"oid": 11}},
-                            ]
-                        }
-                    },
-                }
-
-            def order(self, *args, **kwargs):
-                raise AssertionError("panic pair must use one bulk request")
-
-            def modify_order(self, oid, coin, is_buy, size, limit_px, order_type, reduce_only=False):
-                self.modifies.append((oid, coin, is_buy, Decimal(str(size)), order_type, reduce_only))
-                return {
-                    "status": "ok",
-                    "response": {"data": {"statuses": [{"resting": {"oid": 12}}]}},
+                    "response": {"data": {"statuses": [{"resting": {"oid": 11}}]}},
                 }
 
         info = FakeInfo()
@@ -1879,23 +1911,26 @@ class GridAvgTests(unittest.TestCase):
             updated, changed = maintain_grid(row, cache)
 
         self.assertTrue(changed)
-        self.assertEqual(exchange.bulk_calls, 1)
+        self.assertEqual(exchange.bulk_calls, 0)
         self.assertEqual(len(exchange.orders), 2)
         self.assertEqual(exchange.orders[0][1], True)
         self.assertTrue(exchange.orders[0][4])
         self.assertEqual(exchange.orders[1][1], False)
         self.assertFalse(exchange.orders[1][4])
         self.assertEqual(exchange.orders[1][3], {"limit": {"tif": "Gtc"}})
-        self.assertEqual(exchange.orders[1][2], Decimal("102"))
-        self.assertEqual(exchange.orders[1][5], Decimal("1"))
-        self.assertEqual(exchange.modifies, [(11, "BTC", False, Decimal("0.4"), {"limit": {"tif": "Gtc"}}, False)])
+        self.assertEqual(exchange.orders[1][2], Decimal("103.02"))
+        self.assertEqual(exchange.orders[1][5], Decimal("0.4"))
         reversal = next(entry for entry in updated["levels"] if entry.get("panic_reversal_order"))
         self.assertEqual(reversal["status"], "active")
-        self.assertEqual(reversal["oid"], 12)
+        self.assertEqual(reversal["oid"], 11)
         self.assertEqual(reversal["size"], "0.4")
         self.assertTrue(reversal["replace_never_cancel"])
+        self.assertEqual(reversal["plan"]["panic_reversal_anchor_price"], Decimal("101"))
+        self.assertEqual(reversal["plan"]["panic_reversal_anchor_source"], "market_fill")
+        self.assertEqual(updated["panic_reduce_fill_price"], "101")
+        self.assertEqual(updated["panic_reversal_anchor_source"], "market_fill")
         cached_open_orders = cache["open_orders"][("mainnet", "acct", "")]
-        self.assertTrue(any(int(order["oid"]) == 12 for order in cached_open_orders))
+        self.assertTrue(any(int(order["oid"]) == 11 for order in cached_open_orders))
 
     def test_missing_scan_keeps_exchange_open_oid_without_resubmitting(self) -> None:
         entry = {

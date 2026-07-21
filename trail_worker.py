@@ -2013,20 +2013,21 @@ def panic_reversal_order_from_reduce(
     row: dict[str, Any],
     coin: str,
     asset: dict[str, Any],
-    current_mid: Decimal,
+    reduce_fill_price: Decimal,
     reduced_is_buy: bool,
     reduced_size: Decimal,
     position_size: Decimal,
     policy: str,
+    anchor_source: str = "market_fill",
 ) -> dict[str, Any] | None:
     gap = Decimal(str(row["gap_rate"]))
-    if current_mid <= 0 or gap <= 0:
+    if reduce_fill_price <= 0 or gap <= 0:
         return None
     next_is_buy = not reduced_is_buy
     sz_decimals = int(row.get("sz_decimals") or asset["szDecimals"])
     panic_gap = gap * GRID_PANIC_REVERSAL_GAP_MULTIPLIER
     multiplier = Decimal("1") - panic_gap if next_is_buy else Decimal("1") + panic_gap
-    next_px = rounded_perp_price(current_mid * multiplier, sz_decimals)
+    next_px = rounded_perp_price(reduce_fill_price * multiplier, sz_decimals)
     if next_px <= 0:
         return None
     reduce_only = grid_order_should_reduce_only(position_size, next_is_buy, policy)
@@ -2050,6 +2051,8 @@ def panic_reversal_order_from_reduce(
     if isinstance(plan, dict):
         plan["label"] = "grid-panic-reversal"
         plan["panic_reversal_gap_multiplier"] = GRID_PANIC_REVERSAL_GAP_MULTIPLIER
+        plan["panic_reversal_anchor_price"] = reduce_fill_price
+        plan["panic_reversal_anchor_source"] = anchor_source
         plan["order_type"] = {"limit": {"tif": "Gtc"}}
     return order
 
@@ -2116,18 +2119,19 @@ def limit_chase_replacement_order_from_market(
     row: dict[str, Any],
     coin: str,
     asset: dict[str, Any],
-    current_mid: Decimal,
+    market_fill_price: Decimal,
     market_is_buy: bool,
     size: Decimal,
+    anchor_source: str = "market_fill",
 ) -> dict[str, Any] | None:
     gap = Decimal(str(row["gap_rate"]))
-    if current_mid <= 0 or gap <= 0 or size <= 0:
+    if market_fill_price <= 0 or gap <= 0 or size <= 0:
         return None
     replacement_is_buy = not market_is_buy
     chase_gap = gap * GRID_PANIC_REVERSAL_GAP_MULTIPLIER
     multiplier = Decimal("1") - chase_gap if replacement_is_buy else Decimal("1") + chase_gap
     sz_decimals = int(row.get("sz_decimals") or asset["szDecimals"])
-    replacement_px = rounded_perp_price(current_mid * multiplier, sz_decimals)
+    replacement_px = rounded_perp_price(market_fill_price * multiplier, sz_decimals)
     if replacement_px <= 0:
         return None
     order = grid_order_entry(
@@ -2149,6 +2153,8 @@ def limit_chase_replacement_order_from_market(
     if isinstance(plan, dict):
         plan["label"] = "grid-limit-chase-replacement"
         plan["limit_chase_gap_multiplier"] = GRID_PANIC_REVERSAL_GAP_MULTIPLIER
+        plan["limit_chase_anchor_price"] = market_fill_price
+        plan["limit_chase_anchor_source"] = anchor_source
         plan["order_type"] = {"limit": {"tif": "Gtc"}}
     return order
 
@@ -3824,6 +3830,9 @@ def submit_grid_panic_reduce(
             filled_size = decimal_or_none(filled.get("totalSz", filled.get("sz")))
             if filled_size is not None and filled_size > 0:
                 order["filled_size"] = decimal_to_plain(filled_size)
+            filled_avg_px = decimal_or_none(filled.get("avgPx"))
+            if filled_avg_px is not None and filled_avg_px > 0:
+                order["filled_avg_px"] = decimal_to_plain(filled_avg_px)
             return True
         if isinstance(status.get("resting"), dict):
             order["oid"] = int(status["resting"].get("oid", 0))
@@ -5178,31 +5187,12 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         if panic_order is not None:
             panic_order["panic_ratio"] = decimal_to_plain(panic_ratio)
             panic_order["panic_ratio_threshold"] = decimal_to_plain(panic_threshold)
-            panic_reversal = panic_reversal_order_from_reduce(
-                row,
-                coin,
-                asset,
-                current_mid,
-                bool(panic_order.get("is_buy")),
-                Decimal(str(panic_order["size"])),
-                position_size,
-                policy,
-            )
-            pair_submitted = panic_reversal is not None and callable(getattr(exchange, "bulk_orders", None))
+            panic_reversal = None
+            # The reversal price depends on the IOC fill avgPx, so these two
+            # exchange actions must be submitted sequentially.
+            pair_submitted = False
             keep_paired_reversal = False
-            if pair_submitted:
-                submitted, keep_paired_reversal = submit_grid_panic_pair(
-                    exchange,
-                    coin,
-                    panic_order,
-                    panic_reversal,
-                    now,
-                    row,
-                    cache,
-                    current_open_orders,
-                )
-            else:
-                submitted = submit_grid_panic_reduce(exchange, coin, panic_order, now, row, cache)
+            submitted = submit_grid_panic_reduce(exchange, coin, panic_order, now, row, cache)
             if submitted:
                 panic_reduced = 1
                 row["panic_reduce_at"] = now
@@ -5219,15 +5209,23 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                         levels.append(panic_reversal)
                     changed = True
                 else:
+                    panic_filled_avg_px = decimal_or_none(panic_order.get("filled_avg_px"))
+                    panic_reversal_anchor_price = panic_filled_avg_px or current_mid
+                    panic_reversal_anchor_source = (
+                        "market_fill" if panic_filled_avg_px is not None else "mid_fallback"
+                    )
+                    row["panic_reduce_fill_price"] = decimal_to_plain(panic_reversal_anchor_price)
+                    row["panic_reversal_anchor_source"] = panic_reversal_anchor_source
                     panic_reversal = panic_reversal_order_from_reduce(
                         row,
                         coin,
                         asset,
-                        current_mid,
+                        panic_reversal_anchor_price,
                         bool(panic_order.get("is_buy")),
                         Decimal(str(panic_order.get("filled_size") or panic_order["size"])),
                         position_size,
                         policy,
+                        panic_reversal_anchor_source,
                     )
                 if panic_reversal is not None and not pair_submitted:
                     reversal_side = str(panic_reversal.get("side") or "")
@@ -6198,6 +6196,9 @@ def submit_grid_limit_chase_market(
         filled_size = decimal_or_none(filled.get("totalSz", filled.get("sz")))
         if filled_size is not None and filled_size > 0:
             order["filled_size"] = decimal_to_plain(filled_size)
+        filled_avg_px = decimal_or_none(filled.get("avgPx"))
+        if filled_avg_px is not None and filled_avg_px > 0:
+            order["filled_avg_px"] = decimal_to_plain(filled_avg_px)
         row.pop("limit_chase_error", None)
         row.pop("limit_chase_error_at", None)
         return True
@@ -6301,13 +6302,19 @@ def run_grid_limit_chase_p3(cache: dict[str, Any]) -> bool:
         return True
 
     filled_size = decimal_or_none(market_order.get("filled_size")) or decimal_or_none(market_order.get("size"))
+    filled_avg_px = decimal_or_none(market_order.get("filled_avg_px"))
+    replacement_anchor_price = filled_avg_px or current_mid
+    replacement_anchor_source = "market_fill" if filled_avg_px is not None else "mid_fallback"
+    row["limit_chase_fill_price"] = decimal_to_plain(replacement_anchor_price)
+    row["limit_chase_replacement_anchor_source"] = replacement_anchor_source
     replacement = limit_chase_replacement_order_from_market(
         row,
         coin,
         asset,
-        current_mid,
+        replacement_anchor_price,
         is_buy,
         filled_size or Decimal("0"),
+        replacement_anchor_source,
     )
     if replacement is None:
         row["limit_chase_status"] = "market_filled_replacement_invalid"
