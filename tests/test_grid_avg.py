@@ -67,6 +67,7 @@ from trail_worker import (
     grid_margin_pause_active,
     grid_bypassed_replacement_margin_pause_candidates,
     grid_missing_recovery_allowed,
+    grid_near_far_add_risk_allowed,
     grid_near_far_rebalance_pair,
     grid_order_status_is_cancelled,
     find_current_position_from_state,
@@ -3257,6 +3258,15 @@ class GridAvgTests(unittest.TestCase):
         row["levels"][0]["status"] = "paused_action_limit"
         row["levels"][0]["oid"] = None
         self.assertTrue(grid_risk_density_restore_allowed(row, paused, "buy", Decimal("1"), 16, Decimal("1")))
+
+    def test_near_far_swap_can_improve_spacing_above_risk_density_cap(self) -> None:
+        self.assertTrue(grid_near_far_add_risk_allowed(16, 16, 12))
+        self.assertTrue(grid_near_far_add_risk_allowed(16, 15, 12))
+
+    def test_near_far_swap_cannot_increase_add_risk_above_density_cap(self) -> None:
+        self.assertFalse(grid_near_far_add_risk_allowed(16, 17, 12))
+        self.assertFalse(grid_near_far_add_risk_allowed(12, 13, 12))
+        self.assertTrue(grid_near_far_add_risk_allowed(11, 12, 12))
 
     def test_prune_keeps_regular_near_far_restore_target(self) -> None:
         target = {

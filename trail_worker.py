@@ -2310,6 +2310,15 @@ def grid_risk_density_allowed(target_per_side: int, multiplier: Decimal) -> int:
     return max(1, min(target_per_side, allowed))
 
 
+def grid_near_far_add_risk_allowed(
+    current_add_risk: int,
+    prospective_add_risk: int,
+    allowed_add_risk: int,
+) -> bool:
+    """Allow P2 near/far swaps that do not increase existing add-risk density."""
+    return prospective_add_risk <= allowed_add_risk or prospective_add_risk <= current_add_risk
+
+
 def grid_target_orders_per_side(row: dict[str, Any]) -> int:
     saved_target = int(row.get("target_orders_per_side") or GRID_TARGET_ORDERS_PER_SIDE)
     if saved_target in {5, 10}:
@@ -5153,6 +5162,11 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             prospective_active = [
                 entry for entry in active_grid_entries(row, side) if id(entry) != id(pause_entry)
             ] + [restore_entry]
+            current_add_risk = sum(
+                1
+                for entry in active_grid_entries(row, side)
+                if grid_order_would_add_risk(position_size, bool(entry.get("is_buy")))
+            )
             prospective_add_risk = sum(
                 1
                 for entry in prospective_active
@@ -5165,7 +5179,11 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 ),
                 grid_roe_add_risk_allowed(target_per_side, position_roe_for_controls),
             )
-            if prospective_add_risk > prospective_add_risk_allowed:
+            if not grid_near_far_add_risk_allowed(
+                current_add_risk,
+                prospective_add_risk,
+                prospective_add_risk_allowed,
+            ):
                 continue
             pause_status = (
                 GRID_REPLACEMENT_PAUSE_STATUS
