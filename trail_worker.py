@@ -19,7 +19,6 @@ ensure_local_venv(__file__)
 
 from hl_order import (  # noqa: E402
     DEFAULT_SLIPPAGE,
-    GRID_ACCOUNT_MARGIN_RATIO_THRESHOLD,
     GRID_TARGET_ORDERS_PER_SIDE,
     SERVER_BATCH_PATH,
     asset_requires_isolated_margin,
@@ -66,7 +65,6 @@ DONE_RETENTION_DAYS = 7
 DONE_RETENTION_MAX = 500
 GRID_LEVEL_HISTORY_MAX = 120
 GRID_FILL_LOOKBACK_SECONDS = 24 * 60 * 60
-GRID_ACCOUNT_MARGIN_RATIO_SOFT_THRESHOLD = Decimal("0.90")
 GRID_MAX_SUBMISSIONS_PER_SIDE_PER_RUN = 1
 GRID_ADD_RISK_BRAKE_STREAK = 2
 GRID_ADD_RISK_BRAKE_PAIR_RETENTION_SECONDS = 24 * 60 * 60
@@ -783,48 +781,6 @@ def grid_margin_pause_active(
             row.pop("margin_pauses", None)
         return False
     return True
-
-
-def account_margin_ratio(
-    info: Any,
-    account: str,
-    network: str,
-    cache: dict[str, Any],
-) -> Decimal | None:
-    ratio_cache = cache.setdefault("account_margin_ratios", {})
-    cache_key = (network, account)
-    if cache_key in ratio_cache:
-        return ratio_cache[cache_key]
-
-    spot_state = info.spot_user_state(account)
-    total = None
-    for balance in spot_state.get("balances", []):
-        if not isinstance(balance, dict):
-            continue
-        if balance.get("token") == 0 or str(balance.get("coin", "")).upper() == "USDC":
-            total = decimal_or_none(balance.get("total"))
-            break
-
-    available = None
-    for item in spot_state.get("tokenToAvailableAfterMaintenance", []):
-        if not isinstance(item, (list, tuple)) or len(item) < 2:
-            continue
-        try:
-            token = int(item[0])
-        except (TypeError, ValueError):
-            continue
-        if token == 0:
-            available = decimal_or_none(item[1])
-            break
-
-    if total is None or total <= 0:
-        ratio = Decimal("0")
-    elif available is None:
-        ratio = None
-    else:
-        ratio = max(Decimal("0"), available) / total
-    ratio_cache[cache_key] = ratio
-    return ratio
 
 
 def account_spot_withdrawable(
@@ -2635,18 +2591,6 @@ def logarithmic_keep_indexes(count: int, keep_count: int) -> set[int]:
     return keep
 
 
-def grid_margin_gap_multiplier(margin_ratio: Decimal | None) -> Decimal:
-    if (
-        margin_ratio is None
-        or margin_ratio >= GRID_ACCOUNT_MARGIN_RATIO_SOFT_THRESHOLD
-        or margin_ratio <= GRID_ACCOUNT_MARGIN_RATIO_THRESHOLD
-    ):
-        return Decimal("1")
-    window = GRID_ACCOUNT_MARGIN_RATIO_SOFT_THRESHOLD - GRID_ACCOUNT_MARGIN_RATIO_THRESHOLD
-    distance_to_hard_stop = margin_ratio - GRID_ACCOUNT_MARGIN_RATIO_THRESHOLD
-    return Decimal("1") + Decimal(str(math.log(float(window / distance_to_hard_stop))))
-
-
 def grid_risk_density_multiplier(row: dict[str, Any], side: str, margin_gap_multiplier: Decimal) -> Decimal:
     multiplier = Decimal("1")
     avg_multiplier = decimal_or_none(row.get("avg_multiplier"))
@@ -2797,7 +2741,6 @@ def grid_bypassed_replacement_margin_pause_candidates(
     row: dict[str, Any],
     position_size: Decimal,
     account_margin_protected: bool,
-    account_margin_hard_stop: bool,
     now: int,
 ) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
@@ -3314,8 +3257,6 @@ def next_depth_order(
     sz_decimals = int(row.get("sz_decimals") or asset["szDecimals"])
     is_buy = side == "buy"
     adds_risk = grid_order_would_add_risk(position_size, is_buy)
-    if adds_risk:
-        gap *= Decimal(str(row.get("margin_gap_multiplier") or "1"))
     gap_probe = {"side": side, "is_buy": is_buy, "price": decimal_to_plain(reference_px or current_mid)}
     boundary_needed = any(
         grid_price_would_cross_market(side, existing, current_mid, None, None)
@@ -3366,7 +3307,6 @@ def submit_grid_order_entry(
     open_orders: list[dict[str, Any]] | None = None,
     cache: dict[str, Any] | None = None,
     consume_p1_budget: bool = False,
-    account_margin_hard_stop: bool = True,
     bypass_margin_controls: bool = False,
 ) -> bool:
     preserve_panic_reversal_price = grid_order_is_never_cancel(order)
@@ -4740,7 +4680,6 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         row.get("avg_current_value"),
         row.get("effective_gap_rate"),
     )
-    margin_ratio = account_margin_ratio(info, account, network, cache)
     spot_withdrawable_state = account_spot_withdrawable(info, account, network, cache)
     if spot_withdrawable_state is None:
         withdrawable = None
@@ -4752,13 +4691,18 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     withdrawable_reduce_only = account_withdrawable_reduce_only(withdrawable)
     withdrawable_pause_active = account_withdrawable_pause_active(withdrawable)
     withdrawable_pause_phase = account_withdrawable_pause_phase(withdrawable)
-    account_margin_hard_stop = margin_ratio is not None and margin_ratio < GRID_ACCOUNT_MARGIN_RATIO_THRESHOLD
-    account_margin_protected = account_margin_hard_stop or withdrawable_reduce_only
-    margin_gap_multiplier = grid_margin_gap_multiplier(margin_ratio)
-    margin_gap_multiplier_text = decimal_to_plain(margin_gap_multiplier)
-    margin_state_changed = row.get("margin_gap_multiplier") != margin_gap_multiplier_text
-    row["margin_gap_multiplier"] = margin_gap_multiplier_text
-    row["margin_gap_soft_threshold"] = decimal_to_plain(GRID_ACCOUNT_MARGIN_RATIO_SOFT_THRESHOLD)
+    account_margin_protected = withdrawable_reduce_only
+    margin_gap_multiplier = Decimal("1")
+    retired_margin_keys = (
+        "margin_gap_multiplier",
+        "margin_gap_soft_threshold",
+        "account_margin_ratio",
+        "account_margin_hard_stop",
+        "account_margin_protected",
+    )
+    margin_state_changed = any(key in row for key in retired_margin_keys)
+    for key in retired_margin_keys:
+        row.pop(key, None)
     row["account_usdc_total"] = decimal_to_plain(total_usdc) if total_usdc is not None else None
     row["account_usdc_withdrawable"] = decimal_to_plain(withdrawable) if withdrawable is not None else None
     row["account_usdc_withdrawable_ratio"] = (
@@ -4767,7 +4711,6 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     row["account_usdc_reduce_only_only"] = withdrawable_reduce_only
     row["account_usdc_withdrawable_pause_active"] = withdrawable_pause_active
     row["account_usdc_withdrawable_pause_phase"] = withdrawable_pause_phase
-    row["account_margin_hard_stop"] = account_margin_hard_stop
     brake_state_pruned = prune_add_risk_brake_state(row, now)
     mark_phase("margin")
 
@@ -4854,7 +4797,6 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 open_orders=current_open_orders,
                 cache=cache,
                 consume_p1_budget=True,
-                account_margin_hard_stop=account_margin_hard_stop,
             )
         except RuntimeError as exc:
             error_text = str(exc)
@@ -4907,7 +4849,6 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 open_orders=current_open_orders,
                 cache=cache,
                 consume_p1_budget=not bypass_current_controls,
-                account_margin_hard_stop=account_margin_hard_stop,
                 bypass_margin_controls=bypass_current_controls,
             )
         except RuntimeError as exc:
@@ -5107,7 +5048,6 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             row,
             position_size,
             account_margin_protected,
-            account_margin_hard_stop,
             now,
         )
         if allow_p0
@@ -5928,8 +5868,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     row["last_fill_check_ms"] = now_ms
     row["position_value"] = decimal_to_plain(position_value)
     row["position_size"] = decimal_to_plain(position_size)
-    row["account_margin_ratio"] = decimal_to_plain(margin_ratio) if margin_ratio is not None else None
-    row["account_margin_protected"] = account_margin_protected
+    row["add_risk_protected"] = account_margin_protected
     row["open_oids"] = sorted(grid_batch_open_oids(row))
     note_values = {
         "replacements": replacements,
@@ -5958,7 +5897,6 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             run_counters[key] = int(run_counters.get(key, 0) or 0) + int(value or 0)
         note_values = dict(run_counters)
     margin_cooldowns = ",".join(sorted((row.get("margin_pauses") or {}).keys())) or "-"
-    margin_ratio_label = f"{margin_ratio * Decimal('100'):.2f}%" if margin_ratio is not None else "unknown"
     action_limit_label = "1" if action_limit_error(cache) else "0"
     action_limit_budget = action_limit_p1_budget_remaining(cache)
     action_limit_budget_label = "-" if action_limit_budget is None else str(action_limit_budget)
@@ -5971,8 +5909,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         f"action_limit={action_limit_label}; action_limit_p1_budget={action_limit_budget_label}; "
         f"filled_stop={','.join(sorted(filled_submission_sides)) or '-'}; "
         f"avg={row.get('avg') if row.get('avg') is not None else '-'}; avg_multiplier={row.get('avg_multiplier', '1')}; "
-        f"margin_gap_multiplier={decimal_to_plain(margin_gap_multiplier)}; "
-        f"account_margin={margin_ratio_label}; account_protected={int(account_margin_protected)}; "
+        f"withdrawable={row.get('account_usdc_withdrawable') or '-'}; add_risk_protected={int(account_margin_protected)}; "
         f"roe={row.get('roe') or '-'}; roe_allowed=buy:{row.get('roe_add_risk_allowed_buy')},sell:{row.get('roe_add_risk_allowed_sell')}; "
         f"panic_ratio={row.get('panic_ratio') or '-'}; panic_reduced={note_values['panic_reduced']}"
     )
@@ -6410,7 +6347,6 @@ def run_grid_limit_chase_p3(cache: dict[str, Any]) -> bool:
             margin_blocked_sides=None,
             open_orders=open_orders,
             cache=cache,
-            account_margin_hard_stop=False,
             bypass_margin_controls=True,
         )
     except Exception as exc:

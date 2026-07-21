@@ -255,10 +255,10 @@ xyz:SPCX grid --reverse
 
 - 所有 `--modify` 都只更新策略配置，不会主动撤销或重铺现有 grid 子单；新参数从以后生成的新单开始生效。
 - `grid --reverse` 会原地翻转当前策略的 signed 仓位范围和 `avg`，不会主动撤销或重铺现有子单。例如 `--limit -25 500 --avg 50` 会变为 `--limit -500 25 --avg -50`；未设置 `avg` 时仍保持未设置。
-- 模式、仓位范围或最低下单额变化后，如果现有订单违反新的方向、仓位上下限、保证金保护或 reduce-only 要求，Worker 仍会按安全规则单独撤销相关订单。
+- 模式、仓位范围或最低下单额变化后，如果现有订单违反新的方向、仓位上下限、withdrawable 保护或 reduce-only 要求，Worker 仍会按安全规则单独撤销相关订单。
 - 从 `avg` 模式切回无方向的普通网格可使用 `--modify --trend 0`。
 - `--modify` 只改变命令中明确提供的参数；例如只传 `--trend` 时会沿用原来的 gap，只传 `--gap` 时也会沿用原来的 trend。`--modify --gap 0` 会按当前价格和费率重算默认 gap。
-- 修改 `--limit` 的下限后，Worker 会按新仓位范围维护后续订单；账户安全余量率低于 70% 时，账户保护仍优先，Worker 不会为了达到下限而新增风险。
+- 修改 `--limit` 的下限后，Worker 会按新仓位范围维护后续订单；`withdrawable < 5` 时账户保护仍优先，Worker 不会为了达到下限而新增风险。
 
 ### 查询、恢复、取消
 
@@ -277,16 +277,16 @@ BTC --cancel grid
 - 到达持仓上下限后，worker 会压缩越界方向的 grid 单，但最靠近盘口的一张作为保活单继续保留/恢复；因此实际持仓最多可能越过配置边界一个子单金额，保活单成交后不会继续叠加第二张越界单。
 - 仓位降到能容纳下一张加仓单后，worker 再把加仓方向补回到最多 16 张。
 - 补缺失子单时优先参考盘口 best bid/ask，而不是只参考 mid；盘口读取失败时才退回 mid。
-- 加风险方向 active 单超过当前风险密度预算时，worker 会按 `avg_multiplier` / `margin_gap_multiplier` 把允许数量压缩为 `floor(16 / multiplier)`，最低保留 1 张；超过部分按价格近远用等比/自然对数分布抽稀暂停为 `paused_risk_density`，近侧保留更密、远侧更疏。系数下降后，`paused_risk_density` 会优先于常规补档恢复。
+- 加风险方向 active 单超过当前风险密度预算时，worker 会按 `avg_multiplier` 把允许数量压缩为 `floor(16 / multiplier)`，最低保留 1 张；超过部分按价格近远用等比/自然对数分布抽稀暂停为 `paused_risk_density`，近侧保留更密、远侧更疏。系数下降后，`paused_risk_density` 会优先于常规补档恢复。
 - 持仓 ROE 由 Hyperliquid `position.returnOnEquity` 直接返回；低于 -10% 时，worker 会按 -10% 到 -40% 的线性区间压缩加仓侧 active 数量，超出部分暂停为 `paused_roe`；低于 -40% 时，加仓侧仍最低保留 1 张保活单。强制减仓仍只由 `panic_ratio` 触发。
 - 为减少挂单保证金占用并避免 1 分钟内盘口被打穿，每侧 active grid 单最多保留 16 张；普通补档、缺单恢复和 paused 恢复都要求该侧 active 少于 16 张。成交反向单优先提交，提交后若超过 16 张，再按近密远疏的等比/自然对数分布优先保留成交反向单并暂停其他旧 active 为 `paused_active_cap`，之后在 active 少于 16 张时也按同一分布逐步恢复。即时 replacement 即使单侧 actual open active 已超过 32 张也仍先提交，随后 worker 优先从最远侧 live `pending_cancel` 开始撤普通旧单，逐步把 active 压回 32 张以内；历史 replacement 恢复仍需等 active 回到 32 张及以下。
-- P2 额度充足时，worker 会把同侧 active 与所有当前可恢复的 paused 档位一视同仁地按“近密远疏”重新计算，每轮每侧最多做一组 `active <-> paused` 渐进式互换。需要撤销的 active 仍按对数分布抽稀决定；恢复目标则固定选择比该 active 更靠近盘口的最近可恢复 paused，不能因对数抽样而跳过更近档位。P2 撤销目标 active 并提升该最近 paused 的恢复优先级，实际重新挂单仍由下一轮 P1 执行。一换一互换只要不增加当前加风险单数量，就不会因 `avg_multiplier` / `margin_gap_multiplier` 已把风险密度预算压到当前数量以下而被阻断；新增风险单仍受该预算限制。会立即穿过盘口或仍受仓位上下限、ROE、保证金、reduce-only 容量约束的 paused 档位不参与本轮互换。
+- P2 额度充足时，worker 会把同侧 active 与所有当前可恢复的 paused 档位一视同仁地按“近密远疏”重新计算，每轮每侧最多做一组 `active <-> paused` 渐进式互换。需要撤销的 active 仍按对数分布抽稀决定；恢复目标则固定选择比该 active 更靠近盘口的最近可恢复 paused，不能因对数抽样而跳过更近档位。P2 撤销目标 active 并提升该最近 paused 的恢复优先级，实际重新挂单仍由下一轮 P1 执行。一换一互换只要不增加当前加风险单数量，就不会因 `avg_multiplier` 已把风险密度预算压到当前数量以下而被阻断；新增风险单仍受该预算限制。会立即穿过盘口或仍受仓位上下限、ROE、withdrawable、reduce-only 容量约束的 paused 档位不参与本轮互换。
 - 为避免异常循环无限堆积可恢复记录，`levels` 内同侧 active、pending、recovery_deferred 和 paused 合计最多保留 1024 张；历史记录不占这个名额，仍由独立历史裁剪控制。超过时会优先清理普通 paused，必要时先撤交易所 active 挂单再从本地清除，`replacement_order` 最后才会被清。
 - 全仓或逐仓的加仓方向若被交易所以保证金不足拒绝，worker 会对该方向冷却 10 分钟，本轮不再继续试单；减仓方向照常维护。仓位缩小会提前解除冷却，否则到期后探测一次。
 - reduce-only 子单的活动数量总和不会超过当前可减仓数量；交易所因可减仓数量不足自动取消的 `reduceOnlyCanceled` 不会被当作手动撤单反复补回。
 - 单边漂移接近爆仓时会主动泄压：空仓用 `(liqPx - mid) / (mid - 最近active买入减仓价)`，多仓用 `(mid - liqPx) / (最近active卖出减仓价 - mid)` 计算 `panic_ratio`；若低于 `panic_ratio_threshold`（默认 `100`），Worker 会先提交 IOC + 滑点保护的 reduce-only panic 单，确认成交后再以回执中的实际成交均价 `avgPx` 为锚点，在反方向 `2 * gap` 处提交实际成交 size 的 GTC 回补单；只有回执缺少有效 `avgPx` 时才回退到触发时 mid。这个顺序比旧的同批 `bulk_orders` 多一次 API 往返，但不会在 IOC 结果未知时预挂无支撑的回补单，也不再需要按部分成交量二次修改已挂 GTC。回补提交失败会按实际减仓成交量和首次计算价格持续重试。这张 panic 回补单保持 `status=active` 并带 `replace_never_cancel=true`：除非成交或用户明确取消整条 grid，否则不会被 ROE、风险密度、仓位范围、active cap、reduce-only 刷新、dense regrid、P2 近远重排、连续加仓刹车或历史裁剪撤销；需要压缩 active 数量时普通单先让位。它从首次提交开始就固定使用成交锚定价格，不参与 active/paused 价格占位检查，且不会因最小名义金额重试而放大 size。panic 减仓本身不作为普通 fill 近距离回补，永久回补单成交后生成的下一张普通反向单不继承 `replace_never_cancel`，恢复为一般 grid OID。
-- 每轮只查询一次账户 USDC 的“维护保证金后余量 / 总余额”。比例低于 `70%` 时，普通维护仍不新增加风险单；比例不低于 `70%`、但 USDC 可提余额低于 `5` 时，加风险方向只允许最低 1 张保活单，减风险方向强制使用 reduce-only。可提比例不参与该保护判断。USDC 可提余额低于 `10` 期间，Worker 每轮仍会在同一账户的全部 grid 中按订单 `timestamp` 从早到晚选择一张 `active`、非 reduce-only、非永久保护单；旧记录缺少交易所毫秒 `timestamp` 时使用 `submitted_at * 1000`，同一毫秒才以数值 `oid` 从小到大打破并列。选中单正常暂停为 `paused_withdrawable`，每个账户每轮最多一张；`5 <= withdrawable < 10` 时在 P2 执行，`0 < withdrawable < 5` 时提级到 P1 尾部执行，`withdrawable = 0` 时提级到 P0 执行。P2 撤单继续受 P2 headroom 门槛约束，P1 尾部撤单使用 P1 请求预算，P0 撤单不等待 P2 headroom。余额恢复到 `10` 及以上后才进入常规恢复流程。交易所实际返回保证金不足后仍进入同侧冷却。保护解除后，Worker 按当时盘口重新计算缺失档位，并保持每轮每方向最多新增一张，不恢复保护期间的旧价格。
-- 普通成交产生的即时 replacement 在生成当轮绕过 `limit`、ROE、账户保证金、active cap、本地 action limit 和每方向提交前置检查，优先尝试把反向单挂出；成功后仍占用该方向本轮额度，交易所真实拒单也照常处理。下一轮起重新纳入全部控制：不满足条件时正常 pause，满足保活条件时最多留下 1 张。
+- Worker 使用账户 USDC `withdrawable` 作为增加风险的资金保护：`withdrawable < 5` 时，加风险方向只允许最低 1 张保活单，减风险方向强制使用 reduce-only。USDC 可提余额低于 `10` 期间，Worker 每轮仍会在同一账户的全部 grid 中按订单 `timestamp` 从早到晚选择一张 `active`、非 reduce-only、非永久保护单；旧记录缺少交易所毫秒 `timestamp` 时使用 `submitted_at * 1000`，同一毫秒才以数值 `oid` 从小到大打破并列。选中单正常暂停为 `paused_withdrawable`，每个账户每轮最多一张；`5 <= withdrawable < 10` 时在 P2 执行，`0 < withdrawable < 5` 时提级到 P1 尾部执行，`withdrawable = 0` 时提级到 P0 执行。P2 撤单继续受 P2 headroom 门槛约束，P1 尾部撤单使用 P1 请求预算，P0 撤单不等待 P2 headroom。余额恢复到 `10` 及以上后才进入常规恢复流程。爆仓风险独立由 `panic_ratio` 监控和主动减仓。交易所实际返回保证金不足后仍进入同侧冷却。保护解除后，Worker 按当时盘口重新计算缺失档位，并保持每轮每方向最多新增一张，不恢复保护期间的旧价格。
+- 普通成交产生的即时 replacement 在生成当轮绕过 `limit`、ROE、withdrawable、active cap、本地 action limit 和每方向提交前置检查，优先尝试把反向单挂出；成功后仍占用该方向本轮额度，交易所真实拒单也照常处理。下一轮起重新纳入全部控制：不满足条件时正常 pause，满足保活条件时最多留下 1 张。
 - grid/trail 创建、修改和取消与 Worker 共用 `server_batch.lock`；命令执行期间 Worker 会跳过该轮，避免旧任务快照覆盖刚完成的修改，不需要手动暂停定时器。
 - 旧版保存的非 ALO grid 子单在 Worker 再次提交时会自动刷新为 ALO；历史 post-only 拒绝仍按可恢复状态兼容处理。
 
@@ -601,9 +601,7 @@ journalctl -u simple-hyper-sync.service -n 80 --no-pager
 
 ```text
 +- Account ----------------+
-| 账户安全余量率: 47.64%     |
 | withdrawable(USDC): 0   |
-| Grid保护(<70%): 开启       |
 | 统一账户比率: 0.19%        |
 | 统一账户杠杆: 0.09x        |
 +----------------------------+
@@ -708,7 +706,6 @@ reduce_only=True：只允许减仓 / 平仓，不允许反手
 
 统一账户指标口径：
 
-- 账户安全余量率：`tokenToAvailableAfterMaintenance[USDC] / balances[USDC].total`；低于 `70%` 时，Grid 每侧仍保留离市场最近的 `1` 张 active survival 单，其余新增风险子单被拦截，减风险方向使用 reduce-only。
 - `withdrawable(USDC)`：`balances[USDC].total - balances[USDC].hold`，与 Worker 的可提余额保护使用同一口径。
 - 统一账户比率：将各 DEX 的 maintenance margin 按 collateral token 聚合，再除以对应 spot 抵押品余额，取风险最高的一组。
 - 统一账户杠杆：当前总名义仓位 / 活跃抵押品余额。

@@ -113,7 +113,6 @@ GRID_SIDE_ALIASES = {"grid"}
 DEFAULT_GRID_GAP_LABEL = ["auto-minTick", "auto-takerFee", "auto-makerFee"]
 DEFAULT_GRID_RANGE = ["auto", "auto"]
 GRID_TARGET_ORDERS_PER_SIDE = 16
-GRID_ACCOUNT_MARGIN_RATIO_THRESHOLD = Decimal("0.70")
 GRID_AVG_ASYMPTOTIC_SCALE = Decimal("0.404631578947368516")
 GRID_AVG_ASYMPTOTIC_POWER = Decimal("0.1213062962221336")
 GRID_AVG_BOUNDARY_MULTIPLIER = Decimal("1E+9")
@@ -501,7 +500,7 @@ def spot_usdc_withdrawable(spot_state: dict[str, Any]) -> Optional[Decimal]:
 def unified_account_metrics(
     info: Info,
     account: str,
-) -> tuple[Optional[Decimal], Optional[Decimal], Optional[Decimal], Optional[Decimal]]:
+) -> tuple[Optional[Decimal], Optional[Decimal], Optional[Decimal]]:
     spot_state = info.spot_user_state(account)
     log_event("spot_state", spot_state)
     usdc_withdrawable = spot_usdc_withdrawable(spot_state)
@@ -518,24 +517,6 @@ def unified_account_metrics(
         spot_totals[int(token)] = Decimal(str(balance.get("total", "0")))
     if skipped_balances:
         log_event("spot_balances_without_token", skipped_balances)
-
-    available_after_maintenance: dict[int, Decimal] = {}
-    for item in spot_state.get("tokenToAvailableAfterMaintenance", []):
-        if not isinstance(item, (list, tuple)) or len(item) < 2:
-            continue
-        try:
-            available_after_maintenance[int(item[0])] = Decimal(str(item[1]))
-        except (TypeError, ValueError):
-            continue
-
-    usdc_total = spot_totals.get(0, Decimal("0"))
-    usdc_available = available_after_maintenance.get(0)
-    if usdc_total <= 0:
-        account_safety_margin_ratio = Decimal("0")
-    elif usdc_available is None:
-        account_safety_margin_ratio = None
-    else:
-        account_safety_margin_ratio = max(Decimal("0"), usdc_available) / usdc_total
 
     maintenance_by_token: dict[int, Decimal] = {}
     notional_by_token: dict[int, Decimal] = {}
@@ -581,27 +562,19 @@ def unified_account_metrics(
         "spot_totals": spot_totals,
         "unified_ratio": unified_ratio,
         "unified_leverage": unified_leverage,
-        "account_safety_margin_ratio": account_safety_margin_ratio,
         "usdc_withdrawable": usdc_withdrawable,
     }
     log_event("unified_metrics", metrics)
-    return unified_ratio, unified_leverage, account_safety_margin_ratio, usdc_withdrawable
+    return unified_ratio, unified_leverage, usdc_withdrawable
 
 
 def print_account_metrics(info: Info, account: str) -> None:
-    unified_ratio, unified_leverage, account_safety_margin_ratio, usdc_withdrawable = unified_account_metrics(
-        info, account
-    )
+    unified_ratio, unified_leverage, usdc_withdrawable = unified_account_metrics(info, account)
     action_rate = user_action_rate_limit_metrics(info, account)
-    protection_status = "未知"
-    if account_safety_margin_ratio is not None:
-        protection_status = "开启" if account_safety_margin_ratio < GRID_ACCOUNT_MARGIN_RATIO_THRESHOLD else "关闭"
     print_box(
         "Account",
         [
-            ("账户安全余量率", format_percent(account_safety_margin_ratio)),
             ("withdrawable(USDC)", format_optional_decimal(usdc_withdrawable)),
-            ("Grid保护(<70%)", protection_status),
             ("统一账户比率", format_percent(unified_ratio)),
             ("统一账户杠杆", format_leverage(unified_leverage)),
             ("nRequestsUsed", action_rate.get("nRequestsUsed", "-")),
@@ -1946,7 +1919,6 @@ def query_grid(args: argparse.Namespace) -> None:
             ("position", f"{decimal_to_plain(position_size)} / {decimal_to_display(position_value)}"),
             *grid_query_avg_summary(row, asset, position_size, position_value),
             ("trend", f"{row.get('trend', '0')} actual {row.get('actual_trend', '0%')}"),
-            ("margin_gap", format_optional_decimal(row.get("margin_gap_multiplier"))),
             ("roe", format_optional_percent(row.get("roe"))),
             ("roe_limit", (
                 f"value>{format_optional_decimal(row.get('roe_min_position_value', '100'))} "
@@ -3944,7 +3916,6 @@ def format_server_batch_rows(rows: list[dict[str, Any]], network: str, account: 
         is_grid = row.get("type") == "grid"
         limit = grid_limit_display(row) if is_grid else "-"
         trend = f"{row.get('trend', '0')} / {row.get('actual_trend', '0%')}" if is_grid else "-"
-        margin_gap = format_optional_decimal(row.get("margin_gap_multiplier")) if is_grid else "-"
         avg = str(row.get("avg")) if is_grid and row.get("avg") is not None else "-"
         display_rows.append(
             {
@@ -3955,7 +3926,6 @@ def format_server_batch_rows(rows: list[dict[str, Any]], network: str, account: 
                 "limit": limit,
                 "avg": avg,
                 "trend": trend,
-                "mgap": margin_gap,
                 "trail": str(row.get("trail", row.get("gap", "-"))),
                 "bestPx": format_optional_decimal(row.get("best_px")),
                 "stopPx": format_optional_decimal(row.get("stop_px")),
@@ -3997,7 +3967,6 @@ def print_server_batch(rows: list[dict[str, Any]], network: str, account: str | 
             ("limit", "limit"),
             ("avg", "avg"),
             ("trend", "trend"),
-            ("mgap", "mgap"),
             ("trail", "trail"),
             ("bestPx", "bestPx"),
             ("stopPx", "stopPx"),

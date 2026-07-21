@@ -69,7 +69,6 @@ from trail_worker import (
     grid_active_cap_restore_allowed,
     grid_active_cap_pause_candidates,
     replacement_active_cap_submit_allowed,
-    grid_margin_gap_multiplier,
     grid_limit_chase_direction,
     grid_margin_pause_active,
     grid_bypassed_replacement_margin_pause_candidates,
@@ -2848,12 +2847,6 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(entry["status"], "recovery_deferred")
         self.assertEqual(entry["oid"], 123)
 
-    def test_margin_gap_multiplier_starts_at_ninety_and_rises_toward_hard_stop(self) -> None:
-        self.assertEqual(grid_margin_gap_multiplier(None), Decimal("1"))
-        self.assertEqual(grid_margin_gap_multiplier(Decimal("0.90")), Decimal("1"))
-        self.assertEqual(grid_margin_gap_multiplier(Decimal("0.70")), Decimal("1"))
-        self.assertEqual(grid_margin_gap_multiplier(Decimal("0.80")).quantize(Decimal("0.001")), Decimal("1.693"))
-
     def test_roe_allowed_linearly_compresses_add_risk_active_count(self) -> None:
         self.assertEqual(grid_roe_add_risk_allowed(10, None), 10)
         self.assertEqual(grid_roe_add_risk_allowed(10, Decimal("-0.10")), 10)
@@ -3021,36 +3014,28 @@ class GridAvgTests(unittest.TestCase):
         row = {"levels": [closest, bypassed]}
 
         self.assertEqual(
-            grid_bypassed_replacement_margin_pause_candidates(
-                row, Decimal("1"), True, False, 8
-            ),
+            grid_bypassed_replacement_margin_pause_candidates(row, Decimal("1"), True, 8),
             [bypassed],
         )
 
         bypassed["price"] = "110"
         self.assertEqual(
-            grid_bypassed_replacement_margin_pause_candidates(
-                row, Decimal("1"), True, False, 8
-            ),
+            grid_bypassed_replacement_margin_pause_candidates(row, Decimal("1"), True, 8),
             [],
         )
         self.assertNotIn("immediate_control_bypass_at", bypassed)
 
         bypassed["immediate_control_bypass_at"] = 8
         self.assertEqual(
-            grid_bypassed_replacement_margin_pause_candidates(
-                row, Decimal("1"), True, True, 8
-            ),
+            grid_bypassed_replacement_margin_pause_candidates(row, Decimal("1"), True, 8),
             [],
         )
         self.assertEqual(
-            grid_bypassed_replacement_margin_pause_candidates(
-                row, Decimal("1"), True, True, 9
-            ),
+            grid_bypassed_replacement_margin_pause_candidates(row, Decimal("1"), True, 9),
             [],
         )
 
-    def test_margin_gap_multiplier_only_widens_add_risk_far_topup(self) -> None:
+    def test_legacy_margin_gap_multiplier_no_longer_changes_topup_spacing(self) -> None:
         row = {
             "gap_rate": "0.01",
             "min_order_value": "1",
@@ -3095,8 +3080,8 @@ class GridAvgTests(unittest.TestCase):
             "abs",
         )
         self.assertIsNotNone(add_risk_topup)
-        self.assertEqual(add_risk_topup["price"], "87.22")
-        self.assertEqual(add_risk_topup["plan"]["grid_gap"], Decimal("0.02"))
+        self.assertEqual(add_risk_topup["price"], "88.11")
+        self.assertEqual(add_risk_topup["plan"]["grid_gap"], Decimal("0.01"))
 
         reduce_risk_topup = next_depth_order(
             row,
@@ -4133,7 +4118,6 @@ class GridAvgTests(unittest.TestCase):
             "abs",
             True,
             set(),
-            account_margin_hard_stop=True,
         )
 
         self.assertTrue(submitted)
@@ -4211,7 +4195,6 @@ class GridAvgTests(unittest.TestCase):
             True,
             set(),
             margin_blocked_sides={("BTC", "buy")},
-            account_margin_hard_stop=True,
             bypass_margin_controls=True,
         )
 
@@ -5668,6 +5651,7 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertEqual(display_rows[0]["avg"], "200")
         self.assertEqual(display_rows[1]["avg"], "-")
+        self.assertNotIn("mgap", display_rows[0])
 
     def test_grid_plan_persists_base_and_effective_values(self) -> None:
         class FakeInfo:
