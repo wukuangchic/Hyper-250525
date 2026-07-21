@@ -6198,7 +6198,11 @@ def submit_grid_limit_chase_market(
 
 def run_grid_limit_chase_p3(cache: dict[str, Any]) -> bool:
     candidates = cache.get("limit_chase_candidates")
-    if not isinstance(candidates, list) or not candidates or not noncritical_grid_work_allowed(cache):
+    if (
+        not cache.get("limit_chase_p1_completed")
+        or not isinstance(candidates, list)
+        or not candidates
+    ):
         return False
     candidate = random.choice(candidates)
     row = candidate.get("row") if isinstance(candidate, dict) else None
@@ -6252,10 +6256,6 @@ def run_grid_limit_chase_p3(cache: dict[str, Any]) -> bool:
     if is_buy is None:
         row["limit_chase_status"] = "skipped_back_within_limit"
         return True
-    if not noncritical_grid_work_allowed(cache):
-        row["limit_chase_status"] = "skipped_action_headroom"
-        return True
-
     market_order = build_grid_limit_chase_market_order(
         exchange,
         row,
@@ -6452,6 +6452,8 @@ def run_once() -> None:
         # reused.  l2/book caches are cleared so marketability checks remain
         # fresh, while our in-memory open-order delta stays authoritative for
         # duplicate detection inside this run.
+        if phase == GRID_ACTION_PHASE_P1_WITHDRAWABLE:
+            grid_cache["limit_chase_p1_completed"] = True
     grid_cache.pop("grid_action_phase", None)
     grid_cache["api_stat_phase"] = "p3_limit_chase"
     grid_cache["api_stat_context"] = "-"

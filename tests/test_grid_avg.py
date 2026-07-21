@@ -597,7 +597,13 @@ class GridAvgTests(unittest.TestCase):
             return row, False
 
         def fake_limit_chase_p3(cache: dict) -> bool:
-            calls.append(("P3", cache.get("grid_action_phase")))
+            calls.append(
+                (
+                    "P3",
+                    cache.get("grid_action_phase"),
+                    cache.get("limit_chase_p1_completed"),
+                )
+            )
             return False
 
         with (
@@ -630,7 +636,7 @@ class GridAvgTests(unittest.TestCase):
                 ("BTC", "p1_withdrawable"),
                 ("ETH", "p2"),
                 ("BTC", "p2"),
-                ("P3", None),
+                ("P3", None, True),
             ],
         )
         save_server_batch.assert_not_called()
@@ -672,7 +678,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(seen[1], ({"stale": True}, {"shared": True}, 3))
         self.assertEqual(info.clear_calls, 8)
 
-    def test_limit_chase_p3_requeries_and_submits_one_market_then_permanent_replacement(self) -> None:
+    def test_limit_chase_p3_ignores_p2_quota_after_p1_and_submits_replacement(self) -> None:
         class FakeInfo:
             def all_mids(self, dex):
                 return {"BTC": "100"}
@@ -731,7 +737,9 @@ class GridAvgTests(unittest.TestCase):
         exchange = FakeExchange()
         cache = {
             "now": 123,
-            "action_limit_headroom": 200,
+            "action_limit_headroom": 0,
+            "action_limit_error": "P2 action quota unavailable",
+            "limit_chase_p1_completed": True,
             "clients": {("mainnet", 20.0, ""): (info, exchange, "0xabc", None, None)},
             "limit_chase_candidates": [
                 {"row": row, "startup_position_value": "180", "startup_is_buy": False}
@@ -798,6 +806,7 @@ class GridAvgTests(unittest.TestCase):
         cache = {
             "now": 123,
             "action_limit_headroom": 200,
+            "limit_chase_p1_completed": True,
             "clients": {("mainnet", 20.0, ""): (FakeInfo(), FakeExchange(), "0xabc", None, None)},
             "limit_chase_candidates": [{"row": row, "startup_position_value": "180"}],
         }
