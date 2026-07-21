@@ -61,6 +61,7 @@ from simple_hyper.order_specs import MIN_NOTIONAL
 
 RATE_LIMIT_LOG_PATH = SERVER_BATCH_PATH.parent / "logs" / "trail-rate-limit.jsonl"
 ACTION_AUDIT_LOG_PATH = SERVER_BATCH_PATH.parent / "logs" / "trail-action-audit.jsonl"
+API_TIMING_LOG_PATH = SERVER_BATCH_PATH.parent / "logs" / "trail-api-timing.jsonl"
 DONE_RETENTION_DAYS = 7
 DONE_RETENTION_MAX = 500
 GRID_LEVEL_HISTORY_MAX = 120
@@ -167,6 +168,171 @@ class GridPostOnlyRejected(Exception):
 
 class GridActionBudgetUnavailable(Exception):
     """A P1 exchange action has no remaining pre-reserved request budget."""
+
+
+class WorkerApiProxy:
+    """Measure high-level SDK calls without changing their return values."""
+
+    def __init__(self, target: Any, cache: dict[str, Any], client: str) -> None:
+        self._worker_api_target = target
+        self._worker_api_cache = cache
+        self._worker_api_client = client
+
+    def __getattr__(self, name: str) -> Any:
+        attribute = getattr(self._worker_api_target, name)
+        if not callable(attribute) or name.startswith("_") or name == "clear_cache":
+            return attribute
+
+        def measured(*args: Any, **kwargs: Any) -> Any:
+            started_at = time.monotonic()
+            error = False
+            try:
+                return attribute(*args, **kwargs)
+            except Exception:
+                error = True
+                raise
+            finally:
+                record_worker_api_timing(
+                    self._worker_api_cache,
+                    self._worker_api_client,
+                    name,
+                    time.monotonic() - started_at,
+                    error,
+                )
+
+        return measured
+
+
+def worker_api_stat_key(cache: dict[str, Any], client: str, method: str) -> str:
+    phase = str(cache.get("grid_action_phase") or cache.get("api_stat_phase") or "setup")
+    context = str(cache.get("api_stat_context") or "-")
+    return f"{phase}|{context}|{client}.{method}"
+
+
+def record_worker_api_timing(
+    cache: dict[str, Any],
+    client: str,
+    method: str,
+    elapsed: float,
+    error: bool = False,
+) -> None:
+    stats = cache.setdefault("api_stats", {})
+    key = worker_api_stat_key(cache, client, method)
+    item = stats.setdefault(
+        key,
+        {
+            "phase": key.split("|", 1)[0],
+            "context": key.split("|", 2)[1],
+            "method": f"{client}.{method}",
+            "count": 0,
+            "errors": 0,
+            "total_ms": 0.0,
+            "max_ms": 0.0,
+        },
+    )
+    elapsed_ms = max(0.0, elapsed * 1000)
+    item["count"] += 1
+    item["errors"] += int(error)
+    item["total_ms"] += elapsed_ms
+    item["max_ms"] = max(float(item["max_ms"]), elapsed_ms)
+
+
+def instrument_worker_client_tuple(
+    clients: tuple[Any, Any | None, str, str, dict[str, Any]],
+    cache: dict[str, Any],
+) -> tuple[Any, Any | None, str, str, dict[str, Any]]:
+    info, exchange, account, signer, role = clients
+    raw_info = getattr(info, "_info", None)
+    if raw_info is not None:
+        if not isinstance(raw_info, WorkerApiProxy):
+            info._info = WorkerApiProxy(raw_info, cache, "info")
+    elif not isinstance(info, WorkerApiProxy):
+        info = WorkerApiProxy(info, cache, "info")
+    if exchange is not None and not isinstance(exchange, WorkerApiProxy):
+        exchange = WorkerApiProxy(exchange, cache, "exchange")
+    return info, exchange, account, signer, role
+
+
+def build_worker_clients(
+    cache: dict[str, Any],
+    network: str,
+    timeout: float,
+    raw_coin: str,
+    *,
+    need_exchange: bool = True,
+) -> tuple[Any, Any | None, str, str, dict[str, Any]]:
+    started_at = time.monotonic()
+    error = False
+    try:
+        clients = build_clients(network, timeout, raw_coin, need_exchange=need_exchange)
+    except Exception:
+        error = True
+        raise
+    finally:
+        record_worker_api_timing(
+            cache,
+            "client",
+            "build_clients",
+            time.monotonic() - started_at,
+            error,
+        )
+    return instrument_worker_client_tuple(clients, cache)
+
+
+def worker_api_stats_payload(cache: dict[str, Any]) -> dict[str, Any] | None:
+    stats = cache.get("api_stats")
+    if not isinstance(stats, dict) or not stats:
+        return None
+    methods = sorted(
+        (
+            {
+                **item,
+                "total_ms": round(float(item["total_ms"]), 3),
+                "max_ms": round(float(item["max_ms"]), 3),
+            }
+            for item in stats.values()
+        ),
+        key=lambda item: (-float(item["total_ms"]), str(item["phase"]), str(item["method"])),
+    )
+    request_methods = [item for item in methods if not str(item["method"]).startswith("client.")]
+    return {
+        "ts": int(time.time()),
+        "run_started_at": int(cache.get("run_started_at") or 0),
+        "run_elapsed_ms": round((time.monotonic() - float(cache.get("run_monotonic_started_at") or 0)) * 1000, 3),
+        "request_count": sum(int(item["count"]) for item in request_methods),
+        "error_count": sum(int(item["errors"]) for item in request_methods),
+        "api_total_ms": round(sum(float(item["total_ms"]) for item in request_methods), 3),
+        "client_build_count": sum(
+            int(item["count"]) for item in methods if str(item["method"]) == "client.build_clients"
+        ),
+        "observed_total_ms": round(sum(float(item["total_ms"]) for item in methods), 3),
+        "methods": methods,
+    }
+
+
+def emit_worker_api_stats(cache: dict[str, Any]) -> dict[str, Any] | None:
+    payload = worker_api_stats_payload(cache)
+    if payload is None:
+        return None
+    try:
+        API_TIMING_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with API_TIMING_LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+    except OSError as exc:
+        print(f"trail_worker: api_stats_write_error={type(exc).__name__}: {exc}")
+    top = payload["methods"][:8]
+    top_text = "; ".join(
+        f"{item['phase']}/{item['context']}/{item['method']}="
+        f"{item['count']}x/{item['total_ms']:.1f}ms/max{item['max_ms']:.1f}/err{item['errors']}"
+        for item in top
+    )
+    print(
+        f"trail_worker: api_stats requests={payload['request_count']} errors={payload['error_count']} "
+        f"api_total={payload['api_total_ms']:.1f}ms client_builds={payload['client_build_count']} "
+        f"observed_total={payload['observed_total_ms']:.1f}ms "
+        f"run_elapsed={payload['run_elapsed_ms']:.1f}ms top={top_text}"
+    )
+    return payload
 
 
 def audit_grid_action(action: str, **payload: Any) -> None:
@@ -1087,12 +1253,20 @@ def find_replacement_trail_order(info: Any, account: str, dex: str, row: dict[st
     return None
 
 
-def modify_trail_stop(row: dict[str, Any], mid_px: Decimal) -> tuple[dict[str, Any], bool]:
-    info, exchange, account, _signer, _role = build_clients(
-        str(row.get("network") or "mainnet"),
-        float(row.get("timeout") or 20),
-        batch_row_raw_coin(row),
+def modify_trail_stop(
+    row: dict[str, Any],
+    mid_px: Decimal,
+    api_cache: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], bool]:
+    network = str(row.get("network") or "mainnet")
+    timeout = float(row.get("timeout") or 20)
+    raw_coin = batch_row_raw_coin(row)
+    clients = (
+        build_clients(network, timeout, raw_coin)
+        if api_cache is None
+        else build_worker_clients(api_cache, network, timeout, raw_coin)
     )
+    info, exchange, account, _signer, _role = clients
     coin, asset = resolve_perp_asset(info, batch_row_raw_coin(row))
     dex = str(row.get("dex") or "")
     oid = int(row["oid"])
@@ -4369,7 +4543,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     client_cache = cache.setdefault("clients", {})
     client_key = (network, timeout, dex)
     if client_key not in client_cache:
-        client_cache[client_key] = build_clients(network, timeout, raw_coin)
+        client_cache[client_key] = build_worker_clients(cache, network, timeout, raw_coin)
     info, exchange, account, _signer, _role = client_cache[client_key]
     mark_phase("clients")
     coin, asset = resolve_perp_asset(info, batch_row_raw_coin(row))
@@ -6030,6 +6204,7 @@ def run_grid_limit_chase_p3(cache: dict[str, Any]) -> bool:
     row = candidate.get("row") if isinstance(candidate, dict) else None
     if not isinstance(row, dict) or not grid_row_recoverable_from_error(row):
         return False
+    cache["api_stat_context"] = str(row.get("coin") or "-")
 
     network = str(row.get("network") or "mainnet")
     timeout = float(row.get("timeout") or 20)
@@ -6038,7 +6213,7 @@ def run_grid_limit_chase_p3(cache: dict[str, Any]) -> bool:
     client_key = (network, timeout, dex)
     client_cache = cache.setdefault("clients", {})
     if client_key not in client_cache:
-        client_cache[client_key] = build_clients(network, timeout, raw_coin)
+        client_cache[client_key] = build_worker_clients(cache, network, timeout, raw_coin)
     info, exchange, account, _signer, _role = client_cache[client_key]
     clear_info_cache(info)
     coin, asset = resolve_perp_asset(info, raw_coin)
@@ -6192,21 +6367,33 @@ def run_once() -> None:
         return
 
     mids_cache: dict[tuple[str, str], dict[str, Any]] = {}
-    grid_cache: dict[str, Any] = {"grid_rows": rows}
+    grid_cache: dict[str, Any] = {
+        "grid_rows": rows,
+        "run_started_at": int(time.time()),
+        "run_monotonic_started_at": time.monotonic(),
+    }
     changed = False
     for index in active_trail_indexes:
         row = rows[index]
         try:
+            grid_cache["api_stat_phase"] = "trail"
+            grid_cache["api_stat_context"] = str(row.get("coin") or "-")
             network = str(row.get("network") or "mainnet")
             raw_coin = batch_row_raw_coin(row)
             dex = str(row.get("dex") or "")
             cache_key = (network, dex)
             if cache_key not in mids_cache:
-                info, _exchange, account, _signer, _role = build_clients(network, float(row.get("timeout") or 20), raw_coin, need_exchange=False)
+                info, _exchange, account, _signer, _role = build_worker_clients(
+                    grid_cache,
+                    network,
+                    float(row.get("timeout") or 20),
+                    raw_coin,
+                    need_exchange=False,
+                )
                 mids_cache[cache_key] = info.all_mids(dex)
                 print(f"trail_worker: mids loaded {network}:{dex or 'default'} account={mask(account)}")
             mid_px = Decimal(str(mids_cache[cache_key][row["coin"]]))
-            rows[index], row_changed = modify_trail_stop(row, mid_px)
+            rows[index], row_changed = modify_trail_stop(row, mid_px, grid_cache)
             changed = changed or row_changed
             changed = save_worker_progress(rows, changed)
         except Exception as exc:
@@ -6228,6 +6415,7 @@ def run_once() -> None:
         nonlocal changed
         row = rows[index]
         try:
+            grid_cache["api_stat_context"] = str(row.get("coin") or "-")
             started_at = time.monotonic()
             rows[index], row_changed = maintain_grid(row, grid_cache)
             changed = changed or row_changed
@@ -6265,6 +6453,8 @@ def run_once() -> None:
         # fresh, while our in-memory open-order delta stays authoritative for
         # duplicate detection inside this run.
     grid_cache.pop("grid_action_phase", None)
+    grid_cache["api_stat_phase"] = "p3_limit_chase"
+    grid_cache["api_stat_context"] = "-"
     try:
         p3_changed = run_grid_limit_chase_p3(grid_cache)
         changed = changed or p3_changed
@@ -6277,6 +6467,7 @@ def run_once() -> None:
     grid_history_pruned = prune_grid_level_history(rows)
     if changed or pruned or grid_history_pruned:
         save_server_batch(rows)
+    emit_worker_api_stats(grid_cache)
 
 
 def main() -> None:

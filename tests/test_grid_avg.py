@@ -1,6 +1,9 @@
+import json
+import tempfile
 import unittest
 from argparse import Namespace
 from decimal import Decimal
+from pathlib import Path
 from unittest.mock import patch
 
 from hl_order import (
@@ -37,6 +40,7 @@ from hl_order import (
 )
 from trail_worker import (
     GridActionBudgetUnavailable,
+    WorkerApiProxy,
     active_grid_oids,
     action_limit_p1_budget_for_deficit,
     action_limit_p1_budget_for_headroom,
@@ -58,6 +62,7 @@ from trail_worker import (
     dense_grid_entries,
     defer_paused_grid_restore_if_crossing,
     enable_action_limit_p1_budget,
+    emit_worker_api_stats,
     grid_panic_ratio,
     grid_panic_ratio_threshold,
     grid_row_recoverable_from_error,
@@ -120,6 +125,7 @@ from trail_worker import (
     prune_grid_levels,
     regrid_dense_entries,
     reserve_grid_exchange_actions,
+    record_worker_api_timing,
     replacement_order_from_fill,
     restore_pending_cancel_entries,
     run_once,
@@ -474,6 +480,64 @@ class GridAvgTests(unittest.TestCase):
             user_action_rate_limit_metrics(FakeInfo(), "0xabc"),
             {"nRequestsUsed": "209725", "nRequestsCap": "207711", "deficit": "2014"},
         )
+
+    def test_worker_api_proxy_records_phase_context_latency_count_and_errors(self) -> None:
+        class FakeInfo:
+            def user_state(self, account, dex=""):
+                return {"account": account, "dex": dex}
+
+            def all_mids(self, dex=""):
+                raise RuntimeError("temporary info failure")
+
+        cache = {
+            "grid_action_phase": "p1_paused_replacement",
+            "api_stat_context": "mkts:USTECH",
+        }
+        proxy = WorkerApiProxy(FakeInfo(), cache, "info")
+
+        with patch("trail_worker.time.monotonic", side_effect=[1.0, 1.125, 2.0, 2.5]):
+            self.assertEqual(proxy.user_state("acct", dex="mkts"), {"account": "acct", "dex": "mkts"})
+            with self.assertRaisesRegex(RuntimeError, "temporary info failure"):
+                proxy.all_mids("mkts")
+
+        user_state = cache["api_stats"]["p1_paused_replacement|mkts:USTECH|info.user_state"]
+        all_mids = cache["api_stats"]["p1_paused_replacement|mkts:USTECH|info.all_mids"]
+        self.assertEqual(user_state["count"], 1)
+        self.assertEqual(user_state["errors"], 0)
+        self.assertEqual(user_state["total_ms"], 125.0)
+        self.assertEqual(all_mids["count"], 1)
+        self.assertEqual(all_mids["errors"], 1)
+        self.assertEqual(all_mids["max_ms"], 500.0)
+
+    def test_emit_worker_api_stats_writes_jsonl_and_prints_top_calls(self) -> None:
+        cache = {
+            "run_started_at": 100,
+            "run_monotonic_started_at": 10.0,
+            "grid_action_phase": "p0",
+            "api_stat_context": "BTC",
+        }
+        record_worker_api_timing(cache, "info", "user_state", 0.25)
+        record_worker_api_timing(cache, "exchange", "order", 0.75, error=True)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trail-api-timing.jsonl"
+            with (
+                patch("trail_worker.API_TIMING_LOG_PATH", path),
+                patch("trail_worker.time.monotonic", return_value=12.0),
+                patch("trail_worker.time.time", return_value=123),
+                patch("builtins.print") as print_mock,
+            ):
+                payload = emit_worker_api_stats(cache)
+
+            self.assertIsNotNone(payload)
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["request_count"], 2)
+            self.assertEqual(saved["error_count"], 1)
+            self.assertEqual(saved["api_total_ms"], 1000.0)
+            self.assertEqual(saved["run_elapsed_ms"], 2000.0)
+            self.assertEqual(saved["methods"][0]["method"], "exchange.order")
+            self.assertEqual(saved["methods"][0]["context"], "BTC")
+            self.assertIn("requests=2", print_mock.call_args.args[0])
 
     def test_precheck_action_limit_blocks_p1_when_used_reaches_cap(self) -> None:
         class FakeInfo:
