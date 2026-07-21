@@ -6198,6 +6198,8 @@ def submit_grid_limit_chase_market(
         filled_size = decimal_or_none(filled.get("totalSz", filled.get("sz")))
         if filled_size is not None and filled_size > 0:
             order["filled_size"] = decimal_to_plain(filled_size)
+        row.pop("limit_chase_error", None)
+        row.pop("limit_chase_error_at", None)
         return True
     row["limit_chase_error"] = f"limit chase market response did not include a fill: {result}"
     row["limit_chase_error_at"] = now

@@ -732,6 +732,8 @@ class GridAvgTests(unittest.TestCase):
             "min_order_value": "10",
             "sz_decimals": 2,
             "levels": [],
+            "limit_chase_error": "stale minimum notional rejection",
+            "limit_chase_error_at": 122,
         }
         info = FakeInfo()
         exchange = FakeExchange()
@@ -765,6 +767,8 @@ class GridAvgTests(unittest.TestCase):
         self.assertTrue(replacement["replace_never_cancel"])
         self.assertEqual(row["limit_chase_withdrawable"], "25")
         self.assertEqual(row["limit_chase_status"], "submitted")
+        self.assertNotIn("limit_chase_error", row)
+        self.assertNotIn("limit_chase_error_at", row)
 
     def test_limit_chase_p3_requires_withdrawable_strictly_above_ten(self) -> None:
         class FakeInfo:
