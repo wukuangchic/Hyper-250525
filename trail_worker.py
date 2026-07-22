@@ -2587,6 +2587,31 @@ def grid_entries_near_first_per_side(entries: list[Any]) -> list[Any]:
     return ordered
 
 
+def grid_nearest_non_crossing_paused_entries(
+    entries: list[Any],
+    current_mid: Decimal,
+    best_bid: Decimal | None = None,
+    best_ask: Decimal | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Lock each side to its nearest paused level so farther levels cannot leapfrog it."""
+    nearest: dict[str, dict[str, Any]] = {}
+    for side in ("buy", "sell"):
+        candidates = [
+            entry
+            for entry in entries
+            if isinstance(entry, dict)
+            and str(entry.get("side") or "") == side
+            and str(entry.get("status") or "") in GRID_PAUSED_STATUSES
+            and not grid_recovery_price_would_cross_market(entry, current_mid, best_bid, best_ask)
+        ]
+        if candidates:
+            nearest[side] = min(
+                candidates,
+                key=lambda entry: grid_entry_near_to_far_key(entry, side),
+            )
+    return nearest
+
+
 def grid_level_side_cap_clear_key(entry: dict[str, Any]) -> tuple[int, int, Decimal]:
     status = str(entry.get("status") or "")
     replacement_order = bool(entry.get("replacement_order"))
@@ -5518,18 +5543,22 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     replacement_rebalanced = 0
     near_far_rebalanced = 0
     if allow_p2 and isinstance(levels, list) and noncritical_grid_work_allowed(cache):
+        nearest_paused_by_side = grid_nearest_non_crossing_paused_entries(
+            levels,
+            current_mid,
+            best_bid,
+            best_ask,
+        )
         for side in ("buy", "sell"):
             if not side_submission_allowed(side):
                 continue
             if grid_margin_pause_active(row, side, now, position_value, position_size):
                 continue
+            nearest_paused = nearest_paused_by_side.get(side)
             paused_candidates = [
                 entry
-                for entry in levels
-                if isinstance(entry, dict)
-                and str(entry.get("side") or "") == side
-                and str(entry.get("status") or "") in GRID_PAUSED_STATUSES
-                and not (
+                for entry in ([nearest_paused] if nearest_paused is not None else [])
+                if not (
                     withdrawable_pause_active
                     and str(entry.get("status") or "") == GRID_WITHDRAWABLE_PAUSE_STATUS
                 )
@@ -5650,6 +5679,12 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     mark_phase("withdrawable_pause")
 
     restored = 0
+    nearest_paused_by_side = grid_nearest_non_crossing_paused_entries(
+        levels,
+        current_mid,
+        best_bid,
+        best_ask,
+    )
     for entry in (grid_entries_near_first_per_side(levels) if allow_p1_restore else []):
         if (
             not isinstance(entry, dict)
@@ -5659,6 +5694,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         ):
             continue
         side = str(entry["side"])
+        if nearest_paused_by_side.get(side) is not entry:
+            continue
         survival_needed = grid_survival_slot_available(row, side)
         if panic_reduced and grid_order_would_add_risk(position_size, side == "buy") and not survival_needed:
             continue
@@ -5795,6 +5832,12 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     mark_phase("topups")
 
     restore_scan_entries = grid_entries_near_first_per_side(levels)
+    nearest_paused_by_side = grid_nearest_non_crossing_paused_entries(
+        levels,
+        current_mid,
+        best_bid,
+        best_ask,
+    )
     for entry in (restore_scan_entries if (allow_p1_restore or allow_p1_paused_replacement) else []):
         if isinstance(entry, dict) and pause_refresh_reduce_only_replacement(entry, now):
             changed = True
@@ -5837,6 +5880,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         if not isinstance(entry, dict) or entry.get("side") is None or str(entry.get("status")) not in GRID_PAUSED_STATUSES:
             continue
         side = str(entry["side"])
+        if nearest_paused_by_side.get(side) is not entry:
+            continue
         survival_needed = grid_survival_slot_available(row, side)
         is_replacement_order = bool(entry.get("replacement_order"))
         protected_replacement = grid_order_is_never_cancel(entry)

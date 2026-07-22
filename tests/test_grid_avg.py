@@ -146,6 +146,7 @@ from trail_worker import (
     GRID_ACTION_PHASE_P2,
     grid_entries_fit_within_max,
     grid_entries_near_first_per_side,
+    grid_nearest_non_crossing_paused_entries,
     grid_entry_timestamp_ms,
 )
 
@@ -4470,6 +4471,40 @@ class GridAvgTests(unittest.TestCase):
             [(entry["side"], entry["price"]) for entry in ordered],
             [("buy", "99"), ("sell", "101"), ("buy", "90"), ("sell", "120")],
         )
+
+    def test_nearest_paused_lock_does_not_let_farther_status_leapfrog(self) -> None:
+        buy_near_withdrawable = {
+            "side": "buy",
+            "status": "paused_withdrawable",
+            "price": "99",
+        }
+        buy_far_replacement = {
+            "side": "buy",
+            "status": "paused_replacement",
+            "price": "90",
+            "replacement_order": True,
+        }
+        crossing_sell = {
+            "side": "sell",
+            "status": "paused_replacement",
+            "price": "99",
+            "replacement_order": True,
+        }
+        sell_near = {
+            "side": "sell",
+            "status": "paused_limit",
+            "price": "101",
+        }
+
+        nearest = grid_nearest_non_crossing_paused_entries(
+            [buy_far_replacement, crossing_sell, sell_near, buy_near_withdrawable],
+            Decimal("100"),
+            Decimal("99.5"),
+            Decimal("100.5"),
+        )
+
+        self.assertIs(nearest["buy"], buy_near_withdrawable)
+        self.assertIs(nearest["sell"], sell_near)
 
     def test_immediate_replacement_bypasses_margin_prechecks(self) -> None:
         class FakeExchange:
