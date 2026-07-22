@@ -95,6 +95,16 @@ from trail_worker import (
     grid_target_orders_per_side,
     grid_survival_slot_available,
     maintain_grid,
+    maintain_grid_legacy,
+    lifecycle_active_price_too_close,
+    lifecycle_legacy_pause_candidate,
+    lifecycle_mark_deferred_or_discarded,
+    lifecycle_process_anomalies,
+    lifecycle_process_fills,
+    lifecycle_replacement_from_fill,
+    lifecycle_submit_limit_chase,
+    lifecycle_terminal_candidate,
+    migrate_grid_lifecycle,
     mark_missing_order_confirmed_open,
     mark_pending_cancel_confirmed_cancelled,
     mark_withdrawable_protected_restore_submitted,
@@ -125,6 +135,7 @@ from trail_worker import (
     prune_grid_levels,
     regrid_dense_entries,
     reserve_grid_exchange_actions,
+    raw_action_limit_deficit,
     record_worker_api_timing,
     replacement_order_from_fill,
     restore_pending_cancel_entries,
@@ -151,6 +162,204 @@ from trail_worker import (
 
 
 class GridAvgTests(unittest.TestCase):
+    def test_finite_chain_migration_maps_active_to_zero_and_paused_to_legacy_one(self) -> None:
+        row = {
+            "levels": [
+                {"side": "buy", "status": "active", "oid": 1, "replace_never_cancel": True},
+                {"side": "sell", "status": "paused_margin", "oid": None},
+            ],
+            "target_orders_per_side": 16,
+            "margin_pauses": {"buy": {}},
+        }
+
+        self.assertTrue(migrate_grid_lifecycle(row, 123))
+
+        self.assertEqual(row["grid_lifecycle_version"], 2)
+        self.assertEqual(row["levels"][0]["grid_leg"], 0)
+        self.assertEqual(row["levels"][0]["status"], "active")
+        self.assertNotIn("replace_never_cancel", row["levels"][0])
+        self.assertEqual(row["levels"][1]["grid_leg"], 1)
+        self.assertEqual(row["levels"][1]["status"], "legacy_pause")
+        self.assertEqual(row["levels"][1]["legacy_pause_status"], "paused_margin")
+        self.assertNotIn("target_orders_per_side", row)
+        self.assertNotIn("margin_pauses", row)
+
+    def test_finite_chain_replacement_toggles_grid_leg_from_actual_fill(self) -> None:
+        row = {"gap_rate": "0.01", "base_buy_size": "1", "base_sell_size": "1", "min_order_value": "10"}
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        source = {
+            "side": "buy",
+            "is_buy": True,
+            "grid_leg": 0,
+            "fill": {"px": "100", "sz": "0.4"},
+        }
+
+        first = lifecycle_replacement_from_fill(row, "BTC", asset, source)
+        self.assertIsNotNone(first)
+        self.assertEqual(first["side"], "sell")
+        self.assertEqual(first["price"], "101")
+        self.assertEqual(first["size"], "0.4")
+        self.assertEqual(first["grid_leg"], 1)
+
+        first["fill"] = {"px": "101", "sz": "0.4"}
+        second = lifecycle_replacement_from_fill(row, "BTC", asset, first)
+        self.assertIsNotNone(second)
+        self.assertEqual(second["side"], "buy")
+        self.assertEqual(second["grid_leg"], 0)
+
+    def test_finite_chain_only_unfinished_leg_defers_on_submit_failure(self) -> None:
+        unfinished = {"grid_leg": 1}
+        completed = {"grid_leg": 0}
+
+        self.assertEqual(lifecycle_mark_deferred_or_discarded(unfinished, 123, "Insufficient margin"), "margin")
+        self.assertEqual(unfinished["status"], "margin")
+        self.assertEqual(lifecycle_mark_deferred_or_discarded(completed, 123, "Insufficient margin"), "discarded")
+        self.assertEqual(completed["status"], "discarded")
+
+    def test_finite_chain_terminal_candidate_prefers_non_reduce_only_then_oldest(self) -> None:
+        rows = [{
+            "type": "grid", "status": "active", "network": "mainnet", "account": "0xabc", "dex": "",
+            "levels": [
+                {"side": "sell", "status": "active", "oid": 1, "grid_leg": 0, "reduce_only": True, "submitted_at": 1},
+                {"side": "buy", "status": "active", "oid": 2, "grid_leg": 0, "reduce_only": False, "submitted_at": 3},
+                {"side": "buy", "status": "active", "oid": 3, "grid_leg": 1, "reduce_only": False, "submitted_at": 2},
+            ],
+        }]
+
+        candidate = lifecycle_terminal_candidate(rows, "mainnet", "0xabc", "")
+
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate[1]["oid"], 2)
+
+    def test_finite_chain_p6_uses_relative_nearest_legacy_pause(self) -> None:
+        btc = {
+            "type": "grid", "status": "active", "network": "mainnet", "account": "0xabc", "dex": "", "coin": "BTC",
+            "levels": [{"side": "buy", "status": "legacy_pause", "price": "90", "grid_leg": 1}],
+        }
+        eth = {
+            "type": "grid", "status": "active", "network": "mainnet", "account": "0xabc", "dex": "", "coin": "ETH",
+            "levels": [{"side": "sell", "status": "legacy_pause", "price": "201", "grid_leg": 1}],
+        }
+
+        candidate = lifecycle_legacy_pause_candidate([btc, eth], "mainnet", "0xabc", "", {"BTC": "100", "ETH": "200"})
+
+        self.assertIsNotNone(candidate)
+        self.assertIs(candidate[0], eth)
+
+    def test_raw_deficit_preserves_negative_headroom(self) -> None:
+        self.assertEqual(raw_action_limit_deficit({"action_limit_headroom": 101}), -101)
+        self.assertEqual(raw_action_limit_deficit({"action_limit_raw_deficit": 3, "action_limit_error": "hit"}), 3)
+
+    def test_lifecycle_spacing_only_counts_active_orders(self) -> None:
+        row = {
+            "gap_rate": "0.01",
+            "levels": [
+                {"side": "buy", "status": "legacy_pause", "price": "99.5"},
+                {"side": "buy", "status": "active", "price": "98"},
+            ],
+        }
+        self.assertFalse(lifecycle_active_price_too_close(row, "buy", Decimal("100")))
+        row["levels"][1]["price"] = "99.5"
+        self.assertTrue(lifecycle_active_price_too_close(row, "buy", Decimal("100")))
+
+    def test_p2_replaces_filled_leg_and_removes_source(self) -> None:
+        class FakeExchange:
+            def order(self, coin, is_buy, size, price, order_type, reduce_only=False):
+                self.request = (coin, is_buy, size, price, order_type, reduce_only)
+                return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 22}}]}}}
+
+        source = {
+            "side": "buy", "is_buy": True, "status": "filled", "replacement_pending": True,
+            "grid_leg": 0, "fill": {"px": "100", "sz": "0.4"}, "price": "99", "size": "0.4",
+        }
+        row = {"gap_rate": "0.01", "min_order_value": "10", "base_buy_size": "0.4", "base_sell_size": "0.4", "levels": [source]}
+        exchange = FakeExchange()
+        ctx = {
+            "coin": "BTC", "asset": {"szDecimals": 2, "maxLeverage": 20}, "exchange": exchange,
+            "now": 123, "position_size": Decimal("1"), "current_mid": Decimal("100"),
+            "best_bid": Decimal("99.9"), "best_ask": Decimal("100.1"), "open_orders": [],
+            "open_oids": set(), "fills_by_oid": {}, "info": object(), "account": "0xabc",
+        }
+
+        count, changed = lifecycle_process_fills(row, ctx, {"action_limit_headroom": 100})
+
+        self.assertTrue(changed)
+        self.assertEqual(count, 1)
+        self.assertEqual(len(row["levels"]), 1)
+        child = row["levels"][0]
+        self.assertEqual(child["grid_leg"], 1)
+        self.assertEqual(child["side"], "sell")
+        self.assertEqual(child["status"], "active")
+        self.assertTrue(exchange.request[-1])
+
+    def test_p5_cancelled_leg_one_restores_without_reduce_only(self) -> None:
+        class FakeInfo:
+            def query_order_by_oid(self, account, oid):
+                return {"order": {"status": "reduceOnlyCanceled"}}
+
+        class FakeExchange:
+            def order(self, coin, is_buy, size, price, order_type, reduce_only=False):
+                self.reduce_only = reduce_only
+                return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 23}}]}}}
+
+        entry = grid_order_entry(
+            {"gap_rate": "0.01", "min_order_value": "10", "base_buy_size": "1", "base_sell_size": "1"},
+            "BTC", {"szDecimals": 2}, False, Decimal("101"), True, size=Decimal("1"), preserve_size=True,
+        )
+        entry.update({"status": "active", "oid": 9, "grid_leg": 1})
+        row = {"gap_rate": "0.01", "min_order_value": "10", "base_buy_size": "1", "base_sell_size": "1", "levels": [entry]}
+        exchange = FakeExchange()
+        ctx = {
+            "coin": "BTC", "asset": {"szDecimals": 2, "maxLeverage": 20}, "exchange": exchange,
+            "now": 123, "position_size": Decimal("1"), "current_mid": Decimal("100"),
+            "best_bid": Decimal("99.9"), "best_ask": Decimal("100.1"), "open_orders": [],
+            "open_oids": set(), "fills_by_oid": {}, "info": FakeInfo(), "account": "0xabc",
+        }
+
+        count, changed = lifecycle_process_anomalies(row, ctx, {"action_limit_headroom": 200})
+
+        self.assertTrue(changed)
+        self.assertEqual(count, 1)
+        self.assertEqual(entry["status"], "active")
+        self.assertEqual(entry["grid_leg"], 1)
+        self.assertFalse(exchange.reduce_only)
+
+    def test_p4_market_fill_births_leg_one_gtc_order(self) -> None:
+        class FakeExchange:
+            def __init__(self):
+                self.calls = []
+
+            def _slippage_price(self, coin, is_buy, slippage, mid):
+                return 100
+
+            def order(self, coin, is_buy, size, price, order_type, reduce_only=False):
+                self.calls.append((is_buy, order_type, reduce_only))
+                if len(self.calls) == 1:
+                    return {"status": "ok", "response": {"data": {"statuses": [{"filled": {"oid": 1, "avgPx": "100", "totalSz": "0.3"}}]}}}
+                return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 2}}]}}}
+
+        row = {
+            "position_limit_mode": "limit", "min_position_value": "-100", "max_position_value": "150",
+            "gap_rate": "0.01", "min_order_value": "10", "base_buy_size": "0.3", "base_sell_size": "0.3",
+            "levels": [],
+        }
+        exchange = FakeExchange()
+        ctx = {
+            "withdrawable": Decimal("6"), "position_size": Decimal("2"), "position_value": Decimal("200"),
+            "exchange": exchange, "coin": "BTC", "asset": {"szDecimals": 2, "maxLeverage": 20},
+            "current_mid": Decimal("100"), "best_bid": Decimal("99.9"), "best_ask": Decimal("100.1"),
+            "now": 123, "open_orders": [],
+        }
+
+        changed = lifecycle_submit_limit_chase(row, ctx, {"action_limit_headroom": 200})
+
+        self.assertTrue(changed)
+        self.assertEqual(len(row["levels"]), 1)
+        birth = row["levels"][0]
+        self.assertEqual(birth["grid_leg"], 1)
+        self.assertEqual(birth["birth_source"], "limit_chase")
+        self.assertEqual(birth["plan"]["order_type"], {"limit": {"tif": "Gtc"}})
+
     def test_spot_usdc_withdrawable_matches_worker_total_minus_hold(self) -> None:
         self.assertEqual(
             spot_usdc_withdrawable(
@@ -822,20 +1031,9 @@ class GridAvgTests(unittest.TestCase):
             calls.append((row["coin"], cache.get("grid_action_phase")))
             return row, False
 
-        def fake_limit_chase_p3(cache: dict) -> bool:
-            calls.append(
-                (
-                    "P3",
-                    cache.get("grid_action_phase"),
-                    cache.get("limit_chase_p1_completed"),
-                )
-            )
-            return False
-
         with (
             patch("trail_worker.load_server_batch", return_value=rows),
             patch("trail_worker.maintain_grid", side_effect=fake_maintain_grid),
-            patch("trail_worker.run_grid_limit_chase_p3", side_effect=fake_limit_chase_p3),
             patch("trail_worker.random.shuffle", side_effect=lambda indexes: indexes.reverse()),
             patch("trail_worker.prune_done_rows", return_value=(rows, False)),
             patch("trail_worker.prune_grid_level_history", return_value=False),
@@ -848,26 +1046,23 @@ class GridAvgTests(unittest.TestCase):
             [
                 ("ETH", "p0"),
                 ("BTC", "p0"),
-                ("ETH", "p1_latest_replacement"),
-                ("BTC", "p1_latest_replacement"),
-                ("ETH", "p1_paused_replacement"),
-                ("BTC", "p1_paused_replacement"),
-                ("ETH", "p1_cancels"),
-                ("BTC", "p1_cancels"),
-                ("ETH", "p1_topup"),
-                ("BTC", "p1_topup"),
-                ("ETH", "p1_restore"),
-                ("BTC", "p1_restore"),
-                ("ETH", "p1_withdrawable"),
-                ("BTC", "p1_withdrawable"),
+                ("ETH", "p1"),
+                ("BTC", "p1"),
                 ("ETH", "p2"),
                 ("BTC", "p2"),
-                ("P3", None, True),
+                ("ETH", "p3"),
+                ("BTC", "p3"),
+                ("ETH", "p4"),
+                ("BTC", "p4"),
+                ("ETH", "p5"),
+                ("BTC", "p5"),
+                ("ETH", "p6"),
+                ("BTC", "p6"),
             ],
         )
         save_server_batch.assert_not_called()
 
-    def test_run_once_reuses_read_caches_between_action_phases(self) -> None:
+    def test_run_once_refreshes_position_and_market_caches_between_action_phases(self) -> None:
         rows = [{"type": "grid", "status": "active", "coin": "BTC", "levels": []}]
         seen = []
 
@@ -901,8 +1096,8 @@ class GridAvgTests(unittest.TestCase):
             run_once()
 
         self.assertEqual(seen[0], (None, None, None))
-        self.assertEqual(seen[1], ({"stale": True}, {"shared": True}, 3))
-        self.assertEqual(info.clear_calls, 8)
+        self.assertEqual(seen[1], (None, None, 3))
+        self.assertEqual(info.clear_calls, 7)
 
     def test_limit_chase_p3_waits_every_ten_seconds_for_market_and_replacement_capacity(self) -> None:
         class FakeInfo:
@@ -1032,7 +1227,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertNotIn("limit_chase_error", row)
         self.assertNotIn("limit_chase_error_at", row)
 
-    def test_limit_chase_p3_requires_withdrawable_strictly_above_ten(self) -> None:
+    def test_legacy_limit_chase_requires_withdrawable_strictly_above_five(self) -> None:
         class FakeInfo:
             def all_mids(self, dex):
                 return {"BTC": "100"}
@@ -1047,13 +1242,13 @@ class GridAvgTests(unittest.TestCase):
             def spot_user_state(self, account):
                 return {
                     "balances": [
-                        {"token": 0, "coin": "USDC", "total": "20", "hold": "10"}
+                        {"token": 0, "coin": "USDC", "total": "15", "hold": "10"}
                     ]
                 }
 
         class FakeExchange:
             def order(self, *args, **kwargs):
-                raise AssertionError("P3 must not submit when withdrawable equals 10")
+                raise AssertionError("limit chase must not submit when withdrawable equals 5")
 
         row = {
             "type": "grid",
@@ -2162,7 +2357,7 @@ class GridAvgTests(unittest.TestCase):
 
         cache = {"now": 123, "grid_action_phase": "p0"}
         with patch("trail_worker.build_clients", return_value=(info, exchange, "acct", "signer", {})):
-            updated, changed = maintain_grid(row, cache)
+            updated, changed = maintain_grid_legacy(row, cache)
 
         self.assertTrue(changed)
         self.assertEqual(exchange.bulk_calls, 0)
@@ -2368,14 +2563,14 @@ class GridAvgTests(unittest.TestCase):
         }
 
         with patch("trail_worker.build_clients", return_value=(info, exchange, "acct", "signer", {})):
-            updated, changed = maintain_grid(row, {"now": 123, "grid_action_phase": "p0"})
+            updated, changed = maintain_grid_legacy(row, {"now": 123, "grid_action_phase": "p0"})
             self.assertTrue(changed)
             reversal = next(entry for entry in updated["levels"] if entry.get("panic_reversal_order"))
             self.assertEqual(reversal["status"], "paused_replacement")
             self.assertEqual(reversal["size"], "0.4")
             self.assertTrue(reversal["replace_never_cancel"])
 
-            updated, changed = maintain_grid(
+            updated, changed = maintain_grid_legacy(
                 updated,
                 {"now": 124, "grid_action_phase": "p1_paused_replacement"},
             )
@@ -2535,7 +2730,7 @@ class GridAvgTests(unittest.TestCase):
             patch("trail_worker.build_clients", return_value=(info, exchange, "acct", "signer", {})),
             patch("trail_worker.time.sleep") as sleep_mock,
         ):
-            updated, changed = maintain_grid(row, {"now": 123, "grid_action_phase": "p0"})
+            updated, changed = maintain_grid_legacy(row, {"now": 123, "grid_action_phase": "p0"})
 
         self.assertTrue(changed)
         self.assertEqual(sleep_mock.call_count, 3)
@@ -2623,7 +2818,7 @@ class GridAvgTests(unittest.TestCase):
             patch("trail_worker.build_clients", return_value=(FakeInfo(), FakeExchange(), "acct", "signer", {})),
             patch("trail_worker.precheck_action_limit"),
         ):
-            updated, _changed = maintain_grid(row, {"now": 123, "grid_action_phase": "p1_cancels"})
+            updated, _changed = maintain_grid_legacy(row, {"now": 123, "grid_action_phase": "p1_cancels"})
 
         self.assertEqual([entry["status"] for entry in updated["levels"]], ["active", "active"])
         self.assertEqual([entry["oid"] for entry in updated["levels"]], [101, 102])
@@ -4697,7 +4892,7 @@ class GridAvgTests(unittest.TestCase):
             patch("trail_worker.build_clients", return_value=(FakeInfo(), exchange, "acct", "signer", {})),
             patch("trail_worker.precheck_action_limit"),
         ):
-            updated, changed = maintain_grid(row, cache)
+            updated, changed = maintain_grid_legacy(row, cache)
 
         self.assertTrue(changed)
         self.assertEqual(len(exchange.orders), 1)

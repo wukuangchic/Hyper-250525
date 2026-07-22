@@ -1731,6 +1731,7 @@ def grid_mid_marker_row(current_mid: Decimal) -> dict[str, str]:
     marker = "----"
     return {
         "side": marker,
+        "leg": marker,
         "status": "mid",
         "live": "-",
         "price": f"--- {format_optional_decimal(current_mid)} ---",
@@ -1763,6 +1764,8 @@ def format_grid_detail_rows(
         "paused_reduce_capacity",
         "paused_account_margin",
         "paused_roe",
+        "margin",
+        "legacy_pause",
     }
     live_entries = [entry for entry in entries if str(entry.get("status", "active")) in live_statuses]
     history_entries = [entry for entry in entries if str(entry.get("status", "active")) not in live_statuses]
@@ -1784,6 +1787,7 @@ def format_grid_detail_rows(
         rows.append(
             {
                 "side": str(entry.get("side", "")),
+                "leg": str(entry.get("grid_leg", "-")),
                 "status": display_status,
                 "live": live,
                 "price": format_optional_decimal(entry.get("price", entry.get("limit_px"))),
@@ -1807,6 +1811,15 @@ def grid_query_avg_summary(
     position_size: Decimal,
     position_value: Decimal,
 ) -> list[tuple[str, str]]:
+    if int(row.get("grid_lifecycle_version") or 0) >= 2:
+        return [
+            ("gap", f"{row.get('gap', '')} ({row.get('gap_rate', '')})"),
+            (
+                "size",
+                f"buy {row.get('base_buy_size', row.get('buy_size', ''))} / "
+                f"sell {row.get('base_sell_size', row.get('sell_size', ''))}",
+            ),
+        ]
     avg_value = decimal_or_none(row.get("avg"))
     base_gap = Decimal(str(row.get("gap_rate") or "0"))
     base_buy_size = Decimal(str(row.get("base_buy_size") or row.get("buy_size") or "0"))
@@ -1934,7 +1947,8 @@ def query_grid(args: argparse.Namespace) -> None:
                 if row.get("panic_reduce_at")
                 else "-"
             )),
-            ("target_side", str(row.get("target_orders_per_side", GRID_TARGET_ORDERS_PER_SIDE))),
+            ("lifecycle", f"v{row.get('grid_lifecycle_version', '-')} finite-chain"),
+            ("legacy_pause", str(row.get("legacy_pause_remaining", "0"))),
             ("active_buy", str(active_buy)),
             ("active_sell", str(active_sell)),
             ("live_oids", f"{live_count}/{len(grid_batch_open_oids(row))}"),
@@ -1948,6 +1962,7 @@ def query_grid(args: argparse.Namespace) -> None:
             detail_rows,
             [
                 ("side", "side"),
+                ("leg", "leg"),
                 ("status", "status"),
                 ("live", "live"),
                 ("price", "price"),
@@ -3549,7 +3564,7 @@ def build_grid_batch_row(
         "avg_multiplier": decimal_to_plain(Decimal(str(plans[0].get("grid_avg_multiplier", "1")))) if plans else "1",
         "avg_current_value": decimal_to_plain(Decimal(str(plans[0].get("grid_avg_current_value", "0")))) if plans else "0",
         "actual_trend": getattr(args, "resolved_grid_trend", "0%"),
-        "target_orders_per_side": GRID_TARGET_ORDERS_PER_SIDE,
+        "grid_lifecycle_version": 2,
         "buy_size": decimal_to_plain(buy_sizes[0]) if buy_sizes else "",
         "sell_size": decimal_to_plain(sell_sizes[0]) if sell_sizes else "",
         "base_buy_size": decimal_to_plain(base_buy_sizes[0]) if base_buy_sizes else "",
@@ -3563,7 +3578,7 @@ def build_grid_batch_row(
         "created_at": now,
         "updated_at": now,
         "last_fill_check_ms": (now - 3600) * 1000,
-        "levels": levels,
+        "levels": [dict(level, grid_leg=0) if isinstance(level, dict) else level for level in levels],
         "note": "; ".join(str(error) for error in status_errors) if status_errors else "active true grid",
     }
 
@@ -4406,7 +4421,7 @@ def build_recovered_grid_batch_row(
         "avg_multiplier": "1",
         "avg_current_value": "0",
         "actual_trend": actual_trend,
-        "target_orders_per_side": GRID_TARGET_ORDERS_PER_SIDE,
+        "grid_lifecycle_version": 2,
         "buy_size": decimal_to_plain(buy_size),
         "sell_size": decimal_to_plain(sell_size),
         "base_buy_size": decimal_to_plain(base_buy_size),
@@ -4420,7 +4435,7 @@ def build_recovered_grid_batch_row(
         "created_at": now,
         "updated_at": now,
         "last_fill_check_ms": (now - 24 * 60 * 60) * 1000,
-        "levels": levels,
+        "levels": [dict(level, grid_leg=0) if isinstance(level, dict) else level for level in levels],
         "note": "recovered from open limit orders",
     }
 
@@ -4441,10 +4456,8 @@ def recover_grid_batch_order(
     ensure_no_duplicate_grid_batch(load_server_batch(), args.network, account, coin)
     max_position_value = Decimal(str(args.grid_position_limit_value))
     gap_rate = resolve_grid_spacing(args, info, account, asset, dex, current_mid)
-    orders = select_grid_recovery_orders(
-        recoverable_grid_open_orders(info, account, dex, coin, args.network),
-        GRID_TARGET_ORDERS_PER_SIDE,
-    )
+    orders = recoverable_grid_open_orders(info, account, dex, coin, args.network)
+    orders = select_grid_recovery_orders(orders, max(1, len(orders)))
     if not orders:
         print_account_metrics(info, account)
         print_box("Grid Recover", [("coin", coin), ("matched", "0")])
@@ -5266,25 +5279,19 @@ def place_order(args: argparse.Namespace) -> None:
             print("dex:", dex or "default")
             print("current_mid:", mids.get(coin))
             print("max_leverage:", max_leverage)
-            print("grid_orders:", len(plans))
-        statuses = submit_order_plans(
-            exchange,
-            info,
-            account,
-            coin,
-            max_leverage,
-            plans,
-            "na",
-            args,
-            price_rate,
-            "Grid Limit Orders",
-            retry_action_limit=False,
-        )
-        if statuses is not None:
-            row = build_grid_batch_row(args, account, coin, dex, asset, plans, statuses, amount, slippage)
-            submitted_oids = {oid for status in statuses if (oid := status_resting_oid(status)) is not None and oid > 0}
-            append_server_batch_or_cancel_orders(row, exchange, coin, submitted_oids)
-            print_grid_batch_status(row, price_rate)
+            print("grid_orders:", 0)
+            print("grid_birth:", "waiting for P4 limit-chase")
+        # Finite-chain grids start empty.  P4 limit-chase is the only birth
+        # source for a new empty grid; it creates the first grid_leg=1 order
+        # only after its IOC market order has actually filled.
+        row = build_grid_batch_row(args, account, coin, dex, asset, plans, [], amount, slippage)
+        row["levels"] = []
+        row["grid_lifecycle_version"] = 2
+        row.pop("target_orders_per_side", None)
+        row["note"] = "finite-chain grid waiting for P4 limit-chase birth"
+        if not args.dry_run:
+            append_server_batch_or_cancel_orders(row, exchange, coin, set())
+        print_grid_batch_status(row, price_rate)
         return
 
     is_buy = parse_side(args.side)

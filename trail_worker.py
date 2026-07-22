@@ -88,7 +88,11 @@ GRID_ROE_STOP_THRESHOLD = Decimal("-0.40")
 GRID_SURVIVAL_ACTIVE_ORDERS_PER_SIDE = 1
 GRID_WITHDRAWABLE_REDUCE_ONLY_THRESHOLD = Decimal("5")
 GRID_WITHDRAWABLE_PAUSE_THRESHOLD = Decimal("10")
-GRID_LIMIT_CHASE_WITHDRAWABLE_THRESHOLD = Decimal("10")
+GRID_LIMIT_CHASE_WITHDRAWABLE_THRESHOLD = Decimal("5")
+GRID_LIFECYCLE_VERSION = 2
+GRID_LEGACY_PAUSE_STATUS = "legacy_pause"
+GRID_MARGIN_STATUS = "margin"
+GRID_P6_WITHDRAWABLE_THRESHOLD = Decimal("20")
 GRID_PANIC_RATIO_LEGACY_DEFAULT_THRESHOLDS = {
     Decimal("10"),
     Decimal("20"),
@@ -127,6 +131,22 @@ GRID_ACTION_PHASES = (
     GRID_ACTION_PHASE_P1_RESTORE,
     GRID_ACTION_PHASE_P1_WITHDRAWABLE,
     GRID_ACTION_PHASE_P2,
+)
+GRID_LIFECYCLE_PHASE_P0 = "p0"
+GRID_LIFECYCLE_PHASE_P1 = "p1"
+GRID_LIFECYCLE_PHASE_P2 = "p2"
+GRID_LIFECYCLE_PHASE_P3 = "p3"
+GRID_LIFECYCLE_PHASE_P4 = "p4"
+GRID_LIFECYCLE_PHASE_P5 = "p5"
+GRID_LIFECYCLE_PHASE_P6 = "p6"
+GRID_LIFECYCLE_PHASES = (
+    GRID_LIFECYCLE_PHASE_P0,
+    GRID_LIFECYCLE_PHASE_P1,
+    GRID_LIFECYCLE_PHASE_P2,
+    GRID_LIFECYCLE_PHASE_P3,
+    GRID_LIFECYCLE_PHASE_P4,
+    GRID_LIFECYCLE_PHASE_P5,
+    GRID_LIFECYCLE_PHASE_P6,
 )
 GRID_MAX_LEVELS_PER_SIDE = 1024
 GRID_MAX_ACTIVE_ORDERS_PER_SIDE = 16
@@ -361,6 +381,21 @@ def action_limit_deficit(cache: dict[str, Any] | None) -> int:
         return 0
 
 
+def raw_action_limit_deficit(cache: dict[str, Any] | None) -> int:
+    """Return used-cap, preserving negative headroom for lifecycle phase gates."""
+    if not isinstance(cache, dict):
+        return 0
+    if "action_limit_headroom" in cache and not action_limit_error(cache):
+        try:
+            return -max(0, int(cache.get("action_limit_headroom") or 0))
+        except (TypeError, ValueError):
+            return 0
+    try:
+        return int(cache.get("action_limit_raw_deficit", cache.get("action_limit_deficit", 0)) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def grid_order_far_from_mid(entry: dict[str, Any], current_mid: Decimal, rate: Decimal) -> bool:
     price = decimal_or_none(entry.get("price", entry.get("limit_px")))
     if price is None or price <= 0 or current_mid <= 0:
@@ -424,6 +459,7 @@ def clear_cumulative_action_limit_retry_cache(cache: dict[str, Any] | None) -> N
     cache.pop("action_limit_error", None)
     cache.pop("action_limit_at", None)
     cache.pop("action_limit_deficit", None)
+    cache.pop("action_limit_raw_deficit", None)
     rate_cache = cache.get("user_action_rate_limits")
     if isinstance(rate_cache, dict):
         rate_cache.clear()
@@ -620,6 +656,7 @@ def precheck_action_limit(info: Any, account: str, cache: dict[str, Any], networ
         cap = int(rate.get("nRequestsCap") or 0)
     except (TypeError, ValueError):
         return None
+    cache["action_limit_raw_deficit"] = used - cap if cap > 0 else 0
     cache["action_limit_deficit"] = max(0, used - cap) if cap > 0 else 0
     audit_snapshots = cache.setdefault("rate_limit_audit_snapshots", {})
     audit_key = (network, account)
@@ -2062,6 +2099,8 @@ def panic_reversal_order_from_reduce(
     order["replacement_order"] = True
     order["panic_reversal_order"] = True
     order["replace_never_cancel"] = True
+    order["grid_leg"] = 1
+    order["birth_source"] = "panic"
     plan = order.get("plan")
     if isinstance(plan, dict):
         plan["label"] = "grid-panic-reversal"
@@ -2163,6 +2202,8 @@ def limit_chase_replacement_order_from_market(
     order["replacement_order"] = True
     order["limit_chase_replacement"] = True
     order["replace_never_cancel"] = True
+    order["grid_leg"] = 1
+    order["birth_source"] = "limit_chase"
     set_grid_order_reduce_only(order, False)
     plan = order.get("plan")
     if isinstance(plan, dict):
@@ -4621,7 +4662,7 @@ def near_grid_orders_if_stale(
     return entries
 
 
-def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> tuple[dict[str, Any], bool]:
+def maintain_grid_legacy(row: dict[str, Any], cache: dict[str, Any] | None = None) -> tuple[dict[str, Any], bool]:
     phase_started_at = time.monotonic()
     last_phase_at = phase_started_at
     phase_timings: list[tuple[str, float]] = []
@@ -6157,6 +6198,25 @@ def prune_grid_levels(row: dict[str, Any]) -> bool:
     levels = row.get("levels")
     if not isinstance(levels, list):
         return False
+    if int(row.get("grid_lifecycle_version") or 0) >= GRID_LIFECYCLE_VERSION:
+        kept = [
+            entry
+            for entry in levels
+            if not isinstance(entry, dict)
+            or str(entry.get("status") or "") not in {
+                "cancelled",
+                "discarded",
+                "filled_replaced",
+                "skipped_account_margin",
+                "skipped_post_only",
+                "skipped_exchange_reject",
+            }
+        ]
+        if len(kept) == len(levels):
+            return False
+        row["levels"] = kept
+        row["history_pruned_at"] = int(time.time())
+        return True
 
     live_statuses = {
         "active",
@@ -6514,6 +6574,719 @@ def run_grid_limit_chase_p3(cache: dict[str, Any]) -> bool:
     return True
 
 
+def migrate_grid_lifecycle(row: dict[str, Any], now: int) -> bool:
+    """Move a saved grid into the finite-chain lifecycle without reviving old controls."""
+    if int(row.get("grid_lifecycle_version") or 0) >= GRID_LIFECYCLE_VERSION:
+        return False
+    levels = row.setdefault("levels", [])
+    changed = False
+    for entry in levels:
+        if not isinstance(entry, dict) or not entry.get("side"):
+            continue
+        status = str(entry.get("status") or "active")
+        entry.pop("replace_never_cancel", None)
+        entry.pop("panic_reversal_order", None)
+        entry.pop("limit_chase_replacement", None)
+        if status.startswith("paused_") or status in GRID_PAUSED_STATUSES:
+            entry["legacy_pause_status"] = status
+            entry["status"] = GRID_LEGACY_PAUSE_STATUS
+            entry["oid"] = None
+            entry["grid_leg"] = 1
+            entry["legacy_pause_migrated_at"] = now
+            changed = True
+            continue
+        if status in {"active", "pending", "recovery_deferred", GRID_PENDING_CANCEL_STATUS}:
+            entry["status"] = "active"
+            entry["grid_leg"] = 0
+            changed = True
+            continue
+        if status == "filled" or bool(entry.get("replacement_pending")):
+            entry.setdefault("grid_leg", 0)
+            changed = True
+    row["grid_lifecycle_version"] = GRID_LIFECYCLE_VERSION
+    row["grid_lifecycle_migrated_at"] = now
+    row.pop("target_orders_per_side", None)
+    row.pop("margin_pauses", None)
+    return True
+
+
+def lifecycle_leg(entry: dict[str, Any]) -> int:
+    try:
+        return 1 if int(entry.get("grid_leg") or 0) == 1 else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def lifecycle_active_price_too_close(
+    row: dict[str, Any],
+    side: str,
+    price: Decimal,
+    *,
+    exclude: dict[str, Any] | None = None,
+) -> bool:
+    gap = Decimal(str(row["gap_rate"]))
+    threshold = price * gap * GRID_ALO_SPACING_MULTIPLIER
+    for entry in row.get("levels") or []:
+        if not isinstance(entry, dict) or entry is exclude:
+            continue
+        if str(entry.get("status") or "") not in {"active", "pending"}:
+            continue
+        if str(entry.get("side") or "") != side:
+            continue
+        existing = decimal_or_none(entry.get("price", entry.get("limit_px")))
+        if existing is not None and existing > 0 and abs(existing - price) <= threshold:
+            return True
+    return False
+
+
+def lifecycle_fill_price_size(entry: dict[str, Any]) -> tuple[Decimal | None, Decimal | None]:
+    fill = entry.get("fill")
+    if isinstance(fill, dict):
+        price = decimal_or_none(fill.get("avgPx", fill.get("px")))
+        size = decimal_or_none(fill.get("totalSz", fill.get("sz")))
+    else:
+        price = None
+        size = None
+    price = price or decimal_or_none(entry.get("filled_avg_px")) or decimal_or_none(
+        entry.get("price", entry.get("limit_px"))
+    )
+    size = size or decimal_or_none(entry.get("filled_size")) or decimal_or_none(entry.get("size"))
+    return price, size
+
+
+def lifecycle_replacement_from_fill(
+    row: dict[str, Any],
+    coin: str,
+    asset: dict[str, Any],
+    source: dict[str, Any],
+) -> dict[str, Any] | None:
+    fill_price, fill_size = lifecycle_fill_price_size(source)
+    gap = Decimal(str(row["gap_rate"]))
+    if fill_price is None or fill_price <= 0 or fill_size is None or fill_size <= 0 or gap <= 0:
+        return None
+    is_buy = not bool(source.get("is_buy"))
+    multiplier = Decimal("1") - gap if is_buy else Decimal("1") + gap
+    price = rounded_perp_price(
+        fill_price * multiplier,
+        int(row.get("sz_decimals") or asset["szDecimals"]),
+    )
+    if price <= 0:
+        return None
+    order = grid_order_entry(
+        row,
+        coin,
+        asset,
+        is_buy,
+        price,
+        False,
+        size=fill_size,
+        gap=gap,
+        preserve_size=True,
+    )
+    order["replacement_order"] = True
+    order["grid_leg"] = 1 - lifecycle_leg(source)
+    order["source_grid_leg"] = lifecycle_leg(source)
+    order["replacement_anchor_price"] = decimal_to_plain(fill_price)
+    order["replacement_anchor_source"] = "market_fill" if isinstance(source.get("fill"), dict) else "saved_fill"
+    order["preserve_fill_size"] = True
+    return order
+
+
+def lifecycle_mark_deferred_or_discarded(
+    order: dict[str, Any],
+    now: int,
+    error_text: str,
+) -> str:
+    """Preserve leg 1 as chain debt; leg 0 may terminate after a failed submit."""
+    order["oid"] = None
+    order["last_error"] = error_text
+    if lifecycle_leg(order) == 1:
+        order["status"] = GRID_MARGIN_STATUS
+        order["margin_at"] = now
+        return GRID_MARGIN_STATUS
+    order["status"] = "discarded"
+    order["discarded_at"] = now
+    return "discarded"
+
+
+def lifecycle_submit_order(
+    exchange: Any,
+    coin: str,
+    order: dict[str, Any],
+    now: int,
+    row: dict[str, Any],
+    asset: dict[str, Any],
+    position_size: Decimal,
+    current_mid: Decimal,
+    best_bid: Decimal | None,
+    best_ask: Decimal | None,
+    isolated_leverage_ready: set[str],
+    open_orders: list[dict[str, Any]] | None,
+    cache: dict[str, Any],
+    *,
+    search_outward: bool,
+    force_gtc: bool = False,
+    force_non_reduce_only: bool = False,
+) -> str:
+    """Submit one finite-chain order; chain debt defers, completed legs may end."""
+    order.pop("replace_never_cancel", None)
+    reduce_only = False if force_non_reduce_only else grid_order_reduces_position(order, position_size)
+    set_grid_order_reduce_only(order, reduce_only)
+    set_grid_order_tif(order, "Gtc" if force_gtc else "Alo")
+    plan = order.get("plan")
+    if not isinstance(plan, dict):
+        return lifecycle_mark_deferred_or_discarded(order, now, "grid order is missing its saved plan")
+    if position_size == 0 and not reduce_only and asset_requires_isolated_margin(asset) and coin not in isolated_leverage_ready:
+        try:
+            reserve_grid_exchange_actions(cache)
+            leverage, leverage_result = update_isolated_opening_leverage(exchange, int(asset["maxLeverage"]), coin)
+        except Exception as exc:
+            if is_insufficient_margin_text(str(exc)):
+                return lifecycle_mark_deferred_or_discarded(order, now, str(exc))
+            raise
+        if leverage_result.get("status") != "ok":
+            error_text = f"Failed to set isolated opening leverage to {leverage}x: {leverage_result}"
+            if is_insufficient_margin_text(error_text):
+                return lifecycle_mark_deferred_or_discarded(order, now, error_text)
+            raise RuntimeError(error_text)
+        isolated_leverage_ready.add(coin)
+    if not bool(order.get("preserve_fill_size")):
+        ensure_grid_order_min_notional(row, asset, order)
+    if adopt_matching_open_grid_order(open_orders, coin, order, now, row):
+        return "submitted"
+
+    for attempt in range(GRID_ALO_PRICE_ATTEMPT_LIMIT):
+        price = decimal_or_none(order.get("price", order.get("limit_px")))
+        side = str(order.get("side") or "")
+        if price is None or price <= 0 or side not in {"buy", "sell"}:
+            return lifecycle_mark_deferred_or_discarded(order, now, "invalid lifecycle order price")
+        if search_outward:
+            while (
+                grid_price_would_cross_market(side, price, current_mid, best_bid, best_ask)
+                or lifecycle_active_price_too_close(row, side, price, exclude=order)
+            ):
+                next_price = next_outward_grid_price(row, asset, order)
+                if next_price is None or next_price <= 0 or next_price == price:
+                    return lifecycle_mark_deferred_or_discarded(order, now, "unable to move lifecycle order outward")
+                set_grid_order_price(order, next_price)
+                price = next_price
+        try:
+            oid, state, submit_status = submit_grid_child_order(exchange, coin, order, cache)
+        except GridPostOnlyRejected as exc:
+            if force_gtc or not search_outward:
+                return lifecycle_mark_deferred_or_discarded(order, now, str(exc))
+            next_price = next_outward_grid_price(row, asset, order)
+            if next_price is None or next_price <= 0 or next_price == price:
+                return lifecycle_mark_deferred_or_discarded(order, now, str(exc))
+            set_grid_order_price(order, next_price)
+            order["alo_rejects"] = int(order.get("alo_rejects") or 0) + 1
+            continue
+        except GridActionBudgetUnavailable:
+            raise
+        except RuntimeError as exc:
+            if is_insufficient_margin_text(str(exc)):
+                return lifecycle_mark_deferred_or_discarded(order, now, str(exc))
+            raise
+        order["oid"] = oid
+        order["status"] = state
+        order["submitted_at"] = now
+        order["last_submit_status"] = submit_status
+        if state == "active":
+            record_submitted_open_grid_order(open_orders, coin, order, oid, now)
+        elif state == "filled":
+            order["filled_at"] = now
+            order["replacement_pending"] = True
+            filled = submit_status.get("filled") if isinstance(submit_status, dict) else None
+            if isinstance(filled, dict):
+                order["fill"] = {
+                    "oid": oid,
+                    "px": filled.get("avgPx", order.get("price")),
+                    "sz": filled.get("totalSz", filled.get("sz", order.get("size"))),
+                    "time": now * 1000,
+                }
+        return "submitted"
+    return lifecycle_mark_deferred_or_discarded(order, now, "ALO outward search exhausted")
+
+
+def lifecycle_context(row: dict[str, Any], cache: dict[str, Any]) -> dict[str, Any]:
+    network = str(row.get("network") or "mainnet")
+    timeout = float(row.get("timeout") or 20)
+    raw_coin = batch_row_raw_coin(row)
+    dex = str(row.get("dex") or "")
+    client_key = (network, timeout, dex)
+    clients = cache.setdefault("clients", {})
+    if client_key not in clients:
+        clients[client_key] = build_worker_clients(cache, network, timeout, raw_coin)
+    info, exchange, account, _signer, _role = clients[client_key]
+    coin, asset = resolve_perp_asset(info, raw_coin)
+    now = int(cache.setdefault("now", int(time.time())))
+    precheck_action_limit(info, account, cache, network, now)
+    mids_key = (network, dex)
+    mids_cache = cache.setdefault("mids", {})
+    if mids_key not in mids_cache:
+        mids_cache[mids_key] = info.all_mids(dex)
+    mids = mids_cache[mids_key]
+    current_mid = Decimal(str(mids[coin]))
+    books_key = (network, coin)
+    books = cache.setdefault("books", {})
+    if books_key not in books:
+        books[books_key] = best_bid_ask(info, coin)
+    best_bid, best_ask = books[books_key]
+    state_key = (network, account, dex)
+    states = cache.setdefault("user_states", {})
+    if state_key not in states:
+        states[state_key] = info.user_state(account, dex=dex)
+    position = find_current_position_from_state(states[state_key], coin)
+    if position is None:
+        position_size = Decimal("0")
+        position_value = Decimal("0")
+        liquidation_px = None
+    else:
+        position_size = Decimal(str(position.get("szi") or "0"))
+        position_value = decimal_or_none(position.get("positionValue")) or abs(position_size * current_mid)
+        position_value = abs(position_value)
+        liquidation_px = decimal_or_none(position.get("liquidationPx"))
+    withdrawable_state = account_spot_withdrawable(info, account, network, cache)
+    withdrawable = withdrawable_state[0] if withdrawable_state is not None else None
+    open_key = (network, account, dex)
+    open_cache = cache.setdefault("open_orders", {})
+    if open_key not in open_cache:
+        open_cache[open_key] = collect_frontend_open_orders(info, account, dex)
+    open_orders = open_cache[open_key]
+    open_oids = open_order_oids(info, account, dex, coin, open_orders)
+    now_ms = now * 1000
+    common_start_ms = (now - GRID_FILL_LOOKBACK_SECONDS) * 1000
+    fills_key = (network, account, common_start_ms, now_ms)
+    fills_cache = cache.setdefault("fills", {})
+    if fills_key not in fills_cache:
+        fills_cache[fills_key] = info.user_fills_by_time(account, common_start_ms, now_ms)
+    fills_by_oid = recent_fills_by_oid(info, account, coin, common_start_ms, now_ms, fills_cache[fills_key])
+    row["account_usdc_withdrawable"] = decimal_to_plain(withdrawable) if withdrawable is not None else None
+    row["position_size"] = decimal_to_plain(position_size)
+    row["position_value"] = decimal_to_plain(position_value)
+    row["raw_deficit"] = raw_action_limit_deficit(cache)
+    return {
+        "network": network,
+        "dex": dex,
+        "info": info,
+        "exchange": exchange,
+        "account": account,
+        "coin": coin,
+        "asset": asset,
+        "now": now,
+        "now_ms": now_ms,
+        "mids": mids,
+        "current_mid": current_mid,
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "position_size": position_size,
+        "position_value": position_value,
+        "liquidation_px": liquidation_px,
+        "withdrawable": withdrawable,
+        "open_orders": open_orders,
+        "open_oids": open_oids,
+        "fills_by_oid": fills_by_oid,
+    }
+
+
+def lifecycle_row_account_key(row: dict[str, Any], network: str, account: str, dex: str) -> tuple[str, str, str]:
+    return network, str(row.get("account") or account).lower(), str(row.get("dex") or dex)
+
+
+def lifecycle_terminal_candidate(
+    rows: list[dict[str, Any]],
+    network: str,
+    account: str,
+    dex: str,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    account_key = account.lower()
+    candidates: list[tuple[bool, int, int, dict[str, Any], dict[str, Any]]] = []
+    for candidate_row in rows:
+        if not isinstance(candidate_row, dict) or candidate_row.get("type") != "grid":
+            continue
+        if str(candidate_row.get("network") or "mainnet") != network:
+            continue
+        if str(candidate_row.get("dex") or "") != dex:
+            continue
+        if str(candidate_row.get("account") or account).lower() != account_key:
+            continue
+        for entry in candidate_row.get("levels") or []:
+            if not isinstance(entry, dict) or str(entry.get("status") or "") != "active":
+                continue
+            if lifecycle_leg(entry) != 0 or entry.get("oid") is None:
+                continue
+            timestamp = grid_entry_timestamp_ms(entry) or 0
+            try:
+                oid = int(entry.get("oid") or 0)
+            except (TypeError, ValueError):
+                oid = 0
+            candidates.append((bool(entry.get("reduce_only")), timestamp, oid, candidate_row, entry))
+    if not candidates:
+        return None
+    _reduce_only, _timestamp, _oid, candidate_row, entry = min(candidates, key=lambda item: item[:3])
+    return candidate_row, entry
+
+
+def lifecycle_cancel_terminal_entry(
+    exchange: Any,
+    coin: str,
+    row: dict[str, Any],
+    entry: dict[str, Any],
+    now: int,
+    cache: dict[str, Any],
+) -> bool:
+    try:
+        oid = int(entry["oid"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    reserve_grid_exchange_actions(cache)
+    request = {"coin": coin, "oid": oid}
+    result = exchange.bulk_cancel([request])
+    audit_grid_action("grid_leg_terminal_cancel", coin=coin, oid=oid, grid_leg=0, result=result)
+    if not isinstance(result, dict) or result.get("status") != "ok":
+        entry["last_error"] = str(result)
+        entry["terminal_cancel_attempted_at"] = now
+        return False
+    cancelled, errors = successful_cancel_oids(result, [request])
+    if oid not in cancelled:
+        entry["last_error"] = "; ".join(errors) or str(result)
+        entry["terminal_cancel_attempted_at"] = now
+        return False
+    levels = row.get("levels")
+    if isinstance(levels, list) and entry in levels:
+        levels.remove(entry)
+    return True
+
+
+def lifecycle_legacy_pause_candidate(
+    rows: list[dict[str, Any]],
+    network: str,
+    account: str,
+    dex: str,
+    mids: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    candidates: list[tuple[Decimal, int, dict[str, Any], dict[str, Any]]] = []
+    for candidate_row in rows:
+        if not isinstance(candidate_row, dict) or candidate_row.get("type") != "grid":
+            continue
+        if str(candidate_row.get("network") or "mainnet") != network or str(candidate_row.get("dex") or "") != dex:
+            continue
+        if str(candidate_row.get("account") or account).lower() != account.lower():
+            continue
+        mid = decimal_or_none(mids.get(str(candidate_row.get("coin") or "")))
+        if mid is None or mid <= 0:
+            continue
+        for entry in candidate_row.get("levels") or []:
+            if not isinstance(entry, dict) or str(entry.get("status") or "") != GRID_LEGACY_PAUSE_STATUS:
+                continue
+            price = decimal_or_none(entry.get("price", entry.get("limit_px")))
+            if price is None or price <= 0:
+                continue
+            distance = abs(price - mid) / mid
+            candidates.append((distance, grid_entry_timestamp_ms(entry) or 0, candidate_row, entry))
+    if not candidates:
+        return None
+    _distance, _timestamp, candidate_row, entry = min(candidates, key=lambda item: item[:2])
+    return candidate_row, entry
+
+
+def lifecycle_process_fills(
+    row: dict[str, Any],
+    ctx: dict[str, Any],
+    cache: dict[str, Any],
+) -> tuple[int, bool]:
+    levels = row.setdefault("levels", [])
+    newly_filled: list[dict[str, Any]] = []
+    changed = False
+    for entry in list(levels):
+        if not isinstance(entry, dict) or not entry.get("side"):
+            continue
+        if bool(entry.get("replacement_pending")) or str(entry.get("status") or "") == "filled":
+            newly_filled.append(entry)
+            continue
+        if str(entry.get("status") or "") != "active":
+            continue
+        try:
+            oid = int(entry.get("oid"))
+        except (TypeError, ValueError):
+            continue
+        if oid in ctx["open_oids"]:
+            continue
+        fill = ctx["fills_by_oid"].get(oid)
+        if fill is None:
+            order_status = ctx["info"].query_order_by_oid(ctx["account"], oid)
+            if grid_order_status_name(order_status) != "filled":
+                continue
+            entry["confirmed_filled_oid"] = oid
+        else:
+            entry["fill"] = fill
+        entry["status"] = "filled"
+        entry["filled_at"] = ctx["now"]
+        entry["replacement_pending"] = True
+        newly_filled.append(entry)
+        changed = True
+
+    submitted = 0
+    isolated_ready: set[str] = cache.setdefault("lifecycle_isolated_ready", set())
+    for source in newly_filled:
+        child = lifecycle_replacement_from_fill(row, ctx["coin"], ctx["asset"], source)
+        if child is None:
+            source["last_error"] = "filled lifecycle order could not build its replacement"
+            continue
+        result = lifecycle_submit_order(
+            ctx["exchange"], ctx["coin"], child, ctx["now"], row, ctx["asset"],
+            ctx["position_size"], ctx["current_mid"], ctx["best_bid"], ctx["best_ask"],
+            isolated_ready, ctx["open_orders"], cache, search_outward=True,
+        )
+        if source in levels:
+            levels.remove(source)
+        if result in {"submitted", GRID_MARGIN_STATUS}:
+            levels.append(child)
+        source["replacement_pending"] = False
+        source["replacement_processed_at"] = ctx["now"]
+        submitted += int(result == "submitted")
+        changed = True
+    return submitted, changed
+
+
+def lifecycle_process_anomalies(row: dict[str, Any], ctx: dict[str, Any], cache: dict[str, Any]) -> tuple[int, bool]:
+    levels = row.setdefault("levels", [])
+    restored = 0
+    changed = False
+    isolated_ready: set[str] = cache.setdefault("lifecycle_isolated_ready", set())
+    for entry in list(levels):
+        if not isinstance(entry, dict) or str(entry.get("status") or "") != "active":
+            continue
+        try:
+            oid = int(entry.get("oid"))
+        except (TypeError, ValueError):
+            continue
+        if oid in ctx["open_oids"]:
+            continue
+        fill = ctx["fills_by_oid"].get(oid)
+        order_status = None if fill is not None else ctx["info"].query_order_by_oid(ctx["account"], oid)
+        status_name = "filled" if fill is not None else grid_order_status_name(order_status)
+        if status_name == "filled":
+            entry["status"] = "filled"
+            entry["fill"] = fill if fill is not None else entry.get("fill")
+            entry["replacement_pending"] = True
+            entry["filled_at"] = ctx["now"]
+            changed = True
+            continue
+        if status_name.strip().lower() in {"open", "resting"}:
+            continue
+        if status_name == "reduceOnlyCanceled" or grid_order_status_is_cancelled(order_status):
+            if lifecycle_leg(entry) == 0:
+                levels.remove(entry)
+                changed = True
+                continue
+            entry["oid"] = None
+            entry["status"] = "pending"
+            result = lifecycle_submit_order(
+                ctx["exchange"], ctx["coin"], entry, ctx["now"], row, ctx["asset"],
+                ctx["position_size"], ctx["current_mid"], ctx["best_bid"], ctx["best_ask"],
+                isolated_ready, ctx["open_orders"], cache, search_outward=True, force_non_reduce_only=True,
+            )
+            restored += int(result == "submitted")
+            changed = True
+    return restored, changed
+
+
+def lifecycle_submit_limit_chase(row: dict[str, Any], ctx: dict[str, Any], cache: dict[str, Any]) -> bool:
+    if ctx["withdrawable"] is None or ctx["withdrawable"] <= GRID_LIMIT_CHASE_WITHDRAWABLE_THRESHOLD:
+        return False
+    is_buy = grid_limit_chase_direction(row, ctx["position_size"], ctx["position_value"])
+    if is_buy is None:
+        return False
+    market = build_grid_limit_chase_market_order(
+        ctx["exchange"], row, ctx["coin"], ctx["asset"], ctx["current_mid"], is_buy
+    )
+    if market is None:
+        return False
+    plan = market.get("plan")
+    if not isinstance(plan, dict):
+        return False
+    reserve_grid_exchange_actions(cache)
+    result = ctx["exchange"].order(
+        ctx["coin"], bool(plan["is_buy"]), float(plan["size"]), float(plan["limit_px"]),
+        plan["order_type"], reduce_only=False,
+    )
+    if not isinstance(result, dict) or result.get("status") != "ok":
+        row["limit_chase_error"] = str(result)
+        return False
+    filled: dict[str, Any] | None = None
+    for status in result.get("response", {}).get("data", {}).get("statuses", []):
+        if isinstance(status, dict) and isinstance(status.get("filled"), dict):
+            filled = status["filled"]
+            break
+    if filled is None:
+        row["limit_chase_error"] = str(result)
+        return False
+    fill_price = decimal_or_none(filled.get("avgPx")) or ctx["current_mid"]
+    fill_size = decimal_or_none(filled.get("totalSz", filled.get("sz"))) or decimal_or_none(market.get("size"))
+    birth = limit_chase_replacement_order_from_market(
+        row, ctx["coin"], ctx["asset"], fill_price, is_buy, fill_size or Decimal("0"), "market_fill"
+    )
+    if birth is None:
+        return False
+    birth.pop("replace_never_cancel", None)
+    birth["grid_leg"] = 1
+    birth["birth_source"] = "limit_chase"
+    birth["preserve_fill_size"] = True
+    submit_result = lifecycle_submit_order(
+        ctx["exchange"], ctx["coin"], birth, ctx["now"], row, ctx["asset"], ctx["position_size"],
+        ctx["current_mid"], ctx["best_bid"], ctx["best_ask"], cache.setdefault("lifecycle_isolated_ready", set()),
+        ctx["open_orders"], cache, search_outward=False, force_gtc=True,
+    )
+    if submit_result in {"submitted", GRID_MARGIN_STATUS}:
+        row.setdefault("levels", []).append(birth)
+    row["limit_chase_status"] = submit_result
+    row["limit_chase_fill_price"] = decimal_to_plain(fill_price)
+    row["limit_chase_at"] = ctx["now"]
+    return True
+
+
+def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> tuple[dict[str, Any], bool]:
+    cache = cache if cache is not None else {}
+    ctx = lifecycle_context(row, cache)
+    phase = str(cache.get("grid_action_phase") or GRID_LIFECYCLE_PHASE_P0)
+    changed = migrate_grid_lifecycle(row, ctx["now"])
+    levels = row.setdefault("levels", [])
+    counters = cache.setdefault("grid_lifecycle_counters", {}).setdefault(id(row), {})
+
+    if phase == GRID_LIFECYCLE_PHASE_P0:
+        ratio = grid_panic_ratio(row, ctx["position_size"], ctx["current_mid"], ctx["liquidation_px"])
+        threshold = grid_panic_ratio_threshold(row)
+        row["panic_ratio"] = decimal_to_plain(ratio) if ratio is not None else None
+        row["panic_ratio_threshold"] = decimal_to_plain(threshold)
+        if ratio is not None and ratio < threshold:
+            market = build_grid_panic_reduce_order(
+                ctx["exchange"], row, ctx["coin"], ctx["asset"], ctx["current_mid"], ctx["position_size"]
+            )
+            if market is not None and submit_grid_panic_reduce(
+                ctx["exchange"], ctx["coin"], market, ctx["now"], row, cache
+            ):
+                fill_price = decimal_or_none(market.get("filled_avg_px")) or ctx["current_mid"]
+                fill_size = decimal_or_none(market.get("filled_size")) or decimal_or_none(market.get("size"))
+                birth = panic_reversal_order_from_reduce(
+                    row, ctx["coin"], ctx["asset"], fill_price, bool(market.get("is_buy")),
+                    fill_size or Decimal("0"), ctx["position_size"], grid_limit_policy_from_row(row), "market_fill",
+                )
+                if birth is not None:
+                    birth.pop("replace_never_cancel", None)
+                    birth["grid_leg"] = 1
+                    birth["birth_source"] = "panic"
+                    birth["preserve_fill_size"] = True
+                    result = lifecycle_submit_order(
+                        ctx["exchange"], ctx["coin"], birth, ctx["now"], row, ctx["asset"],
+                        ctx["position_size"], ctx["current_mid"], ctx["best_bid"], ctx["best_ask"],
+                        cache.setdefault("lifecycle_isolated_ready", set()), ctx["open_orders"], cache,
+                        search_outward=False, force_gtc=True,
+                    )
+                    if result in {"submitted", GRID_MARGIN_STATUS}:
+                        levels.append(birth)
+                    counters["p0_births"] = int(counters.get("p0_births") or 0) + 1
+                    changed = True
+
+    elif phase == GRID_LIFECYCLE_PHASE_P1:
+        account_key = lifecycle_row_account_key(row, ctx["network"], ctx["account"], ctx["dex"])
+        attempted = cache.setdefault("lifecycle_p1_accounts", set())
+        if ctx["withdrawable"] is not None and ctx["withdrawable"] < GRID_WITHDRAWABLE_PAUSE_THRESHOLD and account_key not in attempted:
+            candidate = lifecycle_terminal_candidate(
+                cache.get("grid_rows") or [row], ctx["network"], ctx["account"], ctx["dex"]
+            )
+            attempted.add(account_key)
+            if candidate is not None:
+                candidate_row, entry = candidate
+                candidate_coin = str(candidate_row.get("coin") or ctx["coin"])
+                if lifecycle_cancel_terminal_entry(
+                    ctx["exchange"], candidate_coin, candidate_row, entry, ctx["now"], cache
+                ):
+                    counters["p1_terminated"] = int(counters.get("p1_terminated") or 0) + 1
+                    changed = True
+
+    elif phase == GRID_LIFECYCLE_PHASE_P2:
+        count, phase_changed = lifecycle_process_fills(row, ctx, cache)
+        counters["p2_replacements"] = int(counters.get("p2_replacements") or 0) + count
+        changed = changed or phase_changed
+
+    elif phase == GRID_LIFECYCLE_PHASE_P3:
+        if raw_action_limit_deficit(cache) < 0 and ctx["withdrawable"] is not None and ctx["withdrawable"] > Decimal("5"):
+            isolated_ready = cache.setdefault("lifecycle_isolated_ready", set())
+            for entry in list(levels):
+                if not isinstance(entry, dict) or str(entry.get("status") or "") != GRID_MARGIN_STATUS:
+                    continue
+                result = lifecycle_submit_order(
+                    ctx["exchange"], ctx["coin"], entry, ctx["now"], row, ctx["asset"], ctx["position_size"],
+                    ctx["current_mid"], ctx["best_bid"], ctx["best_ask"], isolated_ready,
+                    ctx["open_orders"], cache, search_outward=True,
+                )
+                changed = True
+                if result == "submitted":
+                    counters["p3_restored"] = int(counters.get("p3_restored") or 0) + 1
+                if raw_action_limit_deficit(cache) >= 0:
+                    break
+
+    elif phase == GRID_LIFECYCLE_PHASE_P4:
+        if raw_action_limit_deficit(cache) < 0 and not cache.get("lifecycle_p4_birth_used"):
+            if lifecycle_submit_limit_chase(row, ctx, cache):
+                cache["lifecycle_p4_birth_used"] = True
+                counters["p4_births"] = int(counters.get("p4_births") or 0) + 1
+                changed = True
+
+    elif phase == GRID_LIFECYCLE_PHASE_P5:
+        if raw_action_limit_deficit(cache) < -100:
+            count, phase_changed = lifecycle_process_anomalies(row, ctx, cache)
+            counters["p5_restored"] = int(counters.get("p5_restored") or 0) + count
+            changed = changed or phase_changed
+
+    elif phase == GRID_LIFECYCLE_PHASE_P6:
+        account_key = lifecycle_row_account_key(row, ctx["network"], ctx["account"], ctx["dex"])
+        claims = cache.setdefault("lifecycle_p6_claims", {})
+        if account_key not in claims:
+            claims[account_key] = lifecycle_legacy_pause_candidate(
+                cache.get("grid_rows") or [row], ctx["network"], ctx["account"], ctx["dex"], ctx["mids"]
+            )
+        candidate = claims.get(account_key)
+        attempted = cache.setdefault("lifecycle_p6_accounts", set())
+        if (
+            candidate is not None
+            and candidate[0] is row
+            and account_key not in attempted
+            and ctx["withdrawable"] is not None
+            and ctx["withdrawable"] > GRID_P6_WITHDRAWABLE_THRESHOLD
+        ):
+            attempted.add(account_key)
+            _candidate_row, entry = candidate
+            entry["status"] = "pending"
+            entry["grid_leg"] = 1
+            result = lifecycle_submit_order(
+                ctx["exchange"], ctx["coin"], entry, ctx["now"], row, ctx["asset"], ctx["position_size"],
+                ctx["current_mid"], ctx["best_bid"], ctx["best_ask"], cache.setdefault("lifecycle_isolated_ready", set()),
+                ctx["open_orders"], cache, search_outward=True,
+            )
+            if result == "submitted":
+                entry.pop("legacy_pause_status", None)
+                counters["p6_restored"] = int(counters.get("p6_restored") or 0) + 1
+            changed = True
+
+    row["legacy_pause_remaining"] = sum(
+        1 for entry in levels if isinstance(entry, dict) and str(entry.get("status") or "") == GRID_LEGACY_PAUSE_STATUS
+    )
+    row["open_oids"] = sorted(grid_batch_open_oids(row))
+    row["status"] = "active"
+    row["updated_at"] = ctx["now"]
+    row["last_fill_check_ms"] = ctx["now_ms"]
+    row["note"] = (
+        "grid lifecycle v2; "
+        f"phase={phase}; leg0={sum(1 for e in levels if isinstance(e, dict) and lifecycle_leg(e) == 0 and str(e.get('status') or '') == 'active')}; "
+        f"leg1={sum(1 for e in levels if isinstance(e, dict) and lifecycle_leg(e) == 1 and str(e.get('status') or '') == 'active')}; "
+        f"margin={sum(1 for e in levels if isinstance(e, dict) and str(e.get('status') or '') == GRID_MARGIN_STATUS)}; "
+        f"legacy_pause={row['legacy_pause_remaining']}; raw_deficit={raw_action_limit_deficit(cache)}"
+    )
+    return row, changed
+
+
 def run_once() -> None:
     rows = load_server_batch()
     rows, cancelled_grids_pruned = prune_cancelled_grid_rows(rows)
@@ -6609,30 +7382,20 @@ def run_once() -> None:
             changed = True
             changed = save_worker_progress(rows, changed)
 
-    for phase in GRID_ACTION_PHASES:
+    for phase in GRID_LIFECYCLE_PHASES:
         grid_cache["grid_action_phase"] = phase
         for index in active_grid_indexes:
             process_grid_index(index, f"grid {phase}")
         reconcile_cached_grid_open_orders(rows, active_grid_indexes, grid_cache)
         for info, _exchange, _account, _signer, _role in grid_cache.get("clients", {}).values():
             clear_info_cache(info)
-        # Keep worker-start snapshots across action phases.  The global phase
-        # order is still enforced above; only the expensive read-side data is
-        # reused.  l2/book caches are cleared so marketability checks remain
-        # fresh, while our in-memory open-order delta stays authoritative for
-        # duplicate detection inside this run.
-        if phase == GRID_ACTION_PHASE_P1_WITHDRAWABLE:
-            grid_cache["limit_chase_p1_completed"] = True
+        # Each phase must recompute position, withdrawable and market context so
+        # add/reduce classification never relies on a pre-fill snapshot.
+        for cache_name in ("mids", "books", "user_states", "spot_user_states", "fills"):
+            grid_cache.pop(cache_name, None)
+        # Our own open-order delta is reconciled after every phase; retaining it
+        # avoids losing a just-submitted child before the exchange view catches up.
     grid_cache.pop("grid_action_phase", None)
-    grid_cache["api_stat_phase"] = "p3_limit_chase"
-    grid_cache["api_stat_context"] = "-"
-    try:
-        p3_changed = run_grid_limit_chase_p3(grid_cache)
-        changed = changed or p3_changed
-        if p3_changed:
-            changed = save_worker_progress(rows, changed)
-    except Exception as exc:
-        print(f"trail_worker: grid p3 limit-chase error: {type(exc).__name__}: {exc}")
 
     rows, pruned = prune_done_rows(rows)
     grid_history_pruned = prune_grid_level_history(rows)
