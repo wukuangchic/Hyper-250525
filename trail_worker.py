@@ -6203,14 +6203,20 @@ def prune_grid_levels(row: dict[str, Any]) -> bool:
             entry
             for entry in levels
             if not isinstance(entry, dict)
-            or str(entry.get("status") or "") not in {
-                "cancelled",
-                "discarded",
-                "filled_replaced",
-                "skipped_account_margin",
-                "skipped_post_only",
-                "skipped_exchange_reject",
-            }
+            or (
+                str(entry.get("status") or "") not in {
+                    "cancelled",
+                    "discarded",
+                    "filled_replaced",
+                    "skipped_account_margin",
+                    "skipped_post_only",
+                    "skipped_exchange_reject",
+                }
+                and not (
+                    str(entry.get("status") or "") == "filled"
+                    and not bool(entry.get("replacement_pending"))
+                )
+            )
         ]
         if len(kept) == len(levels):
             return False
@@ -6579,9 +6585,11 @@ def migrate_grid_lifecycle(row: dict[str, Any], now: int) -> bool:
     if int(row.get("grid_lifecycle_version") or 0) >= GRID_LIFECYCLE_VERSION:
         return False
     levels = row.setdefault("levels", [])
+    migrated_levels: list[Any] = []
     changed = False
     for entry in levels:
         if not isinstance(entry, dict) or not entry.get("side"):
+            migrated_levels.append(entry)
             continue
         status = str(entry.get("status") or "active")
         entry.pop("replace_never_cancel", None)
@@ -6593,16 +6601,25 @@ def migrate_grid_lifecycle(row: dict[str, Any], now: int) -> bool:
             entry["oid"] = None
             entry["grid_leg"] = 1
             entry["legacy_pause_migrated_at"] = now
+            migrated_levels.append(entry)
             changed = True
             continue
         if status in {"active", "pending", "recovery_deferred", GRID_PENDING_CANCEL_STATUS}:
             entry["status"] = "active"
             entry["grid_leg"] = 0
+            migrated_levels.append(entry)
             changed = True
             continue
-        if status == "filled" or bool(entry.get("replacement_pending")):
+        if status == "filled" and not bool(entry.get("replacement_pending")):
+            # Persisted filled rows are history, not fresh chain debt.  Only an
+            # explicit replacement_pending marker may carry a fill into P2.
+            changed = True
+            continue
+        if bool(entry.get("replacement_pending")):
             entry.setdefault("grid_leg", 0)
             changed = True
+        migrated_levels.append(entry)
+    row["levels"] = migrated_levels
     row["grid_lifecycle_version"] = GRID_LIFECYCLE_VERSION
     row["grid_lifecycle_migrated_at"] = now
     row.pop("target_orders_per_side", None)
@@ -7001,8 +7018,11 @@ def lifecycle_process_fills(
     for entry in list(levels):
         if not isinstance(entry, dict) or not entry.get("side"):
             continue
-        if bool(entry.get("replacement_pending")) or str(entry.get("status") or "") == "filled":
+        if bool(entry.get("replacement_pending")):
             newly_filled.append(entry)
+            continue
+        if str(entry.get("status") or "") == "filled":
+            # A filled row without replacement_pending is terminal history.
             continue
         if str(entry.get("status") or "") != "active":
             continue

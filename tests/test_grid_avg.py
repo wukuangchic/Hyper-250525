@@ -167,6 +167,11 @@ class GridAvgTests(unittest.TestCase):
             "levels": [
                 {"side": "buy", "status": "active", "oid": 1, "replace_never_cancel": True},
                 {"side": "sell", "status": "paused_margin", "oid": None},
+                {"side": "buy", "status": "filled", "oid": 2, "fill": {"px": "99", "sz": "1"}},
+                {
+                    "side": "sell", "status": "filled", "oid": 3, "replacement_pending": True,
+                    "fill": {"px": "101", "sz": "1"},
+                },
             ],
             "target_orders_per_side": 16,
             "margin_pauses": {"buy": {}},
@@ -181,8 +186,24 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(row["levels"][1]["grid_leg"], 1)
         self.assertEqual(row["levels"][1]["status"], "legacy_pause")
         self.assertEqual(row["levels"][1]["legacy_pause_status"], "paused_margin")
+        self.assertEqual(len(row["levels"]), 3)
+        self.assertEqual(row["levels"][2]["oid"], 3)
+        self.assertTrue(row["levels"][2]["replacement_pending"])
         self.assertNotIn("target_orders_per_side", row)
         self.assertNotIn("margin_pauses", row)
+
+    def test_p2_does_not_turn_terminal_filled_history_into_chain_debt(self) -> None:
+        historical = {
+            "side": "buy", "is_buy": True, "status": "filled", "oid": 1,
+            "grid_leg": 0, "fill": {"px": "100", "sz": "1"},
+        }
+        row = {"levels": [historical]}
+
+        submitted, changed = lifecycle_process_fills(row, {}, {})
+
+        self.assertEqual(submitted, 0)
+        self.assertFalse(changed)
+        self.assertEqual(row["levels"], [historical])
 
     def test_finite_chain_replacement_toggles_grid_leg_from_actual_fill(self) -> None:
         row = {"gap_rate": "0.01", "base_buy_size": "1", "base_sell_size": "1", "min_order_value": "10"}
