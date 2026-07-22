@@ -97,6 +97,7 @@ from trail_worker import (
     maintain_grid,
     mark_missing_order_confirmed_open,
     mark_pending_cancel_confirmed_cancelled,
+    mark_withdrawable_protected_restore_submitted,
     modify_trail_stop,
     move_grid_order_away_from_active,
     near_grid_orders_if_stale,
@@ -136,6 +137,7 @@ from trail_worker import (
     submit_grid_order_entry,
     trim_excess_grid_entries,
     withdrawable_protected_paused_restore,
+    withdrawable_protected_restore_submission_available,
     GRID_ACTION_LIMIT_PAUSE_STATUS,
     GRID_PENDING_CANCEL_STATUS,
     GRID_ROE_PAUSE_STATUS,
@@ -285,6 +287,28 @@ class GridAvgTests(unittest.TestCase):
                 Decimal("1"),
                 Decimal("200"),
                 withdrawable_protected_restore=True,
+            )
+        )
+
+    def test_withdrawable_protected_restore_quota_is_shared_across_action_phases(self) -> None:
+        cache = {}
+
+        self.assertTrue(
+            withdrawable_protected_restore_submission_available(
+                cache, "mainnet", "0xabc", "xyz:SPCX", "sell"
+            )
+        )
+        mark_withdrawable_protected_restore_submitted(
+            cache, "mainnet", "0xabc", "xyz:SPCX", "sell"
+        )
+        self.assertFalse(
+            withdrawable_protected_restore_submission_available(
+                cache, "mainnet", "0xabc", "xyz:SPCX", "sell"
+            )
+        )
+        self.assertTrue(
+            withdrawable_protected_restore_submission_available(
+                cache, "mainnet", "0xabc", "xyz:SPCX", "buy"
             )
         )
 

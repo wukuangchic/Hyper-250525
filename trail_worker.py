@@ -942,6 +942,28 @@ def withdrawable_protected_paused_restore(
     return account_margin_protected and grid_order_reduces_position(entry, position_size)
 
 
+def withdrawable_protected_restore_submission_available(
+    cache: dict[str, Any],
+    network: str,
+    account: Any,
+    coin: str,
+    side: str,
+) -> bool:
+    submitted = cache.setdefault("withdrawable_protected_restore_submissions", set())
+    return (network, str(account), coin, side) not in submitted
+
+
+def mark_withdrawable_protected_restore_submitted(
+    cache: dict[str, Any],
+    network: str,
+    account: Any,
+    coin: str,
+    side: str,
+) -> None:
+    submitted = cache.setdefault("withdrawable_protected_restore_submissions", set())
+    submitted.add((network, str(account), coin, side))
+
+
 def pause_grid_margin_side(
     row: dict[str, Any],
     side: str,
@@ -5816,6 +5838,14 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             continue
         if allow_p1_restore and is_replacement_order:
             continue
+        if protected_reduce_only_restore and not withdrawable_protected_restore_submission_available(
+            cache,
+            network,
+            account,
+            coin,
+            side,
+        ):
+            continue
         status = str(entry.get("status"))
         if (
             status == GRID_WITHDRAWABLE_PAUSE_STATUS
@@ -5909,6 +5939,14 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 preserve_replacement_order(levels, entry, now, normalize_margin=True)
             changed = True
             continue
+        if protected_reduce_only_restore:
+            mark_withdrawable_protected_restore_submitted(
+                cache,
+                network,
+                account,
+                coin,
+                side,
+            )
         order_notional = Decimal(str(entry.get("size"))) * Decimal(str(entry.get("price", entry.get("limit_px"))))
         if policy == "limit":
             projected_position_values[side] += order_notional if bool(entry.get("is_buy")) else -order_notional
