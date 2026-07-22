@@ -1,5 +1,6 @@
 import json
 import tempfile
+import time
 import unittest
 from argparse import Namespace
 from decimal import Decimal
@@ -964,6 +965,35 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(all_mids["count"], 1)
         self.assertEqual(all_mids["errors"], 1)
         self.assertEqual(all_mids["max_ms"], 500.0)
+
+    def test_worker_api_proxy_hard_times_out_user_fills_read(self) -> None:
+        class SlowInfo:
+            def user_fills_by_time(self, account, start_ms, end_ms):
+                time.sleep(0.2)
+                return []
+
+        cache = {"grid_action_phase": "p1", "api_stat_context": "XYZ100"}
+        proxy = WorkerApiProxy(SlowInfo(), cache, "info")
+
+        with (
+            patch("trail_worker.GRID_USER_FILLS_HARD_TIMEOUT_SECONDS", 0.02),
+            self.assertRaisesRegex(TimeoutError, "info.user_fills_by_time hard timeout after 0.02s"),
+        ):
+            proxy.user_fills_by_time("acct", 1, 2)
+
+        timing = cache["api_stats"]["p1|XYZ100|info.user_fills_by_time"]
+        self.assertEqual(timing["count"], 1)
+        self.assertEqual(timing["errors"], 1)
+
+    def test_worker_api_proxy_does_not_hard_timeout_exchange_writes(self) -> None:
+        class FakeExchange:
+            def order(self):
+                return {"status": "ok"}
+
+        proxy = WorkerApiProxy(FakeExchange(), {}, "exchange")
+        with patch("trail_worker.worker_api_hard_timeout") as timeout_mock:
+            self.assertEqual(proxy.order(), {"status": "ok"})
+        timeout_mock.assert_not_called()
 
     def test_emit_worker_api_stats_writes_jsonl_and_prints_top_calls(self) -> None:
         cache = {

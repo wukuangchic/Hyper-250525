@@ -6,7 +6,10 @@ from __future__ import annotations
 import json
 import math
 import random
+import signal
+import threading
 import time
+from contextlib import contextmanager
 from copy import deepcopy
 from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
 from pathlib import Path
@@ -65,6 +68,7 @@ DONE_RETENTION_DAYS = 7
 DONE_RETENTION_MAX = 500
 GRID_LEVEL_HISTORY_MAX = 120
 GRID_FILL_LOOKBACK_SECONDS = 24 * 60 * 60
+GRID_USER_FILLS_HARD_TIMEOUT_SECONDS = 30.0
 GRID_MAX_SUBMISSIONS_PER_SIDE_PER_RUN = 1
 GRID_ADD_RISK_BRAKE_STREAK = 2
 GRID_ADD_RISK_BRAKE_PAIR_RETENTION_SECONDS = 24 * 60 * 60
@@ -189,6 +193,38 @@ class GridActionBudgetUnavailable(Exception):
     """A P1 exchange action has no remaining pre-reserved request budget."""
 
 
+class WorkerApiHardTimeout(TimeoutError):
+    """A read-only SDK call exceeded the worker's wall-clock deadline."""
+
+
+@contextmanager
+def worker_api_hard_timeout(seconds: float, label: str):
+    """Enforce a wall-clock deadline for a read call in the Linux worker."""
+    if (
+        seconds <= 0
+        or threading.current_thread() is not threading.main_thread()
+        or not hasattr(signal, "SIGALRM")
+        or not hasattr(signal, "setitimer")
+    ):
+        yield
+        return
+
+    def timeout_handler(_signum: int, _frame: Any) -> None:
+        raise WorkerApiHardTimeout(f"{label} hard timeout after {seconds:g}s")
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    signal.signal(signal.SIGALRM, timeout_handler)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_timer[0] > 0:
+            signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+
+
 class WorkerApiProxy:
     """Measure high-level SDK calls without changing their return values."""
 
@@ -206,6 +242,12 @@ class WorkerApiProxy:
             started_at = time.monotonic()
             error = False
             try:
+                if self._worker_api_client == "info" and name == "user_fills_by_time":
+                    with worker_api_hard_timeout(
+                        GRID_USER_FILLS_HARD_TIMEOUT_SECONDS,
+                        "info.user_fills_by_time",
+                    ):
+                        return attribute(*args, **kwargs)
                 return attribute(*args, **kwargs)
             except Exception:
                 error = True
