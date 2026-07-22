@@ -100,6 +100,8 @@ from trail_worker import (
     lifecycle_active_price_too_close,
     lifecycle_legacy_pause_candidate,
     lifecycle_mark_deferred_or_discarded,
+    lifecycle_reconcile_birth_intents,
+    lifecycle_row_account_key,
     lifecycle_process_anomalies,
     lifecycle_process_fills,
     lifecycle_replacement_from_fill,
@@ -155,6 +157,7 @@ from trail_worker import (
     GRID_ACTION_PHASE_P0,
     GRID_ACTION_PHASE_P1_WITHDRAWABLE,
     GRID_ACTION_PHASE_P2,
+    GRID_CHAIN_DEBT_STATUS,
     grid_entries_fit_within_max,
     grid_entries_near_first_per_side,
     grid_nearest_non_crossing_paused_entries,
@@ -238,6 +241,13 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(lifecycle_mark_deferred_or_discarded(completed, 123, "Insufficient margin"), "discarded")
         self.assertEqual(completed["status"], "discarded")
 
+        non_margin_debt = {"grid_leg": 1}
+        self.assertEqual(
+            lifecycle_mark_deferred_or_discarded(non_margin_debt, 124, "temporary network failure"),
+            GRID_CHAIN_DEBT_STATUS,
+        )
+        self.assertEqual(non_margin_debt["status"], GRID_CHAIN_DEBT_STATUS)
+
     def test_finite_chain_terminal_candidate_prefers_non_reduce_only_then_oldest(self) -> None:
         rows = [{
             "type": "grid", "status": "active", "network": "mainnet", "account": "0xabc", "dex": "",
@@ -248,7 +258,7 @@ class GridAvgTests(unittest.TestCase):
             ],
         }]
 
-        candidate = lifecycle_terminal_candidate(rows, "mainnet", "0xabc", "")
+        candidate = lifecycle_terminal_candidate(rows, "mainnet", "0xabc")
 
         self.assertIsNotNone(candidate)
         self.assertEqual(candidate[1]["oid"], 2)
@@ -256,17 +266,43 @@ class GridAvgTests(unittest.TestCase):
     def test_finite_chain_p6_uses_relative_nearest_legacy_pause(self) -> None:
         btc = {
             "type": "grid", "status": "active", "network": "mainnet", "account": "0xabc", "dex": "", "coin": "BTC",
+            "lifecycle_mid": "100",
             "levels": [{"side": "buy", "status": "legacy_pause", "price": "90", "grid_leg": 1}],
         }
         eth = {
-            "type": "grid", "status": "active", "network": "mainnet", "account": "0xabc", "dex": "", "coin": "ETH",
+            "type": "grid", "status": "active", "network": "mainnet", "account": "0xabc", "dex": "xyz", "coin": "xyz:ETH",
+            "lifecycle_mid": "200",
             "levels": [{"side": "sell", "status": "legacy_pause", "price": "201", "grid_leg": 1}],
         }
 
-        candidate = lifecycle_legacy_pause_candidate([btc, eth], "mainnet", "0xabc", "", {"BTC": "100", "ETH": "200"})
+        candidate = lifecycle_legacy_pause_candidate([btc, eth], "mainnet", "0xabc")
 
         self.assertIsNotNone(candidate)
         self.assertIs(candidate[0], eth)
+
+    def test_finite_chain_account_quota_is_shared_across_dexes(self) -> None:
+        default = {"account": "0xAbC", "dex": ""}
+        xyz = {"account": "0xabc", "dex": "xyz"}
+
+        self.assertEqual(
+            lifecycle_row_account_key(default, "mainnet", "fallback"),
+            lifecycle_row_account_key(xyz, "mainnet", "fallback"),
+        )
+
+    def test_terminal_candidate_selects_across_dexes(self) -> None:
+        default = {
+            "type": "grid", "status": "active", "network": "mainnet", "account": "0xabc", "dex": "",
+            "levels": [{"status": "active", "side": "buy", "oid": 2, "grid_leg": 0, "reduce_only": False, "submitted_at": 3}],
+        }
+        xyz = {
+            "type": "grid", "status": "active", "network": "mainnet", "account": "0xabc", "dex": "xyz",
+            "levels": [{"status": "active", "side": "sell", "oid": 4, "grid_leg": 0, "reduce_only": False, "submitted_at": 1}],
+        }
+
+        candidate = lifecycle_terminal_candidate([default, xyz], "mainnet", "0xabc")
+
+        self.assertIs(candidate[0], xyz)
+        self.assertEqual(candidate[1]["oid"], 4)
 
     def test_raw_deficit_preserves_negative_headroom(self) -> None:
         self.assertEqual(raw_action_limit_deficit({"action_limit_headroom": 101}), -101)
@@ -346,6 +382,34 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(entry["grid_leg"], 1)
         self.assertFalse(exchange.reduce_only)
 
+    def test_p5_restore_exception_preserves_chain_debt_not_pending(self) -> None:
+        class FakeInfo:
+            def query_order_by_oid(self, account, oid):
+                return {"order": {"status": "reduceOnlyCanceled"}}
+
+        class FailingExchange:
+            def order(self, *args, **kwargs):
+                raise RuntimeError("temporary exchange failure")
+
+        entry = grid_order_entry(
+            {"gap_rate": "0.01", "min_order_value": "10", "base_buy_size": "1", "base_sell_size": "1"},
+            "BTC", {"szDecimals": 2}, False, Decimal("101"), True, size=Decimal("1"), preserve_size=True,
+        )
+        entry.update({"status": "active", "oid": 9, "grid_leg": 1})
+        row = {"gap_rate": "0.01", "levels": [entry]}
+        ctx = {
+            "coin": "BTC", "asset": {"szDecimals": 2, "maxLeverage": 20}, "exchange": FailingExchange(),
+            "now": 123, "position_size": Decimal("1"), "current_mid": Decimal("100"),
+            "best_bid": Decimal("99.9"), "best_ask": Decimal("100.1"), "open_orders": [],
+            "open_oids": set(), "fills_by_oid": {}, "info": FakeInfo(), "account": "0xabc",
+        }
+
+        count, changed = lifecycle_process_anomalies(row, ctx, {"action_limit_headroom": 200})
+
+        self.assertTrue(changed)
+        self.assertEqual(count, 0)
+        self.assertEqual(entry["status"], GRID_CHAIN_DEBT_STATUS)
+
     def test_p4_market_fill_births_leg_one_gtc_order(self) -> None:
         class FakeExchange:
             def __init__(self):
@@ -354,7 +418,7 @@ class GridAvgTests(unittest.TestCase):
             def _slippage_price(self, coin, is_buy, slippage, mid):
                 return 100
 
-            def order(self, coin, is_buy, size, price, order_type, reduce_only=False):
+            def order(self, coin, is_buy, size, price, order_type, reduce_only=False, cloid=None):
                 self.calls.append((is_buy, order_type, reduce_only))
                 if len(self.calls) == 1:
                     return {"status": "ok", "response": {"data": {"statuses": [{"filled": {"oid": 1, "avgPx": "100", "totalSz": "0.3"}}]}}}
@@ -381,6 +445,96 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(birth["grid_leg"], 1)
         self.assertEqual(birth["birth_source"], "limit_chase")
         self.assertEqual(birth["plan"]["order_type"], {"limit": {"tif": "Gtc"}})
+
+    def test_p4_timeout_reconciles_cloid_fill_into_leg_one(self) -> None:
+        class TimeoutExchange:
+            def _slippage_price(self, coin, is_buy, slippage, mid):
+                return 100
+
+            def order(self, *args, **kwargs):
+                raise TimeoutError("write response timed out")
+
+        row = {
+            "position_limit_mode": "limit", "min_position_value": "-100", "max_position_value": "150",
+            "gap_rate": "0.01", "min_order_value": "10", "base_buy_size": "0.3", "base_sell_size": "0.3",
+            "levels": [],
+        }
+        ctx = {
+            "withdrawable": Decimal("6"), "position_size": Decimal("2"), "position_value": Decimal("200"),
+            "exchange": TimeoutExchange(), "coin": "BTC", "asset": {"szDecimals": 2, "maxLeverage": 20},
+            "current_mid": Decimal("100"), "best_bid": Decimal("99.9"), "best_ask": Decimal("100.1"),
+            "now": 123, "open_orders": [],
+        }
+        with patch("trail_worker.save_server_batch") as save_mock:
+            self.assertTrue(lifecycle_submit_limit_chase(row, ctx, {"action_limit_headroom": 200, "grid_rows": [row]}))
+        self.assertTrue(save_mock.called)
+        self.assertEqual(row["birth_market_intents"][0]["status"], "awaiting_reconcile")
+
+        class FakeInfo:
+            def query_order_by_cloid(self, account, cloid):
+                return {
+                    "status": "order",
+                    "order": {"order": {"oid": 77}, "status": "filled", "statusTimestamp": 124000},
+                }
+
+        class RecoveryExchange:
+            def order(self, coin, is_buy, size, price, order_type, reduce_only=False):
+                return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 88}}]}}}
+
+        reconcile_ctx = {
+            **ctx,
+            "info": FakeInfo(), "account": "0xabc", "exchange": RecoveryExchange(), "now": 124,
+            "fills_by_oid": {77: {"oid": 77, "px": "100", "sz": "0.3"}},
+        }
+        self.assertTrue(lifecycle_reconcile_birth_intents(row, reconcile_ctx, {"action_limit_headroom": 200}))
+        self.assertNotIn("birth_market_intents", row)
+        self.assertEqual(len(row["levels"]), 1)
+        self.assertEqual(row["levels"][0]["grid_leg"], 1)
+        self.assertEqual(row["levels"][0]["status"], "active")
+        self.assertEqual(row["levels"][0]["birth_source"], "limit_chase")
+
+    def test_p0_birth_uses_single_persisted_cloid_submission(self) -> None:
+        market = {
+            "side": "buy", "is_buy": True, "price": "100", "size": "0.3",
+            "plan": {
+                "is_buy": True, "size": Decimal("0.3"), "limit_px": Decimal("100"),
+                "order_type": {"limit": {"tif": "Ioc"}},
+            },
+        }
+        row = {
+            "type": "grid", "status": "active", "grid_lifecycle_version": 2,
+            "gap_rate": "0.01", "levels": [],
+        }
+        ctx = {
+            "network": "mainnet", "account": "0xabc", "coin": "BTC",
+            "asset": {"szDecimals": 2, "maxLeverage": 20}, "exchange": object(),
+            "info": object(), "now": 123, "now_ms": 123000,
+            "position_size": Decimal("-1"), "position_value": Decimal("-100"),
+            "current_mid": Decimal("100"), "best_bid": Decimal("99.9"), "best_ask": Decimal("100.1"),
+            "withdrawable": Decimal("10"), "liquidation_px": Decimal("120"),
+            "open_orders": [], "open_oids": set(), "fills_by_oid": {},
+        }
+
+        def fake_submit(exchange, coin, order, now, submitted_row, cache, cloid=None):
+            self.assertIsNotNone(cloid)
+            order.update({"status": "filled", "filled_avg_px": "100", "filled_size": "0.3"})
+            return True
+
+        with (
+            patch("trail_worker.lifecycle_context", return_value=ctx),
+            patch("trail_worker.lifecycle_reconcile_birth_intents", return_value=False),
+            patch("trail_worker.grid_panic_ratio", return_value=Decimal("0")),
+            patch("trail_worker.grid_panic_ratio_threshold", return_value=Decimal("1")),
+            patch("trail_worker.build_grid_panic_reduce_order", return_value=market),
+            patch("trail_worker.submit_grid_panic_reduce", side_effect=fake_submit) as submit_mock,
+            patch("trail_worker.lifecycle_materialize_birth_intent", return_value=True),
+            patch("trail_worker.save_server_batch"),
+        ):
+            updated, changed = maintain_grid(row, {"grid_action_phase": "p0", "grid_rows": [row]})
+
+        self.assertTrue(changed)
+        self.assertEqual(submit_mock.call_count, 1)
+        self.assertEqual(updated["birth_market_intents"][0]["status"], "submitting")
 
     def test_spot_usdc_withdrawable_matches_worker_total_minus_hold(self) -> None:
         self.assertEqual(
