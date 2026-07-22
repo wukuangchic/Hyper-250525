@@ -2636,6 +2636,18 @@ def reversed_grid_strategy_values(row: dict[str, Any]) -> tuple[Decimal, Decimal
     return -upper, -lower, -avg if avg is not None else None
 
 
+def shifted_grid_strategy_values(
+    row: dict[str, Any],
+    offset: Decimal,
+) -> tuple[Decimal, Decimal, Decimal | None]:
+    policy = grid_limit_policy_from_row(row)
+    minimum = Decimal(str(row.get("min_position_value") or "0"))
+    maximum = Decimal(str(row.get("max_position_value", "0")))
+    lower, upper = grid_position_bounds(policy, minimum, maximum)
+    avg = decimal_or_none(row.get("avg"))
+    return lower + offset, upper + offset, avg + offset if avg is not None else None
+
+
 def grid_limit_arg(args: argparse.Namespace) -> tuple[str | None, str | None, str | None]:
     explicit_limit = getattr(args, "grid_limit", None)
     if explicit_limit is not None:
@@ -4126,6 +4138,8 @@ def modify_grid_batch_order(
     price_rate: Decimal | None,
 ) -> None:
     reversing = bool(getattr(args, "grid_reverse", False))
+    add_value = getattr(args, "grid_add", None)
+    add_offset = Decimal(str(add_value)) if add_value is not None else None
     batch_rows = load_server_batch()
     matching_indexes = grid_batch_indexes(batch_rows, args.network, account, coin, {"active", "error"})
     if not matching_indexes:
@@ -4141,8 +4155,12 @@ def modify_grid_batch_order(
     old_limit_mode = grid_limit_policy_from_row(row)
     old_min_position_value = Decimal(str(row.get("min_position_value") or "0"))
     reversed_avg: Decimal | None = None
+    shifted_avg: Decimal | None = None
     if reversing:
         new_min_position_value, new_max_position_value, reversed_avg = reversed_grid_strategy_values(row)
+        new_limit_mode = "limit"
+    elif add_offset is not None:
+        new_min_position_value, new_max_position_value, shifted_avg = shifted_grid_strategy_values(row, add_offset)
         new_limit_mode = "limit"
     else:
         new_limit_mode = str(args.grid_position_limit_mode) if args.grid_position_limit_value is not None else old_limit_mode
@@ -4155,7 +4173,7 @@ def modify_grid_batch_order(
     gap_changed = bool(args.gap)
     avg_changed = args.grid_avg is not None
     updates: list[tuple[str, str]] = []
-    if reversing or args.grid_position_limit_value is not None:
+    if reversing or add_offset is not None or args.grid_position_limit_value is not None:
         row["position_limit_mode"] = new_limit_mode
         row["min_position_value"] = decimal_to_plain(new_min_position_value)
         row["max_position_value"] = decimal_to_plain(new_max_position_value)
@@ -4164,6 +4182,9 @@ def modify_grid_batch_order(
             updates.append(("mode_change", f"{old_limit_mode}->{new_limit_mode}"))
     if reversing and reversed_avg is not None:
         row["avg"] = decimal_to_plain(reversed_avg)
+        updates.append(("avg", row["avg"]))
+    if add_offset is not None and shifted_avg is not None:
+        row["avg"] = decimal_to_plain(shifted_avg)
         updates.append(("avg", row["avg"]))
     if args.grid_min is not None:
         row["min_order_value"] = decimal_to_plain(grid_min_notional(args))
@@ -5704,6 +5725,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min", dest="grid_min", help="Grid minimum value per child order in USD. Default: exchange minimum.")
     parser.add_argument("--modify", dest="grid_modify", action="store_true", help="Modify an active server grid for this coin.")
     parser.add_argument(
+        "--add",
+        dest="grid_add",
+        help="Shift an active grid's signed limit range and existing avg target by this USD amount; requires --modify.",
+    )
+    parser.add_argument(
         "--reverse",
         dest="grid_reverse",
         action="store_true",
@@ -5996,13 +6022,26 @@ def parse_args() -> argparse.Namespace:
         args.range_spec = [decimal_to_plain(start_px), decimal_to_plain(args.ladder_end), args.ladder_step]
     if args.symmetric_offset and not args.symmetric:
         parser.error("--offset requires side both")
-    if (args.trend or args.grid_avg is not None or args.gap or args.grid_min or args.grid_reverse) and not args.grid:
-        parser.error("--trend, --avg, --gap, --min, and --reverse require side grid")
+    if (args.trend or args.grid_avg is not None or args.gap or args.grid_min or args.grid_reverse or args.grid_add is not None) and not args.grid:
+        parser.error("--trend, --avg, --gap, --min, --reverse, and --add require side grid")
     if args.grid:
         if args.trend is not None and args.grid_avg is not None:
             parser.error("--avg and --trend are mutually exclusive")
         if sum(bool(value) for value in (args.grid_modify, args.grid_reverse, args.grid_recover)) > 1:
             parser.error("grid --modify, --reverse, and --recover are mutually exclusive")
+        if args.grid_add is not None:
+            if not args.grid_modify:
+                parser.error("grid --add requires --modify")
+            if (
+                args.query
+                or args.grid_limit is not None
+                or args.grid_long is not None
+                or args.grid_short is not None
+                or args.grid_abs is not None
+                or args.trend is not None
+                or args.grid_avg is not None
+            ):
+                parser.error("grid --modify --add cannot be combined with query, --limit, --avg, or --trend")
         if args.grid_reverse and (
             args.query
             or args.grid_limit is not None
@@ -6031,6 +6070,10 @@ def parse_args() -> argparse.Namespace:
         if args.grid_recover and not selected_grid_limits:
             parser.error("grid --recover requires --limit MIN MAX")
         try:
+            if args.grid_add is not None:
+                add_value = Decimal(str(args.grid_add))
+                if not add_value.is_finite():
+                    parser.error("--add must be a finite number")
             if args.gap and not is_auto_grid_gap(args.gap):
                 parse_grid_gap(args.gap)
             parse_percent_decimal(args.trend or "0", "--trend", allow_signed=True)
@@ -6061,7 +6104,7 @@ def parse_args() -> argparse.Namespace:
         except ValueError as exc:
             parser.error(str(exc))
         except InvalidOperation:
-            parser.error("grid limit, --avg, and --min must be valid numbers")
+            parser.error("grid limit, --avg, --add, and --min must be valid numbers")
         args.amount = args.grid_position_limit_value or "10"
     if args.symmetric:
         if not args.symmetric_offset:

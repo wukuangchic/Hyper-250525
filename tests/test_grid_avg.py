@@ -552,6 +552,115 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(row["note"], "reversed grid limit and avg; existing orders kept")
         save_batch.assert_called_once()
 
+    def test_grid_modify_add_shifts_limit_and_existing_avg(self) -> None:
+        row = {
+            "type": "grid",
+            "status": "active",
+            "network": "mainnet",
+            "account": "0xabc",
+            "coin": "BTC",
+            "position_limit_mode": "limit",
+            "min_position_value": "-300",
+            "max_position_value": "300",
+            "avg": "50",
+            "trend": "0",
+            "gap": "0.5%",
+            "gap_rate": "0.005",
+            "levels": [],
+        }
+        args = Namespace(
+            network="mainnet",
+            grid_reverse=False,
+            grid_add="10",
+            grid_position_limit_mode=None,
+            grid_position_min_value=None,
+            grid_position_limit_value=None,
+            grid_min=None,
+            gap=None,
+            trend=None,
+            grid_avg=None,
+            explain=False,
+            dry_run=False,
+        )
+
+        with patch("hl_order.load_server_batch", return_value=[row]), \
+             patch("hl_order.current_position_size_value", return_value=(Decimal("0"), Decimal("0"))), \
+             patch("hl_order.refresh_grid_row_strategy_params"), \
+             patch("hl_order.save_server_batch") as save_batch, \
+             patch("hl_order.print_grid_batch_status"):
+            modify_grid_batch_order(
+                args,
+                exchange=object(),
+                info=object(),
+                account="0xabc",
+                coin="BTC",
+                dex="",
+                asset={},
+                max_leverage=5,
+                current_mid=Decimal("1"),
+                slippage=Decimal("0.05"),
+                price_rate=None,
+            )
+
+        self.assertEqual(row["min_position_value"], "-290")
+        self.assertEqual(row["max_position_value"], "310")
+        self.assertEqual(row["avg"], "60")
+        save_batch.assert_called_once()
+
+    def test_grid_modify_add_negative_shifts_limit_without_creating_avg(self) -> None:
+        row = {
+            "type": "grid",
+            "status": "active",
+            "network": "mainnet",
+            "account": "0xabc",
+            "coin": "BTC",
+            "position_limit_mode": "limit",
+            "min_position_value": "-300",
+            "max_position_value": "300",
+            "avg": None,
+            "trend": "0",
+            "gap": "0.5%",
+            "gap_rate": "0.005",
+            "levels": [],
+        }
+        args = Namespace(
+            network="mainnet",
+            grid_reverse=False,
+            grid_add="-10",
+            grid_position_limit_mode=None,
+            grid_position_min_value=None,
+            grid_position_limit_value=None,
+            grid_min=None,
+            gap=None,
+            trend=None,
+            grid_avg=None,
+            explain=False,
+            dry_run=False,
+        )
+
+        with patch("hl_order.load_server_batch", return_value=[row]), \
+             patch("hl_order.current_position_size_value", return_value=(Decimal("0"), Decimal("0"))), \
+             patch("hl_order.refresh_grid_row_strategy_params"), \
+             patch("hl_order.save_server_batch"), \
+             patch("hl_order.print_grid_batch_status"):
+            modify_grid_batch_order(
+                args,
+                exchange=object(),
+                info=object(),
+                account="0xabc",
+                coin="BTC",
+                dex="",
+                asset={},
+                max_leverage=5,
+                current_mid=Decimal("1"),
+                slippage=Decimal("0.05"),
+                price_rate=None,
+            )
+
+        self.assertEqual(row["min_position_value"], "-310")
+        self.assertEqual(row["max_position_value"], "290")
+        self.assertIsNone(row["avg"])
+
     def test_grid_target_is_sixteen_and_migrates_old_defaults(self) -> None:
         self.assertEqual(GRID_TARGET_ORDERS_PER_SIDE, 16)
         self.assertEqual(grid_target_orders_per_side({"target_orders_per_side": 5}), 16)

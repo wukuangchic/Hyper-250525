@@ -134,6 +134,19 @@ class StrictInputTests(unittest.TestCase):
         self.assert_cli_rejected("BTC", "grid", "--reverse", "--limit", "-500", "500")
         self.assert_cli_rejected("BTC", "grid", "--reverse", "--avg", "0")
 
+    def test_grid_modify_add_accepts_positive_and_negative_amounts(self) -> None:
+        positive = self.parse_cli("BTC", "grid", "--modify", "--add", "10")
+        negative = self.parse_cli("BTC", "grid", "--modify", "--add", "-10")
+
+        self.assertEqual(positive.grid_add, "10")
+        self.assertEqual(negative.grid_add, "-10")
+
+    def test_grid_add_requires_modify_and_rejects_conflicting_strategy_changes(self) -> None:
+        self.assert_cli_rejected("BTC", "grid", "--add", "10")
+        self.assert_cli_rejected("BTC", "grid", "--modify", "--add", "10", "--limit", "-200", "400")
+        self.assert_cli_rejected("BTC", "grid", "--modify", "--add", "10", "--avg", "50")
+        self.assert_cli_rejected("BTC", "grid", "--modify", "--add", "NaN")
+
     def test_grid_requires_limit_range(self) -> None:
         self.assert_cli_rejected("BTC", "grid", "--dry-run")
         self.assert_cli_rejected("BTC", "grid", "--limit", "400", "200", "--dry-run")
