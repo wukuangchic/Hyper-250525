@@ -1764,94 +1764,82 @@ def next_outward_grid_price(row: dict[str, Any], asset: dict[str, Any], order: d
     return rounded_perp_price(price * multiplier, int(row.get("sz_decimals") or asset["szDecimals"]))
 
 
-def shift_paused_grid_entries_outward_for_replacement(
+def paused_only_grid_price_blocker(
+    row: dict[str, Any],
+    order: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Return the nearest paused-only spacing blocker for a fresh replacement."""
+    if not bool(order.get("replacement_order")):
+        return None
+    side = str(order.get("side") or "")
+    price = decimal_or_none(order.get("price", order.get("limit_px")))
+    if not side or price is None or price <= 0:
+        return None
+    threshold = price * Decimal(str(row["gap_rate"])) * GRID_ALO_SPACING_MULTIPLIER
+    blockers = [
+        entry
+        for entry in grid_price_occupancy_entries(row, side)
+        if entry is not order
+        and (existing := decimal_or_none(entry.get("price", entry.get("limit_px")))) is not None
+        and existing > 0
+        and abs(existing - price) <= threshold
+    ]
+    if not blockers or any(str(entry.get("status") or "") not in GRID_PAUSED_STATUSES for entry in blockers):
+        return None
+    return min(
+        blockers,
+        key=lambda entry: abs(
+            (decimal_or_none(entry.get("price", entry.get("limit_px"))) or Decimal("0")) - price
+        ),
+    )
+
+
+def defer_fresh_replacement_behind_paused(
     row: dict[str, Any],
     asset: dict[str, Any],
     order: dict[str, Any],
+    now: int,
     *,
     max_attempts: int = GRID_ALO_PRICE_ATTEMPT_LIMIT,
 ) -> bool:
-    """Let a fresh replacement keep its target by shifting paused markers outward."""
-    if not bool(order.get("replacement_order")):
+    """Restore the paused blocker next and keep the fresh replacement as an outward paused marker."""
+    blocker = paused_only_grid_price_blocker(row, order)
+    if blocker is None:
         return False
-    side = str(order.get("side") or "")
-    target_price = decimal_or_none(order.get("price", order.get("limit_px")))
-    if not side or target_price is None or target_price <= 0:
+    blocker_price = decimal_or_none(blocker.get("price", blocker.get("limit_px")))
+    original_price = decimal_or_none(order.get("price", order.get("limit_px")))
+    if blocker_price is None or blocker_price <= 0 or original_price is None or original_price <= 0:
         return False
-
-    def nearby_entries(price: Decimal, *, exclude: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-        threshold = price * Decimal(str(row["gap_rate"])) * GRID_ALO_SPACING_MULTIPLIER
-        return [
-            entry
-            for entry in grid_price_occupancy_entries(row, side)
-            if entry is not order
-            and entry is not exclude
-            and (existing := decimal_or_none(entry.get("price", entry.get("limit_px")))) is not None
-            and existing > 0
-            and abs(existing - price) <= threshold
-        ]
-
-    blockers = nearby_entries(target_price)
-    if not blockers or any(str(entry.get("status")) not in GRID_PAUSED_STATUSES for entry in blockers):
+    set_grid_order_price(order, blocker_price)
+    for _attempt in range(max_attempts):
+        candidate = next_outward_grid_price(row, asset, order)
+        if candidate is None or candidate <= 0:
+            set_grid_order_price(order, original_price)
+            return False
+        set_grid_order_price(order, candidate)
+        if not active_price_too_close(
+            row,
+            str(order.get("side") or ""),
+            candidate,
+            exclude=order,
+            spacing_multiplier=GRID_ALO_SPACING_MULTIPLIER,
+        ):
+            break
+    else:
+        set_grid_order_price(order, original_price)
         return False
-
-    original_prices: dict[int, tuple[dict[str, Any], Decimal]] = {}
-    moving: set[int] = set()
-    moved_successfully: set[int] = set()
-
-    def remember(entry: dict[str, Any]) -> None:
-        entry_id = id(entry)
-        if entry_id in original_prices:
-            return
-        price = decimal_or_none(entry.get("price", entry.get("limit_px")))
-        if price is not None:
-            original_prices[entry_id] = (entry, price)
-
-    def move_paused(entry: dict[str, Any]) -> bool:
-        entry_id = id(entry)
-        if entry_id in moved_successfully:
-            return True
-        if entry_id in moving:
-            return False
-        if str(entry.get("status")) not in GRID_PAUSED_STATUSES:
-            return False
-        remember(entry)
-        moving.add(entry_id)
-        try:
-            for _attempt in range(max_attempts):
-                candidate = next_outward_grid_price(row, asset, entry)
-                if candidate is None or candidate <= 0:
-                    return False
-                set_grid_order_price(entry, candidate)
-                if abs(candidate - target_price) <= (
-                    target_price * Decimal(str(row["gap_rate"])) * GRID_ALO_SPACING_MULTIPLIER
-                ):
-                    continue
-                candidate_blockers = nearby_entries(candidate, exclude=entry)
-                paused_blockers = [
-                    blocker
-                    for blocker in candidate_blockers
-                    if str(blocker.get("status")) in GRID_PAUSED_STATUSES
-                ]
-                if any(not move_paused(blocker) for blocker in paused_blockers):
-                    return False
-                if not nearby_entries(candidate, exclude=entry):
-                    moved_successfully.add(entry_id)
-                    return True
-            return False
-        finally:
-            moving.discard(entry_id)
-
-    is_buy = bool(order.get("is_buy"))
-    blockers.sort(
-        key=lambda entry: decimal_or_none(entry.get("price", entry.get("limit_px"))) or Decimal("0"),
-        reverse=not is_buy,
+    blocker["fresh_replacement_restore_target_at"] = now
+    blocker["fresh_replacement_restore_target_price"] = decimal_to_plain(blocker_price)
+    prioritize_grid_entry_for_restore(row.setdefault("levels", []), blocker)
+    order["fresh_replacement_deferred_at"] = now
+    order["fresh_replacement_deferred_behind_price"] = decimal_to_plain(blocker_price)
+    preserve_replacement_order(
+        row.setdefault("levels", []),
+        order,
+        now,
+        "paused_occupancy_yield",
     )
-    if all(move_paused(entry) for entry in blockers) and not nearby_entries(target_price):
-        return True
-    for entry, price in original_prices.values():
-        set_grid_order_price(entry, price)
-    return False
+    return True
 
 
 def grid_order_target_gap(row: dict[str, Any], side: str, order: dict[str, Any] | None = None) -> Decimal:
@@ -1923,16 +1911,14 @@ def move_grid_order_away_from_active(
     if not side:
         return False
     price = decimal_or_none(order.get("price", order.get("limit_px")))
-    if (
-        price is not None
-        and active_price_too_close(row, side, price, exclude=order, spacing_multiplier=GRID_ALO_SPACING_MULTIPLIER)
-        and shift_paused_grid_entries_outward_for_replacement(row, asset, order, max_attempts=max_attempts)
-    ):
+    if price is not None and paused_only_grid_price_blocker(row, order) is not None:
         return True
     for _attempt in range(max_attempts):
         price = decimal_or_none(order.get("price", order.get("limit_px")))
         if price is None or price <= 0:
             return False
+        if paused_only_grid_price_blocker(row, order) is not None:
+            return True
         if not active_price_too_close(row, side, price, exclude=order, spacing_multiplier=GRID_ALO_SPACING_MULTIPLIER):
             return True
         next_price = grid_insert_price_between_active_gap(row, asset, order)
@@ -3479,6 +3465,13 @@ def submit_grid_order_entry(
         order["skipped_at"] = now
         order["alo_price_attempts"] = GRID_ALO_PRICE_ATTEMPT_LIMIT
         return False
+    if retry_alo_reject and not preserve_panic_reversal_price and defer_fresh_replacement_behind_paused(
+        row,
+        asset,
+        order,
+        now,
+    ):
+        return False
     ensure_grid_order_min_notional(row, asset, order)
     if adopt_matching_open_grid_order(open_orders, coin, order, now, row):
         return True
@@ -3572,8 +3565,14 @@ def submit_grid_order_entry(
             order["skipped_at"] = now
             order["alo_rejects"] = alo_rejects
             return False
+        if defer_fresh_replacement_behind_paused(row, asset, order, now):
+            order["alo_rejects"] = alo_rejects
+            return False
         set_grid_order_tif(order, "Gtc")
         for attempt in range(1, GRID_ALO_PRICE_ATTEMPT_LIMIT):
+            if defer_fresh_replacement_behind_paused(row, asset, order, now):
+                order["alo_rejects"] = alo_rejects
+                return False
             price = decimal_or_none(order.get("price", order.get("limit_px")))
             if price is None or price <= 0:
                 order["status"] = "skipped_alo_price_search"
@@ -3581,15 +3580,12 @@ def submit_grid_order_entry(
                 order["skipped_at"] = now
                 order["alo_price_attempts"] = attempt
                 return False
-            if (
-                active_price_too_close(
-                    row,
-                    side,
-                    price,
-                    exclude=order,
-                    spacing_multiplier=GRID_ALO_SPACING_MULTIPLIER,
-                )
-                and not shift_paused_grid_entries_outward_for_replacement(row, asset, order)
+            if active_price_too_close(
+                row,
+                side,
+                price,
+                exclude=order,
+                spacing_multiplier=GRID_ALO_SPACING_MULTIPLIER,
             ):
                 next_price = grid_insert_price_between_active_gap(row, asset, order) or next_outward_grid_price(row, asset, order)
                 if next_price is None or next_price <= 0 or next_price == price:
