@@ -76,7 +76,7 @@ GRID_NEAR_REGRID_STALE_GAP_MULTIPLE = Decimal("30")
 GRID_NEAR_REGRID_TARGET_GAP_MULTIPLE = Decimal("15")
 GRID_PANIC_RATIO_THRESHOLD = Decimal("100")
 GRID_PANIC_REVERSAL_GAP_MULTIPLIER = Decimal("2")
-GRID_PANIC_REVERSAL_ACTION_LIMIT_WAIT_SECONDS = 10
+GRID_EMERGENCY_ACTION_LIMIT_WAIT_SECONDS = 10
 GRID_PANIC_REDUCE_MIN_NOTIONAL = MIN_NOTIONAL * Decimal("1.10")
 GRID_LIMIT_CHASE_MIN_NOTIONAL_MULTIPLIER = Decimal("1.10")
 GRID_PENDING_CANCEL_STATUS = "pending_cancel"
@@ -416,6 +416,43 @@ def restore_pending_cancel_entries(
 def is_cumulative_action_limit_text(text: str) -> bool:
     lowered = text.lower()
     return "too many cumulative requests" in lowered and "cumulative volume traded" in lowered
+
+
+def clear_cumulative_action_limit_retry_cache(cache: dict[str, Any] | None) -> None:
+    if not isinstance(cache, dict):
+        return
+    cache.pop("action_limit_error", None)
+    cache.pop("action_limit_at", None)
+    cache.pop("action_limit_deficit", None)
+    rate_cache = cache.get("user_action_rate_limits")
+    if isinstance(rate_cache, dict):
+        rate_cache.clear()
+
+
+def submit_with_cumulative_action_limit_wait(
+    submit: Any,
+    *,
+    cache: dict[str, Any] | None = None,
+    on_wait: Any = None,
+) -> Any:
+    """Retry emergency actions every 10 seconds until cumulative capacity opens."""
+    wait_count = 0
+    while True:
+        try:
+            result = submit()
+        except RuntimeError as exc:
+            error_text = str(exc)
+            if not is_cumulative_action_limit_text(error_text):
+                raise
+        else:
+            error_text = str(result)
+            if not is_cumulative_action_limit_text(error_text):
+                return result
+        wait_count += 1
+        if callable(on_wait):
+            on_wait(wait_count, error_text)
+        time.sleep(GRID_EMERGENCY_ACTION_LIMIT_WAIT_SECONDS)
+        clear_cumulative_action_limit_retry_cache(cache)
 
 
 def is_temporary_action_limit_text(text: str) -> bool:
@@ -3787,14 +3824,27 @@ def submit_grid_panic_reduce(
     plan = order.get("plan")
     if not isinstance(plan, dict):
         return False
-    reserve_grid_exchange_actions(cache)
-    result = exchange.order(
-        coin,
-        bool(plan["is_buy"]),
-        float(plan["size"]),
-        float(plan["limit_px"]),
-        plan["order_type"],
-        reduce_only=True,
+    def submit_once() -> Any:
+        reserve_grid_exchange_actions(cache)
+        return exchange.order(
+            coin,
+            bool(plan["is_buy"]),
+            float(plan["size"]),
+            float(plan["limit_px"]),
+            plan["order_type"],
+            reduce_only=True,
+        )
+
+    def record_wait(wait_count: int, error_text: str) -> None:
+        row["panic_reduce_action_limit_wait_seconds"] = GRID_EMERGENCY_ACTION_LIMIT_WAIT_SECONDS
+        row["panic_reduce_action_limit_wait_at"] = now
+        row["panic_reduce_action_limit_wait_count"] = wait_count
+        row["panic_reduce_action_limit_wait_error"] = error_text
+
+    result = submit_with_cumulative_action_limit_wait(
+        submit_once,
+        cache=cache,
+        on_wait=record_wait,
     )
     audit_grid_action(
         "panic_reduce_submit",
@@ -4913,37 +4963,22 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 cache=cache,
             )
 
-        try:
-            submitted = submit_once()
-        except RuntimeError as exc:
-            error_text = str(exc)
-            if not is_cumulative_action_limit_text(error_text):
-                order["panic_reversal_retry_error"] = error_text
-                order["panic_reversal_retry_at"] = now
-                return False
-            wait_seconds = GRID_PANIC_REVERSAL_ACTION_LIMIT_WAIT_SECONDS
-            order["panic_reversal_action_limit_wait_seconds"] = wait_seconds
+        def record_wait(wait_count: int, error_text: str) -> None:
+            order["panic_reversal_action_limit_wait_seconds"] = GRID_EMERGENCY_ACTION_LIMIT_WAIT_SECONDS
             order["panic_reversal_action_limit_wait_at"] = now
-            time.sleep(wait_seconds)
-            if isinstance(cache, dict):
-                cache.pop("action_limit_error", None)
-                cache.pop("action_limit_at", None)
-                cache.pop("action_limit_deficit", None)
-                rate_cache = cache.get("user_action_rate_limits")
-                if isinstance(rate_cache, dict):
-                    rate_cache.pop((network, account), None)
-            try:
-                submitted = submit_once()
-            except RuntimeError as retry_exc:
-                retry_error_text = str(retry_exc)
-                if not is_cumulative_action_limit_text(retry_error_text):
-                    order["panic_reversal_retry_error"] = retry_error_text
-                    order["panic_reversal_retry_at"] = now
-                    return False
-                mark_action_limit_hit(cache, retry_error_text, now)
-                pause_grid_order_for_action_limit(order, now, retry_error_text)
-                order["panic_reversal_action_limit_retry_error"] = retry_error_text
-                return False
+            order["panic_reversal_action_limit_wait_count"] = wait_count
+            order["panic_reversal_action_limit_wait_error"] = error_text
+
+        try:
+            submitted = submit_with_cumulative_action_limit_wait(
+                submit_once,
+                cache=cache,
+                on_wait=record_wait,
+            )
+        except RuntimeError as exc:
+            order["panic_reversal_retry_error"] = str(exc)
+            order["panic_reversal_retry_at"] = now
+            return False
         if submitted:
             side = str(order.get("side") or "")
             submissions_by_side[side] = submissions_by_side.get(side, 0) + 1
@@ -6242,14 +6277,27 @@ def submit_grid_limit_chase_market(
     plan = order.get("plan")
     if not isinstance(plan, dict):
         return False
-    reserve_grid_exchange_actions(cache)
-    result = exchange.order(
-        coin,
-        bool(plan["is_buy"]),
-        float(plan["size"]),
-        float(plan["limit_px"]),
-        plan["order_type"],
-        reduce_only=False,
+    def submit_once() -> Any:
+        reserve_grid_exchange_actions(cache)
+        return exchange.order(
+            coin,
+            bool(plan["is_buy"]),
+            float(plan["size"]),
+            float(plan["limit_px"]),
+            plan["order_type"],
+            reduce_only=False,
+        )
+
+    def record_wait(wait_count: int, error_text: str) -> None:
+        row["limit_chase_market_action_limit_wait_seconds"] = GRID_EMERGENCY_ACTION_LIMIT_WAIT_SECONDS
+        row["limit_chase_market_action_limit_wait_at"] = now
+        row["limit_chase_market_action_limit_wait_count"] = wait_count
+        row["limit_chase_market_action_limit_wait_error"] = error_text
+
+    result = submit_with_cumulative_action_limit_wait(
+        submit_once,
+        cache=cache,
+        on_wait=record_wait,
     )
     audit_grid_action(
         "limit_chase_market_submit",
@@ -6407,8 +6455,8 @@ def run_grid_limit_chase_p3(cache: dict[str, Any]) -> bool:
 
     levels = row.setdefault("levels", [])
     open_orders = cache.setdefault("open_orders", {}).setdefault((network, account, dex), [])
-    try:
-        replacement_submitted = submit_grid_order_entry(
+    def submit_replacement_once() -> bool:
+        return submit_grid_order_entry(
             exchange,
             coin,
             replacement,
@@ -6425,6 +6473,21 @@ def run_grid_limit_chase_p3(cache: dict[str, Any]) -> bool:
             open_orders=open_orders,
             cache=cache,
             bypass_margin_controls=True,
+        )
+
+    def record_replacement_wait(wait_count: int, error_text: str) -> None:
+        replacement["limit_chase_replacement_action_limit_wait_seconds"] = (
+            GRID_EMERGENCY_ACTION_LIMIT_WAIT_SECONDS
+        )
+        replacement["limit_chase_replacement_action_limit_wait_at"] = now
+        replacement["limit_chase_replacement_action_limit_wait_count"] = wait_count
+        replacement["limit_chase_replacement_action_limit_wait_error"] = error_text
+
+    try:
+        replacement_submitted = submit_with_cumulative_action_limit_wait(
+            submit_replacement_once,
+            cache=cache,
+            on_wait=record_replacement_wait,
         )
     except Exception as exc:
         replacement["last_error"] = str(exc)

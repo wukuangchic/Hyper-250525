@@ -904,7 +904,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(seen[1], ({"stale": True}, {"shared": True}, 3))
         self.assertEqual(info.clear_calls, 8)
 
-    def test_limit_chase_p3_ignores_p2_quota_after_p1_and_submits_replacement(self) -> None:
+    def test_limit_chase_p3_waits_every_ten_seconds_for_market_and_replacement_capacity(self) -> None:
         class FakeInfo:
             def all_mids(self, dex):
                 return {"BTC": "100"}
@@ -934,6 +934,14 @@ class GridAvgTests(unittest.TestCase):
                 self.orders.append((coin, is_buy, size, limit_px, order_type, reduce_only))
                 if len(self.orders) == 1:
                     return {
+                        "status": "err",
+                        "response": (
+                            "Too many cumulative requests sent (10 > 9) for cumulative volume traded $100. "
+                            "Place taker orders to free up 1 request per USDC traded."
+                        ),
+                    }
+                if len(self.orders) == 2:
+                    return {
                         "status": "ok",
                         "response": {
                             "data": {
@@ -942,6 +950,14 @@ class GridAvgTests(unittest.TestCase):
                                 ]
                             }
                         },
+                    }
+                if len(self.orders) == 3:
+                    return {
+                        "status": "err",
+                        "response": (
+                            "Too many cumulative requests sent (11 > 10) for cumulative volume traded $101. "
+                            "Place taker orders to free up 1 request per USDC traded."
+                        ),
                     }
                 return {
                     "status": "ok",
@@ -983,20 +999,32 @@ class GridAvgTests(unittest.TestCase):
         with (
             patch("trail_worker.clear_info_cache"),
             patch("trail_worker.resolve_perp_asset", return_value=("BTC", {"szDecimals": 2, "maxLeverage": 20})),
+            patch("trail_worker.time.sleep") as sleep_mock,
         ):
             self.assertTrue(run_grid_limit_chase_p3(cache))
 
-        self.assertEqual(len(exchange.orders), 2)
+        self.assertEqual(len(exchange.orders), 4)
+        self.assertEqual(sleep_mock.call_count, 2)
+        self.assertTrue(all(call.args == (10,) for call in sleep_mock.call_args_list))
         self.assertEqual(exchange.orders[0][1], False)
         self.assertEqual(exchange.orders[0][4], {"limit": {"tif": "Ioc"}})
         self.assertFalse(exchange.orders[0][5])
-        self.assertEqual(exchange.orders[1][1], True)
-        self.assertEqual(exchange.orders[1][3], 98.98)
-        self.assertEqual(exchange.orders[1][4], {"limit": {"tif": "Gtc"}})
-        self.assertFalse(exchange.orders[1][5])
+        self.assertEqual(exchange.orders[1][1], False)
+        self.assertEqual(exchange.orders[1][4], {"limit": {"tif": "Ioc"}})
+        self.assertEqual(exchange.orders[2][1], True)
+        self.assertEqual(exchange.orders[2][3], 98.98)
+        self.assertEqual(exchange.orders[2][4], {"limit": {"tif": "Gtc"}})
+        self.assertFalse(exchange.orders[2][5])
+        self.assertEqual(exchange.orders[3][1], True)
+        self.assertEqual(exchange.orders[3][3], 98.98)
+        self.assertEqual(exchange.orders[3][4], {"limit": {"tif": "Gtc"}})
         replacement = row["levels"][0]
         self.assertEqual(replacement["oid"], 12)
         self.assertTrue(replacement["replace_never_cancel"])
+        self.assertEqual(row["limit_chase_market_action_limit_wait_seconds"], 10)
+        self.assertEqual(row["limit_chase_market_action_limit_wait_count"], 1)
+        self.assertEqual(replacement["limit_chase_replacement_action_limit_wait_seconds"], 10)
+        self.assertEqual(replacement["limit_chase_replacement_action_limit_wait_count"], 1)
         self.assertEqual(row["limit_chase_withdrawable"], "25")
         self.assertEqual(row["limit_chase_status"], "submitted")
         self.assertEqual(row["limit_chase_fill_price"], "101")
@@ -2415,7 +2443,7 @@ class GridAvgTests(unittest.TestCase):
         prune_grid_levels(paused_row)
         self.assertEqual(paused_row["levels"], [first_paused, second_paused])
 
-    def test_panic_reversal_waits_and_retries_action_limit_once(self) -> None:
+    def test_panic_and_reversal_wait_every_ten_seconds_until_capacity_opens(self) -> None:
         class FakeInfo:
             def post(self, path, payload):
                 return {"nRequestsUsed": 9, "nRequestsCap": 10}
@@ -2467,8 +2495,16 @@ class GridAvgTests(unittest.TestCase):
             def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
                 self.orders.append((coin, is_buy, Decimal(str(limit_px)), order_type, reduce_only))
                 if len(self.orders) == 1:
-                    return {"status": "ok", "response": {"data": {"statuses": [{"filled": {"oid": 10}}]}}}
+                    return {
+                        "status": "err",
+                        "response": (
+                            "Too many cumulative requests sent (10 > 9) for cumulative volume traded $100. "
+                            "Place taker orders to free up 1 request per USDC traded."
+                        ),
+                    }
                 if len(self.orders) == 2:
+                    return {"status": "ok", "response": {"data": {"statuses": [{"filled": {"oid": 10}}]}}}
+                if len(self.orders) in {3, 4}:
                     return {
                         "status": "err",
                         "response": (
@@ -2502,13 +2538,17 @@ class GridAvgTests(unittest.TestCase):
             updated, changed = maintain_grid(row, {"now": 123, "grid_action_phase": "p0"})
 
         self.assertTrue(changed)
-        sleep_mock.assert_called_once_with(10)
-        self.assertEqual(len(exchange.orders), 3)
+        self.assertEqual(sleep_mock.call_count, 3)
+        self.assertTrue(all(call.args == (10,) for call in sleep_mock.call_args_list))
+        self.assertEqual(len(exchange.orders), 5)
         reversal = next(entry for entry in updated["levels"] if entry.get("panic_reversal_order"))
         self.assertEqual(reversal["status"], "active")
         self.assertEqual(reversal["oid"], 11)
+        self.assertEqual(updated["panic_reduce_action_limit_wait_seconds"], 10)
+        self.assertEqual(updated["panic_reduce_action_limit_wait_count"], 1)
         self.assertEqual(reversal["panic_reversal_action_limit_wait_seconds"], 10)
         self.assertEqual(reversal["panic_reversal_action_limit_wait_at"], 123)
+        self.assertEqual(reversal["panic_reversal_action_limit_wait_count"], 2)
 
     def test_refresh_reduce_only_cancel_becomes_non_reduce_paused_replacement(self) -> None:
         entry = {
