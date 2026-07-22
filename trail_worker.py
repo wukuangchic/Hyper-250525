@@ -881,6 +881,8 @@ def grid_reduce_only_capacity_available(
     order: dict[str, Any],
     position_size: Decimal,
     position_value: Decimal,
+    *,
+    withdrawable_protected_restore: bool = False,
 ) -> bool:
     if not bool(order.get("reduce_only", False)):
         return True
@@ -890,7 +892,12 @@ def grid_reduce_only_capacity_available(
     reserved_size = Decimal("0")
     reserved_notional = Decimal("0")
     for entry in active_grid_entries(row, str(order.get("side"))):
-        if entry is order or not bool(entry.get("reduce_only", False)):
+        if entry is order:
+            continue
+        if not bool(entry.get("reduce_only", False)) and not (
+            withdrawable_protected_restore
+            and grid_order_reduces_position(entry, position_size)
+        ):
             continue
         entry_size = decimal_or_none(entry.get("size")) or Decimal("0")
         entry_price = decimal_or_none(entry.get("price", entry.get("limit_px"))) or Decimal("0")
@@ -898,6 +905,8 @@ def grid_reduce_only_capacity_available(
         reserved_notional += entry_size * entry_price
     if reserved_size + requested_size > abs(position_size):
         return False
+    if withdrawable_protected_restore:
+        return True
     policy = grid_limit_policy_from_row(row)
     min_position_value = Decimal(str(row.get("min_position_value") or "0"))
     max_position_value = Decimal(str(row.get("max_position_value") or "0"))
@@ -915,6 +924,22 @@ def grid_reduce_only_capacity_available(
     else:
         projected_value = signed_value - reserved_notional - requested_notional
     return lower_bound <= projected_value <= upper_bound
+
+
+def grid_order_reduces_position(order: dict[str, Any], position_size: Decimal) -> bool:
+    side = str(order.get("side") or "")
+    if side not in {"buy", "sell"} or position_size == 0:
+        return False
+    is_buy = bool(order.get("is_buy")) if order.get("is_buy") is not None else side == "buy"
+    return not grid_order_would_add_risk(position_size, is_buy)
+
+
+def withdrawable_protected_paused_restore(
+    entry: dict[str, Any],
+    position_size: Decimal,
+    account_margin_protected: bool,
+) -> bool:
+    return account_margin_protected and grid_order_reduces_position(entry, position_size)
 
 
 def pause_grid_margin_side(
@@ -3349,7 +3374,19 @@ def submit_grid_order_entry(
     elif restore_without_reduce_only:
         set_grid_order_reduce_only(order, False)
         order["reduce_only_canceled_restore_without_reduce_only_at"] = now
-    if not grid_reduce_only_capacity_available(row, order, position_size, position_value):
+    protected_reduce_only_restore = (
+        account_margin_protected
+        and not bypass_margin_controls
+        and not bool(order.get("limit_chase_replacement"))
+        and grid_order_reduces_position(order, position_size)
+    )
+    if not grid_reduce_only_capacity_available(
+        row,
+        order,
+        position_size,
+        position_value,
+        withdrawable_protected_restore=protected_reduce_only_restore,
+    ):
         order["status"] = "paused_reduce_capacity"
         order["oid"] = None
         order["paused_at"] = now
@@ -5737,18 +5774,38 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         if isinstance(entry, dict) and pause_skipped_account_margin_replacement(levels, entry, now):
             changed = True
             continue
-        if isinstance(entry, dict) and str(entry.get("status")) == "paused_account_margin":
-            if entry.get("replacement_order"):
+        protected_reduce_only_restore = (
+            isinstance(entry, dict)
+            and withdrawable_protected_paused_restore(
+                entry,
+                position_size,
+                account_margin_protected,
+            )
+        )
+        if (
+            isinstance(entry, dict)
+            and str(entry.get("status")) == "paused_account_margin"
+        ):
+            if protected_reduce_only_restore:
+                entry["status"] = (
+                    GRID_REPLACEMENT_PAUSE_STATUS
+                    if entry.get("replacement_order")
+                    else "paused_margin"
+                )
+                entry["withdrawable_reduce_only_restore_migrated_at"] = now
+                changed = True
+            elif entry.get("replacement_order"):
                 preserve_replacement_order(levels, entry, now, "paused_account_margin")
                 changed = True
                 continue
-            # Migrate levels saved by older workers so they are not restored at
-            # stale prices after account-margin protection ends.
-            entry["status"] = "skipped_account_margin"
-            entry["oid"] = None
-            entry["skipped_at"] = now
-            changed = True
-            continue
+            else:
+                # Migrate levels saved by older workers so they are not restored at
+                # stale prices after account-margin protection ends.
+                entry["status"] = "skipped_account_margin"
+                entry["oid"] = None
+                entry["skipped_at"] = now
+                changed = True
+                continue
         if not isinstance(entry, dict) or entry.get("side") is None or str(entry.get("status")) not in GRID_PAUSED_STATUSES:
             continue
         side = str(entry["side"])
@@ -5760,7 +5817,11 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         if allow_p1_restore and is_replacement_order:
             continue
         status = str(entry.get("status"))
-        if status == GRID_WITHDRAWABLE_PAUSE_STATUS and withdrawable_pause_active:
+        if (
+            status == GRID_WITHDRAWABLE_PAUSE_STATUS
+            and withdrawable_pause_active
+            and not protected_reduce_only_restore
+        ):
             continue
         if normalize_margin_paused_replacement(entry, now):
             status = str(entry.get("status"))
@@ -5813,7 +5874,10 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                         continue
             elif len(active_grid_oids(row, side)) >= target_per_side:
                 continue
-        if grid_margin_pause_active(row, side, now, position_value, position_size):
+        if (
+            not protected_reduce_only_restore
+            and grid_margin_pause_active(row, side, now, position_value, position_size)
+        ):
             continue
         if not protected_replacement and defer_paused_grid_restore_if_crossing(
             entry, now, current_mid, best_bid, best_ask
@@ -5821,16 +5885,20 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             continue
         projected_position_value = projected_position_values[side]
         order_notional = Decimal(str(entry.get("size"))) * Decimal(str(entry.get("price", entry.get("limit_px"))))
-        if not protected_replacement and not grid_order_allowed_by_max_or_survival(
-            row,
-            entry,
-            side,
-            position_size,
-            projected_position_value,
-            order_notional,
-            max_position_value,
-            policy,
-            min_position_value,
+        if (
+            not protected_replacement
+            and not protected_reduce_only_restore
+            and not grid_order_allowed_by_max_or_survival(
+                row,
+                entry,
+                side,
+                position_size,
+                projected_position_value,
+                order_notional,
+                max_position_value,
+                policy,
+                min_position_value,
+            )
         ):
             if is_replacement_order:
                 preserve_replacement_order(levels, entry, now, "limit_still_blocked", normalize_margin=True)

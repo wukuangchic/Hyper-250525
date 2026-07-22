@@ -83,6 +83,7 @@ from trail_worker import (
     grid_order_entry,
     grid_order_allowed_by_max_or_survival,
     grid_replacement_rebalance_pair,
+    grid_reduce_only_capacity_available,
     grid_reduce_only_canceled_restore_without_reduce_only,
     grid_roe_add_risk_allowed,
     grid_roe_for_position_value,
@@ -134,6 +135,7 @@ from trail_worker import (
     submit_grid_panic_pair,
     submit_grid_order_entry,
     trim_excess_grid_entries,
+    withdrawable_protected_paused_restore,
     GRID_ACTION_LIMIT_PAUSE_STATUS,
     GRID_PENDING_CANCEL_STATUS,
     GRID_ROE_PAUSE_STATUS,
@@ -194,6 +196,97 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(account_withdrawable_pause_phase(Decimal("9.99")), GRID_ACTION_PHASE_P2)
         self.assertIsNone(account_withdrawable_pause_phase(Decimal("10")))
         self.assertIsNone(account_withdrawable_pause_phase(None))
+
+    def test_withdrawable_protection_allows_every_paused_type_on_reduce_side(self) -> None:
+        paused_statuses = {
+            "paused_max",
+            "paused_limit",
+            "paused_margin",
+            "paused_reduce_capacity",
+            "paused_action_limit",
+            "paused_replacement",
+            "paused_risk_density",
+            "paused_roe",
+            "paused_active_cap",
+            "paused_withdrawable",
+        }
+
+        for status in paused_statuses:
+            with self.subTest(status=status):
+                self.assertTrue(
+                    withdrawable_protected_paused_restore(
+                        {"side": "sell", "is_buy": False, "status": status},
+                        Decimal("1"),
+                        True,
+                    )
+                )
+        self.assertFalse(
+            withdrawable_protected_paused_restore(
+                {"side": "buy", "is_buy": True, "status": "paused_withdrawable"},
+                Decimal("1"),
+                True,
+            )
+        )
+        self.assertFalse(
+            withdrawable_protected_paused_restore(
+                {"side": "sell", "is_buy": False, "status": "paused_withdrawable"},
+                Decimal("1"),
+                False,
+            )
+        )
+
+    def test_withdrawable_protected_reduce_only_capacity_uses_real_position_not_limit_floor(self) -> None:
+        row = {
+            "position_limit_mode": "limit",
+            "min_position_value": "150",
+            "max_position_value": "500",
+            "levels": [
+                {
+                    "side": "sell",
+                    "is_buy": False,
+                    "status": "active",
+                    "oid": 1,
+                    "price": "100",
+                    "size": "0.4",
+                    "reduce_only": False,
+                }
+            ],
+        }
+        order = {
+            "side": "sell",
+            "is_buy": False,
+            "price": "100",
+            "size": "0.6",
+            "reduce_only": True,
+        }
+
+        self.assertFalse(
+            grid_reduce_only_capacity_available(
+                row,
+                order,
+                Decimal("1"),
+                Decimal("200"),
+            )
+        )
+        self.assertTrue(
+            grid_reduce_only_capacity_available(
+                row,
+                order,
+                Decimal("1"),
+                Decimal("200"),
+                withdrawable_protected_restore=True,
+            )
+        )
+        order["size"] = "0.61"
+        self.assertFalse(
+            grid_reduce_only_capacity_available(
+                row,
+                order,
+                Decimal("1"),
+                Decimal("200"),
+                withdrawable_protected_restore=True,
+            )
+        )
 
     def test_limit_chase_direction_uses_signed_limit_bounds_without_reduce_only_assumptions(self) -> None:
         row = {
@@ -2380,6 +2473,51 @@ class GridAvgTests(unittest.TestCase):
         )
 
         self.assertTrue(submitted)
+        self.assertTrue(order["reduce_only"])
+        self.assertTrue(order["plan"]["reduce_only"])
+        self.assertTrue(exchange.orders[0][4])
+
+    def test_withdrawable_protected_paused_limit_submits_as_reduce_only_below_limit_floor(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.orders = []
+
+            def order(self, coin, is_buy, size, limit_px, order_type, reduce_only=False):
+                self.orders.append((coin, is_buy, Decimal(str(limit_px)), order_type, reduce_only))
+                return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 789}}]}}}
+
+        row = {
+            "position_limit_mode": "limit",
+            "min_position_value": "150",
+            "max_position_value": "500",
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "0.6",
+            "base_sell_size": "0.6",
+            "levels": [],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        order = grid_order_entry(row, "BTC", asset, False, Decimal("100"), False)
+        order["status"] = "paused_limit"
+        row["levels"].append(order)
+        exchange = FakeExchange()
+
+        submitted = submit_grid_order_entry(
+            exchange,
+            "BTC",
+            order,
+            1,
+            row,
+            asset,
+            Decimal("1"),
+            Decimal("200"),
+            "limit",
+            True,
+            set(),
+        )
+
+        self.assertTrue(submitted)
+        self.assertEqual(order["status"], "active")
         self.assertTrue(order["reduce_only"])
         self.assertTrue(order["plan"]["reduce_only"])
         self.assertTrue(exchange.orders[0][4])
