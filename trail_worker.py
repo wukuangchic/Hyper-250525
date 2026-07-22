@@ -1682,17 +1682,6 @@ def grid_reduce_only_canceled_restore_without_reduce_only(order: dict[str, Any])
     return str(order.get("status")) == "paused_reduce_capacity" and order.get("reduce_only_canceled_oid") is not None
 
 
-def pause_refreshed_reduce_only_entries(entries: list[dict[str, Any]], now: int) -> int:
-    paused = 0
-    for entry in entries:
-        if str(entry.get("status")) != "refresh_reduce_only" or entry.get("cancelled_at") != now:
-            continue
-        entry["replacement_order"] = True
-        if pause_refresh_reduce_only_replacement(entry, now):
-            paused += 1
-    return paused
-
-
 def pause_refresh_reduce_only_replacement(entry: dict[str, Any], now: int) -> bool:
     if str(entry.get("status")) != "refresh_reduce_only" or not bool(entry.get("replacement_order")):
         return False
@@ -5213,8 +5202,6 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         changed = True
     mark_phase("pre_replacement_risk_pauses")
 
-    refreshed = 0
-
     dense_regridded = 0
     near_regrids = 0
 
@@ -5494,27 +5481,6 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         if active_cap_paused:
             changed = True
     mark_phase("post_replacement_limit_cap")
-
-    to_refresh: list[dict[str, Any]] = []
-    if not account_margin_protected:
-        for entry in active_grid_entries(row):
-            if grid_order_is_never_cancel(entry):
-                continue
-            desired_reduce_only = grid_order_should_reduce_only(position_size, bool(entry.get("is_buy")), policy)
-            if bool(entry.get("reduce_only", False)) == desired_reduce_only:
-                plan = entry.get("plan")
-                if not isinstance(plan, dict) or bool(plan.get("reduce_only", False)) == desired_reduce_only:
-                    continue
-            to_refresh.append(entry)
-    if to_refresh:
-        refreshed = cancel_grid_entries_with_p1_budget(
-            exchange, coin, to_refresh, now, "refresh_reduce_only", cache,
-            row=row, current_mid=current_mid,
-        )
-        if refreshed:
-            pause_refreshed_reduce_only_entries(to_refresh, now)
-            changed = True
-    mark_phase("refresh")
 
     if allow_p2 and noncritical_grid_work_allowed(cache):
         dense_regridded = regrid_dense_entries(
@@ -6029,7 +5995,6 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         "near_far_rebalanced": near_far_rebalanced,
         "topped_up": topped_up,
         "paused": paused,
-        "refreshed": refreshed,
         "dense_regridded": dense_regridded,
         "restored": restored,
         "trimmed": trimmed,
@@ -6055,7 +6020,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     action_limit_budget_label = "-" if action_limit_budget is None else str(action_limit_budget)
     row["note"] = (
         f"grid maintained; replacements={note_values['replacements']}; replacement_rebalanced={note_values['replacement_rebalanced']}; near_far_rebalanced={note_values['near_far_rebalanced']}; topped_up={note_values['topped_up']}; "
-        f"paused={note_values['paused']}; refreshed={note_values['refreshed']}; dense_regridded={note_values['dense_regridded']}; restored={note_values['restored']}; trimmed={note_values['trimmed']}; near_regrids={note_values['near_regrids']}; "
+        f"paused={note_values['paused']}; dense_regridded={note_values['dense_regridded']}; restored={note_values['restored']}; trimmed={note_values['trimmed']}; near_regrids={note_values['near_regrids']}; "
         f"add_risk_braked={note_values['add_risk_braked']}; side_cap_cleared={note_values['side_cap_cleared']}; "
         f"recovered_missing={note_values['recovered_missing']}; margin_cooldown={margin_cooldowns}; "
         f"submissions=buy:{note_values['submissions_buy']},sell:{note_values['submissions_sell']}; "
@@ -6076,7 +6041,6 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         or replacements > 0
         or topped_up > 0
         or paused > 0
-        or refreshed > 0
         or dense_regridded > 0
         or restored > 0
         or trimmed > 0

@@ -109,7 +109,6 @@ from trail_worker import (
     limit_chase_replacement_order_from_market,
     pause_refresh_reduce_only_replacement,
     pause_reduce_only_canceled_entry,
-    pause_refreshed_reduce_only_entries,
     pause_grid_order_for_action_limit,
     pause_grid_margin_side,
     pause_grid_margin_side_entries,
@@ -2551,28 +2550,83 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(reversal["panic_reversal_action_limit_wait_at"], 123)
         self.assertEqual(reversal["panic_reversal_action_limit_wait_count"], 2)
 
-    def test_refresh_reduce_only_cancel_becomes_non_reduce_paused_replacement(self) -> None:
-        entry = {
-            "side": "buy",
-            "status": "refresh_reduce_only",
-            "oid": 123,
-            "is_buy": True,
-            "price": "64.214",
-            "size": "0.16",
-            "reduce_only": True,
-            "cancelled_at": 10,
-            "plan": {"reduce_only": True},
+    def test_active_reduce_only_mismatch_waits_for_exchange_missing_recovery(self) -> None:
+        active_sells = [
+            {
+                "side": "sell",
+                "status": "active",
+                "oid": oid,
+                "is_buy": False,
+                "price": str(price),
+                "size": "0.1",
+                "reduce_only": True,
+                "plan": {"reduce_only": True},
+            }
+            for oid, price in ((101, 101), (102, 102))
+        ]
+
+        class FakeInfo:
+            def meta(self, dex=""):
+                return {"universe": [{"name": "BTC", "szDecimals": 2, "maxLeverage": 20}]}
+
+            def all_mids(self, dex=""):
+                return {"BTC": "100"}
+
+            def l2_snapshot(self, coin):
+                return {"levels": [[{"px": "99"}], [{"px": "101"}]]}
+
+            def user_state(self, account, dex=""):
+                return {
+                    "assetPositions": [
+                        {
+                            "position": {
+                                "coin": "BTC",
+                                "szi": "1",
+                                "positionValue": "100",
+                                "returnOnEquity": "0",
+                            }
+                        }
+                    ]
+                }
+
+            def spot_user_state(self, account):
+                return {"balances": [{"token": 0, "coin": "USDC", "total": "100", "hold": "0"}]}
+
+            def frontend_open_orders(self, account, dex=""):
+                return [{"coin": "BTC", "oid": entry["oid"]} for entry in active_sells]
+
+            def user_fills_by_time(self, account, start_ms, end_ms):
+                return []
+
+        class FakeExchange:
+            def bulk_cancel(self, requests):
+                raise AssertionError("reduce-only mismatch must not trigger an active cancel")
+
+        row = {
+            "type": "grid",
+            "status": "active",
+            "coin": "BTC",
+            "network": "mainnet",
+            "position_limit_mode": "limit",
+            "min_position_value": "-1000",
+            "max_position_value": "1000",
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "0.1",
+            "base_sell_size": "0.1",
+            "target_orders_per_side": 16,
+            "sz_decimals": 2,
+            "levels": active_sells,
         }
 
-        paused = pause_refreshed_reduce_only_entries([entry], 10)
+        with (
+            patch("trail_worker.build_clients", return_value=(FakeInfo(), FakeExchange(), "acct", "signer", {})),
+            patch("trail_worker.precheck_action_limit"),
+        ):
+            updated, _changed = maintain_grid(row, {"now": 123, "grid_action_phase": "p1_cancels"})
 
-        self.assertEqual(paused, 1)
-        self.assertEqual(entry["status"], "paused_replacement")
-        self.assertIsNone(entry["oid"])
-        self.assertTrue(entry["replacement_order"])
-        self.assertEqual(entry["replacement_pause_reason"], "refresh_reduce_only")
-        self.assertFalse(entry["reduce_only"])
-        self.assertFalse(entry["plan"]["reduce_only"])
+        self.assertEqual([entry["status"] for entry in updated["levels"]], ["active", "active"])
+        self.assertEqual([entry["oid"] for entry in updated["levels"]], [101, 102])
 
     def test_old_refresh_reduce_only_replacement_is_migrated_to_paused_replacement(self) -> None:
         entry = {
