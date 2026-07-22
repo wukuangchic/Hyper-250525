@@ -2617,27 +2617,6 @@ def clear_grid_side_cap_entries(exchange: Any, coin: str, row: dict[str, Any], n
     return len(clear_ids)
 
 
-def logarithmic_keep_indexes(count: int, keep_count: int) -> set[int]:
-    if keep_count <= 0:
-        return set()
-    if keep_count >= count:
-        return set(range(count))
-    if keep_count == 1:
-        return {0}
-    log_count = Decimal(str(math.log(count)))
-    keep: set[int] = set()
-    for index in range(keep_count):
-        exponent = log_count * Decimal(index) / Decimal(keep_count - 1)
-        raw = Decimal(str(math.exp(float(exponent)))) - Decimal("1")
-        keep.add(max(0, min(count - 1, int(raw.to_integral_value(rounding=ROUND_HALF_UP)))))
-    if len(keep) < keep_count:
-        for index in range(count):
-            keep.add(index)
-            if len(keep) >= keep_count:
-                break
-    return keep
-
-
 def grid_risk_density_multiplier(row: dict[str, Any], side: str, margin_gap_multiplier: Decimal) -> Decimal:
     multiplier = Decimal("1")
     avg_multiplier = decimal_or_none(row.get("avg_multiplier"))
@@ -2695,11 +2674,10 @@ def grid_risk_density_pause_candidates(
     if len(active_add_risk) <= allowed:
         return [], allowed, multiplier
     active_add_risk.sort(key=lambda entry: grid_entry_near_to_far_key(entry, side))
-    keep_indexes = logarithmic_keep_indexes(len(active_add_risk), allowed)
     to_pause = [
         entry
         for index, entry in enumerate(active_add_risk)
-        if index not in keep_indexes and not bool(entry.get("replacement_order"))
+        if index >= allowed and not bool(entry.get("replacement_order"))
     ]
     return to_pause, allowed, multiplier
 
@@ -2779,8 +2757,7 @@ def grid_roe_pause_candidates(
     if len(active_add_risk) <= allowed:
         return [], allowed
     active_add_risk.sort(key=lambda entry: grid_entry_near_to_far_key(entry, side))
-    keep_indexes = logarithmic_keep_indexes(len(active_add_risk), allowed)
-    to_pause = [entry for index, entry in enumerate(active_add_risk) if index not in keep_indexes]
+    to_pause = active_add_risk[allowed:]
     return to_pause, allowed
 
 
@@ -2843,13 +2820,11 @@ def grid_active_cap_keep_ids(entries: list[dict[str, Any]], side: str, max_activ
     keep_ids = {id(entry) for entry in protected}
     remaining_capacity = max(0, max_active_per_side - len(protected))
     if len(replacements) >= remaining_capacity:
-        keep_indexes = logarithmic_keep_indexes(len(replacements), remaining_capacity)
-        keep_ids.update(id(entry) for index, entry in enumerate(replacements) if index in keep_indexes)
+        keep_ids.update(id(entry) for entry in replacements[:remaining_capacity])
         return keep_ids
     regular_keep_count = remaining_capacity - len(replacements)
-    keep_indexes = logarithmic_keep_indexes(len(regular), regular_keep_count)
     keep_ids.update(id(entry) for entry in replacements)
-    keep_ids.update(id(entry) for index, entry in enumerate(regular) if index in keep_indexes)
+    keep_ids.update(id(entry) for entry in regular[:regular_keep_count])
     return keep_ids
 
 
@@ -2943,8 +2918,7 @@ def grid_replacement_rebalance_keep_ids(
     combined.sort(key=lambda entry: grid_entry_near_to_far_key(entry, side))
     keep_count = min(len(active), len(combined))
     while keep_count > 0:
-        keep_indexes = logarithmic_keep_indexes(len(combined), keep_count)
-        keep_entries = [entry for index, entry in enumerate(combined) if index in keep_indexes]
+        keep_entries = combined[:keep_count]
         if (
             grid_entries_fit_within_max(
                 keep_entries,
@@ -3048,8 +3022,7 @@ def grid_near_far_rebalance_pair(
     keep_count = min(len(active), len(combined))
     keep_ids: set[int] = set()
     while keep_count > 0:
-        keep_indexes = logarithmic_keep_indexes(len(combined), keep_count)
-        keep_entries = [entry for index, entry in enumerate(combined) if index in keep_indexes]
+        keep_entries = combined[:keep_count]
         if (
             grid_entries_fit_within_max(
                 keep_entries,
@@ -3145,8 +3118,7 @@ def grid_risk_density_restore_allowed(
     if len(combined) <= allowed:
         return True
     combined.sort(key=lambda item: grid_entry_near_to_far_key(item, side))
-    keep_indexes = logarithmic_keep_indexes(len(combined), allowed)
-    keep_ids = {id(item) for index, item in enumerate(combined) if index in keep_indexes}
+    keep_ids = {id(item) for item in combined[:allowed]}
     return id(entry) in keep_ids
 
 
@@ -3184,8 +3156,7 @@ def grid_roe_restore_allowed(
     if len(combined) <= allowed:
         return True
     combined.sort(key=lambda item: grid_entry_near_to_far_key(item, side))
-    keep_indexes = logarithmic_keep_indexes(len(combined), allowed)
-    keep_ids = {id(item) for index, item in enumerate(combined) if index in keep_indexes}
+    keep_ids = {id(item) for item in combined[:allowed]}
     return id(entry) in keep_ids
 
 

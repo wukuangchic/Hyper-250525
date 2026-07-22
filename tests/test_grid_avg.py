@@ -3185,7 +3185,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(positive_candidates, [])
         self.assertEqual(positive_allowed, 10)
 
-    def test_roe_restore_respects_stop_and_keep_distribution(self) -> None:
+    def test_roe_restore_respects_stop_and_nearest_first_order(self) -> None:
         row = {
             "levels": [
                 {"side": "buy", "status": "active", "oid": 1, "is_buy": True, "price": "100", "size": "1"},
@@ -3403,7 +3403,7 @@ class GridAvgTests(unittest.TestCase):
             )
         )
 
-    def test_risk_density_pauses_logarithmically_across_add_risk_orders(self) -> None:
+    def test_risk_density_pauses_farthest_add_risk_orders(self) -> None:
         row = {
             "gap_rate": "0.01",
             "avg_multiplier": "2",
@@ -3432,9 +3432,9 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(allowed, 5)
         self.assertEqual(multiplier, Decimal("2"))
         paused_oids = [entry["oid"] for entry in candidates]
-        self.assertEqual(paused_oids, [2, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18])
+        self.assertEqual(paused_oids, list(range(5, 20)))
 
-    def test_active_cap_pauses_logarithmically_beyond_sixteen_active_orders(self) -> None:
+    def test_active_cap_pauses_farthest_orders_beyond_sixteen_active_orders(self) -> None:
         row = {
             "levels": [
                 {
@@ -3454,7 +3454,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(allowed, 16)
         self.assertEqual(
             [entry["oid"] for entry in candidates],
-            [10, 12, 13, 15, 16, 17, 19, 20, 21, 22, 24, 25, 26, 27, 28, 29, 31, 32, 33, 34, 35, 36, 37, 38],
+            list(range(16, 40)),
         )
 
     def test_active_cap_keeps_replacement_before_regular_orders(self) -> None:
@@ -3489,7 +3489,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertNotIn(999, [entry["oid"] for entry in candidates])
         self.assertEqual(len(candidates), 1)
 
-    def test_risk_density_restore_uses_logarithmic_distribution(self) -> None:
+    def test_risk_density_restore_chooses_nearest_paused_order(self) -> None:
         row = {
             "gap_rate": "0.01",
             "avg_multiplier": "2",
@@ -3506,8 +3506,8 @@ class GridAvgTests(unittest.TestCase):
                 for oid in range(20)
             ],
         }
-        should_wait = row["levels"][2]
-        should_restore = row["levels"][8]
+        should_restore = row["levels"][2]
+        should_wait = row["levels"][8]
 
         self.assertFalse(
             grid_risk_density_restore_allowed(row, should_wait, "buy", Decimal("1"), 10, Decimal("1"))
@@ -3516,7 +3516,7 @@ class GridAvgTests(unittest.TestCase):
             grid_risk_density_restore_allowed(row, should_restore, "buy", Decimal("1"), 10, Decimal("1"))
         )
 
-    def test_active_cap_restore_uses_logarithmic_distribution(self) -> None:
+    def test_active_cap_restore_chooses_nearest_paused_order(self) -> None:
         keep_active = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 14, 18, 23, 30}
         row = {
             "levels": [
@@ -3531,8 +3531,8 @@ class GridAvgTests(unittest.TestCase):
                 for oid in range(40)
             ],
         }
-        should_wait = row["levels"][10]
-        should_restore = row["levels"][39]
+        should_restore = row["levels"][10]
+        should_wait = row["levels"][39]
 
         self.assertFalse(grid_active_cap_restore_allowed(row, should_wait, "sell"))
         self.assertTrue(grid_active_cap_restore_allowed(row, should_restore, "sell"))
@@ -3681,7 +3681,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertFalse(mark_pending_cancel_confirmed_cancelled(entry, 123, 10, {"status": "filled"}))
         self.assertEqual(entry["status"], GRID_PENDING_CANCEL_STATUS)
 
-    def test_replacement_rebalance_swaps_toward_logarithmic_distribution(self) -> None:
+    def test_replacement_rebalance_restores_nearest_and_pauses_farthest(self) -> None:
         row = {
             "levels": [
                 {
@@ -3759,7 +3759,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(pause_entry["price"], "102")
         self.assertEqual(restore_entry["price"], "106")
 
-    def test_near_far_rebalance_never_skips_closest_paused_for_log_slot(self) -> None:
+    def test_near_far_rebalance_never_skips_closest_paused(self) -> None:
         row = {
             "levels": [
                 {
@@ -3797,7 +3797,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(pause_entry["price"], "103")
         self.assertEqual(restore_entry["price"], "104")
 
-    def test_near_far_rebalance_keeps_logarithmic_cancel_choice(self) -> None:
+    def test_near_far_rebalance_cancels_farthest_active(self) -> None:
         row = {
             "levels": [
                 {
@@ -3832,7 +3832,7 @@ class GridAvgTests(unittest.TestCase):
             "abs",
         )
 
-        self.assertEqual(pause_entry["price"], "103")
+        self.assertEqual(pause_entry["price"], "101")
         self.assertEqual(restore_entry["price"], "105")
 
     def test_near_far_restore_target_still_respects_risk_slot_count(self) -> None:
