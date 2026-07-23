@@ -568,19 +568,22 @@ def unified_account_metrics(
     return unified_ratio, unified_leverage, usdc_withdrawable
 
 
-def print_account_metrics(info: Info, account: str) -> None:
+def print_account_metrics(info: Info, account: str, legacy_pause_total: int | None = None) -> None:
     unified_ratio, unified_leverage, usdc_withdrawable = unified_account_metrics(info, account)
     action_rate = user_action_rate_limit_metrics(info, account)
+    rows = [
+        ("withdrawable(USDC)", format_optional_decimal(usdc_withdrawable)),
+        ("统一账户比率", format_percent(unified_ratio)),
+        ("统一账户杠杆", format_leverage(unified_leverage)),
+        ("nRequestsUsed", action_rate.get("nRequestsUsed", "-")),
+        ("nRequestsCap", action_rate.get("nRequestsCap", "-")),
+        ("deficit", action_rate.get("deficit", "-")),
+    ]
+    if legacy_pause_total is not None:
+        rows.append(("legacy_pause", str(legacy_pause_total)))
     print_box(
         "Account",
-        [
-            ("withdrawable(USDC)", format_optional_decimal(usdc_withdrawable)),
-            ("统一账户比率", format_percent(unified_ratio)),
-            ("统一账户杠杆", format_leverage(unified_leverage)),
-            ("nRequestsUsed", action_rate.get("nRequestsUsed", "-")),
-            ("nRequestsCap", action_rate.get("nRequestsCap", "-")),
-            ("deficit", action_rate.get("deficit", "-")),
-        ],
+        rows,
     )
 
 
@@ -1882,6 +1885,22 @@ def grid_query_rows(
     ]
 
 
+def grid_account_legacy_pause_total(
+    batch_rows: list[dict[str, Any]],
+    network: str,
+    account: str | None,
+) -> int:
+    return sum(
+        1
+        for row in batch_rows
+        if row.get("type") == "grid"
+        and str(row.get("status", "")) != "cancelled"
+        and batch_row_matches_context(row, network, account)
+        for entry in row.get("levels") or []
+        if isinstance(entry, dict) and str(entry.get("status") or "") == "legacy_pause"
+    )
+
+
 def query_grid(args: argparse.Namespace) -> None:
     info, _exchange, account, signer, role = build_clients(args.network, args.timeout, args.coin, need_exchange=False)
     coin, asset = resolve_perp_asset(info, args.coin)
@@ -1892,8 +1911,12 @@ def query_grid(args: argparse.Namespace) -> None:
         print("signer:", mask(signer))
         print("account_role_source:", role)
 
-    print_account_metrics(info, account)
     batch_rows = load_server_batch()
+    print_account_metrics(
+        info,
+        account,
+        legacy_pause_total=grid_account_legacy_pause_total(batch_rows, args.network, account),
+    )
     rows = grid_query_rows(batch_rows, args.network, account, coin)
     if not rows:
         print_box("Grid", [("coin", coin), ("status", "not found")])

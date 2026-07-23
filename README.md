@@ -590,6 +590,7 @@ journalctl -u simple-hyper-sync.service -n 80 --no-pager
 | withdrawable(USDC): 0   |
 | 统一账户比率: 0.19%        |
 | 统一账户杠杆: 0.09x        |
+| legacy_pause: 0         |
 +----------------------------+
 +- Order ------------------+
 | coin: xyz:XYZ100           |

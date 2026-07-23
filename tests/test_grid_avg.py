@@ -25,10 +25,12 @@ from hl_order import (
     format_grid_detail_rows,
     format_server_batch_rows,
     grid_query_avg_summary,
+    grid_account_legacy_pause_total,
     grid_query_rows,
     is_cumulative_action_limit_text as hl_order_is_cumulative_action_limit_text,
     is_auto_grid_gap,
     modify_grid_batch_order,
+    print_account_metrics,
     order_result_is_retryable_action_limit,
     refresh_grid_row_strategy_params,
     reversed_grid_strategy_values,
@@ -6493,6 +6495,45 @@ class GridAvgTests(unittest.TestCase):
             grid_query_rows(rows, "mainnet", "0xabc", "BTC"),
             [rows[1]],
         )
+
+    def test_grid_account_legacy_pause_total_spans_coins_and_dexes(self) -> None:
+        rows = [
+            {
+                "type": "grid", "status": "active", "network": "mainnet", "account": "0xAbC",
+                "coin": "BTC", "levels": [{"status": "legacy_pause"}, {"status": "active"}],
+            },
+            {
+                "type": "grid", "status": "active", "network": "mainnet", "account": "0xabc",
+                "coin": "xyz:SPCX", "dex": "xyz",
+                "levels": [{"status": "legacy_pause"}, {"status": "legacy_pause"}],
+            },
+            {
+                "type": "grid", "status": "cancelled", "network": "mainnet", "account": "0xabc",
+                "coin": "HYPE", "levels": [{"status": "legacy_pause"}],
+            },
+            {
+                "type": "grid", "status": "active", "network": "testnet", "account": "0xabc",
+                "coin": "ETH", "levels": [{"status": "legacy_pause"}],
+            },
+        ]
+
+        self.assertEqual(grid_account_legacy_pause_total(rows, "mainnet", "0xabc"), 3)
+
+    def test_grid_account_metrics_displays_legacy_pause_total(self) -> None:
+        with (
+            patch(
+                "hl_order.unified_account_metrics",
+                return_value=(Decimal("0.1"), Decimal("2"), Decimal("8")),
+            ),
+            patch(
+                "hl_order.user_action_rate_limit_metrics",
+                return_value={"nRequestsUsed": "1", "nRequestsCap": "2", "deficit": "-1"},
+            ),
+            patch("hl_order.print_box") as print_box_mock,
+        ):
+            print_account_metrics(object(), "0xabc", legacy_pause_total=3719)
+
+        self.assertIn(("legacy_pause", "3719"), print_box_mock.call_args.args[1])
 
     def test_server_batch_rows_display_grid_avg(self) -> None:
         rows = [
