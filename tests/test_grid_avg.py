@@ -311,6 +311,47 @@ class GridAvgTests(unittest.TestCase):
         self.assertIsNotNone(candidate)
         self.assertIs(candidate[0], eth)
 
+    def test_finite_chain_p6_restores_one_legacy_pause_only_above_five_withdrawable(self) -> None:
+        def run(withdrawable: Decimal) -> tuple[dict, int]:
+            row = {
+                "type": "grid", "status": "active", "grid_lifecycle_version": 2,
+                "network": "mainnet", "account": "0xabc", "coin": "BTC",
+                "lifecycle_mid": "100", "gap_rate": "0.01",
+                "levels": [
+                    {"side": "buy", "is_buy": True, "status": "legacy_pause", "price": "99", "grid_leg": 1},
+                    {"side": "sell", "is_buy": False, "status": "legacy_pause", "price": "102", "grid_leg": 1},
+                ],
+            }
+            ctx = {
+                "network": "mainnet", "account": "0xabc", "coin": "BTC",
+                "asset": {"szDecimals": 2, "maxLeverage": 20}, "exchange": object(),
+                "info": object(), "now": 123, "now_ms": 123000,
+                "position_size": Decimal("0"), "position_value": Decimal("0"),
+                "current_mid": Decimal("100"), "best_bid": Decimal("99.9"), "best_ask": Decimal("100.1"),
+                "withdrawable": withdrawable, "liquidation_px": None,
+                "open_orders": [], "open_oids": set(), "fills_by_oid": {},
+            }
+
+            def fake_submit(_exchange, _coin, entry, *_args, **_kwargs):
+                entry.update({"status": "active", "oid": 77})
+                return "submitted"
+
+            with (
+                patch("trail_worker.lifecycle_context", return_value=ctx),
+                patch("trail_worker.lifecycle_submit_order", side_effect=fake_submit) as submit_mock,
+            ):
+                maintain_grid(row, {"grid_action_phase": "p6", "grid_rows": [row]})
+            return row, submit_mock.call_count
+
+        at_boundary, boundary_submits = run(Decimal("5"))
+        above_boundary, above_submits = run(Decimal("5.01"))
+
+        self.assertEqual(boundary_submits, 0)
+        self.assertEqual(at_boundary["legacy_pause_remaining"], 2)
+        self.assertEqual(above_submits, 1)
+        self.assertEqual(above_boundary["legacy_pause_remaining"], 1)
+        self.assertEqual(sum(entry["status"] == "active" for entry in above_boundary["levels"]), 1)
+
     def test_finite_chain_account_quota_is_shared_across_dexes(self) -> None:
         default = {"account": "0xAbC", "dex": ""}
         xyz = {"account": "0xabc", "dex": "xyz"}
