@@ -970,6 +970,19 @@ def grid_limit_chase_direction(
     return None
 
 
+def grid_limit_chase_market_reduces_position(
+    position_size: Decimal,
+    is_buy: bool,
+    order_size: Decimal,
+) -> bool:
+    """Return whether a P4 market action can only reduce the current position."""
+    if order_size <= 0:
+        return False
+    if is_buy:
+        return position_size < 0 and order_size <= abs(position_size)
+    return position_size > 0 and order_size <= position_size
+
+
 def record_grid_limit_chase_candidate(
     cache: dict[str, Any],
     row: dict[str, Any],
@@ -7372,8 +7385,6 @@ def lifecycle_reconcile_birth_intents(
 def lifecycle_submit_limit_chase(row: dict[str, Any], ctx: dict[str, Any], cache: dict[str, Any]) -> bool:
     if lifecycle_has_birth_intent(row, "limit_chase"):
         return True
-    if ctx["withdrawable"] is None or ctx["withdrawable"] <= GRID_LIMIT_CHASE_WITHDRAWABLE_THRESHOLD:
-        return False
     is_buy = grid_limit_chase_direction(row, ctx["position_size"], ctx["position_value"])
     if is_buy is None:
         return False
@@ -7381,6 +7392,18 @@ def lifecycle_submit_limit_chase(row: dict[str, Any], ctx: dict[str, Any], cache
         ctx["exchange"], row, ctx["coin"], ctx["asset"], ctx["current_mid"], is_buy
     )
     if market is None:
+        return False
+    market_size = decimal_or_none(market.get("size")) or Decimal("0")
+    reduces_position = grid_limit_chase_market_reduces_position(
+        ctx["position_size"], is_buy, market_size
+    )
+    if (
+        not reduces_position
+        and (
+            ctx["withdrawable"] is None
+            or ctx["withdrawable"] <= GRID_LIMIT_CHASE_WITHDRAWABLE_THRESHOLD
+        )
+    ):
         return False
     plan = market.get("plan")
     if not isinstance(plan, dict):

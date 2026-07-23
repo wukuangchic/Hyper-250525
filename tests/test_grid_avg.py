@@ -88,6 +88,7 @@ from trail_worker import (
     grid_replacement_rebalance_pair,
     grid_reduce_only_capacity_available,
     grid_reduce_only_canceled_restore_without_reduce_only,
+    grid_limit_chase_market_reduces_position,
     grid_roe_add_risk_allowed,
     grid_roe_for_position_value,
     grid_latest_replacement_roe_allowed,
@@ -484,7 +485,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(count, 0)
         self.assertEqual(entry["status"], GRID_CHAIN_DEBT_STATUS)
 
-    def test_p4_market_fill_births_leg_one_gtc_order(self) -> None:
+    def test_p4_reduce_market_ignores_low_withdrawable_and_births_leg_one_gtc_order(self) -> None:
         class FakeExchange:
             def __init__(self):
                 self.calls = []
@@ -505,7 +506,7 @@ class GridAvgTests(unittest.TestCase):
         }
         exchange = FakeExchange()
         ctx = {
-            "withdrawable": Decimal("6"), "position_size": Decimal("2"), "position_value": Decimal("200"),
+            "withdrawable": Decimal("0"), "position_size": Decimal("2"), "position_value": Decimal("200"),
             "exchange": exchange, "coin": "BTC", "asset": {"szDecimals": 2, "maxLeverage": 20},
             "current_mid": Decimal("100"), "best_bid": Decimal("99.9"), "best_ask": Decimal("100.1"),
             "now": 123, "open_orders": [],
@@ -519,6 +520,41 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(birth["grid_leg"], 1)
         self.assertEqual(birth["birth_source"], "limit_chase")
         self.assertEqual(birth["plan"]["order_type"], {"limit": {"tif": "Gtc"}})
+
+    def test_p4_add_market_still_requires_withdrawable_above_five(self) -> None:
+        class UnexpectedExchange:
+            def _slippage_price(self, coin, is_buy, slippage, mid):
+                return 100
+
+            def order(self, *args, **kwargs):
+                raise AssertionError("P4 add-risk market action must remain blocked")
+
+        row = {
+            "position_limit_mode": "limit", "min_position_value": "100", "max_position_value": "150",
+            "gap_rate": "0.01", "min_order_value": "10", "base_buy_size": "0.3", "base_sell_size": "0.3",
+            "levels": [],
+        }
+        ctx = {
+            "withdrawable": Decimal("0"), "position_size": Decimal("0.5"), "position_value": Decimal("50"),
+            "exchange": UnexpectedExchange(), "coin": "BTC", "asset": {"szDecimals": 2, "maxLeverage": 20},
+            "current_mid": Decimal("100"), "best_bid": Decimal("99.9"), "best_ask": Decimal("100.1"),
+            "now": 123, "open_orders": [],
+        }
+
+        self.assertFalse(lifecycle_submit_limit_chase(row, ctx, {"action_limit_headroom": 200}))
+        self.assertEqual(row["levels"], [])
+
+    def test_p4_direction_is_not_reduction_when_size_would_flip_position(self) -> None:
+        self.assertTrue(
+            grid_limit_chase_market_reduces_position(
+                Decimal("-0.3"), True, Decimal("0.3")
+            )
+        )
+        self.assertFalse(
+            grid_limit_chase_market_reduces_position(
+                Decimal("-0.2"), True, Decimal("0.3")
+            )
+        )
 
     def test_p4_timeout_reconciles_cloid_fill_into_leg_one(self) -> None:
         class TimeoutExchange:
