@@ -2180,6 +2180,7 @@ def build_grid_limit_chase_market_order(
     asset: dict[str, Any],
     current_mid: Decimal,
     is_buy: bool,
+    max_size: Decimal | None = None,
 ) -> dict[str, Any] | None:
     if current_mid <= 0:
         return None
@@ -2189,12 +2190,18 @@ def build_grid_limit_chase_market_order(
         return None
     sz_decimals = int(row.get("sz_decimals") or asset["szDecimals"])
     step = Decimal(1).scaleb(-sz_decimals)
-    size = (size / step).to_integral_value(rounding=ROUND_FLOOR) * step
-    if size <= 0:
+    base_size = (size / step).to_integral_value(rounding=ROUND_FLOOR) * step
+    if base_size <= 0:
         return None
     row_min_notional = decimal_or_none(row.get("min_order_value")) or MIN_NOTIONAL
     min_notional = max(MIN_NOTIONAL, row_min_notional) * GRID_LIMIT_CHASE_MIN_NOTIONAL_MULTIPLIER
-    size = grid_size_for_min_notional(size, current_mid, sz_decimals, min_notional)
+    base_size = grid_size_for_min_notional(base_size, current_mid, sz_decimals, min_notional)
+    size = base_size * Decimal("2")
+    if max_size is not None:
+        size = min(size, max(Decimal("0"), max_size))
+    size = (size / step).to_integral_value(rounding=ROUND_FLOOR) * step
+    if size <= 0:
+        return None
     if size * current_mid < min_notional:
         return None
     slippage = Decimal(str(row.get("slippage") or DEFAULT_SLIPPAGE))
@@ -3881,19 +3888,34 @@ def build_grid_panic_reduce_order(
     max_size = abs(position_size)
     if max_size <= 0:
         return None
-    size = min(size, max_size)
     sz_decimals = int(row.get("sz_decimals") or asset["szDecimals"])
     step = Decimal(1).scaleb(-sz_decimals)
-    size = (size / step).to_integral_value(rounding=ROUND_FLOOR) * step
-    if size <= 0:
+    base_size = (size / step).to_integral_value(rounding=ROUND_FLOOR) * step
+    if base_size <= 0:
         return None
     slippage = Decimal(str(row.get("slippage") or DEFAULT_SLIPPAGE))
     limit_px = Decimal(str(exchange._slippage_price(coin, is_buy, float(slippage), float(current_mid))))
     limit_px = rounded_perp_price(limit_px, sz_decimals)
     if limit_px <= 0:
         return None
+    if base_size * limit_px < GRID_PANIC_REDUCE_MIN_NOTIONAL:
+        base_size = grid_size_for_min_notional(
+            base_size,
+            limit_px,
+            sz_decimals,
+            GRID_PANIC_REDUCE_MIN_NOTIONAL,
+        )
+    size = min(base_size * Decimal("2"), max_size)
+    size = (size / step).to_integral_value(rounding=ROUND_FLOOR) * step
+    if size <= 0:
+        return None
     if size * limit_px < GRID_PANIC_REDUCE_MIN_NOTIONAL:
-        size = grid_size_for_min_notional(size, limit_px, sz_decimals, GRID_PANIC_REDUCE_MIN_NOTIONAL)
+        size = grid_size_for_min_notional(
+            size,
+            limit_px,
+            sz_decimals,
+            GRID_PANIC_REDUCE_MIN_NOTIONAL,
+        )
         size = min(size, max_size)
         size = (size / step).to_integral_value(rounding=ROUND_FLOOR) * step
         if size <= 0:
@@ -7273,6 +7295,97 @@ def lifecycle_has_birth_intent(row: dict[str, Any], source: str) -> bool:
     )
 
 
+def lifecycle_birth_twin_orders(
+    row: dict[str, Any],
+    asset: dict[str, Any],
+    near_birth: dict[str, Any],
+    fill_price: Decimal,
+    fill_size: Decimal,
+) -> list[dict[str, Any]]:
+    """Split a P0/P4 market birth into near/far children when both are tradable."""
+    gap = Decimal(str(row["gap_rate"]))
+    sz_decimals = int(row.get("sz_decimals") or asset["szDecimals"])
+    step = Decimal(1).scaleb(-sz_decimals)
+    near_size = ((fill_size / Decimal("2")) / step).to_integral_value(rounding=ROUND_FLOOR) * step
+    far_size = ((fill_size - near_size) / step).to_integral_value(rounding=ROUND_FLOOR) * step
+    near_price = decimal_or_none(near_birth.get("price", near_birth.get("limit_px")))
+    if (
+        fill_price <= 0
+        or gap <= 0
+        or near_price is None
+        or near_price <= 0
+        or near_size <= 0
+        or far_size <= 0
+    ):
+        near_birth["birth_slot"] = "single"
+        return [near_birth]
+
+    side = str(near_birth.get("side") or "")
+    active_prices = [
+        price
+        for entry in row.get("levels") or []
+        if (
+            isinstance(entry, dict)
+            and str(entry.get("status") or "") == "active"
+            and str(entry.get("side") or "") == side
+        )
+        if (price := decimal_or_none(entry.get("price", entry.get("limit_px")))) is not None
+        and price > 0
+    ]
+    if side == "buy":
+        if active_prices:
+            far_anchor = min([near_price, *active_prices])
+            far_price = rounded_perp_price(far_anchor * (Decimal("1") - gap), sz_decimals)
+        else:
+            far_price = rounded_perp_price(
+                fill_price * (Decimal("1") - gap * Decimal("3")),
+                sz_decimals,
+            )
+    elif side == "sell":
+        if active_prices:
+            far_anchor = max([near_price, *active_prices])
+            far_price = rounded_perp_price(far_anchor * (Decimal("1") + gap), sz_decimals)
+        else:
+            far_price = rounded_perp_price(
+                fill_price * (Decimal("1") + gap * Decimal("3")),
+                sz_decimals,
+            )
+    else:
+        near_birth["birth_slot"] = "single"
+        return [near_birth]
+
+    min_notional = max(
+        MIN_NOTIONAL,
+        decimal_or_none(row.get("min_order_value")) or MIN_NOTIONAL,
+    )
+    if (
+        far_price <= 0
+        or near_size * near_price < min_notional
+        or far_size * far_price < min_notional
+    ):
+        near_birth["birth_slot"] = "single"
+        return [near_birth]
+
+    set_grid_order_size_exact(near_birth, near_size)
+    near_birth["birth_slot"] = "near"
+    near_plan = near_birth.get("plan")
+    if isinstance(near_plan, dict):
+        near_plan["birth_slot"] = "near"
+        near_plan["birth_size_fraction"] = Decimal("0.5")
+
+    far_birth = deepcopy(near_birth)
+    set_grid_order_size_exact(far_birth, far_size)
+    set_grid_order_price(far_birth, far_price)
+    far_birth["birth_slot"] = "far"
+    far_plan = far_birth.get("plan")
+    if isinstance(far_plan, dict):
+        far_plan["birth_slot"] = "far"
+        far_plan["birth_size_fraction"] = Decimal("0.5")
+        far_plan["birth_far_gap_multiplier"] = Decimal("1")
+        far_plan["birth_far_anchor_source"] = "active_farthest" if active_prices else "fill_3gap"
+    return [near_birth, far_birth]
+
+
 def lifecycle_materialize_birth_intent(
     row: dict[str, Any],
     ctx: dict[str, Any],
@@ -7288,22 +7401,21 @@ def lifecycle_materialize_birth_intent(
         return False
     cloid_text = str(intent.get("cloid") or "")
     levels = row.setdefault("levels", [])
-    existing = next(
-        (
-            entry
-            for entry in levels
-            if isinstance(entry, dict) and str(entry.get("birth_intent_cloid") or "") == cloid_text
-        ),
-        None,
-    )
-    if existing is not None:
+    existing_entries = [
+        entry
+        for entry in levels
+        if isinstance(entry, dict) and str(entry.get("birth_intent_cloid") or "") == cloid_text
+    ]
+    if any(not entry.get("birth_slot") for entry in existing_entries):
+        # A pre-twin deployment may already have materialized this cloid as
+        # one full-size birth.  Treat it as complete rather than duplicating it.
         lifecycle_remove_birth_intent(row, intent, cache)
         return True
 
     source = str(intent.get("source") or "")
     market_is_buy = bool(intent.get("market_is_buy"))
     if source == "panic":
-        birth = panic_reversal_order_from_reduce(
+        near_birth = panic_reversal_order_from_reduce(
             row,
             ctx["coin"],
             ctx["asset"],
@@ -7315,7 +7427,7 @@ def lifecycle_materialize_birth_intent(
             "market_fill",
         )
     elif source == "limit_chase":
-        birth = limit_chase_replacement_order_from_market(
+        near_birth = limit_chase_replacement_order_from_market(
             row,
             ctx["coin"],
             ctx["asset"],
@@ -7325,41 +7437,67 @@ def lifecycle_materialize_birth_intent(
             "market_fill",
         )
     else:
-        birth = None
-    if birth is None:
+        near_birth = None
+    if near_birth is None:
         intent["status"] = "filled_waiting_for_birth"
         intent["last_error"] = "filled market action could not build its leg-1 birth order"
         persist_lifecycle_intent(cache)
         return False
 
-    birth.pop("replace_never_cancel", None)
-    birth["grid_leg"] = 1
-    birth["iteration"] = 0
-    birth["birth_source"] = source
-    birth["birth_intent_cloid"] = cloid_text
-    birth["preserve_fill_size"] = True
-    birth["status"] = GRID_CHAIN_DEBT_STATUS
-    levels.append(birth)
-    lifecycle_remove_birth_intent(row, intent, cache)
-    result = lifecycle_submit_order(
-        ctx["exchange"],
-        ctx["coin"],
-        birth,
-        ctx["now"],
+    births = lifecycle_birth_twin_orders(
         row,
         ctx["asset"],
-        ctx["position_size"],
-        ctx["current_mid"],
-        ctx["best_bid"],
-        ctx["best_ask"],
-        cache.setdefault("lifecycle_isolated_ready", set()),
-        ctx["open_orders"],
-        cache,
-        search_outward=False,
-        force_gtc=True,
+        near_birth,
+        fill_price,
+        fill_size,
     )
+    if not births:
+        intent["status"] = "filled_waiting_for_birth"
+        intent["last_error"] = "filled market action could not split its birth order"
+        persist_lifecycle_intent(cache)
+        return False
+
+    existing = {
+        str(entry.get("birth_slot") or "single"): entry
+        for entry in existing_entries
+    }
+    appended: list[dict[str, Any]] = []
+    for birth in births:
+        slot = str(birth.get("birth_slot") or "single")
+        if slot in existing:
+            continue
+        birth.pop("replace_never_cancel", None)
+        birth["grid_leg"] = 1
+        birth["iteration"] = 0
+        birth["birth_source"] = source
+        birth["birth_intent_cloid"] = cloid_text
+        birth["preserve_fill_size"] = True
+        birth["status"] = GRID_CHAIN_DEBT_STATUS
+        levels.append(birth)
+        appended.append(birth)
+    lifecycle_remove_birth_intent(row, intent, cache)
+    results: dict[str, str] = {}
+    for birth in appended:
+        result = lifecycle_submit_order(
+            ctx["exchange"],
+            ctx["coin"],
+            birth,
+            ctx["now"],
+            row,
+            ctx["asset"],
+            ctx["position_size"],
+            ctx["current_mid"],
+            ctx["best_bid"],
+            ctx["best_ask"],
+            cache.setdefault("lifecycle_isolated_ready", set()),
+            ctx["open_orders"],
+            cache,
+            search_outward=False,
+            force_gtc=True,
+        )
+        results[str(birth.get("birth_slot") or "single")] = result
     row[f"{source}_fill_price"] = decimal_to_plain(fill_price)
-    row[f"{source}_birth_status"] = result
+    row[f"{source}_birth_status"] = results or "already_materialized"
     return True
 
 
@@ -7422,7 +7560,20 @@ def lifecycle_submit_limit_chase(row: dict[str, Any], ctx: dict[str, Any], cache
     if is_buy is None:
         return False
     market = build_grid_limit_chase_market_order(
-        ctx["exchange"], row, ctx["coin"], ctx["asset"], ctx["current_mid"], is_buy
+        ctx["exchange"],
+        row,
+        ctx["coin"],
+        ctx["asset"],
+        ctx["current_mid"],
+        is_buy,
+        max_size=(
+            abs(ctx["position_size"])
+            if (
+                (is_buy and ctx["position_size"] < 0)
+                or (not is_buy and ctx["position_size"] > 0)
+            )
+            else None
+        ),
     )
     if market is None:
         return False

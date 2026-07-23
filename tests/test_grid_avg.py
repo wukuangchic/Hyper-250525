@@ -101,8 +101,10 @@ from trail_worker import (
     maintain_grid,
     maintain_grid_legacy,
     lifecycle_active_price_too_close,
+    lifecycle_birth_twin_orders,
     lifecycle_legacy_pause_candidate,
     lifecycle_mark_deferred_or_discarded,
+    lifecycle_materialize_birth_intent,
     lifecycle_reconcile_birth_intents,
     lifecycle_row_account_key,
     lifecycle_process_anomalies,
@@ -553,7 +555,7 @@ class GridAvgTests(unittest.TestCase):
             def order(self, coin, is_buy, size, price, order_type, reduce_only=False, cloid=None):
                 self.calls.append((is_buy, order_type, reduce_only))
                 if len(self.calls) == 1:
-                    return {"status": "ok", "response": {"data": {"statuses": [{"filled": {"oid": 1, "avgPx": "100", "totalSz": "0.3"}}]}}}
+                    return {"status": "ok", "response": {"data": {"statuses": [{"filled": {"oid": 1, "avgPx": "100", "totalSz": "0.6"}}]}}}
                 return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 2}}]}}}
 
         row = {
@@ -572,11 +574,16 @@ class GridAvgTests(unittest.TestCase):
         changed = lifecycle_submit_limit_chase(row, ctx, {"action_limit_headroom": 200})
 
         self.assertTrue(changed)
-        self.assertEqual(len(row["levels"]), 1)
-        birth = row["levels"][0]
-        self.assertEqual(birth["grid_leg"], 1)
-        self.assertEqual(birth["birth_source"], "limit_chase")
-        self.assertEqual(birth["plan"]["order_type"], {"limit": {"tif": "Gtc"}})
+        self.assertEqual(len(row["levels"]), 2)
+        near, far = row["levels"]
+        self.assertEqual([near["birth_slot"], far["birth_slot"]], ["near", "far"])
+        self.assertEqual([near["size"], far["size"]], ["0.3", "0.3"])
+        self.assertEqual([near["price"], far["price"]], ["98", "97"])
+        self.assertTrue(all(birth["grid_leg"] == 1 for birth in row["levels"]))
+        self.assertTrue(all(birth["birth_source"] == "limit_chase" for birth in row["levels"]))
+        self.assertTrue(
+            all(birth["plan"]["order_type"] == {"limit": {"tif": "Gtc"}} for birth in row["levels"])
+        )
 
     def test_p4_add_market_still_requires_withdrawable_above_five(self) -> None:
         class UnexpectedExchange:
@@ -691,14 +698,82 @@ class GridAvgTests(unittest.TestCase):
         reconcile_ctx = {
             **ctx,
             "info": FakeInfo(), "account": "0xabc", "exchange": RecoveryExchange(), "now": 124,
-            "fills_by_oid": {77: {"oid": 77, "px": "100", "sz": "0.3"}},
+            "fills_by_oid": {77: {"oid": 77, "px": "100", "sz": "0.6"}},
         }
         self.assertTrue(lifecycle_reconcile_birth_intents(row, reconcile_ctx, {"action_limit_headroom": 200}))
         self.assertNotIn("birth_market_intents", row)
-        self.assertEqual(len(row["levels"]), 1)
-        self.assertEqual(row["levels"][0]["grid_leg"], 1)
-        self.assertEqual(row["levels"][0]["status"], "active")
-        self.assertEqual(row["levels"][0]["birth_source"], "limit_chase")
+        self.assertEqual(len(row["levels"]), 2)
+        self.assertEqual([entry["birth_slot"] for entry in row["levels"]], ["near", "far"])
+        self.assertTrue(all(entry["grid_leg"] == 1 for entry in row["levels"]))
+        self.assertTrue(all(entry["status"] == "active" for entry in row["levels"]))
+        self.assertTrue(all(entry["birth_source"] == "limit_chase" for entry in row["levels"]))
+
+    def test_birth_intent_recovery_completes_missing_far_twin_without_duplicate_near(self) -> None:
+        class FakeExchange:
+            def __init__(self):
+                self.calls = 0
+
+            def order(self, *args, **kwargs):
+                self.calls += 1
+                return {
+                    "status": "ok",
+                    "response": {"data": {"statuses": [{"resting": {"oid": 88}}]}},
+                }
+
+        cloid = "0xabc"
+        existing_near = {
+            "side": "sell",
+            "is_buy": False,
+            "status": "active",
+            "oid": 77,
+            "price": "102",
+            "limit_px": "102",
+            "size": "0.3",
+            "birth_slot": "near",
+            "birth_intent_cloid": cloid,
+            "grid_leg": 1,
+        }
+        intent = {
+            "cloid": cloid,
+            "source": "panic",
+            "market_is_buy": True,
+        }
+        row = {
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "0.3",
+            "base_sell_size": "0.3",
+            "levels": [existing_near],
+            "birth_market_intents": [intent],
+        }
+        exchange = FakeExchange()
+        ctx = {
+            "coin": "BTC",
+            "asset": {"szDecimals": 2, "maxLeverage": 20},
+            "exchange": exchange,
+            "now": 124,
+            "position_size": Decimal("-3.4"),
+            "current_mid": Decimal("100"),
+            "best_bid": Decimal("99.9"),
+            "best_ask": Decimal("100.1"),
+            "open_orders": [],
+        }
+
+        self.assertTrue(
+            lifecycle_materialize_birth_intent(
+                row,
+                ctx,
+                {"action_limit_headroom": 200},
+                intent,
+                Decimal("100"),
+                Decimal("0.6"),
+            )
+        )
+
+        self.assertNotIn("birth_market_intents", row)
+        self.assertEqual(exchange.calls, 1)
+        self.assertEqual([entry["birth_slot"] for entry in row["levels"]], ["near", "far"])
+        self.assertEqual([entry["size"] for entry in row["levels"]], ["0.3", "0.3"])
 
     def test_p0_birth_uses_single_persisted_cloid_submission(self) -> None:
         market = {
@@ -2356,7 +2431,7 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertIsNotNone(order)
         self.assertEqual(order["side"], "buy")
-        self.assertEqual(order["size"], "0.2")
+        self.assertEqual(order["size"], "0.4")
         self.assertTrue(order["reduce_only"])
         self.assertEqual(order["plan"]["order_type"], {"limit": {"tif": "Ioc"}})
         self.assertTrue(order["plan"]["reduce_only"])
@@ -2385,7 +2460,7 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertIsNotNone(market)
         self.assertEqual(market["side"], "sell")
-        self.assertEqual(market["size"], "0.3")
+        self.assertEqual(market["size"], "0.6")
         self.assertFalse(market["reduce_only"])
         self.assertEqual(market["plan"]["order_type"], {"limit": {"tif": "Ioc"}})
         self.assertIsNotNone(replacement)
@@ -2396,6 +2471,73 @@ class GridAvgTests(unittest.TestCase):
         self.assertTrue(replacement["replace_never_cancel"])
         self.assertTrue(replacement["limit_chase_replacement"])
         self.assertEqual(replacement["plan"]["order_type"], {"limit": {"tif": "Gtc"}})
+
+    def test_birth_twins_split_fill_and_put_far_child_beyond_farthest_active(self) -> None:
+        row = {
+            "gap_rate": "0.01",
+            "base_buy_size": "0.3",
+            "base_sell_size": "0.3",
+            "min_order_value": "10",
+            "levels": [
+                {
+                    "side": "sell",
+                    "status": "active",
+                    "oid": 9,
+                    "price": "110",
+                    "size": "0.3",
+                }
+            ],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        near = panic_reversal_order_from_reduce(
+            row,
+            "BTC",
+            asset,
+            Decimal("100"),
+            True,
+            Decimal("0.6"),
+            Decimal("-4"),
+            "abs",
+        )
+
+        twins = lifecycle_birth_twin_orders(
+            row,
+            asset,
+            near,
+            Decimal("100"),
+            Decimal("0.6"),
+        )
+
+        self.assertEqual([order["birth_slot"] for order in twins], ["near", "far"])
+        self.assertEqual([order["size"] for order in twins], ["0.3", "0.3"])
+        self.assertEqual([order["price"] for order in twins], ["102", "111.1"])
+        self.assertEqual(
+            twins[1]["plan"]["birth_far_anchor_source"],
+            "active_farthest",
+        )
+
+    def test_limit_chase_double_size_can_be_capped_before_crossing_zero(self) -> None:
+        class FakeExchange:
+            def _slippage_price(self, coin, is_buy, slippage, reference_price):
+                return Decimal(str(reference_price))
+
+        market = build_grid_limit_chase_market_order(
+            FakeExchange(),
+            {
+                "gap_rate": "0.01",
+                "base_buy_size": "0.3",
+                "base_sell_size": "0.3",
+                "min_order_value": "10",
+            },
+            "BTC",
+            {"szDecimals": 2, "maxLeverage": 20},
+            Decimal("100"),
+            True,
+            max_size=Decimal("0.4"),
+        )
+
+        self.assertIsNotNone(market)
+        self.assertEqual(market["size"], "0.4")
 
     def test_limit_chase_replacement_uses_spcx_fill_price_and_actual_gap(self) -> None:
         row = {
@@ -2447,11 +2589,11 @@ class GridAvgTests(unittest.TestCase):
         )
 
         self.assertIsNotNone(market)
-        self.assertEqual(market["size"], "0.07")
+        self.assertEqual(market["size"], "0.14")
         self.assertGreaterEqual(market["plan"]["reference_notional"], Decimal("11"))
         self.assertEqual(market["plan"]["min_notional_buffer"], Decimal("11.00"))
         self.assertIsNotNone(replacement)
-        self.assertEqual(replacement["size"], "0.07")
+        self.assertEqual(replacement["size"], "0.14")
 
 
     def test_panic_reduce_order_uses_min_notional_buffer(self) -> None:
@@ -2476,7 +2618,7 @@ class GridAvgTests(unittest.TestCase):
         )
 
         self.assertIsNotNone(order)
-        self.assertEqual(order["size"], "0.00017")
+        self.assertEqual(order["size"], "0.00034")
         self.assertGreaterEqual(Decimal(str(order["plan"]["notional"])), Decimal("11"))
 
     def test_panic_reversal_after_short_reduce_is_far_sell_with_normal_gap(self) -> None:
@@ -2993,7 +3135,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(reversal["status"], "active")
         self.assertEqual(reversal["oid"], 11)
         self.assertEqual(reversal["size"], "0.4")
-        self.assertEqual([order[1] for order in exchange.orders], [Decimal("1"), Decimal("0.4"), Decimal("0.4")])
+        self.assertEqual([order[1] for order in exchange.orders], [Decimal("2.0"), Decimal("0.4"), Decimal("0.4")])
 
     def test_never_cancel_replacement_is_excluded_from_worker_cancellations(self) -> None:
         class FakeExchange:
