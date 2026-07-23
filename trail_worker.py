@@ -6814,36 +6814,6 @@ def lifecycle_replacement_from_fill(
     return order
 
 
-def lifecycle_terminal_replacement_limit_discard(
-    row: dict[str, Any],
-    order: dict[str, Any],
-    position_size: Decimal,
-    position_value: Decimal,
-) -> dict[str, str] | None:
-    """Describe a debt-free replacement that would worsen a signed limit breach."""
-    if lifecycle_leg(order) != 0 or grid_limit_policy_from_row(row) != "limit":
-        return None
-    minimum = Decimal(str(row.get("min_position_value") or "0"))
-    maximum = Decimal(str(row.get("max_position_value") or "0"))
-    lower_bound, upper_bound = grid_position_bounds("limit", minimum, maximum)
-    signed_value = signed_position_value(position_size, position_value)
-    is_buy = bool(order.get("is_buy"))
-    if signed_value < lower_bound and not is_buy:
-        breach = "below_lower_sell"
-    elif signed_value > upper_bound and is_buy:
-        breach = "above_upper_buy"
-    else:
-        return None
-    return {
-        "reason": "terminal_leg_worsens_limit_breach",
-        "breach": breach,
-        "side": "buy" if is_buy else "sell",
-        "p2_signed_position_value": decimal_to_plain(signed_value),
-        "limit_lower": decimal_to_plain(lower_bound),
-        "limit_upper": decimal_to_plain(upper_bound),
-    }
-
-
 def lifecycle_mark_deferred_or_discarded(
     order: dict[str, Any],
     now: int,
@@ -7191,37 +7161,6 @@ def lifecycle_process_fills(
         child = lifecycle_replacement_from_fill(row, ctx["coin"], ctx["asset"], source)
         if child is None:
             source["last_error"] = "filled lifecycle order could not build its replacement"
-            continue
-        p2_position_value = decimal_or_none(ctx.get("position_value"))
-        if p2_position_value is None:
-            p2_position_value = abs(ctx["position_size"] * ctx["current_mid"])
-        terminal_discard = lifecycle_terminal_replacement_limit_discard(
-            row, child, ctx["position_size"], p2_position_value
-        )
-        if terminal_discard is not None:
-            lifecycle_mark_deferred_or_discarded(child, ctx["now"], terminal_discard["reason"])
-            if source in levels:
-                levels.remove(source)
-            source["replacement_pending"] = False
-            source["replacement_processed_at"] = ctx["now"]
-            source["replacement_processed_reason"] = terminal_discard["reason"]
-            row["p2_terminal_discard_count"] = int(row.get("p2_terminal_discard_count") or 0) + 1
-            row["last_p2_terminal_discard"] = {
-                **terminal_discard,
-                "at": ctx["now"],
-                "source_oid": source.get("oid"),
-                "source_grid_leg": lifecycle_leg(source),
-                "replacement_grid_leg": lifecycle_leg(child),
-            }
-            audit_grid_action(
-                "grid_p2_terminal_replacement_discard",
-                coin=ctx["coin"],
-                source_oid=source.get("oid"),
-                source_grid_leg=lifecycle_leg(source),
-                replacement_grid_leg=lifecycle_leg(child),
-                **terminal_discard,
-            )
-            changed = True
             continue
         result = lifecycle_submit_order(
             ctx["exchange"], ctx["coin"], child, ctx["now"], row, ctx["asset"],

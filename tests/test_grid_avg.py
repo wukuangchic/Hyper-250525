@@ -109,7 +109,6 @@ from trail_worker import (
     lifecycle_process_fills,
     lifecycle_replacement_from_fill,
     lifecycle_submit_limit_chase,
-    lifecycle_terminal_replacement_limit_discard,
     lifecycle_terminal_candidate,
     lifecycle_fill_price_size,
     migrate_grid_lifecycle,
@@ -242,47 +241,6 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(second["side"], "buy")
         self.assertEqual(second["grid_leg"], 0)
         self.assertEqual(second["iteration"], 4)
-
-    def test_terminal_replacement_limit_discard_uses_strict_p2_signed_bounds(self) -> None:
-        row = {
-            "position_limit_mode": "limit",
-            "min_position_value": "-100",
-            "max_position_value": "100",
-        }
-        sell = {"grid_leg": 0, "is_buy": False}
-        buy = {"grid_leg": 0, "is_buy": True}
-
-        below_sell = lifecycle_terminal_replacement_limit_discard(
-            row, sell, Decimal("-1"), Decimal("150")
-        )
-        above_buy = lifecycle_terminal_replacement_limit_discard(
-            row, buy, Decimal("1"), Decimal("150")
-        )
-
-        self.assertEqual(below_sell["breach"], "below_lower_sell")
-        self.assertEqual(above_buy["breach"], "above_upper_buy")
-        self.assertIsNone(
-            lifecycle_terminal_replacement_limit_discard(row, buy, Decimal("-1"), Decimal("150"))
-        )
-        self.assertIsNone(
-            lifecycle_terminal_replacement_limit_discard(row, sell, Decimal("1"), Decimal("150"))
-        )
-        self.assertIsNone(
-            lifecycle_terminal_replacement_limit_discard(row, sell, Decimal("-1"), Decimal("100"))
-        )
-        self.assertIsNone(
-            lifecycle_terminal_replacement_limit_discard(row, buy, Decimal("1"), Decimal("100"))
-        )
-        self.assertIsNone(
-            lifecycle_terminal_replacement_limit_discard(
-                {**row, "position_limit_mode": "abs"}, sell, Decimal("-1"), Decimal("150")
-            )
-        )
-        self.assertIsNone(
-            lifecycle_terminal_replacement_limit_discard(
-                row, {"grid_leg": 1, "is_buy": False}, Decimal("-1"), Decimal("150")
-            )
-        )
 
     def test_confirmed_resting_fill_uses_saved_limit_when_history_is_truncated(self) -> None:
         entry = {
@@ -485,66 +443,6 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(child["side"], "sell")
         self.assertEqual(child["status"], "active")
         self.assertTrue(exchange.request[-1])
-
-    def test_p2_discards_terminal_replacement_that_worsens_limit_breach(self) -> None:
-        cases = [
-            {
-                "name": "below lower sell",
-                "source": {
-                    "side": "buy", "is_buy": True, "status": "filled", "replacement_pending": True,
-                    "grid_leg": 1, "oid": 11, "fill": {"px": "100", "sz": "0.4"},
-                },
-                "position_size": Decimal("-1"),
-                "position_value": Decimal("150"),
-                "breach": "below_lower_sell",
-            },
-            {
-                "name": "above upper buy",
-                "source": {
-                    "side": "sell", "is_buy": False, "status": "filled", "replacement_pending": True,
-                    "grid_leg": 1, "oid": 12, "fill": {"px": "100", "sz": "0.4"},
-                },
-                "position_size": Decimal("1"),
-                "position_value": Decimal("150"),
-                "breach": "above_upper_buy",
-            },
-        ]
-        for case in cases:
-            with self.subTest(case["name"]):
-                row = {
-                    "position_limit_mode": "limit",
-                    "min_position_value": "-100",
-                    "max_position_value": "100",
-                    "gap_rate": "0.01",
-                    "min_order_value": "10",
-                    "base_buy_size": "0.4",
-                    "base_sell_size": "0.4",
-                    "levels": [case["source"]],
-                }
-                ctx = {
-                    "coin": "BTC", "asset": {"szDecimals": 2, "maxLeverage": 20},
-                    "exchange": object(), "now": 123,
-                    "position_size": case["position_size"], "position_value": case["position_value"],
-                    "current_mid": Decimal("100"), "best_bid": Decimal("99.9"),
-                    "best_ask": Decimal("100.1"), "open_orders": [], "open_oids": set(),
-                    "fills_by_oid": {}, "info": object(), "account": "0xabc",
-                }
-
-                with patch("trail_worker.audit_grid_action") as audit:
-                    count, changed = lifecycle_process_fills(
-                        row, ctx, {"action_limit_headroom": 100}
-                    )
-
-                self.assertTrue(changed)
-                self.assertEqual(count, 0)
-                self.assertEqual(row["levels"], [])
-                self.assertEqual(row["p2_terminal_discard_count"], 1)
-                self.assertEqual(row["last_p2_terminal_discard"]["breach"], case["breach"])
-                self.assertEqual(
-                    row["last_p2_terminal_discard"]["reason"],
-                    "terminal_leg_worsens_limit_breach",
-                )
-                audit.assert_called_once()
 
     def test_p2_iteration_counts_each_alo_submit_after_outward_rejects(self) -> None:
         class FakeExchange:
