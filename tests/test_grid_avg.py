@@ -2472,7 +2472,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertTrue(replacement["limit_chase_replacement"])
         self.assertEqual(replacement["plan"]["order_type"], {"limit": {"tif": "Gtc"}})
 
-    def test_birth_twins_split_fill_and_put_far_child_beyond_farthest_active(self) -> None:
+    def test_birth_twins_split_fill_and_put_far_child_at_active_near_midpoint(self) -> None:
         row = {
             "gap_rate": "0.01",
             "base_buy_size": "0.3",
@@ -2510,11 +2510,12 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertEqual([order["birth_slot"] for order in twins], ["near", "far"])
         self.assertEqual([order["size"] for order in twins], ["0.3", "0.3"])
-        self.assertEqual([order["price"] for order in twins], ["102", "111.1"])
+        self.assertEqual([order["price"] for order in twins], ["102", "106"])
         self.assertEqual(
             twins[1]["plan"]["birth_far_anchor_source"],
-            "active_farthest",
+            "near_farthest_active_midpoint",
         )
+        self.assertEqual(twins[1]["plan"]["birth_far_active_price"], Decimal("110"))
 
     def test_limit_chase_double_size_can_be_capped_before_crossing_zero(self) -> None:
         class FakeExchange:

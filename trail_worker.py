@@ -7333,18 +7333,24 @@ def lifecycle_birth_twin_orders(
         and price > 0
     ]
     if side == "buy":
-        if active_prices:
-            far_anchor = min([near_price, *active_prices])
-            far_price = rounded_perp_price(far_anchor * (Decimal("1") - gap), sz_decimals)
+        farthest_active = min(active_prices) if active_prices else None
+        if farthest_active is not None and farthest_active < near_price:
+            far_price = rounded_perp_price(
+                (near_price + farthest_active) / Decimal("2"),
+                sz_decimals,
+            )
         else:
             far_price = rounded_perp_price(
                 fill_price * (Decimal("1") - gap * Decimal("3")),
                 sz_decimals,
             )
     elif side == "sell":
-        if active_prices:
-            far_anchor = max([near_price, *active_prices])
-            far_price = rounded_perp_price(far_anchor * (Decimal("1") + gap), sz_decimals)
+        farthest_active = max(active_prices) if active_prices else None
+        if farthest_active is not None and farthest_active > near_price:
+            far_price = rounded_perp_price(
+                (near_price + farthest_active) / Decimal("2"),
+                sz_decimals,
+            )
         else:
             far_price = rounded_perp_price(
                 fill_price * (Decimal("1") + gap * Decimal("3")),
@@ -7381,8 +7387,17 @@ def lifecycle_birth_twin_orders(
     if isinstance(far_plan, dict):
         far_plan["birth_slot"] = "far"
         far_plan["birth_size_fraction"] = Decimal("0.5")
-        far_plan["birth_far_gap_multiplier"] = Decimal("1")
-        far_plan["birth_far_anchor_source"] = "active_farthest" if active_prices else "fill_3gap"
+        far_plan["birth_far_anchor_source"] = (
+            "near_farthest_active_midpoint"
+            if farthest_active is not None
+            and (
+                (side == "buy" and farthest_active < near_price)
+                or (side == "sell" and farthest_active > near_price)
+            )
+            else "fill_3gap"
+        )
+        if far_plan["birth_far_anchor_source"] == "near_farthest_active_midpoint":
+            far_plan["birth_far_active_price"] = farthest_active
     return [near_birth, far_birth]
 
 

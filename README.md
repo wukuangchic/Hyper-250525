@@ -189,7 +189,7 @@ JPY both 20 --offset 2% --tp 1% --sl 0.7%
 
 ## 服务器真实网格单
 
-`grid` 现在是有限订单链，不再维持固定数量或固定密度。新建 grid 初始为空，不提交任何格子单；只有仓位 value 超出 `--limit MIN MAX` 后，P4 `limit-chase` 的 IOC 市价回归单确认成交，才会按实际 `avgPx` 在反方向出生 near/far 两张 `grid_leg=1` GTC 单。near 位于 `2 * gap`，far 位于反向 active 单最远端之外 `1 * gap`；该方向没有 active 时 far 位于成交价的 `3 * gap`。后续成交由 P2 按 `1 ↔ 0` 延续。
+`grid` 现在是有限订单链，不再维持固定数量或固定密度。新建 grid 初始为空，不提交任何格子单；只有仓位 value 超出 `--limit MIN MAX` 后，P4 `limit-chase` 的 IOC 市价回归单确认成交，才会按实际 `avgPx` 在反方向出生 near/far 两张 `grid_leg=1` GTC 单。near 位于 `2 * gap`，far 位于 near 与反向最远 active 单的价格中点；该方向没有比 near 更远的 active 时，far 位于成交价的 `3 * gap`。后续成交由 P2 按 `1 ↔ 0` 延续。
 
 `grid_leg=1` 表示当前往复尚未闭合，是必须继续处理的“链债务”；`grid_leg=0` 表示上一组往复已经闭合，在 withdrawable 紧张时可以终结。P0/P4 的 IOC 市价单是无格属性的出生事件，只有成交后派生的反向限价单带格属性。
 
@@ -214,7 +214,7 @@ BTC grid --limit -300 0
 
 参数：
 
-- `--gap`：P2 往复使用 `1 * gap`。P0/P4 的 IOC 目标数量使用 `2 * base_size`，确认成交后把实际成交量等分成 near/far 双胞胎：near 使用 `2 * gap`，far 使用反向 active 最远端之外 `1 * gap`；没有反向 active 时使用成交价的 `3 * gap`。仓位不足或拆分后任一子单低于最小下单金额时安全退化为一张完整成交量的 near 单。创建时不生成初始挂单。
+- `--gap`：P2 往复使用 `1 * gap`。P0/P4 的 IOC 目标数量使用 `2 * base_size`，确认成交后把实际成交量等分成 near/far 双胞胎：near 使用 `2 * gap`，far 使用 near 与反向最远 active 单的价格中点；没有比 near 更远的反向 active 时使用成交价的 `3 * gap`。仓位不足或拆分后任一子单低于最小下单金额时安全退化为一张完整成交量的 near 单。创建时不生成初始挂单。
 - 不写 `--gap`，或写 `--gap 0` / `--gap 0%` 时，默认使用 `最小价格变动百分比 + 折扣后 takerFee + 折扣后 makerFee`。
 - `--trend`：数量倾向，默认 `0`；正数让买入数量大于卖出数量，负数让卖出数量大于买入数量。取消趋势用 `--modify --trend 0`。
 - `--avg` / `--trend` 只保留为基础下单 size 的兼容配置，不再驱动 top-up、密度或动态间距维护。
