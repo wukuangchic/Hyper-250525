@@ -316,7 +316,7 @@ class GridAvgTests(unittest.TestCase):
             row = {
                 "type": "grid", "status": "active", "grid_lifecycle_version": 2,
                 "network": "mainnet", "account": "0xabc", "coin": "BTC",
-                "lifecycle_mid": "100", "gap_rate": "0.01",
+                "gap_rate": "0.01",
                 "levels": [
                     {"side": "buy", "is_buy": True, "status": "legacy_pause", "price": "99", "grid_leg": 1},
                     {"side": "sell", "is_buy": False, "status": "legacy_pause", "price": "102", "grid_leg": 1},

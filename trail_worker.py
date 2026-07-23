@@ -7432,6 +7432,9 @@ def lifecycle_submit_limit_chase(row: dict[str, Any], ctx: dict[str, Any], cache
 def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> tuple[dict[str, Any], bool]:
     cache = cache if cache is not None else {}
     ctx = lifecycle_context(row, cache)
+    # P6 compares legacy prices across markets, so every row needs the live
+    # midpoint gathered for this worker run before the account-wide scan.
+    row["lifecycle_mid"] = decimal_to_plain(ctx["current_mid"])
     phase = str(cache.get("grid_action_phase") or GRID_LIFECYCLE_PHASE_P0)
     changed = migrate_grid_lifecycle(row, ctx["now"])
     levels = row.setdefault("levels", [])
