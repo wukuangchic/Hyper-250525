@@ -223,7 +223,7 @@ BTC grid --limit -300 0
 - `--total`、旧 `--max` 和旧 `--long` / `--short` / `--abs` 都不再作为推荐 grid 参数；新命令使用 `--limit MIN MAX`。
 - P0 `panic`：沿用 `panic_ratio` 触发条件。先用 IOC reduce-only 市价减仓；确认成交后，以实际 `avgPx` 为锚点，在反方向 `2 * gap` 处直接提交 `grid_leg=1` GTC 单。空 grid 没有可用于计算 ratio 的 active 减仓格时，P0 不会凭空出生订单。
 - P1 `terminal`：当账户 `withdrawable < 10` 时，每个账户（跨 DEX 合并计算）每轮最多撤一张真正占用保证金的非 reduce-only、`grid_leg=0` active 单，并按交易所订单时间从旧到新选择。reduce-only 挂单不占用保证金，P1 不撤；交易所确认撤单成功后才从 batch 移除，后续不再维护。
-- P2 `replacement`：处理确认成交的 active 格子单，以实际成交价为锚点在反方向 `1 * gap` 提交 ALO。每次成交都翻转格属性 `0 ↔ 1`；提交前按当前仓位重新判断增仓或减仓，减仓统一 reduce-only。
+- P2 `replacement`：处理确认成交的 active 格子单，以实际成交价为锚点在反方向 `1 * gap` 提交 ALO。每次成交都翻转格属性 `0 ↔ 1`；提交前按 P2 开始时重新读取的仓位判断增仓或减仓，减仓统一 reduce-only。若原单为 `grid_leg=1`、待提交 replacement 已翻转为无链债务的 `grid_leg=0`，且 P2 signed 仓位 value 已低于 `--limit` 下界而待提交方向为 sell，或已高于上界而待提交方向为 buy，则不向交易所提交并直接终结该链；刚好等于边界时不终结。
 - P3 `debt`：所有未能挂出的 `grid_leg=1` 都是必须重试的链债务；只有交易所明确返回保证金不足时状态才记为 `margin`，超时、限流、网络或其他提交失败记为 `chain_debt`。两者均在 `withdrawable > 5` 且 raw deficit `< 0` 时重新提交。`grid_leg=0` 提交失败则直接终结。
 - P4 `limit-chase`：raw deficit `< 0` 且 signed 仓位 value 仍在 `--limit` 之外时，按原方向逻辑提交一张 IOC 市价回归单。市价纯减仓（方向正确且数量不超过当前仓位）不受 `withdrawable` 限制；会加仓或穿过零仓反向开仓的动作仍要求 `withdrawable > 5`。确认成交后，以实际 `avgPx` 为锚点，在反方向 `2 * gap` 处提交 `grid_leg=1` GTC 单。P4 不设每轮全局数量上限，随机顺序中每个符合条件的 Grid 都可以执行；新空 grid 仍仅由 P4 出生。
 - P5 `anomaly`：只在 raw deficit `< -100` 时运行。记录中的 OID 异常消失且确认未成交时，`grid_leg=1` 当轮恢复为同方向、同价格、同属性的非 reduce-only ALO 单；`grid_leg=0` 直接从 batch 移除。
