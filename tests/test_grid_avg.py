@@ -282,12 +282,13 @@ class GridAvgTests(unittest.TestCase):
         )
         self.assertEqual(non_margin_debt["status"], GRID_CHAIN_DEBT_STATUS)
 
-    def test_finite_chain_terminal_candidate_prefers_non_reduce_only_then_oldest(self) -> None:
+    def test_finite_chain_terminal_candidate_excludes_reduce_only_and_uses_oldest(self) -> None:
         rows = [{
             "type": "grid", "status": "active", "network": "mainnet", "account": "0xabc", "dex": "",
             "levels": [
                 {"side": "sell", "status": "active", "oid": 1, "grid_leg": 0, "reduce_only": True, "submitted_at": 1},
                 {"side": "buy", "status": "active", "oid": 2, "grid_leg": 0, "reduce_only": False, "submitted_at": 3},
+                {"side": "sell", "status": "active", "oid": 4, "grid_leg": 0, "reduce_only": False, "submitted_at": 4},
                 {"side": "buy", "status": "active", "oid": 3, "grid_leg": 1, "reduce_only": False, "submitted_at": 2},
             ],
         }]
@@ -296,6 +297,17 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertIsNotNone(candidate)
         self.assertEqual(candidate[1]["oid"], 2)
+
+    def test_finite_chain_terminal_candidate_returns_none_for_reduce_only_orders(self) -> None:
+        rows = [{
+            "type": "grid", "status": "active", "network": "mainnet", "account": "0xabc", "dex": "",
+            "levels": [
+                {"side": "buy", "status": "active", "oid": 1, "grid_leg": 0, "reduce_only": True, "submitted_at": 1},
+                {"side": "sell", "status": "active", "oid": 2, "grid_leg": 0, "reduce_only": True, "submitted_at": 2},
+            ],
+        }]
+
+        self.assertIsNone(lifecycle_terminal_candidate(rows, "mainnet", "0xabc"))
 
     def test_finite_chain_p6_uses_relative_nearest_legacy_pause(self) -> None:
         btc = {

@@ -6998,7 +6998,7 @@ def lifecycle_terminal_candidate(
     account: str,
 ) -> tuple[dict[str, Any], dict[str, Any]] | None:
     account_key = account.lower()
-    candidates: list[tuple[bool, int, int, dict[str, Any], dict[str, Any]]] = []
+    candidates: list[tuple[int, int, dict[str, Any], dict[str, Any]]] = []
     for candidate_row in rows:
         if not isinstance(candidate_row, dict) or candidate_row.get("type") != "grid":
             continue
@@ -7009,17 +7009,17 @@ def lifecycle_terminal_candidate(
         for entry in candidate_row.get("levels") or []:
             if not isinstance(entry, dict) or str(entry.get("status") or "") != "active":
                 continue
-            if lifecycle_leg(entry) != 0 or entry.get("oid") is None:
+            if lifecycle_leg(entry) != 0 or entry.get("oid") is None or bool(entry.get("reduce_only")):
                 continue
             timestamp = grid_entry_timestamp_ms(entry) or 0
             try:
                 oid = int(entry.get("oid") or 0)
             except (TypeError, ValueError):
                 oid = 0
-            candidates.append((bool(entry.get("reduce_only")), timestamp, oid, candidate_row, entry))
+            candidates.append((timestamp, oid, candidate_row, entry))
     if not candidates:
         return None
-    _reduce_only, _timestamp, _oid, candidate_row, entry = min(candidates, key=lambda item: item[:3])
+    _timestamp, _oid, candidate_row, entry = min(candidates, key=lambda item: item[:2])
     return candidate_row, entry
 
 
