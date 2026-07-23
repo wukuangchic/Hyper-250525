@@ -568,6 +568,46 @@ class GridAvgTests(unittest.TestCase):
             )
         )
 
+    def test_p4_allows_multiple_grid_births_in_one_worker_round(self) -> None:
+        rows = [
+            {
+                "type": "grid", "status": "active", "grid_lifecycle_version": 2,
+                "network": "mainnet", "account": "0xabc", "coin": coin, "levels": [],
+            }
+            for coin in ("BTC", "ETH")
+        ]
+        ctx = {
+            "network": "mainnet", "account": "0xabc",
+            "asset": {"szDecimals": 2, "maxLeverage": 20}, "exchange": object(),
+            "info": object(), "now": 123, "now_ms": 123000,
+            "position_size": Decimal("1"), "position_value": Decimal("200"),
+            "current_mid": Decimal("100"), "best_bid": Decimal("99.9"), "best_ask": Decimal("100.1"),
+            "withdrawable": Decimal("10"), "liquidation_px": None,
+            "open_orders": [], "open_oids": set(), "fills_by_oid": {},
+        }
+        cache = {
+            "grid_action_phase": "p4",
+            "grid_rows": rows,
+            "action_limit_headroom": 200,
+        }
+
+        with (
+            patch("trail_worker.lifecycle_context", side_effect=[
+                {**ctx, "coin": "BTC"},
+                {**ctx, "coin": "ETH"},
+            ]),
+            patch("trail_worker.lifecycle_submit_limit_chase", return_value=True) as submit_mock,
+        ):
+            for row in rows:
+                maintain_grid(row, cache)
+
+        self.assertEqual(submit_mock.call_count, 2)
+        self.assertNotIn("lifecycle_p4_birth_used", cache)
+        self.assertEqual(
+            [cache["grid_lifecycle_counters"][id(row)]["p4_births"] for row in rows],
+            [1, 1],
+        )
+
     def test_p4_timeout_reconciles_cloid_fill_into_leg_one(self) -> None:
         class TimeoutExchange:
             def _slippage_price(self, coin, is_buy, slippage, mid):

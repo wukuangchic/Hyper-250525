@@ -7541,9 +7541,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                     break
 
     elif phase == GRID_LIFECYCLE_PHASE_P4:
-        if raw_action_limit_deficit(cache) < 0 and not cache.get("lifecycle_p4_birth_used"):
+        if raw_action_limit_deficit(cache) < 0:
             if lifecycle_submit_limit_chase(row, ctx, cache):
-                cache["lifecycle_p4_birth_used"] = True
                 counters["p4_births"] = int(counters.get("p4_births") or 0) + 1
                 changed = True
 
