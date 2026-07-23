@@ -189,13 +189,16 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertEqual(row["grid_lifecycle_version"], 2)
         self.assertEqual(row["levels"][0]["grid_leg"], 0)
+        self.assertEqual(row["levels"][0]["iteration"], 0)
         self.assertEqual(row["levels"][0]["status"], "active")
         self.assertNotIn("replace_never_cancel", row["levels"][0])
         self.assertEqual(row["levels"][1]["grid_leg"], 1)
+        self.assertEqual(row["levels"][1]["iteration"], 0)
         self.assertEqual(row["levels"][1]["status"], "legacy_pause")
         self.assertEqual(row["levels"][1]["legacy_pause_status"], "paused_margin")
         self.assertEqual(len(row["levels"]), 3)
         self.assertEqual(row["levels"][2]["oid"], 3)
+        self.assertEqual(row["levels"][2]["iteration"], 0)
         self.assertTrue(row["levels"][2]["replacement_pending"])
         self.assertNotIn("target_orders_per_side", row)
         self.assertNotIn("margin_pauses", row)
@@ -220,6 +223,7 @@ class GridAvgTests(unittest.TestCase):
             "side": "buy",
             "is_buy": True,
             "grid_leg": 0,
+            "iteration": 4,
             "fill": {"px": "100", "sz": "0.4"},
         }
 
@@ -229,12 +233,14 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(first["price"], "101")
         self.assertEqual(first["size"], "0.4")
         self.assertEqual(first["grid_leg"], 1)
+        self.assertEqual(first["iteration"], 4)
 
         first["fill"] = {"px": "101", "sz": "0.4"}
         second = lifecycle_replacement_from_fill(row, "BTC", asset, first)
         self.assertIsNotNone(second)
         self.assertEqual(second["side"], "buy")
         self.assertEqual(second["grid_leg"], 0)
+        self.assertEqual(second["iteration"], 4)
 
     def test_confirmed_resting_fill_uses_saved_limit_when_history_is_truncated(self) -> None:
         entry = {
@@ -415,7 +421,7 @@ class GridAvgTests(unittest.TestCase):
 
         source = {
             "side": "buy", "is_buy": True, "status": "filled", "replacement_pending": True,
-            "grid_leg": 0, "fill": {"px": "100", "sz": "0.4"}, "price": "99", "size": "0.4",
+            "grid_leg": 0, "iteration": 0, "fill": {"px": "100", "sz": "0.4"}, "price": "99", "size": "0.4",
         }
         row = {"gap_rate": "0.01", "min_order_value": "10", "base_buy_size": "0.4", "base_sell_size": "0.4", "levels": [source]}
         exchange = FakeExchange()
@@ -433,9 +439,48 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(len(row["levels"]), 1)
         child = row["levels"][0]
         self.assertEqual(child["grid_leg"], 1)
+        self.assertEqual(child["iteration"], 1)
         self.assertEqual(child["side"], "sell")
         self.assertEqual(child["status"], "active")
         self.assertTrue(exchange.request[-1])
+
+    def test_p2_iteration_counts_each_alo_submit_after_outward_rejects(self) -> None:
+        class FakeExchange:
+            def __init__(self):
+                self.calls = 0
+
+            def order(self, coin, is_buy, size, price, order_type, reduce_only=False):
+                self.calls += 1
+                if self.calls <= 2:
+                    return {
+                        "status": "ok",
+                        "response": {"data": {"statuses": [{"error": "Post only order would have immediately matched"}]}},
+                    }
+                return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 22}}]}}}
+
+        source = {
+            "side": "buy", "is_buy": True, "status": "filled", "replacement_pending": True,
+            "grid_leg": 0, "iteration": 4, "fill": {"px": "100", "sz": "0.4"},
+            "price": "99", "size": "0.4",
+        }
+        row = {
+            "gap_rate": "0.01", "min_order_value": "10",
+            "base_buy_size": "0.4", "base_sell_size": "0.4", "levels": [source],
+        }
+        exchange = FakeExchange()
+        ctx = {
+            "coin": "BTC", "asset": {"szDecimals": 2, "maxLeverage": 20}, "exchange": exchange,
+            "now": 123, "position_size": Decimal("1"), "current_mid": Decimal("100"),
+            "best_bid": Decimal("99.9"), "best_ask": Decimal("100.1"), "open_orders": [],
+            "open_oids": set(), "fills_by_oid": {}, "info": object(), "account": "0xabc",
+        }
+
+        count, changed = lifecycle_process_fills(row, ctx, {"action_limit_headroom": 100})
+
+        self.assertTrue(changed)
+        self.assertEqual(count, 1)
+        self.assertEqual(exchange.calls, 3)
+        self.assertEqual(row["levels"][0]["iteration"], 7)
 
     def test_p5_cancelled_leg_one_restores_without_reduce_only(self) -> None:
         class FakeInfo:
@@ -2177,6 +2222,7 @@ class GridAvgTests(unittest.TestCase):
         rows = format_grid_detail_rows(row, {1, 2, 3, 4})
 
         self.assertEqual([item["price"] for item in rows], ["105.00", "103.00", "101.00", "99.00"])
+        self.assertEqual([item["iteration"] for item in rows], ["0", "0", "0", "0"])
 
     def test_grid_detail_rows_insert_mid_marker_by_price(self) -> None:
         row = {

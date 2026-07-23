@@ -1556,11 +1556,14 @@ def submit_grid_child_order(
     cache: dict[str, Any] | None = None,
     *,
     consume_p1_budget: bool = False,
+    increment_iteration: bool = False,
 ) -> tuple[int | None, str, dict[str, Any] | None]:
     plan = order.get("plan")
     if not isinstance(plan, dict):
         raise ValueError("grid child order is missing its saved plan")
     reserve_grid_exchange_actions(cache, consume_p1_budget=consume_p1_budget)
+    if increment_iteration:
+        order["iteration"] = lifecycle_iteration(order) + 1
     result = exchange.order(
         coin,
         bool(plan["is_buy"]),
@@ -6685,6 +6688,7 @@ def migrate_grid_lifecycle(row: dict[str, Any], now: int) -> bool:
     row["grid_lifecycle_migrated_at"] = now
     row.pop("target_orders_per_side", None)
     row.pop("margin_pauses", None)
+    initialize_lifecycle_iterations(row)
     return True
 
 
@@ -6693,6 +6697,26 @@ def lifecycle_leg(entry: dict[str, Any]) -> int:
         return 1 if int(entry.get("grid_leg") or 0) == 1 else 0
     except (TypeError, ValueError):
         return 0
+
+
+def lifecycle_iteration(entry: dict[str, Any]) -> int:
+    try:
+        return max(0, int(entry.get("iteration") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def initialize_lifecycle_iterations(row: dict[str, Any]) -> bool:
+    """Persist iteration=0 for pre-counter grid entries."""
+    changed = False
+    for entry in row.get("levels") or []:
+        if not isinstance(entry, dict) or not entry.get("side"):
+            continue
+        iteration = lifecycle_iteration(entry)
+        if entry.get("iteration") != iteration:
+            entry["iteration"] = iteration
+            changed = True
+    return changed
 
 
 def lifecycle_active_price_too_close(
@@ -6783,6 +6807,7 @@ def lifecycle_replacement_from_fill(
     order["replacement_order"] = True
     order["grid_leg"] = 1 - lifecycle_leg(source)
     order["source_grid_leg"] = lifecycle_leg(source)
+    order["iteration"] = lifecycle_iteration(source)
     order["replacement_anchor_price"] = decimal_to_plain(fill_price)
     order["replacement_anchor_source"] = "market_fill" if isinstance(source.get("fill"), dict) else "saved_fill"
     order["preserve_fill_size"] = True
@@ -6833,6 +6858,7 @@ def lifecycle_submit_order(
 ) -> str:
     """Submit one finite-chain order; chain debt defers, completed legs may end."""
     order.pop("replace_never_cancel", None)
+    order["iteration"] = lifecycle_iteration(order)
     reduce_only = False if force_non_reduce_only else grid_order_reduces_position(order, position_size)
     set_grid_order_reduce_only(order, reduce_only)
     set_grid_order_tif(order, "Gtc" if force_gtc else "Alo")
@@ -6870,7 +6896,13 @@ def lifecycle_submit_order(
                 set_grid_order_price(order, next_price)
                 price = next_price
         try:
-            oid, state, submit_status = submit_grid_child_order(exchange, coin, order, cache)
+            oid, state, submit_status = submit_grid_child_order(
+                exchange,
+                coin,
+                order,
+                cache,
+                increment_iteration=not force_gtc,
+            )
         except GridPostOnlyRejected as exc:
             if force_gtc or not search_outward:
                 return lifecycle_mark_deferred_or_discarded(order, now, str(exc))
@@ -7302,6 +7334,7 @@ def lifecycle_materialize_birth_intent(
 
     birth.pop("replace_never_cancel", None)
     birth["grid_leg"] = 1
+    birth["iteration"] = 0
     birth["birth_source"] = source
     birth["birth_intent_cloid"] = cloid_text
     birth["preserve_fill_size"] = True
@@ -7460,6 +7493,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     row["lifecycle_mid"] = decimal_to_plain(ctx["current_mid"])
     phase = str(cache.get("grid_action_phase") or GRID_LIFECYCLE_PHASE_P0)
     changed = migrate_grid_lifecycle(row, ctx["now"])
+    changed = initialize_lifecycle_iterations(row) or changed
     levels = row.setdefault("levels", [])
     counters = cache.setdefault("grid_lifecycle_counters", {}).setdefault(id(row), {})
 

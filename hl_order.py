@@ -1735,6 +1735,7 @@ def grid_mid_marker_row(current_mid: Decimal) -> dict[str, str]:
     return {
         "side": marker,
         "leg": marker,
+        "iteration": marker,
         "status": "mid",
         "live": "-",
         "price": f"--- {format_optional_decimal(current_mid)} ---",
@@ -1791,6 +1792,9 @@ def format_grid_detail_rows(
             {
                 "side": str(entry.get("side", "")),
                 "leg": str(entry.get("grid_leg", "-")),
+                "iteration": str(max(0, int(entry.get("iteration") or 0)))
+                if str(entry.get("iteration") or "0").lstrip("-").isdigit()
+                else "0",
                 "status": display_status,
                 "live": live,
                 "price": format_optional_decimal(entry.get("price", entry.get("limit_px"))),
@@ -1986,6 +1990,7 @@ def query_grid(args: argparse.Namespace) -> None:
             [
                 ("side", "side"),
                 ("leg", "leg"),
+                ("iteration", "iter"),
                 ("status", "status"),
                 ("live", "live"),
                 ("price", "price"),
