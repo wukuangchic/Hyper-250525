@@ -6666,13 +6666,28 @@ def run_grid_limit_chase_p3(cache: dict[str, Any]) -> bool:
     return True
 
 
+def migrate_legacy_grid_position_limit_mode(row: dict[str, Any]) -> bool:
+    """Canonicalize legacy abs/long/short bounds as an equivalent signed limit."""
+    policy = grid_limit_policy_from_row(row)
+    if policy == "limit":
+        return False
+    minimum = Decimal(str(row.get("min_position_value") or "0"))
+    maximum = Decimal(str(row.get("max_position_value") or "0"))
+    lower_bound, upper_bound = grid_position_bounds(policy, minimum, maximum)
+    row["position_limit_mode"] = "limit"
+    row["min_position_value"] = decimal_to_plain(lower_bound)
+    row["max_position_value"] = decimal_to_plain(upper_bound)
+    row.pop("max_position_mode", None)
+    return True
+
+
 def migrate_grid_lifecycle(row: dict[str, Any], now: int) -> bool:
     """Move a saved grid into the finite-chain lifecycle without reviving old controls."""
+    changed = migrate_legacy_grid_position_limit_mode(row)
     if int(row.get("grid_lifecycle_version") or 0) >= GRID_LIFECYCLE_VERSION:
-        return False
+        return changed
     levels = row.setdefault("levels", [])
     migrated_levels: list[Any] = []
-    changed = False
     for entry in levels:
         if not isinstance(entry, dict) or not entry.get("side"):
             migrated_levels.append(entry)

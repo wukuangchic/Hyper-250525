@@ -205,6 +205,28 @@ class GridAvgTests(unittest.TestCase):
         self.assertNotIn("target_orders_per_side", row)
         self.assertNotIn("margin_pauses", row)
 
+    def test_finite_chain_migration_canonicalizes_legacy_position_modes_to_limit(self) -> None:
+        cases = [
+            ("abs", "0", "100", "-100", "100"),
+            ("long", "50", "400", "50", "400"),
+            ("short", "50", "400", "-400", "-50"),
+        ]
+        for mode, minimum, maximum, expected_minimum, expected_maximum in cases:
+            with self.subTest(mode=mode):
+                row = {
+                    "grid_lifecycle_version": 2,
+                    "position_limit_mode": mode,
+                    "min_position_value": minimum,
+                    "max_position_value": maximum,
+                    "levels": [],
+                }
+
+                self.assertTrue(migrate_grid_lifecycle(row, 123))
+                self.assertEqual(row["position_limit_mode"], "limit")
+                self.assertEqual(row["min_position_value"], expected_minimum)
+                self.assertEqual(row["max_position_value"], expected_maximum)
+                self.assertFalse(migrate_grid_lifecycle(row, 124))
+
     def test_p2_does_not_turn_terminal_filled_history_into_chain_debt(self) -> None:
         historical = {
             "side": "buy", "is_buy": True, "status": "filled", "oid": 1,
