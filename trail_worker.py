@@ -6704,6 +6704,22 @@ def lifecycle_active_price_too_close(
     return False
 
 
+def lifecycle_was_confirmed_resting(entry: dict[str, Any]) -> bool:
+    """A fully filled limit order that previously rested filled at its saved limit."""
+    submit_status = entry.get("last_submit_status")
+    resting = submit_status.get("resting") if isinstance(submit_status, dict) else None
+    if not isinstance(resting, dict):
+        return False
+    resting_oid = resting.get("oid")
+    entry_oid = entry.get("oid")
+    if resting_oid is None or entry_oid is None:
+        return True
+    try:
+        return int(resting_oid) == int(entry_oid)
+    except (TypeError, ValueError):
+        return False
+
+
 def lifecycle_fill_price_size(entry: dict[str, Any]) -> tuple[Decimal | None, Decimal | None]:
     fill = entry.get("fill")
     if isinstance(fill, dict):
@@ -6712,9 +6728,12 @@ def lifecycle_fill_price_size(entry: dict[str, Any]) -> tuple[Decimal | None, De
     else:
         price = None
         size = None
-    # A confirmed fill without fill details must wait for history.  Falling
-    # back to the resting limit can shift the next order away from avgPx.
     price = price or decimal_or_none(entry.get("filled_avg_px"))
+    # Once an order is confirmed resting, a later full fill executes at that
+    # resting limit.  This fallback is deliberately unavailable to an IOC or
+    # a GTC that crossed immediately, whose avgPx must come from fill details.
+    if price is None and lifecycle_was_confirmed_resting(entry):
+        price = decimal_or_none(entry.get("price", entry.get("limit_px")))
     size = size or decimal_or_none(entry.get("filled_size")) or decimal_or_none(entry.get("size"))
     return price, size
 

@@ -107,6 +107,7 @@ from trail_worker import (
     lifecycle_replacement_from_fill,
     lifecycle_submit_limit_chase,
     lifecycle_terminal_candidate,
+    lifecycle_fill_price_size,
     migrate_grid_lifecycle,
     mark_missing_order_confirmed_open,
     mark_pending_cancel_confirmed_cancelled,
@@ -231,6 +232,36 @@ class GridAvgTests(unittest.TestCase):
         self.assertIsNotNone(second)
         self.assertEqual(second["side"], "buy")
         self.assertEqual(second["grid_leg"], 0)
+
+    def test_confirmed_resting_fill_uses_saved_limit_when_history_is_truncated(self) -> None:
+        entry = {
+            "oid": 123,
+            "price": "100",
+            "size": "0.4",
+            "status": "filled",
+            "replacement_pending": True,
+            "last_submit_status": {"resting": {"oid": 123}},
+        }
+
+        self.assertEqual(
+            lifecycle_fill_price_size(entry),
+            (Decimal("100"), Decimal("0.4")),
+        )
+
+    def test_unconfirmed_crossing_fill_does_not_use_saved_limit(self) -> None:
+        entry = {
+            "oid": 123,
+            "price": "100",
+            "size": "0.4",
+            "status": "filled",
+            "replacement_pending": True,
+            "last_submit_status": {"filled": {"oid": 123}},
+        }
+
+        self.assertEqual(
+            lifecycle_fill_price_size(entry),
+            (None, Decimal("0.4")),
+        )
 
     def test_finite_chain_only_unfinished_leg_defers_on_submit_failure(self) -> None:
         unfinished = {"grid_leg": 1}
