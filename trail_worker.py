@@ -463,6 +463,21 @@ def lifecycle_p3_pending_pool(
     return pending
 
 
+def lifecycle_p3_failure_is_unknown(entry: dict[str, Any]) -> bool:
+    """Only deprioritize errors without a known retry/recovery path."""
+    error_text = str(entry.get("last_error") or "").strip()
+    if not error_text:
+        return False
+    lowered = error_text.lower()
+    known_retryable = (
+        is_insufficient_margin_text(error_text)
+        or is_post_only_reject_text(error_text)
+        or is_cumulative_action_limit_text(error_text)
+        or any(marker in lowered for marker in TRANSIENT_ERROR_TEXTS)
+    )
+    return not known_retryable
+
+
 def lifecycle_p7_farthest_pair(row: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]] | None:
     """Return the farthest active leg-1 buy/sell pair for one grid."""
     buys: list[tuple[Decimal, dict[str, Any]]] = []
@@ -7993,6 +8008,15 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 changed = True
                 if result == "submitted":
                     counters["p3_restored"] = int(counters.get("p3_restored") or 0) + 1
+                elif (
+                    result in {GRID_MARGIN_STATUS, GRID_CHAIN_DEBT_STATUS}
+                    and lifecycle_p3_failure_is_unknown(entry)
+                    and entry in levels
+                ):
+                    # Known retryable failures keep their queue position. Only
+                    # unknown/unresolvable failures move behind other debts.
+                    levels.remove(entry)
+                    levels.append(entry)
                 if raw_action_limit_deficit(cache) >= 0:
                     break
 

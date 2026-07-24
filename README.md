@@ -218,19 +218,19 @@ BTC grid --limit -300 0
 - 不写 `--gap`，或写 `--gap 0` / `--gap 0%` 时，默认使用 `最小价格变动百分比 + 折扣后 takerFee + 折扣后 makerFee`。
 - `--trend`：数量倾向，默认 `0`；正数让买入数量大于卖出数量，负数让卖出数量大于买入数量。取消趋势用 `--modify --trend 0`。
 - `--avg` / `--trend` 只保留为基础下单 size 的兼容配置，不再驱动 top-up、密度或动态间距维护。
-- 修改 `--gap` 只影响后续 P0/P2/P3/P4/P6 生成或外移的订单；既有 active 单不会被主动改价。
+- 修改 `--gap` 只影响后续 P0/P2/P3/P4/P6 生成或外移的订单，以及 P7 重组后交给 P3 的新债务单；既有 active 单不会被主动改价。
 - `--min 20`：每张子单价值至少 20；不填时按交易所最小名义价值。
 - `--total`、旧 `--max` 和旧 `--long` / `--short` / `--abs` 都不再作为推荐 grid 参数；新命令使用 `--limit MIN MAX`。
 - P0 `panic`：沿用 `panic_ratio` 触发条件。先用 `2 * base_size` 的 IOC reduce-only 市价减仓，并以当前实际仓位为上限；确认成交后，以实际 `avgPx` 为锚点出生 near/far 两张各半成交量的 `grid_leg=1` GTC 单。空 grid 没有可用于计算 ratio 的 active 减仓格时，P0 不会凭空出生订单。
 - P1 `terminal`：当账户 `withdrawable < 10` 时，每个账户（跨 DEX 合并计算）每轮最多撤一张真正占用保证金的非 reduce-only、`grid_leg=0` active 单，并按交易所订单时间从旧到新选择。reduce-only 挂单不占用保证金，P1 不撤；交易所确认撤单成功后才从 batch 移除，后续不再维护。
 - P2 `replacement`：处理确认成交的 active 格子单，以实际成交价为锚点在反方向 `1 * gap` 提交 ALO。每次成交都翻转格属性 `0 ↔ 1`；提交前按当前仓位重新判断增仓或减仓，减仓统一 reduce-only。
-- P3 `debt`：所有未能挂出的 `grid_leg=1` 都是必须重试的链债务；只有交易所明确返回保证金不足时状态才记为 `margin`，超时、限流、网络或其他提交失败记为 `chain_debt`。两者均在 `withdrawable > 5` 且 raw deficit `< 0` 时重新提交。`grid_leg=0` 提交失败则直接终结。
+- P3 `debt queue`：所有未能挂出的 `grid_leg=1` 都是必须重试的债务队列项；只有交易所明确返回保证金不足时状态才记为 `margin`，超时、限流、网络或其他提交失败记为 `chain_debt`。每轮 P3 根据当前快照构建队列并逐项处理，不是一次性提交全部债务；只有 `withdrawable > 5` 且 raw deficit `< 0` 时才提交，成功提交后退出 P3 队列（通常回到 active，若立即成交则交由 P2），失败则继续保留在队列并移动到队尾，下一轮再尝试。`grid_leg=0` 提交失败则直接终结。P7 产生的重组单也以 `chain_debt` 写入，等下一轮进入同一队列。
 - P4 `limit-chase`：raw deficit `< 0` 且 signed 仓位 value 仍在 `--limit` 之外时，按原方向逻辑提交一张目标数量为 `2 * base_size` 的 IOC 市价回归单；当方向正在减仓时，数量封顶到当前仓位，避免一次动作穿过零仓。市价纯减仓不受 `withdrawable` 限制；会加仓的动作仍要求 `withdrawable > 5`。确认成交后，以实际 `avgPx` 为锚点出生 near/far 两张各半成交量的 `grid_leg=1` GTC 单。P4 不设每轮全局数量上限，随机顺序中每个符合条件的 Grid 都可以执行；新空 grid 仍仅由 P4 出生。
 - P5 `anomaly`：只在 raw deficit `< -100` 时运行。记录中的 OID 异常消失且确认未成交时，`grid_leg=1` 当轮恢复为同方向、同价格、同属性的非 reduce-only ALO 单；`grid_leg=0` 直接从 batch 移除。
 - P6 `legacy-pause`：仅用于过渡。升级时现有 active 统一记为 `grid_leg=0`，现有 paused 统一转为 `legacy_pause + grid_leg=1`。当 `withdrawable > 5` 时，每个账户（跨 DEX 合并计算）每轮只恢复一张相对盘口最近的 legacy pause；恢复完成后进入普通生命周期。
 - P7 `debt-restructure`：仅在 `raw deficit < -100` 且 `withdrawable < 5` 时运行；每个账户（跨 DEX、跨币种合并）每轮最多操作一组，且该币种 BUY/SELL 两侧 active 数量都必须 `> 10`。满足后选择 active `grid_leg=1` 的最远 BUY 和最远 SELL（不筛选 reduce-only），撤销两腿后按原跨度围绕当前 mid 对称规划；size 取两腿平均值。两腿都撤销成功后，新单以 `chain_debt` 写入，下一轮进入普通 P3 队列；若只有一腿撤销成功，则把已撤销的一腿按原属性恢复为 P3 债务。网络错误和部分撤单结果会持久化意图并在后续轮次重试。
 - 每轮严格按 `P0 → P1 → P2 → P3 → P4 → P5 → P6 → P7` 执行。P0/P1/P2 必须扫描；P3/P4 仅在 raw deficit `< 0` 时执行；P5 仅在 raw deficit `< -100` 时执行；P6 只受自己的过渡余额条件控制；P7 只受自己的债务重组条件控制。
-- P2/P3/P5/P6 的限价单使用 ALO。若价格已经穿盘、ALO 被 post-only 拒绝，或与同侧已有 active 单距离不足，会沿远离盘口方向每次外移 `1 * gap` 后继续尝试；距离检查只看真实 active 单，不把旧 paused 记录当占位。
+- P2/P3/P5/P6 的限价单使用 ALO。若价格已经穿盘、ALO 被 post-only 拒绝，或与同侧已有 active 单距离不足，会沿远离盘口方向每次外移 `1 * gap` 后继续尝试；距离检查只看真实 active 单，不把旧 paused 记录当占位。P3 每次只处理当前队列目标，下一项等待后续队列处理。
 - P0/P4 派生的 near/far 双胞胎直接使用 GTC。P0/P4 的 IOC 市价单本身没有 `grid_leg`，只有确认成交后派生的反向格子单带属性。两张子单共享出生 `cloid`，并分别持久化 `birth_slot=near/far`；市价提交前会先持久化出生意图，写请求超时或进程中断后，下一轮按 `cloid` 查单并以实际成交价、数量补齐缺失的子单，避免漏单或重复单。
 - v2 生命周期不再执行 top-up、每侧 active-cap、固定 16 格、dense regrid、ROE/risk-density 暂停、普通 pause/recovery 或保活单逻辑。
 - Worker 继续输出 Info/Exchange/API 初始化调用的耗时统计，并把完整明细追加到 `logs/trail-api-timing.jsonl`。
@@ -268,7 +268,7 @@ BTC --cancel grid
 ```
 
 - `BTC grid --recover --limit -300 300 --gap 0.5%` 会把当前该币普通 limit open orders 接管为 `grid_leg=0`，用于服务器断点或 JSON 丢失后的人工恢复。
-- `BTC grid --query` 会展示该币 grid 的 limit/min/gap/仓位、买卖两边 active 数量、每张子单的 oid/价格/状态/live 情况和最近成交。
+- `BTC grid --query` 会展示该币 grid 的 limit/min/gap/仓位、买卖两边 active 数量、每张子单的 oid/价格/状态/live 情况和最近成交，并额外显示当前账户跨 DEX/跨币种的全部 `P3 Queue`。
 - `BTC --cancel grid` 会取消服务器维护的网格和所有活跃子单。
 
 ### Worker 行为
@@ -277,7 +277,7 @@ BTC --cancel grid
 - active 格子成交后由 P2 立即接续；优先使用成交历史中的实际成交价。若交易所已确认该限价单曾经 `resting`，但成交历史因接口条数上限缺失，则其完全成交价就是原挂单价，允许用保存的价格和数量接续；未确认 resting 的穿盘 GTC/IOC 仍必须等待实际 `avgPx`。
 - 每次提交前都根据最新仓位和订单方向重新判断增仓/减仓。减仓单使用 reduce-only，增仓单不使用 reduce-only；P5 异常恢复按规则强制使用非 reduce-only。
 - `grid_leg=1` 的接续单若未能挂出，会按真实失败原因保留为 `margin` 或 `chain_debt` 等待 P3；`grid_leg=0` 的接续单遇到失败直接终结，不形成长期暂停队列。
-- P1 撤单和 P6 恢复都以账户为配额单位，避免同一账户下多个币种在一轮内同时集中动作。
+- P1 撤单、P6 恢复和 P7 重组都以账户为配额单位，跨 DEX 合并计算；P3 本身按债务队列逐项处理，不额外占用 P1/P6/P7 的账户级配额。P7 每轮最多操作一组远端 BUY/SELL。
 - grid/trail 创建、修改和取消与 Worker 共用 `server_batch.lock`；命令执行期间 Worker 会跳过该轮，避免旧任务快照覆盖刚完成的修改。
 - 旧任务第一次进入 v2 Worker 时自动迁移：active 记为 leg 0，paused 记为 legacy pause/leg 1。P6 清空过渡队列后，旧 pause 状态不再产生。
 

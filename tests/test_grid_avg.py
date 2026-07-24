@@ -107,6 +107,7 @@ from trail_worker import (
     lifecycle_mark_deferred_or_discarded,
     lifecycle_materialize_birth_intent,
     lifecycle_p3_pending_pool,
+    lifecycle_p3_failure_is_unknown,
     lifecycle_process_p7,
     lifecycle_p7_farthest_pair,
     lifecycle_reconcile_birth_intents,
@@ -1603,6 +1604,46 @@ class GridAvgTests(unittest.TestCase):
             [(index, entry["id"]) for index, entry in pool],
             [(1, "eth-first"), (1, "eth-second"), (0, "btc-first")],
         )
+
+    def test_p3_failed_entry_moves_to_the_tail_of_its_grid_queue(self) -> None:
+        row = {
+            "type": "grid", "status": "active", "grid_lifecycle_version": 2,
+            "network": "mainnet", "account": "0xabc", "coin": "BTC", "gap_rate": "0.01",
+            "levels": [
+                {"side": "buy", "is_buy": True, "status": GRID_CHAIN_DEBT_STATUS, "grid_leg": 1, "oid": None, "price": "60", "size": "1"},
+                {"side": "sell", "is_buy": False, "status": GRID_CHAIN_DEBT_STATUS, "grid_leg": 1, "oid": None, "price": "110", "size": "1"},
+            ],
+        }
+        ctx = {
+            "network": "mainnet", "account": "0xabc", "coin": "BTC", "asset": {"szDecimals": 2},
+            "exchange": object(), "info": object(), "now": 123, "now_ms": 123000,
+            "position_size": Decimal("0"), "position_value": Decimal("0"), "current_mid": Decimal("100"),
+            "best_bid": Decimal("99"), "best_ask": Decimal("101"), "withdrawable": Decimal("6"),
+            "liquidation_px": None, "open_orders": [], "open_oids": set(), "fills_by_oid": {},
+        }
+
+        def fake_submit(_exchange, _coin, entry, *_args, **_kwargs):
+            entry["status"] = GRID_CHAIN_DEBT_STATUS
+            entry["last_error"] = "unexpected parser failure"
+            return GRID_CHAIN_DEBT_STATUS
+
+        with (
+            patch("trail_worker.lifecycle_context", return_value=ctx),
+            patch("trail_worker.lifecycle_submit_order", side_effect=fake_submit),
+        ):
+            maintain_grid(row, {
+                "grid_action_phase": "p3",
+                "action_limit_raw_deficit": -1,
+                "lifecycle_p3_target": row["levels"][0],
+            })
+
+        self.assertEqual([entry["side"] for entry in row["levels"]], ["sell", "buy"])
+
+    def test_p3_known_retryable_failure_keeps_queue_position(self) -> None:
+        self.assertFalse(lifecycle_p3_failure_is_unknown({"last_error": "Insufficient margin"}))
+        self.assertFalse(lifecycle_p3_failure_is_unknown({"last_error": "temporary network timeout"}))
+        self.assertFalse(lifecycle_p3_failure_is_unknown({"last_error": "Post only order would immediately match"}))
+        self.assertTrue(lifecycle_p3_failure_is_unknown({"last_error": "unexpected parser failure"}))
 
     def test_p7_restructures_farthest_leg1_pair_into_next_round_p3_debt(self) -> None:
         row = {
