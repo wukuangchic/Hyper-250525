@@ -1928,6 +1928,12 @@ def format_p3_queue_rows(
                 timestamp_ms = int(timestamp) * 1000
             except (TypeError, ValueError):
                 timestamp_ms = 0
+            try:
+                queue_seq = int(entry["p3_queue_seq"])
+                sort_key = f"{queue_seq:020d}:"
+            except (KeyError, TypeError, ValueError):
+                # Older rows may predate the persisted FIFO sequence.
+                sort_key = f"{10**20 + timestamp_ms:020d}:"
             queue_rows.append(
                 {
                     "dex": str(row.get("dex") or "default"),
@@ -1942,7 +1948,7 @@ def format_p3_queue_rows(
                     "oid": str(entry.get("oid") or "-"),
                     "error": str(entry.get("last_error") or "-"),
                     "updated": format_timestamp_ms(timestamp_ms) if timestamp_ms else "-",
-                    "_sort": f"{timestamp_ms:020d}:{row.get('dex', '')}:{row.get('coin', '')}:{entry.get('side', '')}",
+                    "_sort": f"{sort_key}{row.get('dex', '')}:{row.get('coin', '')}:{entry.get('side', '')}",
                 }
             )
     queue_rows.sort(key=lambda item: item.pop("_sort"))

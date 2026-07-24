@@ -7138,14 +7138,14 @@ class GridAvgTests(unittest.TestCase):
             {
                 "type": "grid", "status": "active", "network": "mainnet", "account": "0xAbC",
                 "coin": "BTC", "levels": [
-                    {"side": "buy", "grid_leg": 1, "status": "chain_debt", "price": "60", "size": "1", "chain_debt_at": 10, "p7_restructure": True},
+                    {"side": "buy", "grid_leg": 1, "status": "chain_debt", "price": "60", "size": "1", "chain_debt_at": 10, "p3_queue_seq": 1, "p7_restructure": True},
                     {"side": "sell", "grid_leg": 1, "status": "active", "price": "110", "size": "1"},
                 ],
             },
             {
                 "type": "grid", "status": "active", "network": "mainnet", "account": "0xabc",
                 "coin": "xyz:SPCX", "dex": "xyz", "levels": [
-                    {"side": "sell", "grid_leg": 1, "status": "margin", "price": "120", "size": "2", "margin_at": 20, "last_error": "Insufficient margin", "p6_legacy_pause": True},
+                    {"side": "sell", "grid_leg": 1, "status": "margin", "price": "120", "size": "2", "margin_at": 5, "p3_queue_seq": 2, "last_error": "Insufficient margin", "p6_legacy_pause": True},
                 ],
             },
             {
