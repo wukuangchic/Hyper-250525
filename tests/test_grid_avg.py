@@ -23,6 +23,7 @@ from hl_order import (
     grid_order_allowed_by_max,
     grid_order_should_reduce_only,
     format_grid_detail_rows,
+    format_p3_queue_rows,
     format_server_batch_rows,
     grid_query_avg_summary,
     grid_account_legacy_pause_total,
@@ -7085,6 +7086,36 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(display_rows[0]["avg"], "200")
         self.assertEqual(display_rows[1]["avg"], "-")
         self.assertNotIn("mgap", display_rows[0])
+
+    def test_p3_queue_rows_span_matching_account_coins_and_dexes(self) -> None:
+        rows = [
+            {
+                "type": "grid", "status": "active", "network": "mainnet", "account": "0xAbC",
+                "coin": "BTC", "levels": [
+                    {"side": "buy", "grid_leg": 1, "status": "chain_debt", "price": "60", "size": "1", "chain_debt_at": 10, "p7_restructure": True},
+                    {"side": "sell", "grid_leg": 1, "status": "active", "price": "110", "size": "1"},
+                ],
+            },
+            {
+                "type": "grid", "status": "active", "network": "mainnet", "account": "0xabc",
+                "coin": "xyz:SPCX", "dex": "xyz", "levels": [
+                    {"side": "sell", "grid_leg": 1, "status": "margin", "price": "120", "size": "2", "margin_at": 20, "last_error": "Insufficient margin"},
+                ],
+            },
+            {
+                "type": "grid", "status": "active", "network": "testnet", "account": "0xabc",
+                "coin": "ETH", "levels": [{"status": "chain_debt", "side": "buy"}],
+            },
+        ]
+
+        display_rows = format_p3_queue_rows(rows, "mainnet", "0xabc")
+
+        self.assertEqual([(row["coin"], row["status"], row["source"]) for row in display_rows], [
+            ("BTC", "chain_debt", "p7"),
+            ("xyz:SPCX", "margin", "-"),
+        ])
+        self.assertEqual(display_rows[0]["price"], "60")
+        self.assertEqual(display_rows[1]["error"], "Insufficient margin")
 
     def test_grid_plan_persists_base_and_effective_values(self) -> None:
         class FakeInfo:

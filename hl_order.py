@@ -1905,6 +1905,75 @@ def grid_account_legacy_pause_total(
     )
 
 
+def format_p3_queue_rows(
+    batch_rows: list[dict[str, Any]],
+    network: str,
+    account: str | None,
+) -> list[dict[str, str]]:
+    """Format all account-scoped P3 debt entries across coins and DEXes."""
+    queue_rows: list[dict[str, str]] = []
+    for row in batch_rows:
+        if (
+            row.get("type") != "grid"
+            or str(row.get("status") or "") == "cancelled"
+            or not batch_row_matches_context(row, network, account)
+        ):
+            continue
+        for entry in row.get("levels") or []:
+            if not isinstance(entry, dict) or str(entry.get("status") or "") not in {"margin", "chain_debt"}:
+                continue
+            status = str(entry.get("status") or "")
+            timestamp = entry.get("chain_debt_at") or entry.get("margin_at") or entry.get("last_error_at") or 0
+            try:
+                timestamp_ms = int(timestamp) * 1000
+            except (TypeError, ValueError):
+                timestamp_ms = 0
+            queue_rows.append(
+                {
+                    "dex": str(row.get("dex") or "default"),
+                    "coin": str(row.get("coin") or ""),
+                    "side": str(entry.get("side") or ""),
+                    "leg": str(entry.get("grid_leg", "-")),
+                    "status": status,
+                    "source": "p7" if entry.get("p7_restructure") else ("p7_restore" if entry.get("p7_restore") else "-"),
+                    "reduce": "1" if bool(entry.get("reduce_only")) else "0",
+                    "price": format_optional_decimal(entry.get("price", entry.get("limit_px"))),
+                    "size": format_optional_quantity(entry.get("size")),
+                    "oid": str(entry.get("oid") or "-"),
+                    "error": str(entry.get("last_error") or "-"),
+                    "updated": format_timestamp_ms(timestamp_ms) if timestamp_ms else "-",
+                    "_sort": f"{timestamp_ms:020d}:{row.get('dex', '')}:{row.get('coin', '')}:{entry.get('side', '')}",
+                }
+            )
+    queue_rows.sort(key=lambda item: item.pop("_sort"))
+    return queue_rows
+
+
+def print_p3_queue(batch_rows: list[dict[str, Any]], network: str, account: str | None) -> None:
+    queue_rows = format_p3_queue_rows(batch_rows, network, account)
+    if not queue_rows:
+        return
+    print_table(
+        "P3 Queue",
+        queue_rows,
+        [
+            ("dex", "dex"),
+            ("coin", "coin"),
+            ("side", "side"),
+            ("leg", "leg"),
+            ("status", "status"),
+            ("source", "source"),
+            ("reduce", "RO"),
+            ("price", "price"),
+            ("size", "size"),
+            ("oid", "oid"),
+            ("error", "error"),
+            ("updated", "updated"),
+        ],
+        show_count=True,
+    )
+
+
 def query_grid(args: argparse.Namespace) -> None:
     info, _exchange, account, signer, role = build_clients(args.network, args.timeout, args.coin, need_exchange=False)
     coin, asset = resolve_perp_asset(info, args.coin)
@@ -1924,6 +1993,7 @@ def query_grid(args: argparse.Namespace) -> None:
     rows = grid_query_rows(batch_rows, args.network, account, coin)
     if not rows:
         print_box("Grid", [("coin", coin), ("status", "not found")])
+        print_p3_queue(batch_rows, args.network, account)
         return
 
     open_oids: set[int] = set()
@@ -2002,6 +2072,7 @@ def query_grid(args: argparse.Namespace) -> None:
             ],
             show_count=False,
         )
+    print_p3_queue(batch_rows, args.network, account)
     print_recent_history(info, account, coin=coin, limit=10)
 
 
@@ -2064,6 +2135,7 @@ def query_account(args: argparse.Namespace) -> None:
         show_count=False,
     )
     print_server_batch(batch_rows, args.network, account)
+    print_p3_queue(batch_rows, args.network, account)
     print_recent_history(info, account, show_empty=True)
 
 
