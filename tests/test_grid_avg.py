@@ -616,7 +616,7 @@ class GridAvgTests(unittest.TestCase):
             all(birth["plan"]["order_type"] == {"limit": {"tif": "Gtc"}} for birth in row["levels"])
         )
 
-    def test_p4_add_market_still_requires_withdrawable_above_five(self) -> None:
+    def test_p4_add_market_still_requires_withdrawable_above_three(self) -> None:
         class UnexpectedExchange:
             def _slippage_price(self, coin, is_buy, slippage, mid):
                 return 100
@@ -630,7 +630,7 @@ class GridAvgTests(unittest.TestCase):
             "levels": [],
         }
         ctx = {
-            "withdrawable": Decimal("0"), "position_size": Decimal("0.5"), "position_value": Decimal("50"),
+            "withdrawable": Decimal("3"), "position_size": Decimal("0.5"), "position_value": Decimal("50"),
             "exchange": UnexpectedExchange(), "coin": "BTC", "asset": {"szDecimals": 2, "maxLeverage": 20},
             "current_mid": Decimal("100"), "best_bid": Decimal("99.9"), "best_ask": Decimal("100.1"),
             "now": 123, "open_orders": [],
@@ -2005,7 +2005,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertNotIn("limit_chase_error", row)
         self.assertNotIn("limit_chase_error_at", row)
 
-    def test_legacy_limit_chase_requires_withdrawable_strictly_above_five(self) -> None:
+    def test_legacy_limit_chase_requires_withdrawable_strictly_above_three(self) -> None:
         class FakeInfo:
             def all_mids(self, dex):
                 return {"BTC": "100"}
@@ -2020,13 +2020,13 @@ class GridAvgTests(unittest.TestCase):
             def spot_user_state(self, account):
                 return {
                     "balances": [
-                        {"token": 0, "coin": "USDC", "total": "15", "hold": "10"}
+                        {"token": 0, "coin": "USDC", "total": "13", "hold": "10"}
                     ]
                 }
 
         class FakeExchange:
             def order(self, *args, **kwargs):
-                raise AssertionError("limit chase must not submit when withdrawable equals 5")
+                raise AssertionError("limit chase must not submit when withdrawable equals 3")
 
         row = {
             "type": "grid",
