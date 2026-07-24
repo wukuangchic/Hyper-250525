@@ -511,39 +511,39 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(exchange.calls, 3)
         self.assertEqual(row["levels"][0]["iteration"], 7)
 
-    def test_p5_cancelled_leg_one_restores_without_reduce_only(self) -> None:
+    def test_p5_cancelled_leg_one_moves_to_p3_queue_tail(self) -> None:
         class FakeInfo:
             def query_order_by_oid(self, account, oid):
                 return {"order": {"status": "reduceOnlyCanceled"}}
-
-        class FakeExchange:
-            def order(self, coin, is_buy, size, price, order_type, reduce_only=False):
-                self.reduce_only = reduce_only
-                return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 23}}]}}}
 
         entry = grid_order_entry(
             {"gap_rate": "0.01", "min_order_value": "10", "base_buy_size": "1", "base_sell_size": "1"},
             "BTC", {"szDecimals": 2}, False, Decimal("101"), True, size=Decimal("1"), preserve_size=True,
         )
         entry.update({"status": "active", "oid": 9, "grid_leg": 1})
-        row = {"gap_rate": "0.01", "min_order_value": "10", "base_buy_size": "1", "base_sell_size": "1", "levels": [entry]}
-        exchange = FakeExchange()
+        prior_debt = {"status": GRID_CHAIN_DEBT_STATUS, "grid_leg": 1, "p3_queue_seq": 4}
+        row = {
+            "gap_rate": "0.01", "min_order_value": "10", "base_buy_size": "1", "base_sell_size": "1",
+            "levels": [prior_debt, entry],
+        }
         ctx = {
-            "coin": "BTC", "asset": {"szDecimals": 2, "maxLeverage": 20}, "exchange": exchange,
+            "coin": "BTC", "asset": {"szDecimals": 2, "maxLeverage": 20}, "exchange": object(),
             "now": 123, "position_size": Decimal("1"), "current_mid": Decimal("100"),
             "best_bid": Decimal("99.9"), "best_ask": Decimal("100.1"), "open_orders": [],
             "open_oids": set(), "fills_by_oid": {}, "info": FakeInfo(), "account": "0xabc",
         }
 
-        count, changed = lifecycle_process_anomalies(row, ctx, {"action_limit_headroom": 200})
+        count, changed = lifecycle_process_anomalies(row, ctx, {"action_limit_headroom": 200, "grid_rows": [row]})
 
         self.assertTrue(changed)
         self.assertEqual(count, 1)
-        self.assertEqual(entry["status"], "active")
+        self.assertEqual(entry["status"], GRID_CHAIN_DEBT_STATUS)
+        self.assertIsNone(entry["oid"])
+        self.assertEqual(entry["p3_queue_seq"], 5)
         self.assertEqual(entry["grid_leg"], 1)
-        self.assertFalse(exchange.reduce_only)
+        self.assertEqual(row["levels"], [prior_debt, entry])
 
-    def test_p5_restore_exception_preserves_chain_debt_not_pending(self) -> None:
+    def test_p5_queue_does_not_depend_on_exchange_submit(self) -> None:
         class FakeInfo:
             def query_order_by_oid(self, account, oid):
                 return {"order": {"status": "reduceOnlyCanceled"}}
@@ -568,8 +568,10 @@ class GridAvgTests(unittest.TestCase):
         count, changed = lifecycle_process_anomalies(row, ctx, {"action_limit_headroom": 200})
 
         self.assertTrue(changed)
-        self.assertEqual(count, 0)
+        self.assertEqual(count, 1)
         self.assertEqual(entry["status"], GRID_CHAIN_DEBT_STATUS)
+        self.assertIsNone(entry["oid"])
+        self.assertEqual(entry["p3_queue_seq"], 0)
 
     def test_p4_reduce_market_ignores_low_withdrawable_and_births_leg_one_gtc_order(self) -> None:
         class FakeExchange:

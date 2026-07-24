@@ -7521,9 +7521,8 @@ def lifecycle_process_fills(
 
 def lifecycle_process_anomalies(row: dict[str, Any], ctx: dict[str, Any], cache: dict[str, Any]) -> tuple[int, bool]:
     levels = row.setdefault("levels", [])
-    restored = 0
+    enqueued = 0
     changed = False
-    isolated_ready: set[str] = cache.setdefault("lifecycle_isolated_ready", set())
     for entry in list(levels):
         if not isinstance(entry, dict) or str(entry.get("status") or "") != "active":
             continue
@@ -7550,16 +7549,19 @@ def lifecycle_process_anomalies(row: dict[str, Any], ctx: dict[str, Any], cache:
                 levels.remove(entry)
                 changed = True
                 continue
+            # P5 only classifies the cancelled leg-1 order.  Leave the actual
+            # restore to the next worker's P3 FIFO, so all debt follows the
+            # same withdrawable, spacing, and action-budget gates.
             entry["oid"] = None
-            entry["status"] = "pending"
-            result = lifecycle_submit_order(
-                ctx["exchange"], ctx["coin"], entry, ctx["now"], row, ctx["asset"],
-                ctx["position_size"], ctx["current_mid"], ctx["best_bid"], ctx["best_ask"],
-                isolated_ready, ctx["open_orders"], cache, search_outward=True, force_non_reduce_only=True,
-            )
-            restored += int(result == "submitted")
+            entry["status"] = GRID_CHAIN_DEBT_STATUS
+            entry["chain_debt_at"] = ctx["now"]
+            entry["p5_restore_queued_at"] = ctx["now"]
+            lifecycle_assign_p3_queue_seq(entry, cache)
+            levels.remove(entry)
+            levels.append(entry)
+            enqueued += 1
             changed = True
-    return restored, changed
+    return enqueued, changed
 
 
 def persist_lifecycle_intent(cache: dict[str, Any]) -> None:
@@ -8081,7 +8083,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     elif phase == GRID_LIFECYCLE_PHASE_P5:
         if raw_action_limit_deficit(cache) < -100:
             count, phase_changed = lifecycle_process_anomalies(row, ctx, cache)
-            counters["p5_restored"] = int(counters.get("p5_restored") or 0) + count
+            counters["p5_enqueued"] = int(counters.get("p5_enqueued") or 0) + count
             changed = changed or phase_changed
 
     elif phase == GRID_LIFECYCLE_PHASE_P6:
