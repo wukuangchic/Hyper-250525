@@ -103,7 +103,6 @@ GRID_BIRTH_INTENT_UNKNOWN_GRACE_SECONDS = 120
 GRID_P6_WITHDRAWABLE_THRESHOLD = Decimal("5")
 GRID_P7_RAW_DEFICIT_THRESHOLD = -100
 GRID_P7_WITHDRAWABLE_THRESHOLD = Decimal("5")
-GRID_P7_MIN_ACTIVE_PER_SIDE = 10
 GRID_PANIC_RATIO_LEGACY_DEFAULT_THRESHOLDS = {
     Decimal("10"),
     Decimal("20"),
@@ -540,14 +539,7 @@ def lifecycle_p7_farthest_pair(row: dict[str, Any]) -> tuple[dict[str, Any], dic
     """Return the farthest active leg-1 buy/sell pair for one grid."""
     buys: list[tuple[Decimal, dict[str, Any]]] = []
     sells: list[tuple[Decimal, dict[str, Any]]] = []
-    active_buy_count = 0
-    active_sell_count = 0
     for entry in row.get("levels") or []:
-        if isinstance(entry, dict) and str(entry.get("status") or "") == "active":
-            if str(entry.get("side") or "") == "buy":
-                active_buy_count += 1
-            elif str(entry.get("side") or "") == "sell":
-                active_sell_count += 1
         if (
             not isinstance(entry, dict)
             or str(entry.get("status") or "") != "active"
@@ -563,12 +555,7 @@ def lifecycle_p7_farthest_pair(row: dict[str, Any]) -> tuple[dict[str, Any], dic
             buys.append((price, entry))
         elif side == "sell":
             sells.append((price, entry))
-    if (
-        active_buy_count <= GRID_P7_MIN_ACTIVE_PER_SIDE
-        or active_sell_count <= GRID_P7_MIN_ACTIVE_PER_SIDE
-        or not buys
-        or not sells
-    ):
+    if not buys or not sells:
         return None
     return min(buys, key=lambda item: item[0])[1], max(sells, key=lambda item: item[0])[1]
 

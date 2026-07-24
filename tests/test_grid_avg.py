@@ -1735,7 +1735,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(restored["price"], "60")
         self.assertTrue(restored["p7_restore"])
 
-    def test_p7_skips_when_either_side_has_only_ten_active_orders(self) -> None:
+    def test_p7_allows_restructure_with_fewer_than_eleven_active_orders_per_side(self) -> None:
         row = {
             "levels": [
                 *[
@@ -1748,7 +1748,9 @@ class GridAvgTests(unittest.TestCase):
                 ],
             ],
         }
-        self.assertIsNone(lifecycle_p7_farthest_pair(row))
+        pair = lifecycle_p7_farthest_pair(row)
+        self.assertIsNotNone(pair)
+        self.assertEqual((pair[0]["oid"], pair[1]["oid"]), (0, 110))
 
     def test_p7_claim_is_account_wide_across_dex_and_coins(self) -> None:
         def make_row() -> dict:
@@ -7139,7 +7141,7 @@ class GridAvgTests(unittest.TestCase):
             {
                 "type": "grid", "status": "active", "network": "mainnet", "account": "0xabc",
                 "coin": "xyz:SPCX", "dex": "xyz", "levels": [
-                    {"side": "sell", "grid_leg": 1, "status": "margin", "price": "120", "size": "2", "margin_at": 20, "last_error": "Insufficient margin"},
+                    {"side": "sell", "grid_leg": 1, "status": "margin", "price": "120", "size": "2", "margin_at": 20, "last_error": "Insufficient margin", "p6_legacy_pause": True},
                 ],
             },
             {
@@ -7152,7 +7154,7 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertEqual([(row["coin"], row["status"], row["source"]) for row in display_rows], [
             ("BTC", "chain_debt", "p7"),
-            ("xyz:SPCX", "margin", "-"),
+            ("xyz:SPCX", "margin", "P6"),
         ])
         self.assertEqual(display_rows[0]["price"], "60")
         self.assertEqual(display_rows[1]["error"], "Insufficient margin")
