@@ -105,6 +105,7 @@ from trail_worker import (
     lifecycle_legacy_pause_candidate,
     lifecycle_mark_deferred_or_discarded,
     lifecycle_materialize_birth_intent,
+    lifecycle_p3_pending_pool,
     lifecycle_reconcile_birth_intents,
     lifecycle_row_account_key,
     lifecycle_process_anomalies,
@@ -1531,8 +1532,18 @@ class GridAvgTests(unittest.TestCase):
 
     def test_run_once_scans_all_grids_by_global_action_phase(self) -> None:
         rows = [
-            {"type": "grid", "status": "active", "coin": "BTC", "levels": []},
-            {"type": "grid", "status": "active", "coin": "ETH", "levels": []},
+            {
+                "type": "grid",
+                "status": "active",
+                "coin": "BTC",
+                "levels": [{"status": GRID_CHAIN_DEBT_STATUS}],
+            },
+            {
+                "type": "grid",
+                "status": "active",
+                "coin": "ETH",
+                "levels": [{"status": GRID_CHAIN_DEBT_STATUS}],
+            },
         ]
         calls = []
 
@@ -1570,6 +1581,62 @@ class GridAvgTests(unittest.TestCase):
             ],
         )
         save_server_batch.assert_not_called()
+
+    def test_lifecycle_p3_pending_pool_preserves_grid_and_level_order(self) -> None:
+        eth_first = {"status": GRID_CHAIN_DEBT_STATUS, "id": "eth-first"}
+        eth_second = {"status": "margin", "id": "eth-second"}
+        btc_first = {"status": GRID_CHAIN_DEBT_STATUS, "id": "btc-first"}
+        rows = [
+            {"levels": [btc_first, {"status": "active"}]},
+            {"levels": [eth_first, {"status": "filled"}, eth_second]},
+        ]
+
+        pool = lifecycle_p3_pending_pool(rows, [1, 0])
+
+        self.assertEqual(
+            [(index, entry["id"]) for index, entry in pool],
+            [(1, "eth-first"), (1, "eth-second"), (0, "btc-first")],
+        )
+
+    def test_run_once_processes_p3_pending_pool_one_entry_at_a_time(self) -> None:
+        rows = [
+            {
+                "type": "grid",
+                "status": "active",
+                "coin": "BTC",
+                "levels": [{"status": GRID_CHAIN_DEBT_STATUS, "id": "btc"}],
+            },
+            {
+                "type": "grid",
+                "status": "active",
+                "coin": "ETH",
+                "levels": [
+                    {"status": GRID_CHAIN_DEBT_STATUS, "id": "eth-first"},
+                    {"status": "margin", "id": "eth-second"},
+                ],
+            },
+        ]
+        p3_targets = []
+
+        def fake_maintain_grid(row: dict, cache: dict) -> tuple[dict, bool]:
+            if cache.get("grid_action_phase") == "p3":
+                p3_targets.append((row["coin"], cache["lifecycle_p3_target"]["id"]))
+            return row, False
+
+        with (
+            patch("trail_worker.load_server_batch", return_value=rows),
+            patch("trail_worker.maintain_grid", side_effect=fake_maintain_grid),
+            patch("trail_worker.random.shuffle", side_effect=lambda indexes: indexes.reverse()),
+            patch("trail_worker.prune_done_rows", return_value=(rows, False)),
+            patch("trail_worker.prune_grid_level_history", return_value=False),
+            patch("trail_worker.save_server_batch"),
+        ):
+            run_once()
+
+        self.assertEqual(
+            p3_targets,
+            [("ETH", "eth-first"), ("ETH", "eth-second"), ("BTC", "btc")],
+        )
 
     def test_run_once_refreshes_position_and_market_caches_between_action_phases(self) -> None:
         rows = [{"type": "grid", "status": "active", "coin": "BTC", "levels": []}]

@@ -442,6 +442,22 @@ def raw_action_limit_deficit(cache: dict[str, Any] | None) -> int:
         return 0
 
 
+def lifecycle_p3_pending_pool(
+    rows: list[dict[str, Any]],
+    active_grid_indexes: list[int],
+) -> list[tuple[int, dict[str, Any]]]:
+    """Snapshot P3 debt in the same order grids and their levels were queued."""
+    pending: list[tuple[int, dict[str, Any]]] = []
+    for index in active_grid_indexes:
+        for entry in rows[index].get("levels") or []:
+            if (
+                isinstance(entry, dict)
+                and str(entry.get("status") or "") in {GRID_MARGIN_STATUS, GRID_CHAIN_DEBT_STATUS}
+            ):
+                pending.append((index, entry))
+    return pending
+
+
 def grid_order_far_from_mid(entry: dict[str, Any], current_mid: Decimal, rate: Decimal) -> bool:
     price = decimal_or_none(entry.get("price", entry.get("limit_px")))
     if price is None or price <= 0 or current_mid <= 0:
@@ -7738,9 +7754,12 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     elif phase == GRID_LIFECYCLE_PHASE_P3:
         if raw_action_limit_deficit(cache) < 0 and ctx["withdrawable"] is not None and ctx["withdrawable"] > Decimal("5"):
             isolated_ready = cache.setdefault("lifecycle_isolated_ready", set())
-            for entry in list(levels):
+            target = cache.get("lifecycle_p3_target")
+            pending_entries = [target] if isinstance(target, dict) else list(levels)
+            for entry in pending_entries:
                 if (
                     not isinstance(entry, dict)
+                    or not any(candidate is entry for candidate in levels)
                     or str(entry.get("status") or "") not in {GRID_MARGIN_STATUS, GRID_CHAIN_DEBT_STATUS}
                 ):
                     continue
@@ -7913,8 +7932,17 @@ def run_once() -> None:
 
     for phase in GRID_LIFECYCLE_PHASES:
         grid_cache["grid_action_phase"] = phase
-        for index in active_grid_indexes:
-            process_grid_index(index, f"grid {phase}")
+        if phase == GRID_LIFECYCLE_PHASE_P3:
+            pending_pool = lifecycle_p3_pending_pool(rows, active_grid_indexes)
+            grid_cache["lifecycle_p3_pending_pool"] = pending_pool
+            for index, entry in pending_pool:
+                grid_cache["lifecycle_p3_target"] = entry
+                process_grid_index(index, f"grid {phase}")
+            grid_cache.pop("lifecycle_p3_target", None)
+            grid_cache.pop("lifecycle_p3_pending_pool", None)
+        else:
+            for index in active_grid_indexes:
+                process_grid_index(index, f"grid {phase}")
         reconcile_cached_grid_open_orders(rows, active_grid_indexes, grid_cache)
         for info, _exchange, _account, _signer, _role in grid_cache.get("clients", {}).values():
             clear_info_cache(info)
