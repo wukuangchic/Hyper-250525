@@ -8050,16 +8050,10 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         ):
             attempted.add(account_key)
             _candidate_row, entry = candidate
-            entry["status"] = "pending"
+            entry["status"] = GRID_MARGIN_STATUS
             entry["grid_leg"] = 1
-            result = lifecycle_submit_order(
-                ctx["exchange"], ctx["coin"], entry, ctx["now"], row, ctx["asset"], ctx["position_size"],
-                ctx["current_mid"], ctx["best_bid"], ctx["best_ask"], cache.setdefault("lifecycle_isolated_ready", set()),
-                ctx["open_orders"], cache, search_outward=True,
-            )
-            if result == "submitted":
-                entry.pop("legacy_pause_status", None)
-                counters["p6_restored"] = int(counters.get("p6_restored") or 0) + 1
+            entry.pop("legacy_pause_status", None)
+            counters["p6_enqueued"] = int(counters.get("p6_enqueued") or 0) + 1
             changed = True
 
     elif phase == GRID_LIFECYCLE_PHASE_P7:

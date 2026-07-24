@@ -170,6 +170,7 @@ from trail_worker import (
     GRID_ACTION_PHASE_P2,
     GRID_CHAIN_DEBT_STATUS,
     GRID_LIFECYCLE_PHASE_P7,
+    GRID_MARGIN_STATUS,
     grid_entries_fit_within_max,
     grid_entries_near_first_per_side,
     grid_nearest_non_crossing_paused_entries,
@@ -362,7 +363,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertIsNotNone(candidate)
         self.assertIs(candidate[0], eth)
 
-    def test_finite_chain_p6_restores_one_legacy_pause_only_above_five_withdrawable(self) -> None:
+    def test_finite_chain_p6_enqueues_legacy_pause_as_margin_debt(self) -> None:
         def run(withdrawable: Decimal) -> tuple[dict, int]:
             row = {
                 "type": "grid", "status": "active", "grid_lifecycle_version": 2,
@@ -383,13 +384,9 @@ class GridAvgTests(unittest.TestCase):
                 "open_orders": [], "open_oids": set(), "fills_by_oid": {},
             }
 
-            def fake_submit(_exchange, _coin, entry, *_args, **_kwargs):
-                entry.update({"status": "active", "oid": 77})
-                return "submitted"
-
             with (
                 patch("trail_worker.lifecycle_context", return_value=ctx),
-                patch("trail_worker.lifecycle_submit_order", side_effect=fake_submit) as submit_mock,
+                patch("trail_worker.lifecycle_submit_order") as submit_mock,
             ):
                 maintain_grid(row, {"grid_action_phase": "p6", "grid_rows": [row]})
             return row, submit_mock.call_count
@@ -399,9 +396,9 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertEqual(boundary_submits, 0)
         self.assertEqual(at_boundary["legacy_pause_remaining"], 2)
-        self.assertEqual(above_submits, 1)
+        self.assertEqual(above_submits, 0)
         self.assertEqual(above_boundary["legacy_pause_remaining"], 1)
-        self.assertEqual(sum(entry["status"] == "active" for entry in above_boundary["levels"]), 1)
+        self.assertEqual(sum(entry["status"] == "margin" for entry in above_boundary["levels"]), 1)
 
     def test_finite_chain_account_quota_is_shared_across_dexes(self) -> None:
         default = {"account": "0xAbC", "dex": ""}
