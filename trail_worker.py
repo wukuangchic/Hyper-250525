@@ -8052,6 +8052,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             _candidate_row, entry = candidate
             entry["status"] = GRID_MARGIN_STATUS
             entry["grid_leg"] = 1
+            entry["p6_legacy_pause"] = True
             entry.pop("legacy_pause_status", None)
             if entry in levels:
                 levels.remove(entry)

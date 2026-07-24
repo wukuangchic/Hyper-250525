@@ -1935,7 +1935,7 @@ def format_p3_queue_rows(
                     "side": str(entry.get("side") or ""),
                     "leg": str(entry.get("grid_leg", "-")),
                     "status": status,
-                    "source": "p7" if entry.get("p7_restructure") else ("p7_restore" if entry.get("p7_restore") else "-"),
+                    "source": "p7" if entry.get("p7_restructure") else ("p7_restore" if entry.get("p7_restore") else ("p6" if entry.get("p6_legacy_pause") else "-")),
                     "reduce": "1" if bool(entry.get("reduce_only")) else "0",
                     "price": format_optional_decimal(entry.get("price", entry.get("limit_px"))),
                     "size": format_optional_quantity(entry.get("size")),
