@@ -460,7 +460,65 @@ def lifecycle_p3_pending_pool(
                 and str(entry.get("status") or "") in {GRID_MARGIN_STATUS, GRID_CHAIN_DEBT_STATUS}
             ):
                 pending.append((index, entry))
-    return pending
+    # P3 is a fixed FIFO pool. Queue positions are initialized before the
+    # worker shuffles indexes for the other lifecycle phases.
+    return sorted(pending, key=lambda item: int(item[1]["p3_queue_seq"]))
+
+
+def lifecycle_initialize_p3_queue(
+    rows: list[dict[str, Any]],
+    active_grid_indexes: list[int],
+) -> bool:
+    """Backfill stable FIFO positions for debt loaded from older state."""
+    maximum = -1
+    for index in active_grid_indexes:
+        for entry in rows[index].get("levels") or []:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("status") or "") not in {GRID_MARGIN_STATUS, GRID_CHAIN_DEBT_STATUS}:
+                continue
+            try:
+                maximum = max(maximum, int(entry["p3_queue_seq"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+    changed = False
+    next_seq = maximum + 1
+    for index in sorted(active_grid_indexes):
+        for entry in rows[index].get("levels") or []:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("status") or "") not in {GRID_MARGIN_STATUS, GRID_CHAIN_DEBT_STATUS}:
+                continue
+            try:
+                int(entry["p3_queue_seq"])
+            except (KeyError, TypeError, ValueError):
+                entry["p3_queue_seq"] = next_seq
+                next_seq += 1
+                changed = True
+    return changed
+
+
+def lifecycle_assign_p3_queue_seq(entry: dict[str, Any], cache: dict[str, Any]) -> None:
+    """Assign one worker-global FIFO position to newly created P3 debt."""
+    if str(entry.get("status") or "") not in {GRID_MARGIN_STATUS, GRID_CHAIN_DEBT_STATUS}:
+        return
+    try:
+        int(entry["p3_queue_seq"])
+        return
+    except (KeyError, TypeError, ValueError):
+        pass
+    next_seq = cache.get("lifecycle_p3_next_seq")
+    if next_seq is None:
+        maximum = -1
+        for row in cache.get("grid_rows") or []:
+            for candidate in row.get("levels") or []:
+                try:
+                    maximum = max(maximum, int(candidate.get("p3_queue_seq")))
+                except (AttributeError, TypeError, ValueError):
+                    continue
+        next_seq = maximum + 1
+    entry["p3_queue_seq"] = int(next_seq)
+    cache["lifecycle_p3_next_seq"] = int(next_seq) + 1
 
 
 def lifecycle_p3_failure_is_unknown(entry: dict[str, Any]) -> bool:
@@ -682,6 +740,7 @@ def lifecycle_process_p7(row: dict[str, Any], ctx: dict[str, Any], cache: dict[s
         order["p7_source_sell_oid"] = intent.get("sell_oid")
         order["status"] = GRID_CHAIN_DEBT_STATUS
         order["chain_debt_at"] = ctx["now"]
+        lifecycle_assign_p3_queue_seq(order, cache)
         levels.append(order)
     row["p7_restructure"] = {
         "at": ctx["now"],
@@ -7147,6 +7206,11 @@ def lifecycle_submit_order(
     force_non_reduce_only: bool = False,
 ) -> str:
     """Submit one finite-chain order; chain debt defers, completed legs may end."""
+    def defer(error_text: str) -> str:
+        result = lifecycle_mark_deferred_or_discarded(order, now, error_text)
+        lifecycle_assign_p3_queue_seq(order, cache)
+        return result
+
     order.pop("replace_never_cancel", None)
     order["iteration"] = lifecycle_iteration(order)
     reduce_only = False if force_non_reduce_only else grid_order_reduces_position(order, position_size)
@@ -7154,16 +7218,16 @@ def lifecycle_submit_order(
     set_grid_order_tif(order, "Gtc" if force_gtc else "Alo")
     plan = order.get("plan")
     if not isinstance(plan, dict):
-        return lifecycle_mark_deferred_or_discarded(order, now, "grid order is missing its saved plan")
+        return defer("grid order is missing its saved plan")
     if position_size == 0 and not reduce_only and asset_requires_isolated_margin(asset) and coin not in isolated_leverage_ready:
         try:
             reserve_grid_exchange_actions(cache)
             leverage, leverage_result = update_isolated_opening_leverage(exchange, int(asset["maxLeverage"]), coin)
         except Exception as exc:
-            return lifecycle_mark_deferred_or_discarded(order, now, str(exc))
+            return defer(str(exc))
         if leverage_result.get("status") != "ok":
             error_text = f"Failed to set isolated opening leverage to {leverage}x: {leverage_result}"
-            return lifecycle_mark_deferred_or_discarded(order, now, error_text)
+            return defer(error_text)
         isolated_leverage_ready.add(coin)
     if not bool(order.get("preserve_fill_size")):
         ensure_grid_order_min_notional(row, asset, order)
@@ -7182,7 +7246,7 @@ def lifecycle_submit_order(
             ):
                 next_price = next_outward_grid_price(row, asset, order)
                 if next_price is None or next_price <= 0 or next_price == price:
-                    return lifecycle_mark_deferred_or_discarded(order, now, "unable to move lifecycle order outward")
+                    return defer("unable to move lifecycle order outward")
                 set_grid_order_price(order, next_price)
                 price = next_price
         try:
@@ -7195,19 +7259,19 @@ def lifecycle_submit_order(
             )
         except GridPostOnlyRejected as exc:
             if force_gtc or not search_outward:
-                return lifecycle_mark_deferred_or_discarded(order, now, str(exc))
+                return defer(str(exc))
             next_price = next_outward_grid_price(row, asset, order)
             if next_price is None or next_price <= 0 or next_price == price:
-                return lifecycle_mark_deferred_or_discarded(order, now, str(exc))
+                return defer(str(exc))
             set_grid_order_price(order, next_price)
             order["alo_rejects"] = int(order.get("alo_rejects") or 0) + 1
             continue
         except GridActionBudgetUnavailable as exc:
-            return lifecycle_mark_deferred_or_discarded(order, now, str(exc))
+            return defer(str(exc))
         except RuntimeError as exc:
-            return lifecycle_mark_deferred_or_discarded(order, now, str(exc))
+            return defer(str(exc))
         except Exception as exc:
-            return lifecycle_mark_deferred_or_discarded(order, now, str(exc))
+            return defer(str(exc))
         order["oid"] = oid
         order["status"] = state
         order["submitted_at"] = now
@@ -7226,7 +7290,7 @@ def lifecycle_submit_order(
                     "time": now * 1000,
                 }
         return "submitted"
-    return lifecycle_mark_deferred_or_discarded(order, now, "ALO outward search exhausted")
+    return defer("ALO outward search exhausted")
 
 
 def lifecycle_context(row: dict[str, Any], cache: dict[str, Any]) -> dict[str, Any]:
@@ -7756,6 +7820,7 @@ def lifecycle_materialize_birth_intent(
         birth["birth_intent_cloid"] = cloid_text
         birth["preserve_fill_size"] = True
         birth["status"] = GRID_CHAIN_DEBT_STATUS
+        lifecycle_assign_p3_queue_seq(birth, cache)
         levels.append(birth)
         appended.append(birth)
     lifecycle_remove_birth_intent(row, intent, cache)
@@ -8053,6 +8118,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             entry["status"] = GRID_MARGIN_STATUS
             entry["grid_leg"] = 1
             entry["p6_legacy_pause"] = True
+            lifecycle_assign_p3_queue_seq(entry, cache)
             entry.pop("legacy_pause_status", None)
             if entry in levels:
                 levels.remove(entry)
@@ -8111,7 +8177,7 @@ def run_once() -> None:
         "run_started_at": int(time.time()),
         "run_monotonic_started_at": time.monotonic(),
     }
-    changed = False
+    changed = lifecycle_initialize_p3_queue(rows, active_grid_indexes)
     for index in active_trail_indexes:
         row = rows[index]
         try:
@@ -8182,7 +8248,7 @@ def run_once() -> None:
     for phase in GRID_LIFECYCLE_PHASES:
         grid_cache["grid_action_phase"] = phase
         if phase == GRID_LIFECYCLE_PHASE_P3:
-            pending_pool = lifecycle_p3_pending_pool(rows, active_grid_indexes)
+            pending_pool = lifecycle_p3_pending_pool(rows, sorted(active_grid_indexes))
             grid_cache["lifecycle_p3_pending_pool"] = pending_pool
             for index, entry in pending_pool:
                 grid_cache["lifecycle_p3_target"] = entry

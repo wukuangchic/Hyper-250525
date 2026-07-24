@@ -1574,8 +1574,8 @@ class GridAvgTests(unittest.TestCase):
                 ("BTC", "p1"),
                 ("ETH", "p2"),
                 ("BTC", "p2"),
-                ("ETH", "p3"),
                 ("BTC", "p3"),
+                ("ETH", "p3"),
                 ("ETH", "p4"),
                 ("BTC", "p4"),
                 ("ETH", "p5"),
@@ -1586,12 +1586,12 @@ class GridAvgTests(unittest.TestCase):
                 ("BTC", "p7"),
             ],
         )
-        save_server_batch.assert_not_called()
+        save_server_batch.assert_called_once()
 
     def test_lifecycle_p3_pending_pool_preserves_grid_and_level_order(self) -> None:
-        eth_first = {"status": GRID_CHAIN_DEBT_STATUS, "id": "eth-first"}
-        eth_second = {"status": "margin", "id": "eth-second"}
-        btc_first = {"status": GRID_CHAIN_DEBT_STATUS, "id": "btc-first"}
+        eth_first = {"status": GRID_CHAIN_DEBT_STATUS, "id": "eth-first", "p3_queue_seq": 0}
+        eth_second = {"status": "margin", "id": "eth-second", "p3_queue_seq": 1}
+        btc_first = {"status": GRID_CHAIN_DEBT_STATUS, "id": "btc-first", "p3_queue_seq": 2}
         rows = [
             {"levels": [btc_first, {"status": "active"}]},
             {"levels": [eth_first, {"status": "filled"}, eth_second]},
@@ -1831,7 +1831,7 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertEqual(
             p3_targets,
-            [("ETH", "eth-first"), ("ETH", "eth-second"), ("BTC", "btc")],
+            [("BTC", "btc"), ("ETH", "eth-first"), ("ETH", "eth-second")],
         )
 
     def test_run_once_refreshes_position_and_market_caches_between_action_phases(self) -> None:
