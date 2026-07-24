@@ -106,6 +106,8 @@ from trail_worker import (
     lifecycle_mark_deferred_or_discarded,
     lifecycle_materialize_birth_intent,
     lifecycle_p3_pending_pool,
+    lifecycle_process_p7,
+    lifecycle_p7_farthest_pair,
     lifecycle_reconcile_birth_intents,
     lifecycle_row_account_key,
     lifecycle_process_anomalies,
@@ -165,6 +167,7 @@ from trail_worker import (
     GRID_ACTION_PHASE_P1_WITHDRAWABLE,
     GRID_ACTION_PHASE_P2,
     GRID_CHAIN_DEBT_STATUS,
+    GRID_LIFECYCLE_PHASE_P7,
     grid_entries_fit_within_max,
     grid_entries_near_first_per_side,
     grid_nearest_non_crossing_paused_entries,
@@ -1578,6 +1581,8 @@ class GridAvgTests(unittest.TestCase):
                 ("BTC", "p5"),
                 ("ETH", "p6"),
                 ("BTC", "p6"),
+                ("ETH", "p7"),
+                ("BTC", "p7"),
             ],
         )
         save_server_batch.assert_not_called()
@@ -1597,6 +1602,156 @@ class GridAvgTests(unittest.TestCase):
             [(index, entry["id"]) for index, entry in pool],
             [(1, "eth-first"), (1, "eth-second"), (0, "btc-first")],
         )
+
+    def test_p7_restructures_farthest_leg1_pair_into_next_round_p3_debt(self) -> None:
+        row = {
+            "gap_rate": "0.01",
+            "sz_decimals": 2,
+            "levels": [
+                {"side": "buy", "is_buy": True, "status": "active", "grid_leg": 1, "oid": 1, "price": "60", "size": "2", "reduce_only": True},
+                {"side": "buy", "is_buy": True, "status": "active", "grid_leg": 1, "oid": 2, "price": "90", "size": "3", "reduce_only": False},
+                {"side": "sell", "is_buy": False, "status": "active", "grid_leg": 1, "oid": 3, "price": "110", "size": "4", "reduce_only": False},
+                {"side": "sell", "is_buy": False, "status": "active", "grid_leg": 1, "oid": 4, "price": "105", "size": "5", "reduce_only": True},
+            ],
+        }
+        row["levels"].extend(
+            [
+                {"side": "buy", "status": "active", "grid_leg": 0, "oid": 100 + index, "price": str(70 + index), "size": "1"}
+                for index in range(9)
+            ]
+            + [
+                {"side": "sell", "status": "active", "grid_leg": 0, "oid": 200 + index, "price": str(101 + index), "size": "1"}
+                for index in range(9)
+            ]
+        )
+
+        class FakeExchange:
+            def bulk_cancel(self, requests):
+                return {"status": "ok", "response": {"data": {"statuses": [
+                    "success",
+                    "success",
+                ]}}}
+
+        pair = lifecycle_p7_farthest_pair(row)
+        self.assertEqual((pair[0]["oid"], pair[1]["oid"]), (1, 3))
+        ctx = {
+            "network": "mainnet", "account": "0xabc", "coin": "BTC", "dex": "",
+            "now": 100, "withdrawable": Decimal("4"), "current_mid": Decimal("100"),
+            "open_oids": {1, 3}, "exchange": FakeExchange(),
+            "asset": {"szDecimals": 2},
+        }
+        cache = {"action_limit_raw_deficit": -101, "grid_action_phase": "p7"}
+        changed, created = lifecycle_process_p7(row, ctx, cache)
+
+        self.assertTrue(changed)
+        self.assertEqual(created, 2)
+        self.assertNotIn("p7_restructure_intent", row)
+        rebuilt = [entry for entry in row["levels"] if entry.get("p7_restructure")]
+        self.assertEqual([(entry["side"], entry["price"]) for entry in rebuilt], [("buy", "75"), ("sell", "125")])
+        self.assertEqual({entry["status"] for entry in rebuilt}, {GRID_CHAIN_DEBT_STATUS})
+        self.assertEqual({entry["size"] for entry in rebuilt}, {"3"})
+        self.assertEqual({entry.get("oid") for entry in rebuilt}, {None})
+        self.assertNotIn(1, {entry.get("oid") for entry in row["levels"]})
+        self.assertNotIn(3, {entry.get("oid") for entry in row["levels"]})
+
+    def test_p7_partial_cancel_puts_cancelled_source_back_in_p3(self) -> None:
+        row = {
+            "gap_rate": "0.01", "levels": [
+                {"side": "buy", "is_buy": True, "status": "active", "grid_leg": 1, "oid": 1, "price": "60", "size": "2", "reduce_only": False},
+                {"side": "sell", "is_buy": False, "status": "active", "grid_leg": 1, "oid": 2, "price": "110", "size": "2", "reduce_only": True},
+            ],
+        }
+        row["levels"].extend(
+            [
+                {"side": "buy", "status": "active", "grid_leg": 0, "oid": 300 + index, "price": str(70 + index), "size": "1"}
+                for index in range(10)
+            ]
+            + [
+                {"side": "sell", "status": "active", "grid_leg": 0, "oid": 400 + index, "price": str(100 + index), "size": "1"}
+                for index in range(10)
+            ]
+        )
+
+        class FakeExchange:
+            def bulk_cancel(self, requests):
+                return {"status": "ok", "response": {"data": {"statuses": [
+                    "success",
+                    {"error": "temporary network failure"},
+                ]}}}
+
+        ctx = {
+            "network": "mainnet", "account": "0xabc", "coin": "BTC",
+            "now": 100, "withdrawable": Decimal("4"), "current_mid": Decimal("100"),
+            "open_oids": {1, 2}, "exchange": FakeExchange(),
+            "asset": {"szDecimals": 2},
+        }
+        changed, created = lifecycle_process_p7(row, ctx, {"action_limit_raw_deficit": -101})
+
+        self.assertTrue(changed)
+        self.assertEqual(created, 1)
+        self.assertEqual([entry["status"] for entry in row["levels"]], ["active", GRID_CHAIN_DEBT_STATUS])
+        restored = row["levels"][1]
+        self.assertEqual(restored["price"], "60")
+        self.assertTrue(restored["p7_restore"])
+
+    def test_p7_skips_when_either_side_has_only_ten_active_orders(self) -> None:
+        row = {
+            "levels": [
+                *[
+                    {"side": "buy", "status": "active", "grid_leg": 1, "oid": index, "price": str(60 + index), "size": "1"}
+                    for index in range(10)
+                ],
+                *[
+                    {"side": "sell", "status": "active", "grid_leg": 1, "oid": 100 + index, "price": str(110 + index), "size": "1"}
+                    for index in range(11)
+                ],
+            ],
+        }
+        self.assertIsNone(lifecycle_p7_farthest_pair(row))
+
+    def test_p7_claim_is_account_wide_across_dex_and_coins(self) -> None:
+        def make_row() -> dict:
+            return {
+                "gap_rate": "0.01",
+                "sz_decimals": 2,
+                "levels": [
+                    {"side": "buy", "status": "active", "grid_leg": 1, "oid": 1, "price": "60", "size": "1"},
+                    *[
+                        {"side": "buy", "status": "active", "grid_leg": 0, "oid": 10 + index, "price": str(70 + index), "size": "1"}
+                        for index in range(10)
+                    ],
+                    {"side": "sell", "status": "active", "grid_leg": 1, "oid": 2, "price": "110", "size": "1"},
+                    *[
+                        {"side": "sell", "status": "active", "grid_leg": 0, "oid": 30 + index, "price": str(100 + index), "size": "1"}
+                        for index in range(10)
+                    ],
+                ],
+            }
+
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def bulk_cancel(self, requests):
+                self.calls += 1
+                return {"status": "ok", "response": {"data": {"statuses": ["success", "success"]}}}
+
+        exchange = FakeExchange()
+        cache = {"action_limit_raw_deficit": -101}
+        base_ctx = {
+            "network": "mainnet", "account": "0xabc", "now": 100,
+            "withdrawable": Decimal("4"), "current_mid": Decimal("100"),
+            "open_oids": {1, 2}, "exchange": exchange, "asset": {"szDecimals": 2},
+        }
+        first_ctx = {**base_ctx, "coin": "BTC"}
+        second_ctx = {**base_ctx, "coin": "ETH"}
+
+        first_changed, _ = lifecycle_process_p7(make_row(), first_ctx, cache)
+        second_changed, _ = lifecycle_process_p7(make_row(), second_ctx, cache)
+
+        self.assertTrue(first_changed)
+        self.assertFalse(second_changed)
+        self.assertEqual(exchange.calls, 1)
 
     def test_run_once_processes_p3_pending_pool_one_entry_at_a_time(self) -> None:
         rows = [

@@ -101,6 +101,9 @@ GRID_MARGIN_STATUS = "margin"
 GRID_CHAIN_DEBT_STATUS = "chain_debt"
 GRID_BIRTH_INTENT_UNKNOWN_GRACE_SECONDS = 120
 GRID_P6_WITHDRAWABLE_THRESHOLD = Decimal("5")
+GRID_P7_RAW_DEFICIT_THRESHOLD = -100
+GRID_P7_WITHDRAWABLE_THRESHOLD = Decimal("5")
+GRID_P7_MIN_ACTIVE_PER_SIDE = 10
 GRID_PANIC_RATIO_LEGACY_DEFAULT_THRESHOLDS = {
     Decimal("10"),
     Decimal("20"),
@@ -147,6 +150,7 @@ GRID_LIFECYCLE_PHASE_P3 = "p3"
 GRID_LIFECYCLE_PHASE_P4 = "p4"
 GRID_LIFECYCLE_PHASE_P5 = "p5"
 GRID_LIFECYCLE_PHASE_P6 = "p6"
+GRID_LIFECYCLE_PHASE_P7 = "p7"
 GRID_LIFECYCLE_PHASES = (
     GRID_LIFECYCLE_PHASE_P0,
     GRID_LIFECYCLE_PHASE_P1,
@@ -155,6 +159,7 @@ GRID_LIFECYCLE_PHASES = (
     GRID_LIFECYCLE_PHASE_P4,
     GRID_LIFECYCLE_PHASE_P5,
     GRID_LIFECYCLE_PHASE_P6,
+    GRID_LIFECYCLE_PHASE_P7,
 )
 GRID_MAX_LEVELS_PER_SIDE = 1024
 GRID_MAX_ACTIVE_ORDERS_PER_SIDE = 16
@@ -456,6 +461,223 @@ def lifecycle_p3_pending_pool(
             ):
                 pending.append((index, entry))
     return pending
+
+
+def lifecycle_p7_farthest_pair(row: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Return the farthest active leg-1 buy/sell pair for one grid."""
+    buys: list[tuple[Decimal, dict[str, Any]]] = []
+    sells: list[tuple[Decimal, dict[str, Any]]] = []
+    active_buy_count = 0
+    active_sell_count = 0
+    for entry in row.get("levels") or []:
+        if isinstance(entry, dict) and str(entry.get("status") or "") == "active":
+            if str(entry.get("side") or "") == "buy":
+                active_buy_count += 1
+            elif str(entry.get("side") or "") == "sell":
+                active_sell_count += 1
+        if (
+            not isinstance(entry, dict)
+            or str(entry.get("status") or "") != "active"
+            or lifecycle_leg(entry) != 1
+            or entry.get("oid") is None
+        ):
+            continue
+        price = decimal_or_none(entry.get("price", entry.get("limit_px")))
+        if price is None or price <= 0:
+            continue
+        side = str(entry.get("side") or "")
+        if side == "buy":
+            buys.append((price, entry))
+        elif side == "sell":
+            sells.append((price, entry))
+    if (
+        active_buy_count <= GRID_P7_MIN_ACTIVE_PER_SIDE
+        or active_sell_count <= GRID_P7_MIN_ACTIVE_PER_SIDE
+        or not buys
+        or not sells
+    ):
+        return None
+    return min(buys, key=lambda item: item[0])[1], max(sells, key=lambda item: item[0])[1]
+
+
+def lifecycle_p7_source_snapshot(entry: dict[str, Any]) -> dict[str, Any]:
+    """Keep enough of a cancelled source order to restore it through P3."""
+    snapshot = deepcopy(entry)
+    snapshot["oid"] = None
+    snapshot["status"] = GRID_CHAIN_DEBT_STATUS
+    snapshot.pop("submitted_at", None)
+    snapshot.pop("cancelled_at", None)
+    snapshot.pop("pending_cancel_at", None)
+    snapshot.pop("pending_cancel_reason", None)
+    snapshot["p7_restore"] = True
+    snapshot["p7_restructure"] = True
+    return snapshot
+
+
+def lifecycle_p7_cancel_result(
+    exchange: Any,
+    coin: str,
+    requests: list[dict[str, int]],
+    cache: dict[str, Any],
+) -> tuple[set[int], list[str]]:
+    """Cancel a P7 pair while retaining partial-success information."""
+    try:
+        reserve_grid_exchange_actions(cache, len(requests))
+        result = exchange.bulk_cancel(requests)
+    except Exception as exc:
+        return set(), [str(exc)]
+    audit_grid_action(
+        "grid_p7_restructure_cancel",
+        coin=coin,
+        requests=requests,
+        result=result,
+        phase=cache.get("grid_action_phase"),
+    )
+    if not isinstance(result, dict) or result.get("status") != "ok":
+        return set(), [str(result)]
+    return successful_cancel_oids(result, requests)
+
+
+def lifecycle_process_p7(row: dict[str, Any], ctx: dict[str, Any], cache: dict[str, Any]) -> tuple[bool, int]:
+    """Compress one remote leg-1 pair and defer its replacement to next-round P3."""
+    if (
+        raw_action_limit_deficit(cache) >= GRID_P7_RAW_DEFICIT_THRESHOLD
+        or ctx["withdrawable"] is None
+        or ctx["withdrawable"] >= GRID_P7_WITHDRAWABLE_THRESHOLD
+    ):
+        return False, 0
+    claims = cache.setdefault("lifecycle_p7_claims", set())
+    # P7 has the same account-wide quota as P1: one pair per account per
+    # worker round, merged across DEXes and coins.
+    claim_key = (ctx["network"], str(ctx["account"]).lower())
+    if claim_key in claims:
+        return False, 0
+    claims.add(claim_key)
+
+    levels = row.setdefault("levels", [])
+    intent = row.get("p7_restructure_intent")
+    if not isinstance(intent, dict):
+        pair = lifecycle_p7_farthest_pair(row)
+        if pair is None:
+            return False, 0
+        buy, sell = pair
+        buy_oid, sell_oid = int(buy["oid"]), int(sell["oid"])
+        if buy_oid not in ctx["open_oids"] or sell_oid not in ctx["open_oids"]:
+            return False, 0
+        intent = {
+            "status": "cancelling",
+            "created_at": ctx["now"],
+            "buy_oid": buy_oid,
+            "sell_oid": sell_oid,
+            "buy_source": deepcopy(buy),
+            "sell_source": deepcopy(sell),
+            "buy_cancelled": False,
+            "sell_cancelled": False,
+        }
+        row["p7_restructure_intent"] = intent
+
+    requests: list[dict[str, int]] = []
+    for side in ("buy", "sell"):
+        if intent.get(f"{side}_cancelled"):
+            continue
+        oid = intent.get(f"{side}_oid")
+        if oid is not None:
+            requests.append({"coin": ctx["coin"], "oid": int(oid)})
+    if requests:
+        cancelled, errors = lifecycle_p7_cancel_result(ctx["exchange"], ctx["coin"], requests, cache)
+        if errors:
+            intent["last_error"] = "; ".join(errors)
+            intent["last_attempt_at"] = ctx["now"]
+        for side in ("buy", "sell"):
+            oid = intent.get(f"{side}_oid")
+            if oid is not None and int(oid) in cancelled:
+                intent[f"{side}_cancelled"] = True
+        if not cancelled:
+            return True, 0
+
+    buy_cancelled = bool(intent.get("buy_cancelled"))
+    sell_cancelled = bool(intent.get("sell_cancelled"))
+    if buy_cancelled != sell_cancelled:
+        restored_side = "buy" if buy_cancelled else "sell"
+        source = intent.get(f"{restored_side}_source")
+        if isinstance(source, dict):
+            restored_oid = intent.get(f"{restored_side}_oid")
+            levels[:] = [
+                entry for entry in levels
+                if not isinstance(entry, dict) or entry.get("oid") != restored_oid
+            ]
+            levels.append(lifecycle_p7_source_snapshot(source))
+        row.pop("p7_restructure_intent", None)
+        return True, 1
+    if not (buy_cancelled and sell_cancelled):
+        return True, 0
+
+    buy_source = intent.get("buy_source")
+    sell_source = intent.get("sell_source")
+    source_oids = {intent.get("buy_oid"), intent.get("sell_oid")}
+    levels[:] = [
+        entry for entry in levels
+        if not isinstance(entry, dict) or entry.get("oid") not in source_oids
+    ]
+
+    def restore_both_sources() -> None:
+        for source in (buy_source, sell_source):
+            if isinstance(source, dict):
+                levels.append(lifecycle_p7_source_snapshot(source))
+
+    buy_price = decimal_or_none(buy_source.get("price")) if isinstance(buy_source, dict) else None
+    sell_price = decimal_or_none(sell_source.get("price")) if isinstance(sell_source, dict) else None
+    if buy_price is None or sell_price is None or sell_price <= buy_price:
+        row["p7_restructure_error"] = "invalid source price span"
+        restore_both_sources()
+        row.pop("p7_restructure_intent", None)
+        return True, 2
+    spread = sell_price - buy_price
+    half = spread / Decimal("2")
+    sz_decimals = int(row.get("sz_decimals") or ctx["asset"]["szDecimals"])
+    new_buy_price = rounded_perp_price(ctx["current_mid"] - half, sz_decimals)
+    new_sell_price = rounded_perp_price(ctx["current_mid"] + half, sz_decimals)
+    if new_buy_price <= 0 or new_buy_price >= new_sell_price:
+        row["p7_restructure_error"] = "restructured prices are not tradable"
+        restore_both_sources()
+        row.pop("p7_restructure_intent", None)
+        return True, 2
+    buy_size = decimal_or_none(buy_source.get("size")) if isinstance(buy_source, dict) else None
+    sell_size = decimal_or_none(sell_source.get("size")) if isinstance(sell_source, dict) else None
+    if buy_size is None or sell_size is None or buy_size <= 0 or sell_size <= 0:
+        row["p7_restructure_error"] = "invalid source size"
+        restore_both_sources()
+        row.pop("p7_restructure_intent", None)
+        return True, 2
+    step = Decimal(1).scaleb(-sz_decimals)
+    new_size = ((buy_size + sell_size) / Decimal("2") / step).to_integral_value(rounding=ROUND_FLOOR) * step
+    if new_size <= 0:
+        row["p7_restructure_error"] = "average source size rounds to zero"
+        restore_both_sources()
+        row.pop("p7_restructure_intent", None)
+        return True, 2
+    new_orders = [
+        grid_order_entry(row, ctx["coin"], ctx["asset"], True, new_buy_price, bool(buy_source.get("reduce_only")), size=new_size, gap=Decimal(str(row["gap_rate"])), preserve_size=True),
+        grid_order_entry(row, ctx["coin"], ctx["asset"], False, new_sell_price, bool(sell_source.get("reduce_only")), size=new_size, gap=Decimal(str(row["gap_rate"])), preserve_size=True),
+    ]
+    for order in new_orders:
+        order["grid_leg"] = 1
+        order["p7_restructure"] = True
+        order["p7_source_buy_oid"] = intent.get("buy_oid")
+        order["p7_source_sell_oid"] = intent.get("sell_oid")
+        order["status"] = GRID_CHAIN_DEBT_STATUS
+        order["chain_debt_at"] = ctx["now"]
+        levels.append(order)
+    row["p7_restructure"] = {
+        "at": ctx["now"],
+        "mid": decimal_to_plain(ctx["current_mid"]),
+        "spread": decimal_to_plain(spread),
+        "size": decimal_to_plain(new_size),
+        "buy_price": decimal_to_plain(new_buy_price),
+        "sell_price": decimal_to_plain(new_sell_price),
+    }
+    row.pop("p7_restructure_intent", None)
+    return True, 2
 
 
 def grid_order_far_from_mid(entry: dict[str, Any], current_mid: Decimal, rate: Decimal) -> bool:
@@ -7815,6 +8037,11 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 entry.pop("legacy_pause_status", None)
                 counters["p6_restored"] = int(counters.get("p6_restored") or 0) + 1
             changed = True
+
+    elif phase == GRID_LIFECYCLE_PHASE_P7:
+        p7_changed, p7_orders = lifecycle_process_p7(row, ctx, cache)
+        counters["p7_restructured"] = int(counters.get("p7_restructured") or 0) + p7_orders
+        changed = changed or p7_changed
 
     row["legacy_pause_remaining"] = sum(
         1 for entry in levels if isinstance(entry, dict) and str(entry.get("status") or "") == GRID_LEGACY_PAUSE_STATUS
