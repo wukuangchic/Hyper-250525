@@ -100,7 +100,6 @@ GRID_LEGACY_PAUSE_STATUS = "legacy_pause"
 GRID_MARGIN_STATUS = "margin"
 GRID_CHAIN_DEBT_STATUS = "chain_debt"
 GRID_BIRTH_INTENT_UNKNOWN_GRACE_SECONDS = 120
-GRID_P6_WITHDRAWABLE_THRESHOLD = Decimal("5")
 GRID_P7_RAW_DEFICIT_THRESHOLD = -100
 GRID_P7_WITHDRAWABLE_THRESHOLD = Decimal("5")
 GRID_PANIC_RATIO_LEGACY_DEFAULT_THRESHOLDS = {
@@ -8099,8 +8098,6 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             candidate is not None
             and candidate[0] is row
             and account_key not in attempted
-            and ctx["withdrawable"] is not None
-            and ctx["withdrawable"] > GRID_P6_WITHDRAWABLE_THRESHOLD
         ):
             attempted.add(account_key)
             _candidate_row, entry = candidate

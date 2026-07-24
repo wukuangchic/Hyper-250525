@@ -363,7 +363,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertIsNotNone(candidate)
         self.assertIs(candidate[0], eth)
 
-    def test_finite_chain_p6_enqueues_legacy_pause_as_margin_debt(self) -> None:
+    def test_finite_chain_p6_enqueues_legacy_pause_without_withdrawable_gate(self) -> None:
         def run(withdrawable: Decimal) -> tuple[dict, int]:
             row = {
                 "type": "grid", "status": "active", "grid_lifecycle_version": 2,
@@ -391,11 +391,13 @@ class GridAvgTests(unittest.TestCase):
                 maintain_grid(row, {"grid_action_phase": "p6", "grid_rows": [row]})
             return row, submit_mock.call_count
 
-        at_boundary, boundary_submits = run(Decimal("5"))
+        at_boundary, boundary_submits = run(Decimal("0"))
         above_boundary, above_submits = run(Decimal("5.01"))
 
         self.assertEqual(boundary_submits, 0)
-        self.assertEqual(at_boundary["legacy_pause_remaining"], 2)
+        self.assertEqual(at_boundary["legacy_pause_remaining"], 1)
+        self.assertEqual(sum(entry["status"] == "margin" for entry in at_boundary["levels"]), 1)
+        self.assertEqual(at_boundary["levels"][-1]["status"], "margin")
         self.assertEqual(above_submits, 0)
         self.assertEqual(above_boundary["legacy_pause_remaining"], 1)
         self.assertEqual(sum(entry["status"] == "margin" for entry in above_boundary["levels"]), 1)
