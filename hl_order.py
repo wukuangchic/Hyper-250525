@@ -2308,7 +2308,7 @@ def update_isolated_opening_leverage(
     max_leverage: int,
     coin: str,
 ) -> tuple[int, dict[str, Any]]:
-    leverage = min(ISOLATED_FALLBACK_LEVERAGE, max_leverage)
+    leverage = max_leverage
     result = exchange.update_leverage(leverage, coin, is_cross=False)
     log_event(
         "update_leverage_result",

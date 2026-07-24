@@ -5274,7 +5274,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
         self.assertEqual(exchange.calls, [(40, "BTC", True)])
 
-    def test_flat_isolated_grid_sets_capped_leverage_once_before_orders(self) -> None:
+    def test_flat_isolated_grid_sets_max_leverage_once_before_orders(self) -> None:
         class FakeExchange:
             def __init__(self) -> None:
                 self.calls = []
@@ -5325,7 +5325,7 @@ class GridAvgTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(exchange.calls[0], ("leverage", 5, "xyz:SPCX", False))
+        self.assertEqual(exchange.calls[0], ("leverage", 20, "xyz:SPCX", False))
         self.assertEqual(sum(call[0] == "leverage" for call in exchange.calls), 1)
         self.assertEqual(sum(call[0] == "order" for call in exchange.calls), 2)
 

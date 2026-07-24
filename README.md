@@ -156,7 +156,7 @@ BTC buy 100 --price 68000 --tp 72000 --sl 65000
 - 加 `--explain` 只打印解析后的订单计划，不提交，也不计算账户指标。
 - 不填价格时，限价单默认按同向订单簿第 `10` 档挂单，且默认 `ALO`。
 - `--market` 会按当前 mid 计算数量，并用带滑点保护的 IOC 单成交。
-- 真实下单前会尝试把当前合约 cross 杠杆设置为 `maxLeverage`；如果标的不支持 cross，会自动切到 isolated，默认 `5x`。
+- 真实下单前会尝试把当前合约 cross 杠杆设置为 `maxLeverage`；如果标的不支持 cross，会自动切到 isolated，默认 `5x`。对于 grid 中明确为 Isolated 且当前空仓的新开仓，会先设置为该标的 `maxLeverage`。
 - 如果数量 round 后名义价值低于 `10` 美元，会向上补一个数量步进。
 - 前台只显示核心结果，完整日志写入 `logs/`。
 
