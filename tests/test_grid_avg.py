@@ -98,6 +98,7 @@ from trail_worker import (
     grid_risk_density_pause_candidates,
     grid_risk_density_restore_allowed,
     grid_target_orders_per_side,
+    GRID_LIMIT_CHASE_WITHDRAWABLE_THRESHOLD,
     grid_survival_slot_available,
     maintain_grid,
     maintain_grid_legacy,
@@ -617,6 +618,7 @@ class GridAvgTests(unittest.TestCase):
         )
 
     def test_p4_add_market_still_requires_withdrawable_above_three(self) -> None:
+        self.assertEqual(GRID_LIMIT_CHASE_WITHDRAWABLE_THRESHOLD, Decimal("3"))
         class UnexpectedExchange:
             def _slippage_price(self, coin, is_buy, slippage, mid):
                 return 100
