@@ -2736,6 +2736,7 @@ class GridAvgTests(unittest.TestCase):
                 {"side": "buy", "status": "skipped_account_margin", "price": "99", "size": "1", "skipped_at": 1},
                 {"side": "buy", "status": "paused_account_margin", "price": "98", "size": "1", "paused_at": 2},
                 {"side": "buy", "status": "paused_roe", "price": "97", "size": "1", "paused_at": 3},
+                {"side": "buy", "status": "legacy_pause", "price": "96", "size": "1", "paused_at": 4},
                 {"side": "sell", "status": "active", "oid": 3, "price": "101", "size": "1"},
             ]
         }
@@ -2744,6 +2745,7 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertEqual([item["status"] for item in rows], ["active", "paused_account_margin", "paused_roe"])
         self.assertNotIn("skipped_account_margin", [item["status"] for item in rows])
+        self.assertNotIn("legacy_pause", [item["status"] for item in rows])
 
     def test_panic_ratio_short_uses_liq_above_mid_and_buy_below_mid(self) -> None:
         row = {

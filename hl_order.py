@@ -1721,7 +1721,7 @@ def format_grid_entry_status(entry: dict[str, Any]) -> str:
 
 def show_grid_entry_in_detail(entry: dict[str, Any]) -> bool:
     status = str(entry.get("status", ""))
-    if status == "skipped_account_margin":
+    if status in {"skipped_account_margin", "legacy_pause"}:
         return False
     if status != "filled":
         return True
