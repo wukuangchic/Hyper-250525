@@ -224,7 +224,7 @@ BTC grid --limit -300 0
 - P0 `panic`：沿用 `panic_ratio` 触发条件。先用 `2 * base_size` 的 IOC reduce-only 市价减仓，并以当前实际仓位为上限；确认成交后，以实际 `avgPx` 为锚点出生 near/far 两张各半成交量的 `grid_leg=1` GTC 单。空 grid 没有可用于计算 ratio 的 active 减仓格时，P0 不会凭空出生订单。
 - P1 `terminal`：当账户 `withdrawable < 10` 时，每个账户（跨 DEX 合并计算）每轮最多撤一张真正占用保证金的非 reduce-only、`grid_leg=0` active 单，并按交易所订单时间从旧到新选择。reduce-only 挂单不占用保证金，P1 不撤；交易所确认撤单成功后才从 batch 移除，后续不再维护。
 - P2 `replacement`：处理确认成交的 active 格子单，以实际成交价为锚点在反方向 `1 * gap` 提交 ALO。每次成交都翻转格属性 `0 ↔ 1`；提交前按当前仓位重新判断增仓或减仓，减仓统一 reduce-only。
-- P3 `debt queue`：所有未能挂出的 `grid_leg=1` 都是必须重试的债务队列项；只有交易所明确返回保证金不足时状态才记为 `margin`，超时、限流、网络或其他提交失败记为 `chain_debt`。每轮 P3 根据当前快照构建队列并逐项处理，不是一次性提交全部债务；只有 `withdrawable > 5` 且 raw deficit `< 0` 时才提交，成功提交后退出 P3 队列（通常回到 active，若立即成交则交由 P2），失败则继续保留在队列并移动到队尾，下一轮再尝试。`grid_leg=0` 提交失败则直接终结。P7 产生的重组单也以 `chain_debt` 写入，等下一轮进入同一队列。
+- P3 `debt queue`：所有未能挂出的 `grid_leg=1` 都是必须重试的债务队列项；只有交易所明确返回保证金不足时状态才记为 `margin`，超时、限流、网络或其他提交失败记为 `chain_debt`。每轮 P3 根据当前快照构建队列并逐项处理，跨币种、跨 DEX 全局最多处理 10 笔债务；不是一次性提交全部债务。只有 `withdrawable > 5` 且 raw deficit `< 0` 时才提交，成功提交后退出 P3 队列（通常回到 active，若立即成交则交由 P2），失败则继续保留在队列并移动到队尾，下一轮再尝试。`grid_leg=0` 提交失败则直接终结。P7 产生的重组单也以 `chain_debt` 写入，等下一轮进入同一队列。
 - P4 `limit-chase`：raw deficit `< 0` 且 signed 仓位 value 仍在 `--limit` 之外时，按原方向逻辑提交一张目标数量为 `2 * base_size` 的 IOC 市价回归单；当方向正在减仓时，数量封顶到当前仓位，避免一次动作穿过零仓。市价纯减仓不受 `withdrawable` 限制；会加仓的动作要求 `withdrawable > 3`，与 P3 的债务恢复门槛 `>5` 分开。确认成交后，以实际 `avgPx` 为锚点出生 near/far 两张各半成交量的 `grid_leg=1` GTC 单。P4 不设每轮全局数量上限，随机顺序中每个符合条件的 Grid 都可以执行；新空 grid 仍仅由 P4 出生。
 - P5 `anomaly`：只在 raw deficit `< -100` 时运行。记录中的 OID 异常消失且确认未成交时，`grid_leg=1` 当轮恢复为同方向、同价格、同属性的非 reduce-only ALO 单；`grid_leg=0` 直接从 batch 移除。
 - P6 `legacy-pause`：仅用于过渡。升级时现有 active 统一记为 `grid_leg=0`，现有 paused 统一转为 `legacy_pause + grid_leg=1`。当 `withdrawable > 3` 时，每个账户（跨 DEX 合并计算）每轮只恢复一张相对盘口最近的 legacy pause；`withdrawable <= 3` 不恢复。恢复后进入普通 P3 债务队列。
@@ -268,7 +268,7 @@ BTC --cancel grid
 ```
 
 - `BTC grid --recover --limit -300 300 --gap 0.5%` 会把当前该币普通 limit open orders 接管为 `grid_leg=0`，用于服务器断点或 JSON 丢失后的人工恢复。
-- `BTC grid --query` 会展示该币 grid 的 limit/min/gap/仓位、买卖两边 active 数量、每张子单的 oid/价格/状态/live 情况和最近成交，并额外显示当前账户跨 DEX/跨币种的全部 `P3 Queue`。
+- `BTC grid --query` 会展示该币 grid 的 limit/min/gap/仓位、买卖两边 active 数量、每张子单的 oid/价格/状态/live 情况和最近成交，并额外显示当前账户跨 DEX/跨币种的全部 `P3 Queue`；P3 队列显示持久化 FIFO 序号，便于回溯。
 - `BTC --cancel grid` 会取消服务器维护的网格和所有活跃子单。
 
 ### Worker 行为

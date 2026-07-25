@@ -1931,11 +1931,14 @@ def format_p3_queue_rows(
             try:
                 queue_seq = int(entry["p3_queue_seq"])
                 sort_key = f"{queue_seq:020d}:"
+                queue_seq_display = str(queue_seq)
             except (KeyError, TypeError, ValueError):
                 # Older rows may predate the persisted FIFO sequence.
                 sort_key = f"{10**20 + timestamp_ms:020d}:"
+                queue_seq_display = "-"
             queue_rows.append(
                 {
+                    "seq": queue_seq_display,
                     "dex": str(row.get("dex") or "default"),
                     "coin": str(row.get("coin") or ""),
                     "side": str(entry.get("side") or ""),
@@ -1963,6 +1966,7 @@ def print_p3_queue(batch_rows: list[dict[str, Any]], network: str, account: str 
         "P3 Queue",
         queue_rows,
         [
+            ("seq", "seq"),
             ("dex", "dex"),
             ("coin", "coin"),
             ("side", "side"),

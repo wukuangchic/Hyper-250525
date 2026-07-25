@@ -104,6 +104,7 @@ GRID_P6_WITHDRAWABLE_THRESHOLD = Decimal("3")
 GRID_P7_RAW_DEFICIT_THRESHOLD = -100
 GRID_P7_WITHDRAWABLE_THRESHOLD = Decimal("5")
 GRID_P7_MIN_ACTIVE_PER_SIDE = 5
+GRID_P3_MAX_RESTORES_PER_RUN = 10
 GRID_PANIC_RATIO_LEGACY_DEFAULT_THRESHOLDS = {
     Decimal("10"),
     Decimal("20"),
@@ -8294,7 +8295,10 @@ def run_once() -> None:
             pending_pool = lifecycle_p3_pending_pool(rows, sorted(active_grid_indexes))
             grid_cache["lifecycle_p3_pending_pool"] = pending_pool
             for index, entry in pending_pool:
+                if int(grid_cache.get("lifecycle_p3_processed") or 0) >= GRID_P3_MAX_RESTORES_PER_RUN:
+                    break
                 grid_cache["lifecycle_p3_target"] = entry
+                grid_cache["lifecycle_p3_processed"] = int(grid_cache.get("lifecycle_p3_processed") or 0) + 1
                 process_grid_index(index, f"grid {phase}")
             grid_cache.pop("lifecycle_p3_target", None)
             grid_cache.pop("lifecycle_p3_pending_pool", None)

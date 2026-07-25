@@ -1870,6 +1870,31 @@ class GridAvgTests(unittest.TestCase):
             [("BTC", "btc"), ("ETH", "eth-first"), ("ETH", "eth-second")],
         )
 
+    def test_run_once_limits_p3_pending_pool_to_ten_entries_per_round(self) -> None:
+        levels = [
+            {"status": GRID_CHAIN_DEBT_STATUS, "id": f"debt-{index}"}
+            for index in range(12)
+        ]
+        rows = [{"type": "grid", "status": "active", "coin": "BTC", "levels": levels}]
+        p3_targets = []
+
+        def fake_maintain_grid(row: dict, cache: dict) -> tuple[dict, bool]:
+            if cache.get("grid_action_phase") == "p3":
+                p3_targets.append(cache["lifecycle_p3_target"]["id"])
+            return row, False
+
+        with (
+            patch("trail_worker.load_server_batch", return_value=rows),
+            patch("trail_worker.maintain_grid", side_effect=fake_maintain_grid),
+            patch("trail_worker.random.shuffle"),
+            patch("trail_worker.prune_done_rows", return_value=(rows, False)),
+            patch("trail_worker.prune_grid_level_history", return_value=False),
+            patch("trail_worker.save_server_batch"),
+        ):
+            run_once()
+
+        self.assertEqual(p3_targets, [f"debt-{index}" for index in range(10)])
+
     def test_run_once_refreshes_position_and_market_caches_between_action_phases(self) -> None:
         rows = [{"type": "grid", "status": "active", "coin": "BTC", "levels": []}]
         seen = []
@@ -7190,6 +7215,7 @@ class GridAvgTests(unittest.TestCase):
             ("BTC", "chain_debt", "p7"),
             ("xyz:SPCX", "margin", "P6"),
         ])
+        self.assertEqual([row["seq"] for row in display_rows], ["1", "2"])
         self.assertEqual(display_rows[0]["price"], "60.00")
         self.assertEqual(display_rows[1]["error"], "Insufficient margin")
 
