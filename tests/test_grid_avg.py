@@ -119,6 +119,7 @@ from trail_worker import (
     lifecycle_process_fills,
     lifecycle_replacement_from_fill,
     lifecycle_submit_limit_chase,
+    lifecycle_submit_order,
     lifecycle_terminal_candidate,
     lifecycle_fill_price_size,
     migrate_grid_lifecycle,
@@ -1649,6 +1650,42 @@ class GridAvgTests(unittest.TestCase):
         self.assertFalse(lifecycle_p3_failure_is_unknown({"last_error": "temporary network timeout"}))
         self.assertFalse(lifecycle_p3_failure_is_unknown({"last_error": "Post only order would immediately match"}))
         self.assertTrue(lifecycle_p3_failure_is_unknown({"last_error": "unexpected parser failure"}))
+
+    def test_p3_reduce_only_failure_retries_without_reduce_only(self) -> None:
+        row = {
+            "gap_rate": "0.01", "base_buy_size": "1", "base_sell_size": "1",
+            "min_order_value": "10", "levels": [],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        order = grid_order_entry(
+            row, "BTC", asset, False, Decimal("110"), True,
+            size=Decimal("1"), preserve_size=True,
+        )
+
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.reduce_only_calls = []
+
+            def order(self, coin, is_buy, size, price, order_type, *, reduce_only=False):
+                self.reduce_only_calls.append(reduce_only)
+                if reduce_only:
+                    raise RuntimeError("Reduce only order would increase position")
+                return {"status": "ok", "response": {"data": {"statuses": [
+                    {"resting": {"oid": 99}},
+                ]}}}
+
+        exchange = FakeExchange()
+        result = lifecycle_submit_order(
+            exchange, "BTC", order, 100, row, asset,
+            Decimal("1"), Decimal("100"), None, None, set(), [],
+            {"action_limit_headroom": 20}, search_outward=False,
+            allow_non_reduce_only_fallback=True,
+        )
+
+        self.assertEqual(result, "submitted")
+        self.assertEqual(exchange.reduce_only_calls, [True, False])
+        self.assertFalse(order["reduce_only"])
+        self.assertEqual(order["oid"], 99)
 
     def test_p7_restructures_farthest_leg1_pair_into_next_round_p3_debt(self) -> None:
         row = {

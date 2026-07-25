@@ -7245,6 +7245,7 @@ def lifecycle_submit_order(
     search_outward: bool,
     force_gtc: bool = False,
     force_non_reduce_only: bool = False,
+    allow_non_reduce_only_fallback: bool = False,
 ) -> str:
     """Submit one finite-chain order; chain debt defers, completed legs may end."""
     def defer(error_text: str) -> str:
@@ -7274,6 +7275,35 @@ def lifecycle_submit_order(
         ensure_grid_order_min_notional(row, asset, order)
     if adopt_matching_open_grid_order(open_orders, coin, order, now, row):
         return "submitted"
+
+    def retry_without_reduce_only(error_text: str) -> str | None:
+        if not (
+            allow_non_reduce_only_fallback
+            and reduce_only
+            and is_reduce_only_would_increase_text(error_text)
+        ):
+            return None
+        order["p3_non_reduce_only_fallback_at"] = now
+        order["p3_non_reduce_only_fallback_error"] = error_text
+        return lifecycle_submit_order(
+            exchange,
+            coin,
+            order,
+            now,
+            row,
+            asset,
+            position_size,
+            current_mid,
+            best_bid,
+            best_ask,
+            isolated_leverage_ready,
+            open_orders,
+            cache,
+            search_outward=search_outward,
+            force_gtc=force_gtc,
+            force_non_reduce_only=True,
+            allow_non_reduce_only_fallback=False,
+        )
 
     for attempt in range(GRID_ALO_PRICE_ATTEMPT_LIMIT):
         price = decimal_or_none(order.get("price", order.get("limit_px")))
@@ -7310,8 +7340,14 @@ def lifecycle_submit_order(
         except GridActionBudgetUnavailable as exc:
             return defer(str(exc))
         except RuntimeError as exc:
+            fallback_result = retry_without_reduce_only(str(exc))
+            if fallback_result is not None:
+                return fallback_result
             return defer(str(exc))
         except Exception as exc:
+            fallback_result = retry_without_reduce_only(str(exc))
+            if fallback_result is not None:
+                return fallback_result
             return defer(str(exc))
         order["oid"] = oid
         order["status"] = state
@@ -8113,6 +8149,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                     ctx["exchange"], ctx["coin"], entry, ctx["now"], row, ctx["asset"], ctx["position_size"],
                     ctx["current_mid"], ctx["best_bid"], ctx["best_ask"], isolated_ready,
                     ctx["open_orders"], cache, search_outward=True,
+                    allow_non_reduce_only_fallback=True,
                 )
                 changed = True
                 if result == "submitted":
