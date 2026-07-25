@@ -7598,6 +7598,7 @@ def lifecycle_process_fills(
             ctx["exchange"], ctx["coin"], child, ctx["now"], row, ctx["asset"],
             ctx["position_size"], ctx["current_mid"], ctx["best_bid"], ctx["best_ask"],
             isolated_ready, ctx["open_orders"], cache, search_outward=True,
+            allow_non_reduce_only_fallback=True,
         )
         if source in levels:
             levels.remove(source)
