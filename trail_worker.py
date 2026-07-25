@@ -100,8 +100,10 @@ GRID_LEGACY_PAUSE_STATUS = "legacy_pause"
 GRID_MARGIN_STATUS = "margin"
 GRID_CHAIN_DEBT_STATUS = "chain_debt"
 GRID_BIRTH_INTENT_UNKNOWN_GRACE_SECONDS = 120
+GRID_P6_WITHDRAWABLE_THRESHOLD = Decimal("3")
 GRID_P7_RAW_DEFICIT_THRESHOLD = -100
 GRID_P7_WITHDRAWABLE_THRESHOLD = Decimal("5")
+GRID_P7_MIN_ACTIVE_PER_SIDE = 5
 GRID_PANIC_RATIO_LEGACY_DEFAULT_THRESHOLDS = {
     Decimal("10"),
     Decimal("20"),
@@ -538,7 +540,14 @@ def lifecycle_p7_farthest_pair(row: dict[str, Any]) -> tuple[dict[str, Any], dic
     """Return the farthest active leg-1 buy/sell pair for one grid."""
     buys: list[tuple[Decimal, dict[str, Any]]] = []
     sells: list[tuple[Decimal, dict[str, Any]]] = []
+    active_buy_count = 0
+    active_sell_count = 0
     for entry in row.get("levels") or []:
+        if isinstance(entry, dict) and str(entry.get("status") or "") == "active":
+            if str(entry.get("side") or "") == "buy":
+                active_buy_count += 1
+            elif str(entry.get("side") or "") == "sell":
+                active_sell_count += 1
         if (
             not isinstance(entry, dict)
             or str(entry.get("status") or "") != "active"
@@ -554,9 +563,54 @@ def lifecycle_p7_farthest_pair(row: dict[str, Any]) -> tuple[dict[str, Any], dic
             buys.append((price, entry))
         elif side == "sell":
             sells.append((price, entry))
-    if not buys or not sells:
+    if (
+        active_buy_count <= GRID_P7_MIN_ACTIVE_PER_SIDE
+        or active_sell_count <= GRID_P7_MIN_ACTIVE_PER_SIDE
+        or not buys
+        or not sells
+    ):
         return None
     return min(buys, key=lambda item: item[0])[1], max(sells, key=lambda item: item[0])[1]
+
+
+def lifecycle_p7_debt_value(row: dict[str, Any]) -> Decimal | None:
+    """Estimate the reworkable leg-1 debt value for P7 prioritization."""
+    if lifecycle_p7_farthest_pair(row) is None:
+        return None
+    buy_size = Decimal("0")
+    sell_size = Decimal("0")
+    for entry in row.get("levels") or []:
+        if (
+            not isinstance(entry, dict)
+            or str(entry.get("status") or "") != "active"
+            or lifecycle_leg(entry) != 1
+        ):
+            continue
+        size = decimal_or_none(entry.get("size"))
+        if size is None or size <= 0:
+            continue
+        if str(entry.get("side") or "") == "buy":
+            buy_size += size
+        elif str(entry.get("side") or "") == "sell":
+            sell_size += size
+    min_order_value = decimal_or_none(row.get("min_order_value")) or MIN_NOTIONAL
+    leverage = decimal_or_none(row.get("lifecycle_max_leverage"))
+    if min(buy_size, sell_size) <= 0 or min_order_value <= 0 or leverage is None or leverage <= 0:
+        return None
+    return min(buy_size, sell_size) * min_order_value / leverage
+
+
+def lifecycle_p7_priority_indexes(rows: list[dict[str, Any]], indexes: list[int]) -> list[int]:
+    """Order P7 work by debt value, while finishing persisted intents first."""
+    def priority(index: int) -> tuple[int, Decimal]:
+        row = rows[index]
+        value = lifecycle_p7_debt_value(row)
+        return (
+            int(isinstance(row.get("p7_restructure_intent"), dict)),
+            value or Decimal("0"),
+        )
+
+    return sorted(indexes, key=priority, reverse=True)
 
 
 def lifecycle_p7_source_snapshot(entry: dict[str, Any]) -> dict[str, Any]:
@@ -7335,6 +7389,7 @@ def lifecycle_context(row: dict[str, Any], cache: dict[str, Any]) -> dict[str, A
     row["account_usdc_withdrawable"] = decimal_to_plain(withdrawable) if withdrawable is not None else None
     row["position_size"] = decimal_to_plain(position_size)
     row["position_value"] = decimal_to_plain(position_value)
+    row["lifecycle_max_leverage"] = decimal_to_plain(asset.get("maxLeverage"))
     row["raw_deficit"] = raw_action_limit_deficit(cache)
     return {
         "network": network,
@@ -8098,6 +8153,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             candidate is not None
             and candidate[0] is row
             and account_key not in attempted
+            and ctx["withdrawable"] is not None
+            and ctx["withdrawable"] > GRID_P6_WITHDRAWABLE_THRESHOLD
         ):
             attempted.add(account_key)
             _candidate_row, entry = candidate
@@ -8242,7 +8299,12 @@ def run_once() -> None:
             grid_cache.pop("lifecycle_p3_target", None)
             grid_cache.pop("lifecycle_p3_pending_pool", None)
         else:
-            for index in active_grid_indexes:
+            indexes = (
+                lifecycle_p7_priority_indexes(rows, active_grid_indexes)
+                if phase == GRID_LIFECYCLE_PHASE_P7
+                else active_grid_indexes
+            )
+            for index in indexes:
                 process_grid_index(index, f"grid {phase}")
         reconcile_cached_grid_open_orders(rows, active_grid_indexes, grid_cache)
         for info, _exchange, _account, _signer, _role in grid_cache.get("clients", {}).values():

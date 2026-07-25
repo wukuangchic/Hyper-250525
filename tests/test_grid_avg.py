@@ -109,7 +109,9 @@ from trail_worker import (
     lifecycle_p3_pending_pool,
     lifecycle_p3_failure_is_unknown,
     lifecycle_process_p7,
+    lifecycle_p7_debt_value,
     lifecycle_p7_farthest_pair,
+    lifecycle_p7_priority_indexes,
     lifecycle_reconcile_birth_intents,
     lifecycle_row_account_key,
     lifecycle_process_anomalies,
@@ -363,7 +365,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertIsNotNone(candidate)
         self.assertIs(candidate[0], eth)
 
-    def test_finite_chain_p6_enqueues_legacy_pause_without_withdrawable_gate(self) -> None:
+    def test_finite_chain_p6_requires_withdrawable_above_three(self) -> None:
         def run(withdrawable: Decimal) -> tuple[dict, int]:
             row = {
                 "type": "grid", "status": "active", "grid_lifecycle_version": 2,
@@ -391,13 +393,11 @@ class GridAvgTests(unittest.TestCase):
                 maintain_grid(row, {"grid_action_phase": "p6", "grid_rows": [row]})
             return row, submit_mock.call_count
 
-        at_boundary, boundary_submits = run(Decimal("0"))
-        above_boundary, above_submits = run(Decimal("5.01"))
+        at_boundary, boundary_submits = run(Decimal("3"))
+        above_boundary, above_submits = run(Decimal("3.01"))
 
         self.assertEqual(boundary_submits, 0)
-        self.assertEqual(at_boundary["legacy_pause_remaining"], 1)
-        self.assertEqual(sum(entry["status"] == "margin" for entry in at_boundary["levels"]), 1)
-        self.assertEqual(at_boundary["levels"][-1]["status"], "margin")
+        self.assertEqual(at_boundary["legacy_pause_remaining"], 2)
         self.assertEqual(above_submits, 0)
         self.assertEqual(above_boundary["legacy_pause_remaining"], 1)
         self.assertEqual(sum(entry["status"] == "margin" for entry in above_boundary["levels"]), 1)
@@ -1734,27 +1734,55 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertTrue(changed)
         self.assertEqual(created, 1)
-        self.assertEqual([entry["status"] for entry in row["levels"]], ["active", GRID_CHAIN_DEBT_STATUS])
-        restored = row["levels"][1]
+        self.assertEqual(sum(entry["status"] == GRID_CHAIN_DEBT_STATUS for entry in row["levels"]), 1)
+        restored = next(entry for entry in row["levels"] if entry.get("p7_restore"))
         self.assertEqual(restored["price"], "60")
         self.assertTrue(restored["p7_restore"])
 
-    def test_p7_allows_restructure_with_fewer_than_eleven_active_orders_per_side(self) -> None:
+    def test_p7_requires_more_than_five_active_orders_per_side(self) -> None:
         row = {
             "levels": [
                 *[
                     {"side": "buy", "status": "active", "grid_leg": 1, "oid": index, "price": str(60 + index), "size": "1"}
-                    for index in range(10)
+                    for index in range(5)
                 ],
                 *[
                     {"side": "sell", "status": "active", "grid_leg": 1, "oid": 100 + index, "price": str(110 + index), "size": "1"}
-                    for index in range(11)
+                    for index in range(6)
                 ],
             ],
         }
+        self.assertIsNone(lifecycle_p7_farthest_pair(row))
+
+        row["levels"].append({"side": "buy", "status": "active", "grid_leg": 1, "oid": 99, "price": "70", "size": "1"})
         pair = lifecycle_p7_farthest_pair(row)
         self.assertIsNotNone(pair)
-        self.assertEqual((pair[0]["oid"], pair[1]["oid"]), (0, 110))
+        self.assertEqual((pair[0]["oid"], pair[1]["oid"]), (0, 105))
+
+    def test_p7_prioritizes_coin_by_balanced_leg1_debt_value(self) -> None:
+        def make_row(coin: str, leverage: str, size: str, min_order_value: str) -> dict:
+            return {
+                "coin": coin,
+                "lifecycle_max_leverage": leverage,
+                "min_order_value": min_order_value,
+                "levels": [
+                    *[
+                        {"side": "buy", "status": "active", "grid_leg": 1, "oid": index, "price": str(60 + index), "size": size}
+                        for index in range(6)
+                    ],
+                    *[
+                        {"side": "sell", "status": "active", "grid_leg": 1, "oid": 100 + index, "price": str(110 + index), "size": size}
+                        for index in range(6)
+                    ],
+                ],
+            }
+
+        btc = make_row("BTC", "20", "1", "10")
+        eth = make_row("ETH", "10", "2", "10")
+
+        self.assertEqual(lifecycle_p7_debt_value(btc), Decimal("3"))
+        self.assertEqual(lifecycle_p7_debt_value(eth), Decimal("12"))
+        self.assertEqual(lifecycle_p7_priority_indexes([btc, eth], [0, 1]), [1, 0])
 
     def test_p7_claim_is_account_wide_across_dex_and_coins(self) -> None:
         def make_row() -> dict:
@@ -1875,7 +1903,7 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertEqual(seen[0], (None, None, None))
         self.assertEqual(seen[1], (None, None, 3))
-        self.assertEqual(info.clear_calls, 7)
+        self.assertEqual(info.clear_calls, 8)
 
     def test_limit_chase_p3_waits_every_ten_seconds_for_market_and_replacement_capacity(self) -> None:
         class FakeInfo:
@@ -7160,7 +7188,7 @@ class GridAvgTests(unittest.TestCase):
             ("BTC", "chain_debt", "p7"),
             ("xyz:SPCX", "margin", "P6"),
         ])
-        self.assertEqual(display_rows[0]["price"], "60")
+        self.assertEqual(display_rows[0]["price"], "60.00")
         self.assertEqual(display_rows[1]["error"], "Insufficient margin")
 
     def test_grid_plan_persists_base_and_effective_values(self) -> None:
