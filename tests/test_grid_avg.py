@@ -90,6 +90,8 @@ from trail_worker import (
     grid_reduce_only_capacity_available,
     grid_reduce_only_canceled_restore_without_reduce_only,
     grid_limit_chase_market_reduces_position,
+    grid_limit_chase_margin_adequacy,
+    grid_limit_chase_add_risk_allowed,
     grid_roe_add_risk_allowed,
     grid_roe_for_position_value,
     grid_latest_replacement_roe_allowed,
@@ -98,7 +100,7 @@ from trail_worker import (
     grid_risk_density_pause_candidates,
     grid_risk_density_restore_allowed,
     grid_target_orders_per_side,
-    GRID_LIMIT_CHASE_WITHDRAWABLE_THRESHOLD,
+    GRID_LIMIT_CHASE_MARGIN_ADEQUACY_THRESHOLD,
     grid_survival_slot_available,
     maintain_grid,
     maintain_grid_legacy,
@@ -705,8 +707,8 @@ class GridAvgTests(unittest.TestCase):
             all(birth["plan"]["order_type"] == {"limit": {"tif": "Gtc"}} for birth in row["levels"])
         )
 
-    def test_p4_add_market_still_requires_withdrawable_above_three(self) -> None:
-        self.assertEqual(GRID_LIMIT_CHASE_WITHDRAWABLE_THRESHOLD, Decimal("3"))
+    def test_p4_add_market_requires_margin_adequacy_strictly_above_1_1(self) -> None:
+        self.assertEqual(GRID_LIMIT_CHASE_MARGIN_ADEQUACY_THRESHOLD, Decimal("1.1"))
         class UnexpectedExchange:
             def _slippage_price(self, coin, is_buy, slippage, mid):
                 return 100
@@ -720,7 +722,8 @@ class GridAvgTests(unittest.TestCase):
             "levels": [],
         }
         ctx = {
-            "withdrawable": Decimal("3"), "position_size": Decimal("0.5"), "position_value": Decimal("50"),
+            "withdrawable": Decimal("4"), "position_size": Decimal("0.5"), "position_value": Decimal("50"),
+            "position_leverage": Decimal("10"),
             "exchange": UnexpectedExchange(), "coin": "BTC", "asset": {"szDecimals": 2, "maxLeverage": 20},
             "current_mid": Decimal("100"), "best_bid": Decimal("99.9"), "best_ask": Decimal("100.1"),
             "now": 123, "open_orders": [],
@@ -728,6 +731,31 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertFalse(lifecycle_submit_limit_chase(row, ctx, {"action_limit_headroom": 200}))
         self.assertEqual(row["levels"], [])
+
+    def test_p4_margin_adequacy_uses_ioc_slippage_price_and_leverage(self) -> None:
+        class FakeExchange:
+            def _slippage_price(self, coin, is_buy, slippage, mid):
+                return Decimal(str(mid)) * Decimal("1.10")
+
+        market = build_grid_limit_chase_market_order(
+            FakeExchange(),
+            {
+                "base_buy_size": "0.3", "min_order_value": "10",
+                "sz_decimals": 2, "slippage": "0.10",
+            },
+            "BTC",
+            {"szDecimals": 2, "maxLeverage": 20},
+            Decimal("100"),
+            True,
+        )
+        self.assertIsNotNone(market)
+        estimated_margin, adequacy = grid_limit_chase_margin_adequacy(
+            market, Decimal("3.63"), Decimal("20")
+        )
+        self.assertEqual(estimated_margin, Decimal("3.3"))
+        self.assertEqual(adequacy, Decimal("1.1"))
+        self.assertFalse(grid_limit_chase_add_risk_allowed(market, Decimal("3.63"), Decimal("20")))
+        self.assertTrue(grid_limit_chase_add_risk_allowed(market, Decimal("3.631"), Decimal("20")))
 
     def test_p4_direction_is_not_reduction_when_size_would_flip_position(self) -> None:
         self.assertTrue(
@@ -2275,7 +2303,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertNotIn("limit_chase_error", row)
         self.assertNotIn("limit_chase_error_at", row)
 
-    def test_legacy_limit_chase_requires_withdrawable_strictly_above_three(self) -> None:
+    def test_legacy_limit_chase_requires_margin_adequacy_above_1_1(self) -> None:
         class FakeInfo:
             def all_mids(self, dex):
                 return {"BTC": "100"}
@@ -2283,7 +2311,10 @@ class GridAvgTests(unittest.TestCase):
             def user_state(self, account, dex=""):
                 return {
                     "assetPositions": [
-                        {"position": {"coin": "BTC", "szi": "2", "positionValue": "200"}}
+                        {"position": {
+                            "coin": "BTC", "szi": "0.5", "positionValue": "50",
+                            "leverage": {"type": "cross", "value": 20},
+                        }}
                     ]
                 }
 
@@ -2295,8 +2326,11 @@ class GridAvgTests(unittest.TestCase):
                 }
 
         class FakeExchange:
+            def _slippage_price(self, coin, is_buy, slippage, reference_price):
+                return reference_price
+
             def order(self, *args, **kwargs):
-                raise AssertionError("limit chase must not submit when withdrawable equals 3")
+                raise AssertionError("limit chase must not submit when margin adequacy is at most 1.1")
 
         row = {
             "type": "grid",
@@ -2305,7 +2339,7 @@ class GridAvgTests(unittest.TestCase):
             "account": "0xabc",
             "coin": "BTC",
             "position_limit_mode": "limit",
-            "min_position_value": "-100",
+            "min_position_value": "100",
             "max_position_value": "150",
             "gap_rate": "0.01",
             "base_buy_size": "0.3",
@@ -2326,7 +2360,7 @@ class GridAvgTests(unittest.TestCase):
         ):
             self.assertTrue(run_grid_limit_chase_p3(cache))
 
-        self.assertEqual(row["limit_chase_status"], "skipped_withdrawable")
+        self.assertEqual(row["limit_chase_status"], "skipped_margin_adequacy")
         self.assertEqual(row["levels"], [])
 
     def test_precheck_action_limit_initializes_shared_p1_budget_below_cap_once(self) -> None:

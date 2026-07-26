@@ -94,7 +94,7 @@ GRID_ROE_STOP_THRESHOLD = Decimal("-0.40")
 GRID_SURVIVAL_ACTIVE_ORDERS_PER_SIDE = 1
 GRID_WITHDRAWABLE_REDUCE_ONLY_THRESHOLD = Decimal("5")
 GRID_WITHDRAWABLE_PAUSE_THRESHOLD = Decimal("10")
-GRID_LIMIT_CHASE_WITHDRAWABLE_THRESHOLD = Decimal("3")
+GRID_LIMIT_CHASE_MARGIN_ADEQUACY_THRESHOLD = Decimal("1.1")
 GRID_LIFECYCLE_VERSION = 2
 GRID_LEGACY_PAUSE_STATUS = "legacy_pause"
 GRID_MARGIN_STATUS = "margin"
@@ -1345,6 +1345,48 @@ def grid_limit_chase_market_reduces_position(
     if is_buy:
         return position_size < 0 and order_size <= abs(position_size)
     return position_size > 0 and order_size <= position_size
+
+
+def grid_limit_chase_margin_adequacy(
+    market_order: dict[str, Any],
+    withdrawable: Decimal | None,
+    leverage: Decimal | None,
+) -> tuple[Decimal | None, Decimal | None]:
+    """Estimate P4 add-risk margin at the IOC slippage price and its coverage."""
+    plan = market_order.get("plan")
+    worst_notional = (
+        decimal_or_none(plan.get("worst_notional")) if isinstance(plan, dict) else None
+    )
+    if (
+        withdrawable is None
+        or withdrawable < 0
+        or leverage is None
+        or leverage <= 0
+        or worst_notional is None
+        or worst_notional <= 0
+    ):
+        return None, None
+    estimated_margin = worst_notional / leverage
+    if estimated_margin <= 0:
+        return None, None
+    return estimated_margin, withdrawable / estimated_margin
+
+
+def grid_limit_chase_add_risk_allowed(
+    market_order: dict[str, Any],
+    withdrawable: Decimal | None,
+    leverage: Decimal | None,
+) -> bool:
+    estimated_margin, adequacy = grid_limit_chase_margin_adequacy(
+        market_order, withdrawable, leverage
+    )
+    plan = market_order.get("plan")
+    if isinstance(plan, dict):
+        plan["estimated_margin"] = estimated_margin
+        plan["margin_leverage"] = leverage
+        plan["margin_adequacy_ratio"] = adequacy
+        plan["margin_adequacy_threshold"] = GRID_LIMIT_CHASE_MARGIN_ADEQUACY_THRESHOLD
+    return adequacy is not None and adequacy > GRID_LIMIT_CHASE_MARGIN_ADEQUACY_THRESHOLD
 
 
 def record_grid_limit_chase_candidate(
@@ -6936,9 +6978,6 @@ def run_grid_limit_chase_p3(cache: dict[str, Any]) -> bool:
         signed_position_value(position_size, position_value)
     )
     row["limit_chase_withdrawable"] = decimal_to_plain(withdrawable) if withdrawable is not None else None
-    if withdrawable is None or withdrawable <= GRID_LIMIT_CHASE_WITHDRAWABLE_THRESHOLD:
-        row["limit_chase_status"] = "skipped_withdrawable"
-        return True
 
     is_buy = grid_limit_chase_direction(row, position_size, position_value)
     if is_buy is None:
@@ -6954,6 +6993,31 @@ def run_grid_limit_chase_p3(cache: dict[str, Any]) -> bool:
     )
     if market_order is None:
         row["limit_chase_status"] = "skipped_invalid_market_order"
+        return True
+    market_size = decimal_or_none(market_order.get("size")) or Decimal("0")
+    reduces_position = grid_limit_chase_market_reduces_position(
+        position_size, is_buy, market_size
+    )
+    position_leverage = decimal_or_none(
+        (current_position.get("leverage") or {}).get("value")
+    ) if isinstance(current_position, dict) else None
+    leverage = position_leverage or decimal_or_none(asset.get("maxLeverage"))
+    estimated_margin, margin_adequacy = grid_limit_chase_margin_adequacy(
+        market_order, withdrawable, leverage
+    )
+    row["limit_chase_estimated_margin"] = (
+        decimal_to_plain(estimated_margin) if estimated_margin is not None else None
+    )
+    row["limit_chase_margin_leverage"] = (
+        decimal_to_plain(leverage) if leverage is not None else None
+    )
+    row["limit_chase_margin_adequacy"] = (
+        decimal_to_plain(margin_adequacy) if margin_adequacy is not None else None
+    )
+    if not reduces_position and not grid_limit_chase_add_risk_allowed(
+        market_order, withdrawable, leverage
+    ):
+        row["limit_chase_status"] = "skipped_margin_adequacy"
         return True
 
     isolated_leverage_ready: set[str] = set()
@@ -7499,6 +7563,9 @@ def lifecycle_context(row: dict[str, Any], cache: dict[str, Any]) -> dict[str, A
         "best_ask": best_ask,
         "position_size": position_size,
         "position_value": position_value,
+        "position_leverage": decimal_or_none(
+            (position.get("leverage") or {}).get("value")
+        ) if isinstance(position, dict) else None,
         "liquidation_px": liquidation_px,
         "withdrawable": withdrawable,
         "open_orders": open_orders,
@@ -8080,9 +8147,11 @@ def lifecycle_submit_limit_chase(row: dict[str, Any], ctx: dict[str, Any], cache
     )
     if (
         not reduces_position
-        and (
-            ctx["withdrawable"] is None
-            or ctx["withdrawable"] <= GRID_LIMIT_CHASE_WITHDRAWABLE_THRESHOLD
+        and not grid_limit_chase_add_risk_allowed(
+            market,
+            ctx["withdrawable"],
+            decimal_or_none(ctx.get("position_leverage"))
+            or decimal_or_none(ctx["asset"].get("maxLeverage")),
         )
     ):
         return False
