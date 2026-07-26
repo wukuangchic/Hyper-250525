@@ -1180,6 +1180,18 @@ def is_grid_nonpositive_price_error_text(text: str) -> bool:
     return "price must be positive" in text.lower()
 
 
+def is_grid_qualified_coin_key_error_text(text: str) -> bool:
+    """Recognize a bare KeyError for a qualified DEX coin."""
+    stripped = text.strip()
+    if len(stripped) < 5 or stripped[0] != stripped[-1] or stripped[0] not in {"'", '"'}:
+        return False
+    coin = stripped[1:-1]
+    dex, separator, symbol = coin.partition(":")
+    return separator == ":" and dex in {"xyz", "mkts"} and bool(symbol) and not any(
+        character.isspace() for character in coin
+    )
+
+
 def grid_row_recoverable_from_error(row: dict[str, Any]) -> bool:
     if row.get("type") != "grid":
         return False
@@ -1203,6 +1215,7 @@ def grid_row_recoverable_from_error(row: dict[str, Any]) -> bool:
         or is_cancel_terminal_race_text(error_text)
         or is_isolated_opening_leverage_error_text(error_text)
         or is_grid_nonpositive_price_error_text(error_text)
+        or any(is_grid_qualified_coin_key_error_text(text) for text in raw_error_texts)
         or (
             "unknown perp coin" in error_text.lower()
             and batch_row_raw_coin(row) != str(row.get("raw_coin") or row.get("coin") or "")
@@ -8485,7 +8498,10 @@ def maintain_grid_p8(row: dict[str, Any], cache: dict[str, Any]) -> tuple[dict[s
     counters["p8_promoted"] = int(counters.get("p8_promoted") or 0) + promoted
     levels = row.setdefault("levels", [])
     row["open_oids"] = sorted(grid_batch_open_oids(row))
+    if row.get("status") != "active" or "error" in row:
+        changed = True
     row["status"] = "active"
+    row.pop("error", None)
     row["updated_at"] = now
     row["note"] = (
         "grid lifecycle v2; phase=p8; "
@@ -8553,8 +8569,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             candidate = lifecycle_terminal_candidate(
                 cache.get("grid_rows") or [row], ctx["network"], ctx["account"]
             )
-            attempted.add(account_key)
-            if candidate is not None:
+            if candidate is not None and candidate[0] is row:
+                attempted.add(account_key)
                 candidate_row, entry = candidate
                 candidate_coin = str(candidate_row.get("coin") or ctx["coin"])
                 if lifecycle_cancel_terminal_entry(
@@ -8671,7 +8687,10 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         1 for entry in levels if isinstance(entry, dict) and str(entry.get("status") or "") == GRID_LEGACY_PAUSE_STATUS
     )
     row["open_oids"] = sorted(grid_batch_open_oids(row))
+    if row.get("status") != "active" or "error" in row:
+        changed = True
     row["status"] = "active"
+    row.pop("error", None)
     row["updated_at"] = ctx["now"]
     row["last_fill_check_ms"] = ctx["now_ms"]
     row["note"] = (

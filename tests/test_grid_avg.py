@@ -438,6 +438,61 @@ class GridAvgTests(unittest.TestCase):
         self.assertIs(candidate[0], xyz)
         self.assertEqual(candidate[1]["oid"], 4)
 
+    def test_p1_waits_for_cross_dex_candidate_own_context(self) -> None:
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.requests = []
+
+            def bulk_cancel(self, requests):
+                self.requests.extend(requests)
+                return {
+                    "status": "ok",
+                    "response": {"data": {"statuses": ["success"]}},
+                }
+
+        ustech = {
+            "type": "grid", "status": "active", "grid_lifecycle_version": 2,
+            "network": "mainnet", "account": "0xabc", "dex": "mkts", "coin": "mkts:USTECH",
+            "levels": [],
+        }
+        jpy_entry = {
+            "side": "buy", "status": "active", "oid": 9, "grid_leg": 0,
+            "reduce_only": False, "submitted_at": 1,
+        }
+        jpy = {
+            "type": "grid", "status": "active", "grid_lifecycle_version": 2,
+            "network": "mainnet", "account": "0xabc", "dex": "xyz", "coin": "xyz:JPY",
+            "levels": [jpy_entry],
+        }
+        mkts_exchange = FakeExchange()
+        xyz_exchange = FakeExchange()
+        cache = {
+            "grid_action_phase": "p1", "grid_rows": [ustech, jpy],
+            "action_limit_headroom": 100,
+        }
+
+        def context_for(row, _cache):
+            return {
+                "network": "mainnet", "account": "0xabc", "coin": row["coin"],
+                "asset": {"szDecimals": 2, "maxLeverage": 20},
+                "exchange": mkts_exchange if row is ustech else xyz_exchange,
+                "info": object(), "now": 123, "now_ms": 123000,
+                "position_size": Decimal("0"), "position_value": Decimal("0"),
+                "current_mid": Decimal("100"), "best_bid": Decimal("99.9"),
+                "best_ask": Decimal("100.1"), "withdrawable": Decimal("1"),
+                "liquidation_px": None, "open_orders": [], "open_oids": {9},
+                "fills_by_oid": {},
+            }
+
+        with patch("trail_worker.lifecycle_context", side_effect=context_for):
+            maintain_grid(ustech, cache)
+            self.assertEqual(mkts_exchange.requests, [])
+            self.assertEqual(cache["lifecycle_p1_accounts"], set())
+            maintain_grid(jpy, cache)
+
+        self.assertEqual(xyz_exchange.requests, [{"coin": "xyz:JPY", "oid": 9}])
+        self.assertEqual(jpy["levels"], [])
+
     def test_raw_deficit_preserves_negative_headroom(self) -> None:
         self.assertEqual(raw_action_limit_deficit({"action_limit_headroom": 101}), -101)
         self.assertEqual(raw_action_limit_deficit({"action_limit_raw_deficit": 3, "action_limit_error": "hit"}), 3)
@@ -3159,6 +3214,18 @@ class GridAvgTests(unittest.TestCase):
             "dex": "xyz",
             "error": "'xyz:SPCX'",
             "note": "grid maintained before the old key error",
+        }
+
+        self.assertTrue(grid_row_recoverable_from_error(row))
+
+    def test_foreign_qualified_coin_key_error_is_recoverable(self) -> None:
+        row = {
+            "type": "grid",
+            "status": "error",
+            "coin": "mkts:USTECH",
+            "raw_coin": "mkts:USTECH",
+            "dex": "mkts",
+            "error": "'xyz:JPY'",
         }
 
         self.assertTrue(grid_row_recoverable_from_error(row))
