@@ -7235,6 +7235,27 @@ def lifecycle_replacement_from_fill(
     order["replacement_anchor_price"] = decimal_to_plain(fill_price)
     order["replacement_anchor_source"] = "market_fill" if isinstance(source.get("fill"), dict) else "saved_fill"
     order["preserve_fill_size"] = True
+    original_notional = fill_size * price
+    if original_notional < MIN_NOTIONAL:
+        expanded_size = grid_size_for_min_notional(
+            fill_size,
+            price,
+            int(row.get("sz_decimals") or asset["szDecimals"]),
+            MIN_NOTIONAL,
+        )
+        if expanded_size <= 0:
+            return None
+        order["size"] = decimal_to_plain(expanded_size)
+        plan = order.get("plan")
+        if isinstance(plan, dict):
+            plan["size"] = expanded_size
+            expanded_notional = expanded_size * price
+            plan["notional"] = expanded_notional
+            plan["target_notional"] = expanded_notional
+            plan["worst_notional"] = expanded_notional
+        order["replacement_expanded_min_notional_from"] = decimal_to_plain(fill_size)
+        order["replacement_expanded_min_notional_at"] = decimal_to_plain(original_notional)
+        order["replacement_min_notional"] = decimal_to_plain(MIN_NOTIONAL)
     return order
 
 
@@ -7627,24 +7648,6 @@ def lifecycle_process_fills(
         child = lifecycle_replacement_from_fill(row, ctx["coin"], ctx["asset"], source)
         if child is None:
             source["last_error"] = "filled lifecycle order could not build its replacement"
-            continue
-        child_size = decimal_or_none(child.get("size"))
-        child_price = decimal_or_none(child.get("price", child.get("limit_px")))
-        child_notional = (
-            child_size * child_price
-            if child_size is not None and child_price is not None
-            else None
-        )
-        if child_notional is not None and child_notional < MIN_NOTIONAL:
-            # Partial fills must not create an exchange-invalid child or P3
-            # debt. Keep the source as terminal fill history for readback.
-            source["replacement_pending"] = False
-            source["replacement_processed_at"] = ctx["now"]
-            source["replacement_discarded_at"] = ctx["now"]
-            source["replacement_discarded_reason"] = "notional_below_minimum"
-            source["replacement_notional"] = decimal_to_plain(child_notional)
-            source["replacement_min_notional"] = decimal_to_plain(MIN_NOTIONAL)
-            changed = True
             continue
         result = lifecycle_submit_order(
             ctx["exchange"], ctx["coin"], child, ctx["now"], row, ctx["asset"],

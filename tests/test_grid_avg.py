@@ -589,10 +589,14 @@ class GridAvgTests(unittest.TestCase):
         self.assertTrue(entry["replacement_pending"])
         self.assertEqual(entry["p3_queue_seq"], 99)
 
-    def test_p2_partial_fill_below_ten_does_not_submit_or_enter_p3(self) -> None:
-        class NoSubmitExchange:
-            def order(self, *args, **kwargs):
-                raise AssertionError("below-minimum partial fill must not submit")
+    def test_p2_partial_fill_below_ten_expands_to_submit(self) -> None:
+        class FakeExchange:
+            def __init__(self):
+                self.calls = []
+
+            def order(self, coin, is_buy, size, price, order_type, reduce_only=False):
+                self.calls.append((coin, is_buy, size, price, order_type, reduce_only))
+                return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 22}}]}}}
 
         source = {
             "side": "sell", "is_buy": False, "status": "filled", "replacement_pending": True,
@@ -606,7 +610,7 @@ class GridAvgTests(unittest.TestCase):
         }
         ctx = {
             "coin": "xyz:SKHY", "asset": {"szDecimals": 2, "maxLeverage": 20},
-            "exchange": NoSubmitExchange(), "now": 124, "position_size": Decimal("0"),
+            "exchange": FakeExchange(), "now": 124, "position_size": Decimal("0"),
             "current_mid": Decimal("170"), "best_bid": Decimal("169.9"),
             "best_ask": Decimal("170.1"), "open_orders": [], "open_oids": set(),
             "fills_by_oid": {}, "info": object(), "account": "0xabc",
@@ -615,13 +619,20 @@ class GridAvgTests(unittest.TestCase):
         count, changed = lifecycle_process_fills(row, ctx, {"action_limit_headroom": 200})
 
         self.assertTrue(changed)
-        self.assertEqual(count, 0)
-        self.assertEqual(row["levels"], [source])
-        self.assertEqual(source["status"], "filled")
+        self.assertEqual(count, 1)
+        self.assertEqual(len(row["levels"]), 1)
+        child = row["levels"][0]
+        self.assertIsNot(child, source)
+        self.assertEqual(child["status"], "active")
+        self.assertEqual(child["oid"], 22)
+        self.assertEqual(child["size"], "0.06")
+        self.assertGreaterEqual(Decimal(child["size"]) * Decimal(child["price"]), Decimal("10"))
+        self.assertEqual(child["replacement_expanded_min_notional_from"], "0.01")
+        self.assertEqual(child["replacement_expanded_min_notional_at"], "1.6898")
+        self.assertEqual(child["replacement_min_notional"], "10")
         self.assertFalse(source["replacement_pending"])
-        self.assertEqual(source["replacement_discarded_reason"], "notional_below_minimum")
-        self.assertEqual(source["replacement_notional"], "1.6898")
-        self.assertEqual(source["replacement_min_notional"], "10")
+        self.assertEqual(len(ctx["exchange"].calls), 1)
+        self.assertEqual(str(ctx["exchange"].calls[0][2]), "0.06")
 
     def test_p5_queue_does_not_depend_on_exchange_submit(self) -> None:
         class FakeInfo:
