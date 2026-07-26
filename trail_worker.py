@@ -7696,12 +7696,19 @@ def lifecycle_process_fills(
         if oid in ctx["open_oids"]:
             continue
         fill = ctx["fills_by_oid"].get(oid)
-        if fill is None:
+        order_status = None
+        if fill is None or lifecycle_leg(entry) == 1:
             order_status = ctx["info"].query_order_by_oid(ctx["account"], oid)
+        partial_fill_size = grid_order_status_partial_fill_size(order_status)
+        if partial_fill_size is not None:
+            entry["filled_size"] = decimal_to_plain(partial_fill_size)
+            entry["confirmed_partial_filled_oid"] = oid
+            entry["exchange_cancel_status"] = grid_order_status_name(order_status)
+        elif fill is None:
             if grid_order_status_name(order_status) != "filled":
                 continue
             entry["confirmed_filled_oid"] = oid
-        else:
+        if fill is not None:
             entry["fill"] = fill
         entry["status"] = "filled"
         entry["filled_at"] = ctx["now"]
@@ -7712,6 +7719,15 @@ def lifecycle_process_fills(
     submitted = 0
     isolated_ready: set[str] = cache.setdefault("lifecycle_isolated_ready", set())
     for source in newly_filled:
+        if source.get("confirmed_partial_filled_oid") is not None and lifecycle_leg(source) == 1:
+            # A partial execution of the debt leg consumes that chain debt.
+            # The exchange-cancelled remainder does not birth another cycle.
+            source["replacement_pending"] = False
+            source["replacement_processed_at"] = ctx["now"]
+            source["partial_chain_terminal_at"] = ctx["now"]
+            source["partial_chain_terminal_reason"] = "partial_fill_completed_leg_one_debt"
+            changed = True
+            continue
         child = lifecycle_replacement_from_fill(row, ctx["coin"], ctx["asset"], source)
         if child is None:
             source["last_error"] = "filled lifecycle order could not build its replacement"
