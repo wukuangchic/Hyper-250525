@@ -80,6 +80,7 @@ from trail_worker import (
     grid_near_far_add_risk_allowed,
     grid_near_far_rebalance_pair,
     grid_order_status_is_cancelled,
+    grid_order_status_partial_fill_size,
     find_current_position_from_state,
     is_cancel_terminal_race_text,
     is_cumulative_action_limit_text,
@@ -692,6 +693,65 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(source["partial_chain_terminal_reason"], "partial_fill_remainder_moved_to_p8")
         self.assertEqual(row["p8_partial_debts"][0]["size"], "0.01")
         self.assertEqual(row["p8_partial_debts"][0]["weighted_notional"], "1.7069")
+
+    def test_full_fill_with_zero_remainder_is_not_partial(self) -> None:
+        order_status = {
+            "status": "order",
+            "order": {
+                "order": {"oid": 9, "origSz": "0.10", "sz": "0.0", "limitPx": "100"},
+                "status": "filled",
+            },
+        }
+
+        self.assertIsNone(grid_order_status_partial_fill_size(order_status))
+
+    def test_p2_repairs_persisted_full_fill_misclassified_as_partial(self) -> None:
+        class FakeExchange:
+            def __init__(self):
+                self.request = None
+
+            def order(self, coin, is_buy, size, price, order_type, reduce_only=False):
+                self.request = (coin, is_buy, size, price, order_type, reduce_only)
+                return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 22}}]}}}
+
+        source = {
+            "side": "buy", "is_buy": True, "status": "filled", "oid": 9,
+            "replacement_pending": True, "grid_leg": 1, "iteration": 5,
+            "price": "100", "size": "0.10", "filled_size": "0.10",
+            "confirmed_partial_filled_oid": 9, "exchange_cancel_status": "filled",
+            "last_error": "partial leg-1 remainder could not enter P8",
+            "last_submit_status": {"resting": {"oid": 9}},
+        }
+        row = {
+            "gap_rate": "0.01", "min_order_value": "10", "sz_decimals": 2,
+            "base_buy_size": "0.10", "base_sell_size": "0.10", "levels": [source],
+        }
+        exchange = FakeExchange()
+        ctx = {
+            "coin": "BTC", "asset": {"szDecimals": 2, "maxLeverage": 20},
+            "exchange": exchange, "now": 124, "position_size": Decimal("1"),
+            "current_mid": Decimal("100"), "best_bid": Decimal("99.9"),
+            "best_ask": Decimal("100.1"), "open_orders": [], "open_oids": set(),
+            "fills_by_oid": {}, "info": object(), "account": "0xabc",
+        }
+
+        count, changed = lifecycle_process_fills(row, ctx, {"action_limit_headroom": 200})
+
+        self.assertTrue(changed)
+        self.assertEqual(count, 1)
+        self.assertEqual(len(row["levels"]), 1)
+        child = row["levels"][0]
+        self.assertIsNot(child, source)
+        self.assertEqual(child["side"], "sell")
+        self.assertEqual(child["price"], "101")
+        self.assertEqual(child["size"], "0.1")
+        self.assertEqual(child["grid_leg"], 0)
+        self.assertEqual(child["status"], "active")
+        self.assertEqual(source["confirmed_filled_oid"], 9)
+        self.assertNotIn("confirmed_partial_filled_oid", source)
+        self.assertFalse(source["replacement_pending"])
+        self.assertNotIn("last_error", source)
+        self.assertTrue(exchange.request[-1])
 
     def test_p8_combines_same_side_remainders_and_promotes_above_ten(self) -> None:
         row = {

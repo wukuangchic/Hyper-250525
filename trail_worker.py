@@ -1716,7 +1716,7 @@ def grid_order_status_partial_fill_size(order_status: Any) -> Decimal | None:
         original_size is None
         or remaining_size is None
         or original_size <= 0
-        or remaining_size < 0
+        or remaining_size <= 0
         or remaining_size >= original_size
     ):
         return None
@@ -7912,26 +7912,39 @@ def lifecycle_process_fills(
                 original_size = decimal_or_none(source.get("size")) or Decimal("0")
                 filled_size = decimal_or_none(source.get("filled_size")) or Decimal("0")
                 remaining_size = original_size - filled_size
-            remaining_price = decimal_or_none(
-                source.get("partial_unfilled_price", source.get("price", source.get("limit_px")))
-            )
-            accumulated = (
-                remaining_price is not None
-                and lifecycle_accumulate_p8_partial_debt(
-                    row, source, remaining_size, remaining_price, ctx["now"]
+            if remaining_size == 0:
+                # Compatibility for rows persisted while a terminal full fill
+                # (origSz > 0, sz == 0) was misclassified as a partial fill.
+                # Clear the partial marker so P2 builds the normal opposite
+                # leg from the confirmed resting fill instead of trying to
+                # accumulate a zero-sized P8 remainder forever.
+                source["confirmed_filled_oid"] = source.pop("confirmed_partial_filled_oid")
+                source.pop("partial_unfilled_size", None)
+                source.pop("partial_unfilled_price", None)
+                if source.get("last_error") == "partial leg-1 remainder could not enter P8":
+                    source.pop("last_error", None)
+            else:
+                remaining_price = decimal_or_none(
+                    source.get("partial_unfilled_price", source.get("price", source.get("limit_px")))
                 )
-            )
-            if not accumulated:
-                source["last_error"] = "partial leg-1 remainder could not enter P8"
+                accumulated = (
+                    remaining_size > 0
+                    and remaining_price is not None
+                    and lifecycle_accumulate_p8_partial_debt(
+                        row, source, remaining_size, remaining_price, ctx["now"]
+                    )
+                )
+                if not accumulated:
+                    source["last_error"] = "partial leg-1 remainder could not enter P8"
+                    continue
+                if source in levels:
+                    levels.remove(source)
+                source["replacement_pending"] = False
+                source["replacement_processed_at"] = ctx["now"]
+                source["partial_chain_terminal_at"] = ctx["now"]
+                source["partial_chain_terminal_reason"] = "partial_fill_remainder_moved_to_p8"
+                changed = True
                 continue
-            if source in levels:
-                levels.remove(source)
-            source["replacement_pending"] = False
-            source["replacement_processed_at"] = ctx["now"]
-            source["partial_chain_terminal_at"] = ctx["now"]
-            source["partial_chain_terminal_reason"] = "partial_fill_remainder_moved_to_p8"
-            changed = True
-            continue
         child = lifecycle_replacement_from_fill(row, ctx["coin"], ctx["asset"], source)
         if child is None:
             source["last_error"] = "filled lifecycle order could not build its replacement"
