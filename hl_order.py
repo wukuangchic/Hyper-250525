@@ -1944,7 +1944,17 @@ def format_p3_queue_rows(
                     "side": str(entry.get("side") or ""),
                     "leg": str(entry.get("grid_leg", "-")),
                     "status": status,
-                    "source": "p7" if entry.get("p7_restructure") else ("p7_restore" if entry.get("p7_restore") else ("P6" if entry.get("p6_legacy_pause") else "-")),
+                    "source": (
+                        "P8"
+                        if str(entry.get("birth_source") or "") == "p8_partial_debt"
+                        else "p7"
+                        if entry.get("p7_restructure")
+                        else "p7_restore"
+                        if entry.get("p7_restore")
+                        else "P6"
+                        if entry.get("p6_legacy_pause")
+                        else "-"
+                    ),
                     "reduce": "1" if bool(entry.get("reduce_only")) else "0",
                     "price": format_optional_decimal(entry.get("price", entry.get("limit_px"))),
                     "size": format_optional_quantity(entry.get("size")),
@@ -2056,6 +2066,8 @@ def query_grid(args: argparse.Namespace) -> None:
             )),
             ("lifecycle", f"v{row.get('grid_lifecycle_version', '-')} finite-chain"),
             ("legacy_pause", str(row.get("legacy_pause_remaining", "0"))),
+            ("p8_partial", str(row.get("p8_partial_debt_count", "0"))),
+            ("p8_value", format_optional_decimal(row.get("p8_partial_debt_value", "0"))),
             ("active_buy", str(active_buy)),
             ("active_sell", str(active_sell)),
             ("live_oids", f"{live_count}/{len(grid_batch_open_oids(row))}"),

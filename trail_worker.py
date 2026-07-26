@@ -152,6 +152,7 @@ GRID_LIFECYCLE_PHASE_P4 = "p4"
 GRID_LIFECYCLE_PHASE_P5 = "p5"
 GRID_LIFECYCLE_PHASE_P6 = "p6"
 GRID_LIFECYCLE_PHASE_P7 = "p7"
+GRID_LIFECYCLE_PHASE_P8 = "p8"
 GRID_LIFECYCLE_PHASES = (
     GRID_LIFECYCLE_PHASE_P0,
     GRID_LIFECYCLE_PHASE_P1,
@@ -161,7 +162,9 @@ GRID_LIFECYCLE_PHASES = (
     GRID_LIFECYCLE_PHASE_P5,
     GRID_LIFECYCLE_PHASE_P6,
     GRID_LIFECYCLE_PHASE_P7,
+    GRID_LIFECYCLE_PHASE_P8,
 )
+GRID_P8_REACCUMULATE_STATUS = "p8_reaccumulate"
 GRID_MAX_LEVELS_PER_SIDE = 1024
 GRID_MAX_ACTIVE_ORDERS_PER_SIDE = 16
 GRID_PAUSED_STATUSES = {
@@ -1718,6 +1721,31 @@ def grid_order_status_partial_fill_size(order_status: Any) -> Decimal | None:
     ):
         return None
     return original_size - remaining_size
+
+
+def grid_order_status_partial_remainder(
+    order_status: Any,
+) -> tuple[Decimal, Decimal | None] | None:
+    """Return exchange-confirmed unfilled size and saved limit price."""
+    if not isinstance(order_status, dict):
+        return None
+    status_order = order_status.get("order")
+    if not isinstance(status_order, dict):
+        return None
+    exchange_order = status_order.get("order")
+    if not isinstance(exchange_order, dict):
+        exchange_order = status_order
+    original_size = decimal_or_none(exchange_order.get("origSz"))
+    remaining_size = decimal_or_none(exchange_order.get("sz"))
+    if (
+        original_size is None
+        or remaining_size is None
+        or original_size <= 0
+        or remaining_size <= 0
+        or remaining_size >= original_size
+    ):
+        return None
+    return remaining_size, decimal_or_none(exchange_order.get("limitPx"))
 
 
 def mark_pending_cancel_confirmed_cancelled(
@@ -7439,6 +7467,14 @@ def lifecycle_submit_order(
                     return defer("unable to move lifecycle order outward")
                 set_grid_order_price(order, next_price)
                 price = next_price
+        if str(order.get("birth_source") or "") == "p8_partial_debt":
+            size = decimal_or_none(order.get("size")) or Decimal("0")
+            if size <= 0 or size * price <= MIN_NOTIONAL:
+                order["status"] = GRID_P8_REACCUMULATE_STATUS
+                order["p8_reaccumulate_at"] = now
+                order["p8_reaccumulate_price"] = decimal_to_plain(price)
+                order["p8_reaccumulate_value"] = decimal_to_plain(size * price)
+                return GRID_P8_REACCUMULATE_STATUS
         try:
             oid, state, submit_status = submit_grid_child_order(
                 exchange,
@@ -7670,6 +7706,151 @@ def lifecycle_legacy_pause_candidate(
     return candidate_row, entry
 
 
+def lifecycle_p8_buckets(row: dict[str, Any]) -> list[dict[str, Any]]:
+    buckets = row.setdefault("p8_partial_debts", [])
+    if not isinstance(buckets, list):
+        buckets = []
+        row["p8_partial_debts"] = buckets
+    return buckets
+
+
+def lifecycle_refresh_p8_summary(row: dict[str, Any]) -> None:
+    buckets = [bucket for bucket in lifecycle_p8_buckets(row) if isinstance(bucket, dict)]
+    total_value = sum(
+        (decimal_or_none(bucket.get("weighted_notional")) or Decimal("0"))
+        for bucket in buckets
+    )
+    row["p8_partial_debt_count"] = len(buckets)
+    row["p8_partial_debt_value"] = decimal_to_plain(total_value)
+    if not buckets:
+        row.pop("p8_partial_debts", None)
+
+
+def lifecycle_accumulate_p8_partial_debt(
+    row: dict[str, Any],
+    source: dict[str, Any],
+    remaining_size: Decimal,
+    price: Decimal,
+    now: int,
+) -> bool:
+    """Accumulate one unfilled leg-1 remainder in its Grid/side P8 bucket."""
+    side = str(source.get("side") or "")
+    if side not in {"buy", "sell"} or remaining_size <= 0 or price <= 0:
+        return False
+    source_oids: list[int] = []
+    for value in source.get("p8_source_oids") or [source.get("oid")]:
+        try:
+            source_oids.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    buckets = lifecycle_p8_buckets(row)
+    bucket = next(
+        (
+            candidate
+            for candidate in buckets
+            if isinstance(candidate, dict) and str(candidate.get("side") or "") == side
+        ),
+        None,
+    )
+    if bucket is None:
+        bucket = {
+            "side": side,
+            "is_buy": side == "buy",
+            "size": "0",
+            "weighted_notional": "0",
+            "weighted_avg_price": "0",
+            "source_count": 0,
+            "source_oids": [],
+            "created_at": now,
+        }
+        buckets.append(bucket)
+    known_oids = {
+        int(value)
+        for value in bucket.get("source_oids") or []
+        if isinstance(value, int) or str(value).isdigit()
+    }
+    if source_oids and all(oid in known_oids for oid in source_oids):
+        return False
+    old_size = decimal_or_none(bucket.get("size")) or Decimal("0")
+    old_notional = decimal_or_none(bucket.get("weighted_notional")) or Decimal("0")
+    total_size = old_size + remaining_size
+    total_notional = old_notional + remaining_size * price
+    bucket["size"] = decimal_to_plain(total_size)
+    bucket["weighted_notional"] = decimal_to_plain(total_notional)
+    bucket["weighted_avg_price"] = decimal_to_plain(total_notional / total_size)
+    bucket["source_count"] = int(bucket.get("source_count") or 0) + int(
+        source.get("p8_source_count") or 1
+    )
+    bucket["source_oids"] = sorted(known_oids.union(source_oids))
+    bucket["updated_at"] = now
+    lifecycle_refresh_p8_summary(row)
+    return True
+
+
+def lifecycle_process_p8(
+    row: dict[str, Any],
+    now: int,
+    cache: dict[str, Any],
+) -> tuple[int, bool]:
+    """Promote strictly-above-$10 side buckets into next-round P3 debt."""
+    buckets = lifecycle_p8_buckets(row)
+    if not buckets:
+        lifecycle_refresh_p8_summary(row)
+        return 0, False
+    levels = row.setdefault("levels", [])
+    sz_decimals = int(row.get("sz_decimals") or 0)
+    asset = {"szDecimals": sz_decimals}
+    coin = str(row.get("coin") or "")
+    promoted = 0
+    changed = False
+    for bucket in list(buckets):
+        if not isinstance(bucket, dict):
+            buckets.remove(bucket)
+            changed = True
+            continue
+        size = decimal_or_none(bucket.get("size")) or Decimal("0")
+        weighted_notional = decimal_or_none(bucket.get("weighted_notional")) or Decimal("0")
+        side = str(bucket.get("side") or "")
+        if size <= 0 or weighted_notional <= MIN_NOTIONAL or side not in {"buy", "sell"}:
+            continue
+        price = rounded_perp_price(weighted_notional / size, sz_decimals)
+        if price <= 0 or size * price <= MIN_NOTIONAL:
+            continue
+        order = grid_order_entry(
+            row,
+            coin,
+            asset,
+            side == "buy",
+            price,
+            False,
+            size=size,
+            gap=Decimal(str(row["gap_rate"])),
+            preserve_size=True,
+        )
+        order.update(
+            {
+                "status": GRID_CHAIN_DEBT_STATUS,
+                "oid": None,
+                "grid_leg": 1,
+                "birth_source": "p8_partial_debt",
+                "preserve_fill_size": True,
+                "p8_promoted_at": now,
+                "p8_weighted_notional": decimal_to_plain(weighted_notional),
+                "p8_weighted_avg_price": decimal_to_plain(weighted_notional / size),
+                "p8_source_count": int(bucket.get("source_count") or 0),
+                "p8_source_oids": list(bucket.get("source_oids") or []),
+                "chain_debt_at": now,
+            }
+        )
+        lifecycle_assign_p3_queue_seq(order, cache)
+        levels.append(order)
+        buckets.remove(bucket)
+        promoted += 1
+        changed = True
+    lifecycle_refresh_p8_summary(row)
+    return promoted, changed
+
+
 def lifecycle_process_fills(
     row: dict[str, Any],
     ctx: dict[str, Any],
@@ -7704,6 +7885,12 @@ def lifecycle_process_fills(
             entry["filled_size"] = decimal_to_plain(partial_fill_size)
             entry["confirmed_partial_filled_oid"] = oid
             entry["exchange_cancel_status"] = grid_order_status_name(order_status)
+            partial_remainder = grid_order_status_partial_remainder(order_status)
+            if partial_remainder is not None:
+                remaining_size, exchange_price = partial_remainder
+                entry["partial_unfilled_size"] = decimal_to_plain(remaining_size)
+                if exchange_price is not None:
+                    entry["partial_unfilled_price"] = decimal_to_plain(exchange_price)
         elif fill is None:
             if grid_order_status_name(order_status) != "filled":
                 continue
@@ -7720,12 +7907,29 @@ def lifecycle_process_fills(
     isolated_ready: set[str] = cache.setdefault("lifecycle_isolated_ready", set())
     for source in newly_filled:
         if source.get("confirmed_partial_filled_oid") is not None and lifecycle_leg(source) == 1:
-            # A partial execution of the debt leg consumes that chain debt.
-            # The exchange-cancelled remainder does not birth another cycle.
+            remaining_size = decimal_or_none(source.get("partial_unfilled_size"))
+            if remaining_size is None:
+                original_size = decimal_or_none(source.get("size")) or Decimal("0")
+                filled_size = decimal_or_none(source.get("filled_size")) or Decimal("0")
+                remaining_size = original_size - filled_size
+            remaining_price = decimal_or_none(
+                source.get("partial_unfilled_price", source.get("price", source.get("limit_px")))
+            )
+            accumulated = (
+                remaining_price is not None
+                and lifecycle_accumulate_p8_partial_debt(
+                    row, source, remaining_size, remaining_price, ctx["now"]
+                )
+            )
+            if not accumulated:
+                source["last_error"] = "partial leg-1 remainder could not enter P8"
+                continue
+            if source in levels:
+                levels.remove(source)
             source["replacement_pending"] = False
             source["replacement_processed_at"] = ctx["now"]
             source["partial_chain_terminal_at"] = ctx["now"]
-            source["partial_chain_terminal_reason"] = "partial_fill_completed_leg_one_debt"
+            source["partial_chain_terminal_reason"] = "partial_fill_remainder_moved_to_p8"
             changed = True
             continue
         child = lifecycle_replacement_from_fill(row, ctx["coin"], ctx["asset"], source)
@@ -7777,12 +7981,39 @@ def lifecycle_process_anomalies(row: dict[str, Any], ctx: dict[str, Any], cache:
         if status_name == "reduceOnlyCanceled" or grid_order_status_is_cancelled(order_status):
             partial_fill_size = grid_order_status_partial_fill_size(order_status)
             if partial_fill_size is not None:
+                partial_remainder = grid_order_status_partial_remainder(order_status)
                 entry["status"] = "filled"
                 entry["filled_size"] = decimal_to_plain(partial_fill_size)
                 entry["confirmed_partial_filled_oid"] = oid
                 entry["exchange_cancel_status"] = status_name
-                entry["replacement_pending"] = True
                 entry["filled_at"] = ctx["now"]
+                if partial_remainder is not None:
+                    remaining_size, exchange_price = partial_remainder
+                    remaining_price = exchange_price or decimal_or_none(
+                        entry.get("price", entry.get("limit_px"))
+                    )
+                else:
+                    original_size = decimal_or_none(entry.get("size")) or Decimal("0")
+                    remaining_size = original_size - partial_fill_size
+                    remaining_price = decimal_or_none(entry.get("price", entry.get("limit_px")))
+                if lifecycle_leg(entry) == 1:
+                    if (
+                        remaining_price is None
+                        or not lifecycle_accumulate_p8_partial_debt(
+                            row, entry, remaining_size, remaining_price, ctx["now"]
+                        )
+                    ):
+                        entry["last_error"] = "partial leg-1 remainder could not enter P8"
+                        changed = True
+                        continue
+                    entry["replacement_pending"] = False
+                    entry["partial_chain_terminal_at"] = ctx["now"]
+                    entry["partial_chain_terminal_reason"] = "partial_fill_remainder_moved_to_p8"
+                    if entry in levels:
+                        levels.remove(entry)
+                    changed = True
+                    continue
+                entry["replacement_pending"] = True
                 changed = True
                 continue
             if lifecycle_leg(entry) == 0:
@@ -8218,13 +8449,38 @@ def lifecycle_submit_limit_chase(row: dict[str, Any], ctx: dict[str, Any], cache
     return True
 
 
+def maintain_grid_p8(row: dict[str, Any], cache: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Run the local-only P8 accumulator without refreshing exchange context."""
+    now = int(cache.setdefault("now", int(time.time())))
+    changed = migrate_grid_lifecycle(row, now)
+    changed = initialize_lifecycle_iterations(row) or changed
+    promoted, p8_changed = lifecycle_process_p8(row, now, cache)
+    changed = changed or p8_changed
+    counters = cache.setdefault("grid_lifecycle_counters", {}).setdefault(id(row), {})
+    counters["p8_promoted"] = int(counters.get("p8_promoted") or 0) + promoted
+    levels = row.setdefault("levels", [])
+    row["open_oids"] = sorted(grid_batch_open_oids(row))
+    row["status"] = "active"
+    row["updated_at"] = now
+    row["note"] = (
+        "grid lifecycle v2; phase=p8; "
+        f"chain_debt={sum(1 for entry in levels if isinstance(entry, dict) and str(entry.get('status') or '') == GRID_CHAIN_DEBT_STATUS)}; "
+        f"p8={row.get('p8_partial_debt_count', 0)}; "
+        f"p8_value={row.get('p8_partial_debt_value', '0')}; "
+        f"raw_deficit={raw_action_limit_deficit(cache)}"
+    )
+    return row, changed
+
+
 def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> tuple[dict[str, Any], bool]:
     cache = cache if cache is not None else {}
+    phase = str(cache.get("grid_action_phase") or GRID_LIFECYCLE_PHASE_P0)
+    if phase == GRID_LIFECYCLE_PHASE_P8:
+        return maintain_grid_p8(row, cache)
     ctx = lifecycle_context(row, cache)
     # P6 compares legacy prices across markets, so every row needs the live
     # midpoint gathered for this worker run before the account-wide scan.
     row["lifecycle_mid"] = decimal_to_plain(ctx["current_mid"])
-    phase = str(cache.get("grid_action_phase") or GRID_LIFECYCLE_PHASE_P0)
     changed = migrate_grid_lifecycle(row, ctx["now"])
     changed = initialize_lifecycle_iterations(row) or changed
     levels = row.setdefault("levels", [])
@@ -8317,6 +8573,17 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 changed = True
                 if result == "submitted":
                     counters["p3_restored"] = int(counters.get("p3_restored") or 0) + 1
+                elif result == GRID_P8_REACCUMULATE_STATUS:
+                    size = decimal_or_none(entry.get("size")) or Decimal("0")
+                    price = decimal_or_none(entry.get("price", entry.get("limit_px"))) or Decimal("0")
+                    if lifecycle_accumulate_p8_partial_debt(
+                        row, entry, size, price, ctx["now"]
+                    ):
+                        if entry in levels:
+                            levels.remove(entry)
+                        counters["p3_returned_to_p8"] = int(
+                            counters.get("p3_returned_to_p8") or 0
+                        ) + 1
                 elif (
                     result in {GRID_MARGIN_STATUS, GRID_CHAIN_DEBT_STATUS}
                     and lifecycle_p3_failure_is_unknown(entry)
@@ -8388,6 +8655,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         f"leg1={sum(1 for e in levels if isinstance(e, dict) and lifecycle_leg(e) == 1 and str(e.get('status') or '') == 'active')}; "
         f"margin={sum(1 for e in levels if isinstance(e, dict) and str(e.get('status') or '') == GRID_MARGIN_STATUS)}; "
         f"chain_debt={sum(1 for e in levels if isinstance(e, dict) and str(e.get('status') or '') == GRID_CHAIN_DEBT_STATUS)}; "
+        f"p8={row.get('p8_partial_debt_count', 0)}; "
+        f"p8_value={row.get('p8_partial_debt_value', '0')}; "
         f"birth_intents={len(row.get('birth_market_intents') or [])}; "
         f"legacy_pause={row['legacy_pause_remaining']}; raw_deficit={raw_action_limit_deficit(cache)}"
     )
@@ -8516,15 +8785,18 @@ def run_once() -> None:
             )
             for index in indexes:
                 process_grid_index(index, f"grid {phase}")
-        reconcile_cached_grid_open_orders(rows, active_grid_indexes, grid_cache)
-        for info, _exchange, _account, _signer, _role in grid_cache.get("clients", {}).values():
-            clear_info_cache(info)
-        # Each phase must recompute position, withdrawable and market context so
-        # add/reduce classification never relies on a pre-fill snapshot.
-        for cache_name in ("mids", "books", "user_states", "spot_user_states", "fills"):
-            grid_cache.pop(cache_name, None)
-        # Our own open-order delta is reconciled after every phase; retaining it
-        # avoids losing a just-submitted child before the exchange view catches up.
+        if phase != GRID_LIFECYCLE_PHASE_P8:
+            reconcile_cached_grid_open_orders(rows, active_grid_indexes, grid_cache)
+            for info, _exchange, _account, _signer, _role in grid_cache.get("clients", {}).values():
+                clear_info_cache(info)
+            # Each exchange-facing phase must recompute position, withdrawable
+            # and market context so add/reduce classification never relies on a
+            # pre-fill snapshot. P8 is local-only and is the final phase.
+            for cache_name in ("mids", "books", "user_states", "spot_user_states", "fills"):
+                grid_cache.pop(cache_name, None)
+            # Our own open-order delta is reconciled after every exchange phase;
+            # retaining it avoids losing a just-submitted child before the
+            # exchange view catches up.
     grid_cache.pop("grid_action_phase", None)
 
     rows, pruned = prune_done_rows(rows)

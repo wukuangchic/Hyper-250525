@@ -112,6 +112,8 @@ from trail_worker import (
     lifecycle_p3_pending_pool,
     lifecycle_p3_failure_is_unknown,
     lifecycle_p3_restore_budget,
+    lifecycle_accumulate_p8_partial_debt,
+    lifecycle_process_p8,
     lifecycle_process_p7,
     lifecycle_p7_debt_value,
     lifecycle_p7_farthest_pair,
@@ -177,6 +179,8 @@ from trail_worker import (
     GRID_ACTION_PHASE_P2,
     GRID_CHAIN_DEBT_STATUS,
     GRID_LIFECYCLE_PHASE_P7,
+    GRID_LIFECYCLE_PHASE_P8,
+    GRID_P8_REACCUMULATE_STATUS,
     GRID_MARGIN_STATUS,
     grid_entries_fit_within_max,
     grid_entries_near_first_per_side,
@@ -550,7 +554,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(entry["grid_leg"], 1)
         self.assertEqual(row["levels"], [prior_debt, entry])
 
-    def test_p5_partially_filled_cancel_is_processed_as_fill(self) -> None:
+    def test_p5_partial_leg_one_remainder_moves_to_p8(self) -> None:
         class FakeInfo:
             def query_order_by_oid(self, account, oid):
                 return {
@@ -584,12 +588,20 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertTrue(changed)
         self.assertEqual(count, 0)
+        self.assertEqual(row["levels"], [])
         self.assertEqual(entry["status"], "filled")
         self.assertEqual(entry["filled_size"], "0.06")
         self.assertEqual(entry["confirmed_partial_filled_oid"], 9)
         self.assertEqual(entry["exchange_cancel_status"], "reduceOnlyCanceled")
-        self.assertTrue(entry["replacement_pending"])
-        self.assertEqual(entry["p3_queue_seq"], 99)
+        self.assertFalse(entry["replacement_pending"])
+        self.assertEqual(entry["partial_chain_terminal_reason"], "partial_fill_remainder_moved_to_p8")
+        self.assertEqual(row["p8_partial_debt_count"], 1)
+        bucket = row["p8_partial_debts"][0]
+        self.assertEqual(bucket["side"], "sell")
+        self.assertEqual(bucket["size"], "0.01")
+        self.assertEqual(bucket["weighted_avg_price"], "170.69")
+        self.assertEqual(bucket["weighted_notional"], "1.7069")
+        self.assertEqual(bucket["source_oids"], [9])
 
     def test_p2_partial_leg_zero_below_ten_expands_to_submit(self) -> None:
         class FakeExchange:
@@ -636,7 +648,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(len(ctx["exchange"].calls), 1)
         self.assertEqual(str(ctx["exchange"].calls[0][2]), "0.06")
 
-    def test_p2_partial_leg_one_terminates_without_replacement(self) -> None:
+    def test_p2_partial_leg_one_remainder_moves_to_p8(self) -> None:
         class FakeInfo:
             def query_order_by_oid(self, account, oid):
                 return {
@@ -673,11 +685,156 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertTrue(changed)
         self.assertEqual(count, 0)
-        self.assertEqual(row["levels"], [source])
+        self.assertEqual(row["levels"], [])
         self.assertEqual(source["status"], "filled")
         self.assertEqual(source["filled_size"], "0.06")
         self.assertFalse(source["replacement_pending"])
-        self.assertEqual(source["partial_chain_terminal_reason"], "partial_fill_completed_leg_one_debt")
+        self.assertEqual(source["partial_chain_terminal_reason"], "partial_fill_remainder_moved_to_p8")
+        self.assertEqual(row["p8_partial_debts"][0]["size"], "0.01")
+        self.assertEqual(row["p8_partial_debts"][0]["weighted_notional"], "1.7069")
+
+    def test_p8_combines_same_side_remainders_and_promotes_above_ten(self) -> None:
+        row = {
+            "coin": "xyz:JPY", "gap_rate": "0.001", "sz_decimals": 2,
+            "min_order_value": "10", "base_buy_size": "0.13", "base_sell_size": "0.13",
+            "levels": [],
+        }
+        first = {"side": "buy", "oid": 101, "grid_leg": 1}
+        second = {"side": "buy", "oid": 102, "grid_leg": 1}
+        self.assertTrue(
+            lifecycle_accumulate_p8_partial_debt(
+                row, first, Decimal("0.08"), Decimal("163.85"), 100
+            )
+        )
+        self.assertTrue(
+            lifecycle_accumulate_p8_partial_debt(
+                row, second, Decimal("0.08"), Decimal("163.81"), 101
+            )
+        )
+        bucket = row["p8_partial_debts"][0]
+        self.assertEqual(bucket["size"], "0.16")
+        self.assertEqual(bucket["weighted_avg_price"], "163.83")
+        self.assertEqual(bucket["weighted_notional"], "26.2128")
+
+        promoted, changed = lifecycle_process_p8(
+            row, 102, {"grid_rows": [row], "lifecycle_p3_next_seq": 7}
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(promoted, 1)
+        self.assertNotIn("p8_partial_debts", row)
+        self.assertEqual(row["p8_partial_debt_count"], 0)
+        debt = row["levels"][0]
+        self.assertEqual(debt["side"], "buy")
+        self.assertEqual(debt["size"], "0.16")
+        self.assertEqual(debt["price"], "163.83")
+        self.assertEqual(debt["status"], GRID_CHAIN_DEBT_STATUS)
+        self.assertEqual(debt["grid_leg"], 1)
+        self.assertEqual(debt["birth_source"], "p8_partial_debt")
+        self.assertTrue(debt["preserve_fill_size"])
+        self.assertEqual(debt["p3_queue_seq"], 7)
+        self.assertEqual(debt["p8_source_oids"], [101, 102])
+
+    def test_p8_keeps_equal_ten_and_separates_sides(self) -> None:
+        row = {
+            "coin": "BTC", "gap_rate": "0.01", "sz_decimals": 2,
+            "min_order_value": "10", "base_buy_size": "1", "base_sell_size": "1",
+            "levels": [],
+        }
+        lifecycle_accumulate_p8_partial_debt(
+            row, {"side": "buy", "oid": 1}, Decimal("1"), Decimal("10"), 100
+        )
+        lifecycle_accumulate_p8_partial_debt(
+            row, {"side": "sell", "oid": 2}, Decimal("0.5"), Decimal("10"), 100
+        )
+
+        promoted, changed = lifecycle_process_p8(row, 101, {"grid_rows": [row]})
+
+        self.assertFalse(changed)
+        self.assertEqual(promoted, 0)
+        self.assertEqual(len(row["p8_partial_debts"]), 2)
+        self.assertEqual(
+            {bucket["side"]: bucket["weighted_notional"] for bucket in row["p8_partial_debts"]},
+            {"buy": "10", "sell": "5"},
+        )
+
+    def test_p8_origin_below_ten_returns_without_exchange_submit(self) -> None:
+        class NoSubmitExchange:
+            def order(self, *args, **kwargs):
+                raise AssertionError("sub-$10 P8 debt must return to its accumulator")
+
+        row = {
+            "coin": "BTC", "gap_rate": "0.01", "sz_decimals": 2,
+            "min_order_value": "10", "base_buy_size": "1", "base_sell_size": "1",
+            "levels": [],
+        }
+        order = grid_order_entry(
+            row, "BTC", {"szDecimals": 2, "maxLeverage": 20}, True,
+            Decimal("9"), False, size=Decimal("1"), preserve_size=True,
+        )
+        order.update({
+            "status": GRID_CHAIN_DEBT_STATUS, "grid_leg": 1,
+            "birth_source": "p8_partial_debt", "preserve_fill_size": True,
+        })
+
+        result = lifecycle_submit_order(
+            NoSubmitExchange(), "BTC", order, 123, row,
+            {"szDecimals": 2, "maxLeverage": 20}, Decimal("1"), Decimal("10"),
+            Decimal("9.9"), Decimal("10.1"), set(), [], {}, search_outward=False,
+        )
+
+        self.assertEqual(result, GRID_P8_REACCUMULATE_STATUS)
+        self.assertEqual(order["size"], "1")
+        self.assertEqual(order["p8_reaccumulate_value"], "9")
+
+    def test_p3_moves_sub_ten_p8_origin_back_to_accumulator(self) -> None:
+        class NoSubmitExchange:
+            def order(self, *args, **kwargs):
+                raise AssertionError("sub-$10 P8 debt must not reach the exchange")
+
+        row = {
+            "type": "grid", "status": "active", "grid_lifecycle_version": 2,
+            "network": "mainnet", "account": "0xabc", "coin": "BTC",
+            "position_limit_mode": "limit", "min_position_value": "-100",
+            "max_position_value": "100", "gap_rate": "0.01", "sz_decimals": 2,
+            "min_order_value": "10", "base_buy_size": "1", "base_sell_size": "1",
+            "levels": [],
+        }
+        debt = grid_order_entry(
+            row, "BTC", {"szDecimals": 2, "maxLeverage": 20}, True,
+            Decimal("9"), False, size=Decimal("1"), preserve_size=True,
+        )
+        debt.update({
+            "status": GRID_CHAIN_DEBT_STATUS, "grid_leg": 1, "p3_queue_seq": 3,
+            "birth_source": "p8_partial_debt", "preserve_fill_size": True,
+            "p8_source_oids": [101, 102], "p8_source_count": 2,
+        })
+        row["levels"].append(debt)
+        ctx = {
+            "network": "mainnet", "account": "0xabc", "coin": "BTC",
+            "asset": {"szDecimals": 2, "maxLeverage": 20}, "exchange": NoSubmitExchange(),
+            "info": object(), "now": 123, "now_ms": 123000,
+            "position_size": Decimal("1"), "position_value": Decimal("10"),
+            "position_leverage": Decimal("20"), "current_mid": Decimal("10"),
+            "best_bid": Decimal("9.9"), "best_ask": Decimal("10.1"),
+            "withdrawable": Decimal("2"), "liquidation_px": None,
+            "open_orders": [], "open_oids": set(), "fills_by_oid": {},
+        }
+        cache = {
+            "grid_rows": [row], "grid_action_phase": "p3",
+            "lifecycle_p3_target": debt, "action_limit_headroom": 200,
+        }
+
+        with patch("trail_worker.lifecycle_context", return_value=ctx):
+            maintained, changed = maintain_grid(row, cache)
+
+        self.assertTrue(changed)
+        self.assertEqual(maintained["levels"], [])
+        self.assertEqual(maintained["p8_partial_debt_count"], 1)
+        bucket = maintained["p8_partial_debts"][0]
+        self.assertEqual(bucket["size"], "1")
+        self.assertEqual(bucket["weighted_notional"], "9")
+        self.assertEqual(bucket["source_oids"], [101, 102])
 
     def test_p5_queue_does_not_depend_on_exchange_submit(self) -> None:
         class FakeInfo:
@@ -1749,6 +1906,8 @@ class GridAvgTests(unittest.TestCase):
                 ("BTC", "p6"),
                 ("ETH", "p7"),
                 ("BTC", "p7"),
+                ("ETH", GRID_LIFECYCLE_PHASE_P8),
+                ("BTC", GRID_LIFECYCLE_PHASE_P8),
             ],
         )
         save_server_batch.assert_called_once()
@@ -7498,6 +7657,12 @@ class GridAvgTests(unittest.TestCase):
                 ],
             },
             {
+                "type": "grid", "status": "active", "network": "mainnet", "account": "0xabc",
+                "coin": "JPY", "levels": [
+                    {"side": "buy", "grid_leg": 1, "status": "chain_debt", "price": "163.83", "size": "0.16", "chain_debt_at": 12, "p3_queue_seq": 3, "birth_source": "p8_partial_debt"},
+                ],
+            },
+            {
                 "type": "grid", "status": "active", "network": "testnet", "account": "0xabc",
                 "coin": "ETH", "levels": [{"status": "chain_debt", "side": "buy"}],
             },
@@ -7508,8 +7673,9 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual([(row["coin"], row["status"], row["source"]) for row in display_rows], [
             ("BTC", "chain_debt", "p7"),
             ("xyz:SPCX", "margin", "P6"),
+            ("JPY", "chain_debt", "P8"),
         ])
-        self.assertEqual([row["seq"] for row in display_rows], ["1", "2"])
+        self.assertEqual([row["seq"] for row in display_rows], ["1", "2", "3"])
         self.assertEqual(display_rows[0]["price"], "60.00")
         self.assertEqual(display_rows[1]["error"], "Insufficient margin")
 
