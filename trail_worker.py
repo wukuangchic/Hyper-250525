@@ -104,6 +104,7 @@ GRID_P6_WITHDRAWABLE_THRESHOLD = Decimal("3")
 GRID_P7_RAW_DEFICIT_THRESHOLD = -100
 GRID_P7_WITHDRAWABLE_THRESHOLD = Decimal("5")
 GRID_P7_MIN_ACTIVE_PER_SIDE = 5
+GRID_P7_MIN_ORDER_AGE_SECONDS = 10 * 60
 GRID_P3_MAX_RESTORES_PER_RUN = 10
 GRID_PANIC_RATIO_LEGACY_DEFAULT_THRESHOLDS = {
     Decimal("10"),
@@ -551,8 +552,11 @@ def lifecycle_p3_failure_is_unknown(entry: dict[str, Any]) -> bool:
     return not known_retryable
 
 
-def lifecycle_p7_farthest_pair(row: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]] | None:
-    """Return the farthest active leg-1 buy/sell pair for one grid."""
+def lifecycle_p7_farthest_pair(
+    row: dict[str, Any],
+    now: int | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Return the farthest eligible active leg-1 buy/sell pair for one grid."""
     buys: list[tuple[Decimal, dict[str, Any]]] = []
     sells: list[tuple[Decimal, dict[str, Any]]] = []
     active_buy_count = 0
@@ -573,6 +577,14 @@ def lifecycle_p7_farthest_pair(row: dict[str, Any]) -> tuple[dict[str, Any], dic
         price = decimal_or_none(entry.get("price", entry.get("limit_px")))
         if price is None or price <= 0:
             continue
+        if now is not None:
+            try:
+                submitted_at = int(entry.get("submitted_at") or 0)
+            except (TypeError, ValueError):
+                submitted_at = 0
+            # Missing/invalid timestamps are treated as infinitely old by policy.
+            if submitted_at > 0 and now - submitted_at < GRID_P7_MIN_ORDER_AGE_SECONDS:
+                continue
         side = str(entry.get("side") or "")
         if side == "buy":
             buys.append((price, entry))
@@ -685,7 +697,7 @@ def lifecycle_process_p7(row: dict[str, Any], ctx: dict[str, Any], cache: dict[s
     levels = row.setdefault("levels", [])
     intent = row.get("p7_restructure_intent")
     if not isinstance(intent, dict):
-        pair = lifecycle_p7_farthest_pair(row)
+        pair = lifecycle_p7_farthest_pair(row, now=ctx["now"])
         if pair is None:
             return False, 0
         buy, sell = pair

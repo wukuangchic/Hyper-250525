@@ -2239,6 +2239,40 @@ class GridAvgTests(unittest.TestCase):
         self.assertIsNotNone(pair)
         self.assertEqual((pair[0]["oid"], pair[1]["oid"]), (0, 105))
 
+    def test_p7_skips_a_pair_until_both_orders_are_ten_minutes_old(self) -> None:
+        row = {
+            "levels": [
+                *[
+                    {
+                        "side": "buy", "status": "active", "grid_leg": 1,
+                        "oid": index, "price": str(60 + index), "size": "1",
+                        "submitted_at": 500,
+                    }
+                    for index in range(6)
+                ],
+                *[
+                    {
+                        "side": "sell", "status": "active", "grid_leg": 1,
+                        "oid": 100 + index, "price": str(110 + index), "size": "1",
+                        "submitted_at": 500,
+                    }
+                    for index in range(6)
+                ],
+            ],
+        }
+
+        self.assertIsNone(lifecycle_p7_farthest_pair(row, now=1099))
+        pair = lifecycle_p7_farthest_pair(row, now=1100)
+        self.assertEqual((pair[0]["oid"], pair[1]["oid"]), (0, 105))
+
+        for entry in row["levels"]:
+            entry.pop("submitted_at")
+        self.assertEqual(
+            (lifecycle_p7_farthest_pair(row, now=501)[0]["oid"],
+             lifecycle_p7_farthest_pair(row, now=501)[1]["oid"]),
+            (0, 105),
+        )
+
     def test_p7_prioritizes_coin_by_balanced_leg1_debt_value(self) -> None:
         def make_row(coin: str, leverage: str, size: str, min_order_value: str) -> dict:
             return {
