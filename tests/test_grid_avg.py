@@ -1997,6 +1997,33 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertEqual(p3_targets, [f"debt-{index}" for index in range(10)])
 
+    def test_run_once_stops_p3_scan_when_snapshotted_budget_is_spent(self) -> None:
+        levels = [
+            {"status": GRID_CHAIN_DEBT_STATUS, "id": f"debt-{index}"}
+            for index in range(5)
+        ]
+        rows = [{"type": "grid", "status": "active", "coin": "BTC", "levels": levels}]
+        p3_targets = []
+
+        def fake_maintain_grid(row: dict, cache: dict) -> tuple[dict, bool]:
+            if cache.get("grid_action_phase") == "p3":
+                p3_targets.append(cache["lifecycle_p3_target"]["id"])
+                cache.setdefault("lifecycle_p3_restore_budget", 2)
+                cache["lifecycle_p3_restore_attempts"] = len(p3_targets)
+            return row, False
+
+        with (
+            patch("trail_worker.load_server_batch", return_value=rows),
+            patch("trail_worker.maintain_grid", side_effect=fake_maintain_grid),
+            patch("trail_worker.random.shuffle"),
+            patch("trail_worker.prune_done_rows", return_value=(rows, False)),
+            patch("trail_worker.prune_grid_level_history", return_value=False),
+            patch("trail_worker.save_server_batch"),
+        ):
+            run_once()
+
+        self.assertEqual(p3_targets, ["debt-0", "debt-1"])
+
     def test_run_once_refreshes_position_and_market_caches_between_action_phases(self) -> None:
         rows = [{"type": "grid", "status": "active", "coin": "BTC", "levels": []}]
         seen = []

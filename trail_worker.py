@@ -8353,6 +8353,12 @@ def run_once() -> None:
             pending_pool = lifecycle_p3_pending_pool(rows, sorted(active_grid_indexes))
             grid_cache["lifecycle_p3_pending_pool"] = pending_pool
             for index, entry in pending_pool:
+                if (
+                    "lifecycle_p3_restore_budget" in grid_cache
+                    and int(grid_cache.get("lifecycle_p3_restore_attempts") or 0)
+                    >= int(grid_cache.get("lifecycle_p3_restore_budget") or 0)
+                ):
+                    break
                 if int(grid_cache.get("lifecycle_p3_processed") or 0) >= GRID_P3_MAX_RESTORES_PER_RUN:
                     break
                 grid_cache["lifecycle_p3_target"] = entry
