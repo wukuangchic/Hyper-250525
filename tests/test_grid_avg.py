@@ -589,6 +589,40 @@ class GridAvgTests(unittest.TestCase):
         self.assertTrue(entry["replacement_pending"])
         self.assertEqual(entry["p3_queue_seq"], 99)
 
+    def test_p2_partial_fill_below_ten_does_not_submit_or_enter_p3(self) -> None:
+        class NoSubmitExchange:
+            def order(self, *args, **kwargs):
+                raise AssertionError("below-minimum partial fill must not submit")
+
+        source = {
+            "side": "sell", "is_buy": False, "status": "filled", "replacement_pending": True,
+            "grid_leg": 1, "iteration": 4, "price": "170.69", "size": "0.07",
+            "filled_size": "0.01", "confirmed_partial_filled_oid": 9,
+            "last_submit_status": {"resting": {"oid": 9}},
+        }
+        row = {
+            "gap_rate": "0.01", "min_order_value": "10", "sz_decimals": 2,
+            "base_buy_size": "0.07", "base_sell_size": "0.07", "levels": [source],
+        }
+        ctx = {
+            "coin": "xyz:SKHY", "asset": {"szDecimals": 2, "maxLeverage": 20},
+            "exchange": NoSubmitExchange(), "now": 124, "position_size": Decimal("0"),
+            "current_mid": Decimal("170"), "best_bid": Decimal("169.9"),
+            "best_ask": Decimal("170.1"), "open_orders": [], "open_oids": set(),
+            "fills_by_oid": {}, "info": object(), "account": "0xabc",
+        }
+
+        count, changed = lifecycle_process_fills(row, ctx, {"action_limit_headroom": 200})
+
+        self.assertTrue(changed)
+        self.assertEqual(count, 0)
+        self.assertEqual(row["levels"], [source])
+        self.assertEqual(source["status"], "filled")
+        self.assertFalse(source["replacement_pending"])
+        self.assertEqual(source["replacement_discarded_reason"], "notional_below_minimum")
+        self.assertEqual(source["replacement_notional"], "1.6898")
+        self.assertEqual(source["replacement_min_notional"], "10")
+
     def test_p5_queue_does_not_depend_on_exchange_submit(self) -> None:
         class FakeInfo:
             def query_order_by_oid(self, account, oid):

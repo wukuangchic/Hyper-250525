@@ -7628,6 +7628,24 @@ def lifecycle_process_fills(
         if child is None:
             source["last_error"] = "filled lifecycle order could not build its replacement"
             continue
+        child_size = decimal_or_none(child.get("size"))
+        child_price = decimal_or_none(child.get("price", child.get("limit_px")))
+        child_notional = (
+            child_size * child_price
+            if child_size is not None and child_price is not None
+            else None
+        )
+        if child_notional is not None and child_notional < MIN_NOTIONAL:
+            # Partial fills must not create an exchange-invalid child or P3
+            # debt. Keep the source as terminal fill history for readback.
+            source["replacement_pending"] = False
+            source["replacement_processed_at"] = ctx["now"]
+            source["replacement_discarded_at"] = ctx["now"]
+            source["replacement_discarded_reason"] = "notional_below_minimum"
+            source["replacement_notional"] = decimal_to_plain(child_notional)
+            source["replacement_min_notional"] = decimal_to_plain(MIN_NOTIONAL)
+            changed = True
+            continue
         result = lifecycle_submit_order(
             ctx["exchange"], ctx["coin"], child, ctx["now"], row, ctx["asset"],
             ctx["position_size"], ctx["current_mid"], ctx["best_bid"], ctx["best_ask"],
