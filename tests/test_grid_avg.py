@@ -525,7 +525,7 @@ class GridAvgTests(unittest.TestCase):
             {"gap_rate": "0.01", "min_order_value": "10", "base_buy_size": "1", "base_sell_size": "1"},
             "BTC", {"szDecimals": 2}, False, Decimal("101"), True, size=Decimal("1"), preserve_size=True,
         )
-        entry.update({"status": "active", "oid": 9, "grid_leg": 1})
+        entry.update({"status": "active", "oid": 9, "grid_leg": 1, "p3_queue_seq": 99})
         prior_debt = {"status": GRID_CHAIN_DEBT_STATUS, "grid_leg": 1, "p3_queue_seq": 4}
         row = {
             "gap_rate": "0.01", "min_order_value": "10", "base_buy_size": "1", "base_sell_size": "1",
@@ -547,6 +547,47 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(entry["p3_queue_seq"], 5)
         self.assertEqual(entry["grid_leg"], 1)
         self.assertEqual(row["levels"], [prior_debt, entry])
+
+    def test_p5_partially_filled_cancel_is_processed_as_fill(self) -> None:
+        class FakeInfo:
+            def query_order_by_oid(self, account, oid):
+                return {
+                    "status": "order",
+                    "order": {
+                        "order": {
+                            "oid": oid,
+                            "limitPx": "170.69",
+                            "origSz": "0.07",
+                            "sz": "0.01",
+                        },
+                        "status": "reduceOnlyCanceled",
+                    },
+                }
+
+        entry = grid_order_entry(
+            {"gap_rate": "0.01", "min_order_value": "10", "base_buy_size": "0.07", "base_sell_size": "0.07"},
+            "xyz:SKHY", {"szDecimals": 2}, False, Decimal("170.69"), True,
+            size=Decimal("0.07"), preserve_size=True,
+        )
+        entry.update({"status": "active", "oid": 9, "grid_leg": 1, "p3_queue_seq": 99})
+        row = {"gap_rate": "0.01", "levels": [entry]}
+        ctx = {
+            "coin": "xyz:SKHY", "asset": {"szDecimals": 2, "maxLeverage": 20}, "exchange": object(),
+            "now": 123, "position_size": Decimal("1"), "current_mid": Decimal("170"),
+            "best_bid": Decimal("169.9"), "best_ask": Decimal("170.1"), "open_orders": [],
+            "open_oids": set(), "fills_by_oid": {}, "info": FakeInfo(), "account": "0xabc",
+        }
+
+        count, changed = lifecycle_process_anomalies(row, ctx, {"action_limit_headroom": 200, "grid_rows": [row]})
+
+        self.assertTrue(changed)
+        self.assertEqual(count, 0)
+        self.assertEqual(entry["status"], "filled")
+        self.assertEqual(entry["filled_size"], "0.06")
+        self.assertEqual(entry["confirmed_partial_filled_oid"], 9)
+        self.assertEqual(entry["exchange_cancel_status"], "reduceOnlyCanceled")
+        self.assertTrue(entry["replacement_pending"])
+        self.assertEqual(entry["p3_queue_seq"], 99)
 
     def test_p5_queue_does_not_depend_on_exchange_submit(self) -> None:
         class FakeInfo:

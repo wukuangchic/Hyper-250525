@@ -1655,6 +1655,29 @@ def grid_order_status_is_cancelled(order_status: Any) -> bool:
     return status_name.endswith(("cancel", "canceled", "cancelled"))
 
 
+def grid_order_status_partial_fill_size(order_status: Any) -> Decimal | None:
+    """Return exchange-confirmed filled size when a terminal order was partial."""
+    if not isinstance(order_status, dict):
+        return None
+    status_order = order_status.get("order")
+    if not isinstance(status_order, dict):
+        return None
+    exchange_order = status_order.get("order")
+    if not isinstance(exchange_order, dict):
+        exchange_order = status_order
+    original_size = decimal_or_none(exchange_order.get("origSz"))
+    remaining_size = decimal_or_none(exchange_order.get("sz"))
+    if (
+        original_size is None
+        or remaining_size is None
+        or original_size <= 0
+        or remaining_size < 0
+        or remaining_size >= original_size
+    ):
+        return None
+    return original_size - remaining_size
+
+
 def mark_pending_cancel_confirmed_cancelled(
     entry: dict[str, Any],
     old_oid: int,
@@ -7648,6 +7671,16 @@ def lifecycle_process_anomalies(row: dict[str, Any], ctx: dict[str, Any], cache:
         if status_name.strip().lower() in {"open", "resting"}:
             continue
         if status_name == "reduceOnlyCanceled" or grid_order_status_is_cancelled(order_status):
+            partial_fill_size = grid_order_status_partial_fill_size(order_status)
+            if partial_fill_size is not None:
+                entry["status"] = "filled"
+                entry["filled_size"] = decimal_to_plain(partial_fill_size)
+                entry["confirmed_partial_filled_oid"] = oid
+                entry["exchange_cancel_status"] = status_name
+                entry["replacement_pending"] = True
+                entry["filled_at"] = ctx["now"]
+                changed = True
+                continue
             if lifecycle_leg(entry) == 0:
                 levels.remove(entry)
                 changed = True
@@ -7659,6 +7692,9 @@ def lifecycle_process_anomalies(row: dict[str, Any], ctx: dict[str, Any], cache:
             entry["status"] = GRID_CHAIN_DEBT_STATUS
             entry["chain_debt_at"] = ctx["now"]
             entry["p5_restore_queued_at"] = ctx["now"]
+            # This is a new debt event, so it joins the current queue tail
+            # instead of reclaiming a FIFO position from an earlier debt.
+            entry.pop("p3_queue_seq", None)
             lifecycle_assign_p3_queue_seq(entry, cache)
             levels.remove(entry)
             levels.append(entry)
