@@ -466,6 +466,17 @@ def lifecycle_p3_pending_pool(
     return sorted(pending, key=lambda item: int(item[1]["p3_queue_seq"]))
 
 
+def lifecycle_p3_restore_budget(withdrawable: Decimal | None) -> int:
+    """Snapshot the strict withdrawable ladder for one P3 worker phase."""
+    if withdrawable is None:
+        return 0
+    return sum(
+        1
+        for threshold in range(1, GRID_P3_MAX_RESTORES_PER_RUN + 1)
+        if withdrawable > Decimal(threshold)
+    )
+
+
 def lifecycle_initialize_p3_queue(
     rows: list[dict[str, Any]],
     active_grid_indexes: list[int],
@@ -8135,17 +8146,26 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         changed = changed or phase_changed
 
     elif phase == GRID_LIFECYCLE_PHASE_P3:
-        if raw_action_limit_deficit(cache) < 0 and ctx["withdrawable"] is not None and ctx["withdrawable"] > Decimal("5"):
+        if "lifecycle_p3_restore_budget" not in cache:
+            cache["lifecycle_p3_restore_budget"] = lifecycle_p3_restore_budget(ctx["withdrawable"])
+        restore_budget = int(cache.get("lifecycle_p3_restore_budget") or 0)
+        restored_attempts = int(cache.get("lifecycle_p3_restore_attempts") or 0)
+        if raw_action_limit_deficit(cache) < 0 and restored_attempts < restore_budget:
             isolated_ready = cache.setdefault("lifecycle_isolated_ready", set())
             target = cache.get("lifecycle_p3_target")
             pending_entries = [target] if isinstance(target, dict) else list(levels)
             for entry in pending_entries:
+                if int(cache.get("lifecycle_p3_restore_attempts") or 0) >= restore_budget:
+                    break
                 if (
                     not isinstance(entry, dict)
                     or not any(candidate is entry for candidate in levels)
                     or str(entry.get("status") or "") not in {GRID_MARGIN_STATUS, GRID_CHAIN_DEBT_STATUS}
                 ):
                     continue
+                cache["lifecycle_p3_restore_attempts"] = int(
+                    cache.get("lifecycle_p3_restore_attempts") or 0
+                ) + 1
                 result = lifecycle_submit_order(
                     ctx["exchange"], ctx["coin"], entry, ctx["now"], row, ctx["asset"], ctx["position_size"],
                     ctx["current_mid"], ctx["best_bid"], ctx["best_ask"], isolated_ready,

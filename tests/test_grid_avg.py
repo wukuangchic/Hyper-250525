@@ -109,6 +109,7 @@ from trail_worker import (
     lifecycle_materialize_birth_intent,
     lifecycle_p3_pending_pool,
     lifecycle_p3_failure_is_unknown,
+    lifecycle_p3_restore_budget,
     lifecycle_process_p7,
     lifecycle_p7_debt_value,
     lifecycle_p7_farthest_pair,
@@ -1610,6 +1611,70 @@ class GridAvgTests(unittest.TestCase):
             [(index, entry["id"]) for index, entry in pool],
             [(1, "eth-first"), (1, "eth-second"), (0, "btc-first")],
         )
+
+    def test_lifecycle_p3_restore_budget_uses_strict_withdrawable_ladder(self) -> None:
+        cases = [
+            (None, 0),
+            (Decimal("1"), 0),
+            (Decimal("1.0001"), 1),
+            (Decimal("2"), 1),
+            (Decimal("2.0001"), 2),
+            (Decimal("10"), 9),
+            (Decimal("10.0001"), 10),
+            (Decimal("100"), 10),
+        ]
+
+        for withdrawable, expected in cases:
+            with self.subTest(withdrawable=withdrawable):
+                self.assertEqual(lifecycle_p3_restore_budget(withdrawable), expected)
+
+    def test_p3_snapshots_withdrawable_budget_once_per_worker_phase(self) -> None:
+        def make_row(coin: str) -> dict:
+            return {
+                "type": "grid", "status": "active", "grid_lifecycle_version": 2,
+                "network": "mainnet", "account": "0xabc", "coin": coin, "gap_rate": "0.01",
+                "levels": [{
+                    "side": "buy", "is_buy": True, "status": GRID_CHAIN_DEBT_STATUS,
+                    "grid_leg": 1, "oid": None, "price": "60", "size": "1",
+                }],
+            }
+
+        def make_ctx(coin: str, withdrawable: str) -> dict:
+            return {
+                "network": "mainnet", "account": "0xabc", "coin": coin,
+                "asset": {"szDecimals": 2}, "exchange": object(), "info": object(),
+                "now": 123, "now_ms": 123000, "position_size": Decimal("0"),
+                "position_value": Decimal("0"), "current_mid": Decimal("100"),
+                "best_bid": Decimal("99"), "best_ask": Decimal("101"),
+                "withdrawable": Decimal(withdrawable), "liquidation_px": None,
+                "open_orders": [], "open_oids": set(), "fills_by_oid": {},
+            }
+
+        rows = [make_row("BTC"), make_row("ETH"), make_row("SOL")]
+        cache = {
+            "grid_action_phase": "p3", "action_limit_raw_deficit": -1,
+            "grid_rows": rows,
+        }
+        submitted = []
+
+        def fake_submit(_exchange, coin, entry, *_args, **_kwargs):
+            submitted.append(coin)
+            entry["status"] = "active"
+            return "submitted"
+
+        with (
+            patch("trail_worker.lifecycle_context", side_effect=[
+                make_ctx("BTC", "2.1"), make_ctx("ETH", "10.1"), make_ctx("SOL", "10.1"),
+            ]),
+            patch("trail_worker.lifecycle_submit_order", side_effect=fake_submit),
+        ):
+            for row in rows:
+                cache["lifecycle_p3_target"] = row["levels"][0]
+                maintain_grid(row, cache)
+
+        self.assertEqual(cache["lifecycle_p3_restore_budget"], 2)
+        self.assertEqual(cache["lifecycle_p3_restore_attempts"], 2)
+        self.assertEqual(submitted, ["BTC", "ETH"])
 
     def test_p3_failed_entry_moves_to_the_tail_of_its_grid_queue(self) -> None:
         row = {
