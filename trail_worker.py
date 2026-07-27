@@ -7233,6 +7233,28 @@ def migrate_grid_lifecycle(row: dict[str, Any], now: int) -> bool:
     return True
 
 
+def invalidate_unqueued_legacy_pauses(row: dict[str, Any], now: int) -> int:
+    """Discard legacy pauses that never made it into the P3 debt queue."""
+    levels = row.get("levels")
+    if not isinstance(levels, list):
+        return 0
+    kept = [
+        entry
+        for entry in levels
+        if not (
+            isinstance(entry, dict)
+            and str(entry.get("status") or "") == GRID_LEGACY_PAUSE_STATUS
+        )
+    ]
+    invalidated = len(levels) - len(kept)
+    if not invalidated:
+        return 0
+    row["levels"] = kept
+    row["legacy_pause_invalidated"] = int(row.get("legacy_pause_invalidated") or 0) + invalidated
+    row["legacy_pause_invalidated_at"] = now
+    return invalidated
+
+
 def lifecycle_leg(entry: dict[str, Any]) -> int:
     try:
         return 1 if int(entry.get("grid_leg") or 0) == 1 else 0
@@ -8523,6 +8545,9 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     # midpoint gathered for this worker run before the account-wide scan.
     row["lifecycle_mid"] = decimal_to_plain(ctx["current_mid"])
     changed = migrate_grid_lifecycle(row, ctx["now"])
+    invalidated = invalidate_unqueued_legacy_pauses(row, ctx["now"])
+    if invalidated:
+        changed = True
     changed = initialize_lifecycle_iterations(row) or changed
     levels = row.setdefault("levels", [])
     counters = cache.setdefault("grid_lifecycle_counters", {}).setdefault(id(row), {})

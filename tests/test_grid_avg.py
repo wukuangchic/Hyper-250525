@@ -407,12 +407,11 @@ class GridAvgTests(unittest.TestCase):
         above_boundary, above_submits = run(Decimal("3.01"))
 
         self.assertEqual(boundary_submits, 0)
-        self.assertEqual(at_boundary["legacy_pause_remaining"], 2)
+        self.assertEqual(at_boundary["legacy_pause_remaining"], 0)
+        self.assertEqual(at_boundary["legacy_pause_invalidated"], 2)
         self.assertEqual(above_submits, 0)
-        self.assertEqual(above_boundary["legacy_pause_remaining"], 1)
-        self.assertEqual(sum(entry["status"] == "margin" for entry in above_boundary["levels"]), 1)
-        self.assertEqual(above_boundary["levels"][-1]["status"], "margin")
-        self.assertTrue(above_boundary["levels"][-1].get("p6_legacy_pause"))
+        self.assertEqual(above_boundary["legacy_pause_remaining"], 0)
+        self.assertEqual(above_boundary["levels"], [])
 
     def test_finite_chain_account_quota_is_shared_across_dexes(self) -> None:
         default = {"account": "0xAbC", "dex": ""}
