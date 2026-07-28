@@ -2533,6 +2533,58 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(entry["status"], "active")
         self.assertEqual(entry["oid"], 9)
 
+    def test_p9_claim_uses_persisted_account_when_cross_dex_row_runs_first(self) -> None:
+        stored_account = "0xstored"
+        xyz = {
+            "type": "grid", "status": "active", "grid_lifecycle_version": 2,
+            "network": "mainnet", "account": stored_account, "coin": "xyz:SKHY",
+            "gap_rate": "0.01", "lifecycle_mid": "130", "lifecycle_leverage": "10",
+            "levels": [],
+        }
+        hype_entry = {
+            "side": "buy", "status": "active", "grid_leg": 1,
+            "oid": 9, "price": "53", "size": "1", "reduce_only": False,
+        }
+        hype = {
+            "type": "grid", "status": "active", "grid_lifecycle_version": 2,
+            "network": "mainnet", "account": stored_account, "coin": "HYPE",
+            "gap_rate": "0.01", "lifecycle_mid": "55", "lifecycle_leverage": "10",
+            "levels": [hype_entry],
+        }
+
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def bulk_cancel(self, requests):
+                self.calls += 1
+                return {"status": "ok", "response": {"data": {"statuses": ["success"]}}}
+
+        exchange = FakeExchange()
+        cache = {
+            "grid_action_phase": GRID_LIFECYCLE_PHASE_P9,
+            "grid_rows": [xyz, hype], "action_limit_headroom": 10,
+        }
+        xyz_ctx = {
+            "network": "mainnet", "account": "0xdex-context", "coin": "xyz:SKHY",
+            "now": 100, "now_ms": 100000, "withdrawable": Decimal("2"),
+            "current_mid": Decimal("130"), "open_oids": set(), "exchange": exchange,
+        }
+        hype_ctx = {
+            "network": "mainnet", "account": stored_account, "coin": "HYPE",
+            "now": 100, "now_ms": 100000, "withdrawable": Decimal("0"),
+            "current_mid": Decimal("55"), "open_oids": {9}, "exchange": exchange,
+        }
+
+        with patch("trail_worker.lifecycle_context", return_value=xyz_ctx):
+            maintain_grid(xyz, cache)
+        with patch("trail_worker.lifecycle_context", return_value=hype_ctx):
+            maintain_grid(hype, cache)
+
+        self.assertEqual(exchange.calls, 1)
+        self.assertEqual(hype_entry["status"], GRID_CHAIN_DEBT_STATUS)
+        self.assertTrue(hype_entry["p9_restore"])
+
     def test_run_once_processes_p3_pending_pool_one_entry_at_a_time(self) -> None:
         rows = [
             {

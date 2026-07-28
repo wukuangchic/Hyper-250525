@@ -8894,7 +8894,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         claims = cache.setdefault("lifecycle_p9_claims", {})
         if account_key not in claims:
             claims[account_key] = lifecycle_p9_candidate(
-                cache.get("grid_rows") or [row], ctx["network"], ctx["account"]
+                cache.get("grid_rows") or [row], ctx["network"], account_key[1]
             )
         candidate = claims.get(account_key)
         attempted = cache.setdefault("lifecycle_p9_accounts", set())
