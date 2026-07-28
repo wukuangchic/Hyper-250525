@@ -8215,6 +8215,22 @@ def lifecycle_birth_twin_orders(
         near_birth["birth_slot"] = "single"
         return [near_birth]
 
+    far_anchor_price = far_price
+    far_spacing_adjustments = 0
+    for _attempt in range(GRID_ALO_PRICE_ATTEMPT_LIMIT):
+        if not lifecycle_active_price_too_close(row, side, far_price):
+            break
+        multiplier = Decimal("1") - gap if side == "buy" else Decimal("1") + gap
+        next_far_price = rounded_perp_price(far_price * multiplier, sz_decimals)
+        if next_far_price <= 0 or next_far_price == far_price:
+            near_birth["birth_slot"] = "single"
+            return [near_birth]
+        far_price = next_far_price
+        far_spacing_adjustments += 1
+    else:
+        near_birth["birth_slot"] = "single"
+        return [near_birth]
+
     min_notional = max(
         MIN_NOTIONAL,
         decimal_or_none(row.get("min_order_value")) or MIN_NOTIONAL,
@@ -8253,6 +8269,9 @@ def lifecycle_birth_twin_orders(
         )
         if far_plan["birth_far_anchor_source"] == "near_farthest_active_midpoint":
             far_plan["birth_far_active_price"] = farthest_active
+        if far_spacing_adjustments:
+            far_plan["birth_far_anchor_price"] = far_anchor_price
+            far_plan["birth_far_spacing_adjustments"] = far_spacing_adjustments
     return [near_birth, far_birth]
 
 

@@ -3476,6 +3476,76 @@ class GridAvgTests(unittest.TestCase):
         )
         self.assertEqual(twins[1]["plan"]["birth_far_active_price"], Decimal("110"))
 
+    def test_birth_twins_move_far_sell_outward_until_active_spacing_is_clear(self) -> None:
+        row = {
+            "gap_rate": "0.01",
+            "base_buy_size": "0.3",
+            "base_sell_size": "0.3",
+            "min_order_value": "10",
+            "levels": [
+                {
+                    "side": "sell",
+                    "status": "active",
+                    "oid": 9,
+                    "price": "103",
+                    "size": "0.3",
+                }
+            ],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        near = panic_reversal_order_from_reduce(
+            row,
+            "BTC",
+            asset,
+            Decimal("100"),
+            True,
+            Decimal("0.6"),
+            Decimal("-4"),
+            "abs",
+        )
+
+        twins = lifecycle_birth_twin_orders(row, asset, near, Decimal("100"), Decimal("0.6"))
+
+        self.assertEqual([order["price"] for order in twins], ["102", "104.57"])
+        self.assertEqual(twins[1]["plan"]["birth_far_anchor_price"], Decimal("102.5"))
+        self.assertEqual(twins[1]["plan"]["birth_far_spacing_adjustments"], 2)
+        self.assertFalse(lifecycle_active_price_too_close(row, "sell", Decimal(twins[1]["price"])))
+
+    def test_birth_twins_move_far_buy_outward_until_active_spacing_is_clear(self) -> None:
+        row = {
+            "gap_rate": "0.01",
+            "base_buy_size": "0.3",
+            "base_sell_size": "0.3",
+            "min_order_value": "10",
+            "levels": [
+                {
+                    "side": "buy",
+                    "status": "active",
+                    "oid": 9,
+                    "price": "97",
+                    "size": "0.3",
+                }
+            ],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        near = panic_reversal_order_from_reduce(
+            row,
+            "BTC",
+            asset,
+            Decimal("100"),
+            False,
+            Decimal("0.6"),
+            Decimal("4"),
+            "abs",
+        )
+
+        twins = lifecycle_birth_twin_orders(row, asset, near, Decimal("100"), Decimal("0.6"))
+
+        self.assertEqual([order["price"] for order in twins], ["98", "95.56"])
+        self.assertEqual(twins[1]["plan"]["birth_far_anchor_price"], Decimal("97.5"))
+        self.assertEqual(twins[1]["plan"]["birth_far_spacing_adjustments"], 2)
+        self.assertFalse(lifecycle_active_price_too_close(row, "buy", Decimal(twins[1]["price"])))
+
     def test_limit_chase_double_size_can_be_capped_before_crossing_zero(self) -> None:
         class FakeExchange:
             def _slippage_price(self, coin, is_buy, slippage, reference_price):
