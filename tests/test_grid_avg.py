@@ -119,6 +119,8 @@ from trail_worker import (
     lifecycle_p7_debt_value,
     lifecycle_p7_farthest_pair,
     lifecycle_p7_priority_indexes,
+    lifecycle_p9_candidate,
+    lifecycle_p9_order_score,
     lifecycle_reconcile_birth_intents,
     lifecycle_row_account_key,
     lifecycle_process_anomalies,
@@ -181,6 +183,7 @@ from trail_worker import (
     GRID_CHAIN_DEBT_STATUS,
     GRID_LIFECYCLE_PHASE_P7,
     GRID_LIFECYCLE_PHASE_P8,
+    GRID_LIFECYCLE_PHASE_P9,
     GRID_P8_REACCUMULATE_STATUS,
     GRID_MARGIN_STATUS,
     grid_entries_fit_within_max,
@@ -2022,6 +2025,8 @@ class GridAvgTests(unittest.TestCase):
                 ("BTC", "p7"),
                 ("ETH", GRID_LIFECYCLE_PHASE_P8),
                 ("BTC", GRID_LIFECYCLE_PHASE_P8),
+                ("ETH", GRID_LIFECYCLE_PHASE_P9),
+                ("BTC", GRID_LIFECYCLE_PHASE_P9),
             ],
         )
         save_server_batch.assert_called_once()
@@ -2406,6 +2411,128 @@ class GridAvgTests(unittest.TestCase):
         self.assertFalse(second_changed)
         self.assertEqual(exchange.calls, 1)
 
+    def test_p9_scores_margin_times_relative_mid_deviation_across_account(self) -> None:
+        btc_order = {
+            "side": "buy", "status": "active", "grid_leg": 0,
+            "oid": 1, "price": "60", "size": "1", "reduce_only": False,
+        }
+        eth_order = {
+            "side": "sell", "status": "active", "grid_leg": 1,
+            "oid": 2, "price": "120", "size": "1", "reduce_only": False,
+        }
+        ignored_reduce_only = {
+            "side": "sell", "status": "active", "grid_leg": 1,
+            "oid": 3, "price": "200", "size": "10", "reduce_only": True,
+        }
+        btc = {
+            "type": "grid", "status": "active", "network": "mainnet",
+            "account": "0xabc", "coin": "BTC", "lifecycle_mid": "100",
+            "lifecycle_leverage": "10", "levels": [btc_order],
+        }
+        eth = {
+            "type": "grid", "status": "active", "network": "mainnet",
+            "account": "0xabc", "coin": "ETH", "lifecycle_mid": "100",
+            "lifecycle_leverage": "20", "levels": [eth_order, ignored_reduce_only],
+        }
+
+        self.assertEqual(
+            lifecycle_p9_order_score(btc, btc_order),
+            (Decimal("2.4"), Decimal("6"), Decimal("0.4")),
+        )
+        candidate = lifecycle_p9_candidate([eth, btc], "mainnet", "0xabc")
+
+        self.assertIs(candidate[0], btc)
+        self.assertIs(candidate[1], btc_order)
+        self.assertEqual(candidate[2:], (Decimal("2.4"), Decimal("6"), Decimal("0.4")))
+
+    def test_p9_below_one_cancels_highest_score_and_appends_original_leg_to_p3_tail(self) -> None:
+        prior_debt = {
+            "side": "sell", "status": GRID_CHAIN_DEBT_STATUS,
+            "grid_leg": 1, "p3_queue_seq": 4,
+        }
+        candidate = {
+            "side": "buy", "is_buy": True, "status": "active", "grid_leg": 0,
+            "oid": 9, "price": "60", "size": "1", "reduce_only": False,
+            "submitted_at": 50,
+        }
+        row = {
+            "type": "grid", "status": "active", "grid_lifecycle_version": 2,
+            "network": "mainnet", "account": "0xabc", "coin": "BTC",
+            "gap_rate": "0.01", "lifecycle_mid": "100", "lifecycle_leverage": "10",
+            "levels": [candidate, prior_debt],
+        }
+
+        class FakeExchange:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def bulk_cancel(self, requests):
+                self.calls += 1
+                self.requests = requests
+                return {"status": "ok", "response": {"data": {"statuses": ["success"]}}}
+
+        exchange = FakeExchange()
+        ctx = {
+            "network": "mainnet", "account": "0xabc", "coin": "BTC",
+            "now": 100, "now_ms": 100000, "withdrawable": Decimal("0.99"),
+            "current_mid": Decimal("100"), "open_oids": {9}, "exchange": exchange,
+        }
+        cache = {
+            "grid_action_phase": GRID_LIFECYCLE_PHASE_P9,
+            "grid_rows": [row], "action_limit_headroom": 10,
+        }
+
+        with patch("trail_worker.lifecycle_context", return_value=ctx):
+            maintained, changed = maintain_grid(row, cache)
+
+        self.assertTrue(changed)
+        self.assertEqual(exchange.calls, 1)
+        self.assertEqual(exchange.requests, [{"coin": "BTC", "oid": 9}])
+        self.assertEqual(candidate["status"], GRID_CHAIN_DEBT_STATUS)
+        self.assertIsNone(candidate["oid"])
+        self.assertEqual(candidate["grid_leg"], 0)
+        self.assertEqual(candidate["p3_queue_seq"], 5)
+        self.assertTrue(candidate["p9_restore"])
+        self.assertEqual(candidate["p9_score"], "2.4")
+        self.assertEqual(maintained["levels"], [prior_debt, candidate])
+
+        retry_result = lifecycle_mark_deferred_or_discarded(
+            candidate, 101, "temporary network failure"
+        )
+        self.assertEqual(retry_result, GRID_CHAIN_DEBT_STATUS)
+        self.assertEqual(candidate["grid_leg"], 0)
+
+    def test_p9_does_not_trigger_at_exactly_one(self) -> None:
+        entry = {
+            "side": "buy", "status": "active", "grid_leg": 1,
+            "oid": 9, "price": "60", "size": "1", "reduce_only": False,
+        }
+        row = {
+            "type": "grid", "status": "active", "grid_lifecycle_version": 2,
+            "network": "mainnet", "account": "0xabc", "coin": "BTC",
+            "gap_rate": "0.01", "lifecycle_mid": "100", "lifecycle_leverage": "10",
+            "levels": [entry],
+        }
+
+        class NoCancelExchange:
+            def bulk_cancel(self, requests):
+                raise AssertionError("withdrawable=1 must not trigger P9")
+
+        ctx = {
+            "network": "mainnet", "account": "0xabc", "coin": "BTC",
+            "now": 100, "now_ms": 100000, "withdrawable": Decimal("1"),
+            "current_mid": Decimal("100"), "open_oids": {9},
+            "exchange": NoCancelExchange(),
+        }
+        with patch("trail_worker.lifecycle_context", return_value=ctx):
+            _maintained, _changed = maintain_grid(
+                row,
+                {"grid_action_phase": GRID_LIFECYCLE_PHASE_P9, "grid_rows": [row]},
+            )
+
+        self.assertEqual(entry["status"], "active")
+        self.assertEqual(entry["oid"], 9)
+
     def test_run_once_processes_p3_pending_pool_one_entry_at_a_time(self) -> None:
         rows = [
             {
@@ -2533,7 +2660,8 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertEqual(seen[0], (None, None, None))
         self.assertEqual(seen[1], (None, None, 3))
-        self.assertEqual(info.clear_calls, 8)
+        self.assertEqual(seen[-1][:2], (None, None))
+        self.assertEqual(info.clear_calls, 9)
 
     def test_limit_chase_p3_waits_every_ten_seconds_for_market_and_replacement_capacity(self) -> None:
         class FakeInfo:
@@ -7903,6 +8031,12 @@ class GridAvgTests(unittest.TestCase):
                 ],
             },
             {
+                "type": "grid", "status": "active", "network": "mainnet", "account": "0xabc",
+                "coin": "HYPE", "levels": [
+                    {"side": "buy", "grid_leg": 0, "status": "chain_debt", "price": "54", "size": "1", "chain_debt_at": 13, "p3_queue_seq": 4, "p9_restore": True},
+                ],
+            },
+            {
                 "type": "grid", "status": "active", "network": "testnet", "account": "0xabc",
                 "coin": "ETH", "levels": [{"status": "chain_debt", "side": "buy"}],
             },
@@ -7914,8 +8048,9 @@ class GridAvgTests(unittest.TestCase):
             ("BTC", "chain_debt", "p7"),
             ("xyz:SPCX", "margin", "P6"),
             ("JPY", "chain_debt", "P8"),
+            ("HYPE", "chain_debt", "P9"),
         ])
-        self.assertEqual([row["seq"] for row in display_rows], ["1", "2", "3"])
+        self.assertEqual([row["seq"] for row in display_rows], ["1", "2", "3", "4"])
         self.assertEqual(display_rows[0]["price"], "60.00")
         self.assertEqual(display_rows[1]["error"], "Insufficient margin")
 

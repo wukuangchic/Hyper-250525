@@ -1945,7 +1945,9 @@ def format_p3_queue_rows(
                     "leg": str(entry.get("grid_leg", "-")),
                     "status": status,
                     "source": (
-                        "P8"
+                        "P9"
+                        if entry.get("p9_restore")
+                        else "P8"
                         if str(entry.get("birth_source") or "") == "p8_partial_debt"
                         else "p7"
                         if entry.get("p7_restructure")

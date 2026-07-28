@@ -105,6 +105,7 @@ GRID_P7_RAW_DEFICIT_THRESHOLD = -100
 GRID_P7_WITHDRAWABLE_THRESHOLD = Decimal("5")
 GRID_P7_MIN_ACTIVE_PER_SIDE = 5
 GRID_P7_MIN_ORDER_AGE_SECONDS = 10 * 60
+GRID_P9_WITHDRAWABLE_THRESHOLD = Decimal("1")
 GRID_P3_MAX_RESTORES_PER_RUN = 10
 GRID_PANIC_RATIO_LEGACY_DEFAULT_THRESHOLDS = {
     Decimal("10"),
@@ -154,6 +155,7 @@ GRID_LIFECYCLE_PHASE_P5 = "p5"
 GRID_LIFECYCLE_PHASE_P6 = "p6"
 GRID_LIFECYCLE_PHASE_P7 = "p7"
 GRID_LIFECYCLE_PHASE_P8 = "p8"
+GRID_LIFECYCLE_PHASE_P9 = "p9"
 GRID_LIFECYCLE_PHASES = (
     GRID_LIFECYCLE_PHASE_P0,
     GRID_LIFECYCLE_PHASE_P1,
@@ -164,6 +166,7 @@ GRID_LIFECYCLE_PHASES = (
     GRID_LIFECYCLE_PHASE_P6,
     GRID_LIFECYCLE_PHASE_P7,
     GRID_LIFECYCLE_PHASE_P8,
+    GRID_LIFECYCLE_PHASE_P9,
 )
 GRID_P8_REACCUMULATE_STATUS = "p8_reaccumulate"
 GRID_MAX_LEVELS_PER_SIDE = 1024
@@ -7419,10 +7422,10 @@ def lifecycle_mark_deferred_or_discarded(
     now: int,
     error_text: str,
 ) -> str:
-    """Preserve leg 1 as debt; only actual margin failures use margin status."""
+    """Preserve unfinished legs and P9 restores; only margin failures use margin status."""
     order["oid"] = None
     order["last_error"] = error_text
-    if lifecycle_leg(order) == 1:
+    if lifecycle_leg(order) == 1 or bool(order.get("p9_restore")):
         if is_insufficient_margin_text(error_text):
             order["status"] = GRID_MARGIN_STATUS
             order["margin_at"] = now
@@ -7641,10 +7644,22 @@ def lifecycle_context(row: dict[str, Any], cache: dict[str, Any]) -> dict[str, A
     if fills_key not in fills_cache:
         fills_cache[fills_key] = info.user_fills_by_time(account, common_start_ms, now_ms)
     fills_by_oid = recent_fills_by_oid(info, account, coin, common_start_ms, now_ms, fills_cache[fills_key])
+    position_leverage = decimal_or_none(
+        (position.get("leverage") or {}).get("value")
+    ) if isinstance(position, dict) else None
+    max_leverage = decimal_or_none(asset.get("maxLeverage"))
+    lifecycle_leverage = (
+        position_leverage
+        if position_leverage is not None and position_leverage > 0
+        else max_leverage
+    )
     row["account_usdc_withdrawable"] = decimal_to_plain(withdrawable) if withdrawable is not None else None
     row["position_size"] = decimal_to_plain(position_size)
     row["position_value"] = decimal_to_plain(position_value)
     row["lifecycle_max_leverage"] = decimal_to_plain(asset.get("maxLeverage"))
+    row["lifecycle_leverage"] = (
+        decimal_to_plain(lifecycle_leverage) if lifecycle_leverage is not None else None
+    )
     row["raw_deficit"] = raw_action_limit_deficit(cache)
     return {
         "network": network,
@@ -7662,9 +7677,7 @@ def lifecycle_context(row: dict[str, Any], cache: dict[str, Any]) -> dict[str, A
         "best_ask": best_ask,
         "position_size": position_size,
         "position_value": position_value,
-        "position_leverage": decimal_or_none(
-            (position.get("leverage") or {}).get("value")
-        ) if isinstance(position, dict) else None,
+        "position_leverage": position_leverage,
         "liquidation_px": liquidation_px,
         "withdrawable": withdrawable,
         "open_orders": open_orders,
@@ -7736,6 +7749,139 @@ def lifecycle_cancel_terminal_entry(
     levels = row.get("levels")
     if isinstance(levels, list) and entry in levels:
         levels.remove(entry)
+    return True
+
+
+def lifecycle_p9_order_score(
+    row: dict[str, Any],
+    entry: dict[str, Any],
+) -> tuple[Decimal, Decimal, Decimal] | None:
+    """Return margin-times-deviation score, margin and deviation for one order."""
+    mid = decimal_or_none(row.get("lifecycle_mid"))
+    price = decimal_or_none(entry.get("price", entry.get("limit_px")))
+    size = decimal_or_none(entry.get("size"))
+    leverage = (
+        decimal_or_none(row.get("lifecycle_leverage"))
+        or decimal_or_none(row.get("lifecycle_max_leverage"))
+    )
+    if (
+        mid is None
+        or mid <= 0
+        or price is None
+        or price <= 0
+        or size is None
+        or size <= 0
+        or leverage is None
+        or leverage <= 0
+    ):
+        return None
+    estimated_margin = price * size / leverage
+    deviation_rate = abs(mid - price) / mid
+    return estimated_margin * deviation_rate, estimated_margin, deviation_rate
+
+
+def lifecycle_p9_candidate(
+    rows: list[dict[str, Any]],
+    network: str,
+    account: str,
+) -> tuple[dict[str, Any], dict[str, Any], Decimal, Decimal, Decimal] | None:
+    """Choose the account-wide active non-reduce-only order with the highest P9 score."""
+    account_key = account.lower()
+    candidates: list[
+        tuple[Decimal, Decimal, Decimal, int, dict[str, Any], dict[str, Any]]
+    ] = []
+    for candidate_row in rows:
+        if not isinstance(candidate_row, dict) or not grid_row_recoverable_from_error(candidate_row):
+            continue
+        if str(candidate_row.get("network") or "mainnet") != network:
+            continue
+        if str(candidate_row.get("account") or account).lower() != account_key:
+            continue
+        for entry in candidate_row.get("levels") or []:
+            if (
+                not isinstance(entry, dict)
+                or str(entry.get("status") or "") != "active"
+                or bool(entry.get("reduce_only"))
+            ):
+                continue
+            try:
+                oid = int(entry["oid"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            score_parts = lifecycle_p9_order_score(candidate_row, entry)
+            if score_parts is None:
+                continue
+            score, estimated_margin, deviation_rate = score_parts
+            candidates.append(
+                (score, estimated_margin, deviation_rate, -oid, candidate_row, entry)
+            )
+    if not candidates:
+        return None
+    score, estimated_margin, deviation_rate, _oid_order, candidate_row, entry = max(
+        candidates, key=lambda item: item[:4]
+    )
+    return candidate_row, entry, score, estimated_margin, deviation_rate
+
+
+def lifecycle_cancel_p9_candidate(
+    exchange: Any,
+    coin: str,
+    row: dict[str, Any],
+    entry: dict[str, Any],
+    score: Decimal,
+    estimated_margin: Decimal,
+    deviation_rate: Decimal,
+    now: int,
+    cache: dict[str, Any],
+) -> bool:
+    """Cancel one confirmed P9 candidate and append it to the P3 FIFO tail."""
+    try:
+        oid = int(entry["oid"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    request = {"coin": coin, "oid": oid}
+    try:
+        reserve_grid_exchange_actions(cache)
+        result = exchange.bulk_cancel([request])
+    except Exception as exc:
+        entry["last_error"] = str(exc)
+        entry["p9_cancel_attempted_at"] = now
+        return False
+    audit_grid_action(
+        "grid_p9_withdrawable_cancel",
+        coin=coin,
+        oid=oid,
+        grid_leg=lifecycle_leg(entry),
+        score=decimal_to_plain(score),
+        estimated_margin=decimal_to_plain(estimated_margin),
+        deviation_rate=decimal_to_plain(deviation_rate),
+        result=result,
+    )
+    if not isinstance(result, dict) or result.get("status") != "ok":
+        entry["last_error"] = str(result)
+        entry["p9_cancel_attempted_at"] = now
+        return False
+    cancelled, errors = successful_cancel_oids(result, [request])
+    if oid not in cancelled:
+        entry["last_error"] = "; ".join(errors) or str(result)
+        entry["p9_cancel_attempted_at"] = now
+        return False
+    entry["p9_source_oid"] = oid
+    entry["p9_cancelled_at"] = now
+    entry["p9_score"] = decimal_to_plain(score)
+    entry["p9_estimated_margin"] = decimal_to_plain(estimated_margin)
+    entry["p9_deviation_rate"] = decimal_to_plain(deviation_rate)
+    entry["p9_restore"] = True
+    entry["oid"] = None
+    entry["status"] = GRID_CHAIN_DEBT_STATUS
+    entry["chain_debt_at"] = now
+    entry.pop("submitted_at", None)
+    entry.pop("p3_queue_seq", None)
+    lifecycle_assign_p3_queue_seq(entry, cache)
+    levels = row.get("levels")
+    if isinstance(levels, list) and entry in levels:
+        levels.remove(entry)
+        levels.append(entry)
     return True
 
 
@@ -8743,6 +8889,37 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         counters["p7_restructured"] = int(counters.get("p7_restructured") or 0) + p7_orders
         changed = changed or p7_changed
 
+    elif phase == GRID_LIFECYCLE_PHASE_P9:
+        account_key = lifecycle_row_account_key(row, ctx["network"], ctx["account"])
+        claims = cache.setdefault("lifecycle_p9_claims", {})
+        if account_key not in claims:
+            claims[account_key] = lifecycle_p9_candidate(
+                cache.get("grid_rows") or [row], ctx["network"], ctx["account"]
+            )
+        candidate = claims.get(account_key)
+        attempted = cache.setdefault("lifecycle_p9_accounts", set())
+        row["p9_withdrawable"] = (
+            decimal_to_plain(ctx["withdrawable"]) if ctx["withdrawable"] is not None else None
+        )
+        if (
+            candidate is not None
+            and candidate[0] is row
+            and account_key not in attempted
+        ):
+            attempted.add(account_key)
+            _candidate_row, entry, score, estimated_margin, deviation_rate = candidate
+            if (
+                ctx["withdrawable"] is not None
+                and ctx["withdrawable"] < GRID_P9_WITHDRAWABLE_THRESHOLD
+                and int(entry["oid"]) in ctx["open_oids"]
+                and lifecycle_cancel_p9_candidate(
+                    ctx["exchange"], ctx["coin"], row, entry, score,
+                    estimated_margin, deviation_rate, ctx["now"], cache,
+                )
+            ):
+                counters["p9_enqueued"] = int(counters.get("p9_enqueued") or 0) + 1
+                changed = True
+
     row["legacy_pause_remaining"] = sum(
         1 for entry in levels if isinstance(entry, dict) and str(entry.get("status") or "") == GRID_LEGACY_PAUSE_STATUS
     )
@@ -8891,11 +9068,12 @@ def run_once() -> None:
                 process_grid_index(index, f"grid {phase}")
         if phase != GRID_LIFECYCLE_PHASE_P8:
             reconcile_cached_grid_open_orders(rows, active_grid_indexes, grid_cache)
+        if phase != GRID_LIFECYCLE_PHASE_P9:
             for info, _exchange, _account, _signer, _role in grid_cache.get("clients", {}).values():
                 clear_info_cache(info)
-            # Each exchange-facing phase must recompute position, withdrawable
-            # and market context so add/reduce classification never relies on a
-            # pre-fill snapshot. P8 is local-only and is the final phase.
+            # Recompute position, withdrawable and market context before every
+            # following phase. Clearing after local-only P8 explicitly forces
+            # P9 to read withdrawable again after P0-P8 have completed.
             for cache_name in ("mids", "books", "user_states", "spot_user_states", "fills"):
                 grid_cache.pop(cache_name, None)
             # Our own open-order delta is reconciled after every exchange phase;
