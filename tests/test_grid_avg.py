@@ -2187,9 +2187,9 @@ class GridAvgTests(unittest.TestCase):
             "gap_rate": "0.01",
             "sz_decimals": 2,
             "levels": [
-                {"side": "buy", "is_buy": True, "status": "active", "grid_leg": 1, "oid": 1, "price": "60", "size": "2", "reduce_only": True},
+                {"side": "buy", "is_buy": True, "status": "active", "grid_leg": 1, "oid": 1, "price": "60", "size": "0.20", "reduce_only": True},
                 {"side": "buy", "is_buy": True, "status": "active", "grid_leg": 1, "oid": 2, "price": "90", "size": "3", "reduce_only": False},
-                {"side": "sell", "is_buy": False, "status": "active", "grid_leg": 1, "oid": 3, "price": "110", "size": "4", "reduce_only": False},
+                {"side": "sell", "is_buy": False, "status": "active", "grid_leg": 1, "oid": 3, "price": "110", "size": "0.25", "reduce_only": False},
                 {"side": "sell", "is_buy": False, "status": "active", "grid_leg": 1, "oid": 4, "price": "105", "size": "5", "reduce_only": True},
             ],
         }
@@ -2228,10 +2228,20 @@ class GridAvgTests(unittest.TestCase):
         rebuilt = [entry for entry in row["levels"] if entry.get("p7_restructure")]
         self.assertEqual([(entry["side"], entry["price"]) for entry in rebuilt], [("buy", "75"), ("sell", "125")])
         self.assertEqual({entry["status"] for entry in rebuilt}, {GRID_CHAIN_DEBT_STATUS})
-        self.assertEqual({entry["size"] for entry in rebuilt}, {"3"})
+        self.assertEqual({entry["size"] for entry in rebuilt}, {"0.2"})
         self.assertEqual({entry.get("oid") for entry in rebuilt}, {None})
         self.assertNotIn(1, {entry.get("oid") for entry in row["levels"]})
         self.assertNotIn(3, {entry.get("oid") for entry in row["levels"]})
+        self.assertEqual(row["p7_restructure"]["size"], "0.2")
+        self.assertEqual(row["p7_restructure"]["buy_residual_size"], "0")
+        self.assertEqual(row["p7_restructure"]["sell_residual_size"], "0.05")
+        self.assertEqual(row["p8_partial_debt_count"], 1)
+        residual = row["p8_partial_debts"][0]
+        self.assertEqual(residual["side"], "sell")
+        self.assertEqual(residual["size"], "0.05")
+        self.assertEqual(residual["weighted_avg_price"], "110")
+        self.assertEqual(residual["weighted_notional"], "5.5")
+        self.assertEqual(residual["source_oids"], [3])
 
     def test_p7_partial_cancel_puts_cancelled_source_back_in_p3(self) -> None:
         row = {

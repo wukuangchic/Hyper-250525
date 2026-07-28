@@ -790,15 +790,17 @@ def lifecycle_process_p7(row: dict[str, Any], ctx: dict[str, Any], cache: dict[s
         row.pop("p7_restructure_intent", None)
         return True, 2
     step = Decimal(1).scaleb(-sz_decimals)
-    new_size = ((buy_size + sell_size) / Decimal("2") / step).to_integral_value(rounding=ROUND_FLOOR) * step
-    if new_size <= 0:
-        row["p7_restructure_error"] = "average source size rounds to zero"
+    paired_size = (min(buy_size, sell_size) / step).to_integral_value(rounding=ROUND_FLOOR) * step
+    if paired_size <= 0:
+        row["p7_restructure_error"] = "paired source size rounds to zero"
         restore_both_sources()
         row.pop("p7_restructure_intent", None)
         return True, 2
+    buy_residual_size = buy_size - paired_size
+    sell_residual_size = sell_size - paired_size
     new_orders = [
-        grid_order_entry(row, ctx["coin"], ctx["asset"], True, new_buy_price, bool(buy_source.get("reduce_only")), size=new_size, gap=Decimal(str(row["gap_rate"])), preserve_size=True),
-        grid_order_entry(row, ctx["coin"], ctx["asset"], False, new_sell_price, bool(sell_source.get("reduce_only")), size=new_size, gap=Decimal(str(row["gap_rate"])), preserve_size=True),
+        grid_order_entry(row, ctx["coin"], ctx["asset"], True, new_buy_price, bool(buy_source.get("reduce_only")), size=paired_size, gap=Decimal(str(row["gap_rate"])), preserve_size=True),
+        grid_order_entry(row, ctx["coin"], ctx["asset"], False, new_sell_price, bool(sell_source.get("reduce_only")), size=paired_size, gap=Decimal(str(row["gap_rate"])), preserve_size=True),
     ]
     for order in new_orders:
         order["grid_leg"] = 1
@@ -809,11 +811,25 @@ def lifecycle_process_p7(row: dict[str, Any], ctx: dict[str, Any], cache: dict[s
         order["chain_debt_at"] = ctx["now"]
         lifecycle_assign_p3_queue_seq(order, cache)
         levels.append(order)
+    for source, residual_size, source_price in (
+        (buy_source, buy_residual_size, buy_price),
+        (sell_source, sell_residual_size, sell_price),
+    ):
+        if residual_size > 0:
+            lifecycle_accumulate_p8_partial_debt(
+                row,
+                source,
+                residual_size,
+                source_price,
+                ctx["now"],
+            )
     row["p7_restructure"] = {
         "at": ctx["now"],
         "mid": decimal_to_plain(ctx["current_mid"]),
         "spread": decimal_to_plain(spread),
-        "size": decimal_to_plain(new_size),
+        "size": decimal_to_plain(paired_size),
+        "buy_residual_size": decimal_to_plain(buy_residual_size),
+        "sell_residual_size": decimal_to_plain(sell_residual_size),
         "buy_price": decimal_to_plain(new_buy_price),
         "sell_price": decimal_to_plain(new_sell_price),
     }
