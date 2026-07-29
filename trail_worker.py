@@ -7591,7 +7591,24 @@ def lifecycle_submit_order(
     return defer("ALO outward search exhausted")
 
 
+def lifecycle_resolve_perp_asset(
+    row: dict[str, Any],
+    cache: dict[str, Any],
+    info: Any,
+    network: str,
+    dex: str,
+) -> tuple[str, dict[str, Any]]:
+    """Resolve immutable market metadata once per Grid for the worker run."""
+    raw_coin = batch_row_raw_coin(row)
+    key = (network, dex, raw_coin)
+    assets = cache.setdefault("perp_assets", {})
+    if key not in assets:
+        assets[key] = resolve_perp_asset(info, raw_coin)
+    return assets[key]
+
+
 def lifecycle_context(row: dict[str, Any], cache: dict[str, Any]) -> dict[str, Any]:
+    phase = str(cache.get("grid_action_phase") or GRID_LIFECYCLE_PHASE_P0)
     network = str(row.get("network") or "mainnet")
     timeout = float(row.get("timeout") or 20)
     raw_coin = batch_row_raw_coin(row)
@@ -7601,49 +7618,102 @@ def lifecycle_context(row: dict[str, Any], cache: dict[str, Any]) -> dict[str, A
     if client_key not in clients:
         clients[client_key] = build_worker_clients(cache, network, timeout, raw_coin)
     info, exchange, account, _signer, _role = clients[client_key]
-    coin, asset = resolve_perp_asset(info, raw_coin)
+    coin, asset = lifecycle_resolve_perp_asset(row, cache, info, network, dex)
     now = int(cache.setdefault("now", int(time.time())))
     precheck_action_limit(info, account, cache, network, now)
-    mids_key = (network, dex)
-    mids_cache = cache.setdefault("mids", {})
-    if mids_key not in mids_cache:
-        mids_cache[mids_key] = info.all_mids(dex)
-    mids = mids_cache[mids_key]
-    current_mid = Decimal(str(mids[coin]))
-    books_key = (network, coin)
-    books = cache.setdefault("books", {})
-    if books_key not in books:
-        books[books_key] = best_bid_ask(info, coin)
-    best_bid, best_ask = books[books_key]
-    state_key = (network, account, dex)
-    states = cache.setdefault("user_states", {})
-    if state_key not in states:
-        states[state_key] = info.user_state(account, dex=dex)
-    position = find_current_position_from_state(states[state_key], coin)
-    if position is None:
-        position_size = Decimal("0")
-        position_value = Decimal("0")
-        liquidation_px = None
-    else:
-        position_size = Decimal(str(position.get("szi") or "0"))
-        position_value = decimal_or_none(position.get("positionValue")) or abs(position_size * current_mid)
-        position_value = abs(position_value)
-        liquidation_px = decimal_or_none(position.get("liquidationPx"))
-    withdrawable_state = account_spot_withdrawable(info, account, network, cache)
-    withdrawable = withdrawable_state[0] if withdrawable_state is not None else None
-    open_key = (network, account, dex)
-    open_cache = cache.setdefault("open_orders", {})
-    if open_key not in open_cache:
-        open_cache[open_key] = collect_frontend_open_orders(info, account, dex)
-    open_orders = open_cache[open_key]
-    open_oids = open_order_oids(info, account, dex, coin, open_orders)
+    needs_mid = phase in {
+        GRID_LIFECYCLE_PHASE_P0,
+        GRID_LIFECYCLE_PHASE_P2,
+        GRID_LIFECYCLE_PHASE_P3,
+        GRID_LIFECYCLE_PHASE_P4,
+        GRID_LIFECYCLE_PHASE_P6,
+    }
+    needs_book = phase in {
+        GRID_LIFECYCLE_PHASE_P0,
+        GRID_LIFECYCLE_PHASE_P2,
+        GRID_LIFECYCLE_PHASE_P3,
+        GRID_LIFECYCLE_PHASE_P4,
+    }
+    needs_position = needs_book
+    needs_withdrawable = phase != GRID_LIFECYCLE_PHASE_P5
+    needs_open_orders = phase in {
+        GRID_LIFECYCLE_PHASE_P0,
+        GRID_LIFECYCLE_PHASE_P2,
+        GRID_LIFECYCLE_PHASE_P3,
+        GRID_LIFECYCLE_PHASE_P4,
+        GRID_LIFECYCLE_PHASE_P5,
+        GRID_LIFECYCLE_PHASE_P7,
+        GRID_LIFECYCLE_PHASE_P9,
+    }
+    needs_fills = phase in {
+        GRID_LIFECYCLE_PHASE_P0,
+        GRID_LIFECYCLE_PHASE_P2,
+        GRID_LIFECYCLE_PHASE_P5,
+    }
+
+    mids: dict[str, Any] = {}
+    current_mid: Decimal | None = None
+    if needs_mid:
+        mids_key = (network, dex)
+        mids_cache = cache.setdefault("mids", {})
+        if mids_key not in mids_cache:
+            mids_cache[mids_key] = info.all_mids(dex)
+        mids = mids_cache[mids_key]
+        current_mid = Decimal(str(mids[coin]))
+
+    best_bid: Decimal | None = None
+    best_ask: Decimal | None = None
+    if needs_book:
+        books_key = (network, coin)
+        books = cache.setdefault("books", {})
+        if books_key not in books:
+            books[books_key] = best_bid_ask(info, coin)
+        best_bid, best_ask = books[books_key]
+
+    position: dict[str, Any] | None = None
+    position_size = Decimal("0")
+    position_value = Decimal("0")
+    liquidation_px: Decimal | None = None
+    if needs_position:
+        state_key = (network, account, dex)
+        states = cache.setdefault("user_states", {})
+        if state_key not in states:
+            states[state_key] = info.user_state(account, dex=dex)
+        position = find_current_position_from_state(states[state_key], coin)
+        if position is not None:
+            position_size = Decimal(str(position.get("szi") or "0"))
+            position_value = decimal_or_none(position.get("positionValue")) or abs(
+                position_size * (current_mid or Decimal("0"))
+            )
+            position_value = abs(position_value)
+            liquidation_px = decimal_or_none(position.get("liquidationPx"))
+
+    withdrawable: Decimal | None = None
+    if needs_withdrawable:
+        withdrawable_state = account_spot_withdrawable(info, account, network, cache)
+        withdrawable = withdrawable_state[0] if withdrawable_state is not None else None
+
+    open_orders: list[dict[str, Any]] = []
+    open_oids: set[int] = set()
+    if needs_open_orders:
+        open_key = (network, account, dex)
+        open_cache = cache.setdefault("open_orders", {})
+        if open_key not in open_cache:
+            open_cache[open_key] = collect_frontend_open_orders(info, account, dex)
+        open_orders = open_cache[open_key]
+        open_oids = open_order_oids(info, account, dex, coin, open_orders)
+
     now_ms = now * 1000
     common_start_ms = (now - GRID_FILL_LOOKBACK_SECONDS) * 1000
-    fills_key = (network, account, common_start_ms, now_ms)
-    fills_cache = cache.setdefault("fills", {})
-    if fills_key not in fills_cache:
-        fills_cache[fills_key] = info.user_fills_by_time(account, common_start_ms, now_ms)
-    fills_by_oid = recent_fills_by_oid(info, account, coin, common_start_ms, now_ms, fills_cache[fills_key])
+    fills_by_oid: dict[int, dict[str, Any]] = {}
+    if needs_fills:
+        fills_key = (network, account, common_start_ms, now_ms)
+        fills_cache = cache.setdefault("fills", {})
+        if fills_key not in fills_cache:
+            fills_cache[fills_key] = info.user_fills_by_time(account, common_start_ms, now_ms)
+        fills_by_oid = recent_fills_by_oid(
+            info, account, coin, common_start_ms, now_ms, fills_cache[fills_key]
+        )
     position_leverage = decimal_or_none(
         (position.get("leverage") or {}).get("value")
     ) if isinstance(position, dict) else None
@@ -7653,9 +7723,13 @@ def lifecycle_context(row: dict[str, Any], cache: dict[str, Any]) -> dict[str, A
         if position_leverage is not None and position_leverage > 0
         else max_leverage
     )
-    row["account_usdc_withdrawable"] = decimal_to_plain(withdrawable) if withdrawable is not None else None
-    row["position_size"] = decimal_to_plain(position_size)
-    row["position_value"] = decimal_to_plain(position_value)
+    if needs_withdrawable:
+        row["account_usdc_withdrawable"] = (
+            decimal_to_plain(withdrawable) if withdrawable is not None else None
+        )
+    if needs_position:
+        row["position_size"] = decimal_to_plain(position_size)
+        row["position_value"] = decimal_to_plain(position_value)
     row["lifecycle_max_leverage"] = decimal_to_plain(asset.get("maxLeverage"))
     row["lifecycle_leverage"] = (
         decimal_to_plain(lifecycle_leverage) if lifecycle_leverage is not None else None
@@ -8724,7 +8798,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     ctx = lifecycle_context(row, cache)
     # P6 compares legacy prices across markets, so every row needs the live
     # midpoint gathered for this worker run before the account-wide scan.
-    row["lifecycle_mid"] = decimal_to_plain(ctx["current_mid"])
+    if ctx["current_mid"] is not None:
+        row["lifecycle_mid"] = decimal_to_plain(ctx["current_mid"])
     changed = migrate_grid_lifecycle(row, ctx["now"])
     invalidated = invalidate_unqueued_legacy_pauses(row, ctx["now"])
     if invalidated:
@@ -8929,7 +9004,12 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     row["status"] = "active"
     row.pop("error", None)
     row["updated_at"] = ctx["now"]
-    row["last_fill_check_ms"] = ctx["now_ms"]
+    if phase in {
+        GRID_LIFECYCLE_PHASE_P0,
+        GRID_LIFECYCLE_PHASE_P2,
+        GRID_LIFECYCLE_PHASE_P5,
+    }:
+        row["last_fill_check_ms"] = ctx["now_ms"]
     row["note"] = (
         "grid lifecycle v2; "
         f"phase={phase}; leg0={sum(1 for e in levels if isinstance(e, dict) and lifecycle_leg(e) == 0 and str(e.get('status') or '') == 'active')}; "

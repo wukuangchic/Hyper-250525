@@ -130,6 +130,7 @@ from trail_worker import (
     lifecycle_submit_order,
     lifecycle_terminal_candidate,
     lifecycle_fill_price_size,
+    lifecycle_context,
     migrate_grid_lifecycle,
     mark_missing_order_confirmed_open,
     mark_pending_cancel_confirmed_cancelled,
@@ -2714,6 +2715,99 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(seen[1], (None, None, 3))
         self.assertEqual(seen[-1][:2], (None, None))
         self.assertEqual(info.clear_calls, 9)
+
+    def test_lifecycle_context_fetches_only_phase_required_data_and_keeps_asset_metadata(self) -> None:
+        class FakeInfo:
+            def __init__(self) -> None:
+                self.calls = {
+                    "meta": 0,
+                    "mids": 0,
+                    "book": 0,
+                    "state": 0,
+                    "spot": 0,
+                    "open": 0,
+                    "fills": 0,
+                    "rate": 0,
+                }
+
+            def post(self, path, payload):
+                self.calls["rate"] += 1
+                return {"nRequestsUsed": 0, "nRequestsCap": 1000}
+
+            def meta(self, dex=""):
+                self.calls["meta"] += 1
+                return {"universe": [{"name": "BTC", "szDecimals": 2, "maxLeverage": 20}]}
+
+            def all_mids(self, dex=""):
+                self.calls["mids"] += 1
+                return {"BTC": "100"}
+
+            def l2_snapshot(self, coin):
+                self.calls["book"] += 1
+                return {"levels": [[{"px": "99"}], [{"px": "101"}]]}
+
+            def user_state(self, account, dex=""):
+                self.calls["state"] += 1
+                return {"assetPositions": []}
+
+            def spot_user_state(self, account):
+                self.calls["spot"] += 1
+                return {"balances": [{"token": 0, "coin": "USDC", "total": "20", "hold": "1"}]}
+
+            def frontend_open_orders(self, account, dex=""):
+                self.calls["open"] += 1
+                return []
+
+            def user_fills_by_time(self, account, start_ms, end_ms):
+                self.calls["fills"] += 1
+                return []
+
+        info = FakeInfo()
+        row = {"type": "grid", "status": "active", "network": "mainnet", "coin": "BTC"}
+        cache = {"now": 123, "grid_action_phase": "p0"}
+
+        with patch("trail_worker.build_clients", return_value=(info, object(), "acct", "signer", {})):
+            lifecycle_context(row, cache)
+            self.assertEqual(
+                info.calls,
+                {"meta": 1, "mids": 1, "book": 1, "state": 1, "spot": 1, "open": 1, "fills": 1, "rate": 1},
+            )
+
+            for name in ("mids", "books", "user_states", "spot_user_states", "fills"):
+                cache.pop(name, None)
+            cache["grid_action_phase"] = "p9"
+            lifecycle_context(row, cache)
+            self.assertEqual(info.calls["meta"], 1)
+            self.assertEqual(info.calls["mids"], 1)
+            self.assertEqual(info.calls["book"], 1)
+            self.assertEqual(info.calls["state"], 1)
+            self.assertEqual(info.calls["spot"], 2)
+            self.assertEqual(info.calls["open"], 1)
+            self.assertEqual(info.calls["fills"], 1)
+
+            for name in ("mids", "books", "user_states", "spot_user_states", "fills"):
+                cache.pop(name, None)
+            cache["grid_action_phase"] = "p5"
+            lifecycle_context(row, cache)
+            self.assertEqual(info.calls["meta"], 1)
+            self.assertEqual(info.calls["mids"], 1)
+            self.assertEqual(info.calls["book"], 1)
+            self.assertEqual(info.calls["state"], 1)
+            self.assertEqual(info.calls["spot"], 2)
+            self.assertEqual(info.calls["open"], 1)
+            self.assertEqual(info.calls["fills"], 2)
+
+            for name in ("mids", "books", "user_states", "spot_user_states", "fills"):
+                cache.pop(name, None)
+            cache["grid_action_phase"] = "p2"
+            lifecycle_context(row, cache)
+            self.assertEqual(info.calls["meta"], 1)
+            self.assertEqual(info.calls["mids"], 2)
+            self.assertEqual(info.calls["book"], 2)
+            self.assertEqual(info.calls["state"], 2)
+            self.assertEqual(info.calls["spot"], 3)
+            self.assertEqual(info.calls["open"], 1)
+            self.assertEqual(info.calls["fills"], 3)
 
     def test_limit_chase_p3_waits_every_ten_seconds_for_market_and_replacement_capacity(self) -> None:
         class FakeInfo:
