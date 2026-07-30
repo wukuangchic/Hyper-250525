@@ -3677,7 +3677,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(order["size"], "0.85")
         self.assertEqual(order["plan"]["base_size"], Decimal("0.20"))
         self.assertEqual(order["plan"]["position_fraction_target"], Decimal("0.856"))
-        self.assertEqual(order["plan"]["position_fraction_cap"], Decimal("1.712"))
+        self.assertEqual(order["plan"]["position_fraction_cap"], Decimal("1.71"))
         self.assertTrue(order["reduce_only"])
         self.assertEqual(order["plan"]["order_type"], {"limit": {"tif": "Ioc"}})
         self.assertTrue(order["plan"]["reduce_only"])
@@ -3732,6 +3732,22 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertIsNotNone(order)
         self.assertEqual(order["size"], "0.13")
+
+    def test_panic_reduce_skips_when_rounded_forty_percent_is_below_one_min(self) -> None:
+        class FakeExchange:
+            def _slippage_price(self, coin, is_buy, slippage, reference_price):
+                return reference_price
+
+        order = build_grid_panic_reduce_order(
+            FakeExchange(),
+            {"base_buy_size": "0.125", "base_sell_size": "0.125", "sz_decimals": 3},
+            "xyz:JPY",
+            {"szDecimals": 3},
+            Decimal("160"),
+            Decimal("0.3124"),
+        )
+
+        self.assertIsNone(order)
 
     def test_limit_chase_market_and_replacement_use_base_size_normal_orders_and_two_gaps(self) -> None:
         class FakeExchange:

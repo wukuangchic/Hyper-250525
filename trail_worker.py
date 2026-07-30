@@ -4406,7 +4406,9 @@ def build_grid_panic_reduce_order(
             sz_decimals,
             GRID_PANIC_REDUCE_MIN_NOTIONAL,
         )
-    position_fraction_cap = max_size * Decimal("0.4")
+    position_fraction_cap = (
+        (max_size * Decimal("0.4") / step).to_integral_value(rounding=ROUND_FLOOR) * step
+    )
     if position_fraction_cap < base_size:
         return None
     position_fraction_target = max_size * Decimal("0.2")
@@ -4416,7 +4418,7 @@ def build_grid_panic_reduce_order(
         max_size,
     )
     size = (size / step).to_integral_value(rounding=ROUND_FLOOR) * step
-    if size <= 0:
+    if size < base_size:
         return None
     if size * limit_px < GRID_PANIC_REDUCE_MIN_NOTIONAL:
         size = grid_size_for_min_notional(
@@ -4427,7 +4429,7 @@ def build_grid_panic_reduce_order(
         )
         size = min(size, position_fraction_cap, max_size)
         size = (size / step).to_integral_value(rounding=ROUND_FLOOR) * step
-        if size <= 0:
+        if size < base_size:
             return None
         if size * limit_px < GRID_PANIC_REDUCE_MIN_NOTIONAL:
             return None
