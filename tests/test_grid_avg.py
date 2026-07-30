@@ -3971,6 +3971,53 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(twins[1]["plan"]["birth_far_spacing_adjustments"], 2)
         self.assertFalse(lifecycle_active_price_too_close(row, "buy", Decimal(twins[1]["price"])))
 
+    def test_dense_birth_keeps_all_layers_and_moves_near_and_far_outward(self) -> None:
+        active_prices = [Decimal("158.68") - Decimal("0.05") * index for index in range(31)]
+        row = {
+            "gap_rate": "0.0002",
+            "base_buy_size": "0.07",
+            "base_sell_size": "0.07",
+            "min_order_value": "10",
+            "sz_decimals": 2,
+            "levels": [
+                {
+                    "side": "buy",
+                    "status": "active",
+                    "oid": index + 1,
+                    "price": str(price),
+                    "size": "0.07",
+                }
+                for index, price in enumerate(active_prices)
+            ],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        near = {
+            "side": "buy",
+            "price": "158.68",
+            "size": "0.62",
+            "plan": {"limit_px": Decimal("158.68"), "size": Decimal("0.62")},
+        }
+
+        births = lifecycle_birth_twin_orders(row, asset, near, Decimal("158.74"), Decimal("0.62"))
+
+        self.assertEqual(
+            [order["birth_slot"] for order in births],
+            ["near", "far1", "far2", "far3", "far4", "far5", "far6", "far7"],
+        )
+        self.assertEqual([order["size"] for order in births], ["0.07"] * 7 + ["0.13"])
+        self.assertEqual(sum(Decimal(order["size"]) for order in births), Decimal("0.62"))
+        self.assertNotEqual(births[0]["price"], "158.68")
+        self.assertGreater(births[0]["plan"]["birth_near_spacing_adjustments"], 0)
+        for index, order in enumerate(births):
+            price = Decimal(order["price"])
+            self.assertFalse(lifecycle_active_price_too_close(row, "buy", price))
+            for previous in births[:index]:
+                previous_price = Decimal(previous["price"])
+                self.assertGreater(
+                    abs(price - previous_price) / previous_price,
+                    Decimal(row["gap_rate"]) * Decimal("0.95"),
+                )
+
     def test_limit_chase_double_size_can_be_capped_before_crossing_zero(self) -> None:
         class FakeExchange:
             def _slippage_price(self, coin, is_buy, slippage, reference_price):
