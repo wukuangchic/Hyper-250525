@@ -4406,8 +4406,15 @@ def build_grid_panic_reduce_order(
             sz_decimals,
             GRID_PANIC_REDUCE_MIN_NOTIONAL,
         )
+    position_fraction_cap = max_size * Decimal("0.4")
+    if position_fraction_cap < base_size:
+        return None
     position_fraction_target = max_size * Decimal("0.2")
-    size = min(max(base_size * Decimal("2"), position_fraction_target), max_size)
+    size = min(
+        max(base_size * Decimal("2"), position_fraction_target),
+        position_fraction_cap,
+        max_size,
+    )
     size = (size / step).to_integral_value(rounding=ROUND_FLOOR) * step
     if size <= 0:
         return None
@@ -4418,7 +4425,7 @@ def build_grid_panic_reduce_order(
             sz_decimals,
             GRID_PANIC_REDUCE_MIN_NOTIONAL,
         )
-        size = min(size, max_size)
+        size = min(size, position_fraction_cap, max_size)
         size = (size / step).to_integral_value(rounding=ROUND_FLOOR) * step
         if size <= 0:
             return None
@@ -4448,6 +4455,7 @@ def build_grid_panic_reduce_order(
             "price_source": f"mid with {slippage} slippage protection",
             "base_size": base_size,
             "position_fraction_target": position_fraction_target,
+            "position_fraction_cap": position_fraction_cap,
         },
     }
 
