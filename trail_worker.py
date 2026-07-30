@@ -4406,8 +4406,8 @@ def build_grid_panic_reduce_order(
             sz_decimals,
             GRID_PANIC_REDUCE_MIN_NOTIONAL,
         )
-    position_tenth = max_size * Decimal("0.1")
-    size = min(max(base_size * Decimal("2"), position_tenth), max_size)
+    position_fraction_target = max_size * Decimal("0.2")
+    size = min(max(base_size * Decimal("2"), position_fraction_target), max_size)
     size = (size / step).to_integral_value(rounding=ROUND_FLOOR) * step
     if size <= 0:
         return None
@@ -4447,7 +4447,7 @@ def build_grid_panic_reduce_order(
             "reference_price": current_mid,
             "price_source": f"mid with {slippage} slippage protection",
             "base_size": base_size,
-            "position_tenth": position_tenth,
+            "position_fraction_target": position_fraction_target,
         },
     }
 

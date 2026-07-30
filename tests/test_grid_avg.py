@@ -3650,7 +3650,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "85"}), Decimal("100"))
         self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "15"}), Decimal("15"))
 
-    def test_panic_reduce_order_uses_larger_of_position_tenth_and_double_base(self) -> None:
+    def test_panic_reduce_order_uses_larger_of_position_twenty_percent_and_double_base(self) -> None:
         class FakeExchange:
             def _slippage_price(self, coin, is_buy, slippage, reference_price):
                 self.args = (coin, is_buy, Decimal(str(slippage)), Decimal(str(reference_price)))
@@ -3674,9 +3674,9 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertIsNotNone(order)
         self.assertEqual(order["side"], "buy")
-        self.assertEqual(order["size"], "0.42")
+        self.assertEqual(order["size"], "0.85")
         self.assertEqual(order["plan"]["base_size"], Decimal("0.20"))
-        self.assertEqual(order["plan"]["position_tenth"], Decimal("0.428"))
+        self.assertEqual(order["plan"]["position_fraction_target"], Decimal("0.856"))
         self.assertTrue(order["reduce_only"])
         self.assertEqual(order["plan"]["order_type"], {"limit": {"tif": "Ioc"}})
         self.assertTrue(order["plan"]["reduce_only"])
