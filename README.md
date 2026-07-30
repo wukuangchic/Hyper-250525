@@ -189,7 +189,7 @@ JPY both 20 --offset 2% --tp 1% --sl 0.7%
 
 ## 服务器真实网格单
 
-`grid` 现在是有限订单链，不再维持固定数量或固定密度。新建 grid 初始为空，不提交任何格子单；只有仓位 value 超出 `--limit MIN MAX` 后，P4 `limit-chase` 的 IOC 市价回归单确认成交，才会按实际 `avgPx` 在反方向出生 near/far 两张 `grid_leg=1` GTC 单。near 位于 `2 * gap`，far 位于 near 与反向最远 active 单的价格中点；该方向没有比 near 更远的 active 时，far 位于成交价的 `3 * gap`。far 候选价如果与同方向 active/pending 档位距离不超过 `0.95 * gap`，会每次向远离盘口方向外移 `1 * gap`，直到找到空档。后续成交由 P2 按 `1 ↔ 0` 延续。
+`grid` 现在是有限订单链，不再维持固定数量或固定密度。新建 grid 初始为空，不提交任何格子单；只有仓位 value 超出 `--limit MIN MAX` 后，P4 `limit-chase` 的 IOC 市价回归单确认成交，才会按实际 `avgPx` 在反方向出生 `grid_leg=1` GTC 子单。near 位于 `2 * gap`；默认 far 不近于 near 与反向最远 active 单的价格中点。实际市价成交量超过 `3 * base_size` 时，依据 `floor(fill_size / base_size)` 扩展为 near、far1、far2……，各 far 依次放在 near 到最远 active 单之间的 `1/N、2/N……(N-1)/N` 处。该方向没有比 near 更远的 active 时，则从成交价的 `3 * gap` 开始逐层向外排列。任一 far 候选价如果与同方向 active/pending 或本次已生成子单的距离不超过 `0.95 * gap`，会每次向远离盘口方向外移 `1 * gap`，直到找到空档。后续成交由 P2 按 `1 ↔ 0` 延续。
 
 `grid_leg=1` 表示当前往复尚未闭合，是必须继续处理的“链债务”；`grid_leg=0` 表示上一组往复已经闭合，在 withdrawable 紧张时可以终结。P0/P4 的 IOC 市价单是无格属性的出生事件，只有成交后派生的反向限价单带格属性。
 
@@ -214,14 +214,14 @@ BTC grid --limit -300 0
 
 参数：
 
-- `--gap`：P2 往复使用 `1 * gap`。P0/P4 的 IOC 目标数量使用 `2 * base_size`，确认成交后把实际成交量等分成 near/far 双胞胎：near 使用 `2 * gap`，far 使用 near 与反向最远 active 单的价格中点；没有比 near 更远的反向 active 时使用成交价的 `3 * gap`。far 候选价还会沿用统一的 `0.95 * gap` 同方向 active/pending 间距检查，过近时每次向外移 `1 * gap` 直到空档。仓位不足或拆分后任一子单低于最小下单金额时安全退化为一张完整成交量的 near 单。创建时不生成初始挂单。
+- `--gap`：P2 往复使用 `1 * gap`。P0 的 IOC 目标数量使用 `max(abs(当前仓位) * 10%, 2 * base_size)` 并以当前仓位封顶；P4 仍使用 `2 * base_size`。确认成交后，默认等分为 near/far；成交量超过 `3 * base_size` 时自动增加分层分母和 far 子单数量。near 使用 `2 * gap`，far 按 near 到反向最远 active 单的中点或 `i/N` 分点生成；没有更远 active 单时从成交价的 `3 * gap` 开始逐层向外排列。far 候选价还会沿用统一的 `0.95 * gap` 同方向占位间距检查。仓位不足或拆分后任一子单低于最小下单金额时安全退化为一张完整成交量的 near 单。创建时不生成初始挂单。
 - 不写 `--gap`，或写 `--gap 0` / `--gap 0%` 时，默认使用 `最小价格变动百分比 + 折扣后 takerFee + 折扣后 makerFee`。
 - `--trend`：数量倾向，默认 `0`；正数让买入数量大于卖出数量，负数让卖出数量大于买入数量。取消趋势用 `--modify --trend 0`。
 - `--avg` / `--trend` 只保留为基础下单 size 的兼容配置，不再驱动 top-up、密度或动态间距维护。
 - 修改 `--gap` 只影响后续 P0/P2/P3/P4/P6 生成或外移的订单，以及 P7 重组、P8 聚合后交给 P3 的新债务单；既有 active 单不会被主动改价。
 - `--min 20`：每张子单价值至少 20；不填时按交易所最小名义价值。
 - `--total`、旧 `--max` 和旧 `--long` / `--short` / `--abs` 都不再作为推荐 grid 参数；新命令使用 `--limit MIN MAX`。
-- P0 `panic`：沿用 `panic_ratio` 触发条件。先用 `2 * base_size` 的 IOC reduce-only 市价减仓，并以当前实际仓位为上限；确认成交后，以实际 `avgPx` 为锚点出生 near/far 两张各半成交量的 `grid_leg=1` GTC 单。空 grid 没有可用于计算 ratio 的 active 减仓格时，P0 不会凭空出生订单。
+- P0 `panic`：沿用 `panic_ratio` 触发条件。IOC reduce-only 市价减仓目标量取 `abs(当前仓位) * 10%` 与 `2 * base_size` 的较大值，并以当前实际仓位为上限。确认成交后，以实际 `avgPx` 为锚点出生动态分层的反向 `grid_leg=1` GTC 单。空 grid 没有可用于计算 ratio 的 active 减仓格时，P0 不会凭空出生订单。
 - P1 `terminal`：当账户 `withdrawable < 10` 时，每个账户（跨 DEX 合并计算）每轮最多撤一张真正占用保证金的非 reduce-only、`grid_leg=0` active 单，并按交易所订单时间从旧到新选择。reduce-only 挂单不占用保证金，P1 不撤；交易所确认撤单成功后才从 batch 移除，后续不再维护。
 - P2 `replacement`：处理确认成交的 active 格子单，以实际成交价为锚点在反方向 `1 * gap` 提交 ALO。部分成交还要先看原单属性：原单 `grid_leg=1` 且余单被交易所取消时，已成交部分终结、不衍生下一腿，未成交部分进入 P8；原单 `grid_leg=0` 时才按实际成交量衍生新的 `grid_leg=1`。衍生单提交前按实际成交量和衍生价格预判订单价值；严格 `< 10 USDC` 时，按该币种数量精度向上扩充到可提交的最小 size，使订单价值至少达到 `10 USDC`，然后正常提交；等于 `10 USDC` 时不扩充。提交前仍按当前仓位判断 reduce-only。
 - P3 `debt queue`：所有未能挂出的 `grid_leg=1` 都是必须重试的债务队列项；只有交易所明确返回保证金不足时状态才记为 `margin`，超时、限流、网络或其他提交失败记为 `chain_debt`。每轮 P3 根据当前快照构建队列并逐项处理，进入 P3 时只读取一次 `withdrawable` 并锁定本轮额度：`withdrawable > 1` 可处理 1 笔、`> 2` 可处理 2 笔，依此递增，`> 10` 时封顶 10 笔；等于整数门槛时不进入下一档。本轮后续余额变化不重算额度。P3 仍要求 raw deficit `< 0` 才提交，成功提交后退出 P3 队列（通常回到 active，若立即成交则交由 P2）；若 reduce-only 提交明确失败为“会增加仓位”，同一笔立即以非 reduce-only 重试；其他失败则继续保留在队列并移动到队尾，下一轮再尝试。`grid_leg=0` 提交失败则直接终结。P7 重组和 P8 聚合产生的订单也以 `chain_debt` 写入，等下一轮进入同一队列；P8 债务保持原累计 size，若向外移价后 value 回落到 `<= 10 USDC`，不扩量并退回 P8 继续累计。
@@ -233,7 +233,7 @@ BTC grid --limit -300 0
 - P9 `withdrawable-tail`：P0-P8 全部完成后，清除账户余额缓存并重新读取一次 withdrawable；严格 `< 1 USDC` 时，每个账户每轮从全部 Grid、DEX、币种的 active 非 reduce-only 单中最多撤一张。排序分数为 `(订单价格 × size ÷ 当前杠杆) × abs(mid - 订单价格) ÷ mid`，即预估占用保证金乘以相对盘口偏离率；选择最高分，交易所确认撤单后保留原 `grid_leg`，以新的 FIFO seq 加入下一轮 P3 队尾。`withdrawable = 1` 不触发。
 - 每轮严格按 `P0 → P1 → P2 → P3 → P4 → P5 → P6 → P7 → P8 → P9` 执行。P0/P1/P2 必须扫描；P3/P4 仅在 raw deficit `< 0` 时执行；P5 仅在 raw deficit `< -100` 时执行；P6 只受自己的过渡余额条件控制；P7 只受自己的债务重组条件控制；P8 无余额和 action-limit 门槛，只做本地累计与入队；P9 在重新读取的 withdrawable 严格 `< 1` 时执行。
 - P2/P3/P5/P6 的限价单使用 ALO。若价格已经穿盘、ALO 被 post-only 拒绝，或与同侧已有 active 单距离不足，会沿远离盘口方向每次外移 `1 * gap` 后继续尝试；距离检查只看真实 active 单，不把旧 paused 记录当占位。P3 每次只处理当前队列目标，下一项等待后续队列处理。
-- P0/P4 派生的 near/far 双胞胎直接使用 GTC。P0/P4 的 IOC 市价单本身没有 `grid_leg`，只有确认成交后派生的反向格子单带属性。两张子单共享出生 `cloid`，并分别持久化 `birth_slot=near/far`；市价提交前会先持久化出生意图，写请求超时或进程中断后，下一轮按 `cloid` 查单并以实际成交价、数量补齐缺失的子单，避免漏单或重复单。
+- P0/P4 派生的 near/far 分层单直接使用 GTC。P0/P4 的 IOC 市价单本身没有 `grid_leg`，只有确认成交后派生的反向格子单带属性。同次子单共享出生 `cloid`，并分别持久化 `birth_slot=near/far` 或 `near/far1/far2/...`；市价提交前会先持久化出生意图，写请求超时或进程中断后，下一轮按 `cloid` 查单并以实际成交价、数量补齐缺失的子单，避免漏单或重复单。
 - v2 生命周期不再执行 top-up、每侧 active-cap、固定 16 格、dense regrid、ROE/risk-density 暂停、普通 pause/recovery 或保活单逻辑。
 - Worker 继续输出 Info/Exchange/API 初始化调用的耗时统计，并把完整明细追加到 `logs/trail-api-timing.jsonl`。
 

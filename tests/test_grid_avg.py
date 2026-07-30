@@ -3650,7 +3650,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "85"}), Decimal("100"))
         self.assertEqual(grid_panic_ratio_threshold({"panic_ratio_threshold": "15"}), Decimal("15"))
 
-    def test_panic_reduce_order_uses_base_size_ioc_and_reduce_only(self) -> None:
+    def test_panic_reduce_order_uses_larger_of_position_tenth_and_double_base(self) -> None:
         class FakeExchange:
             def _slippage_price(self, coin, is_buy, slippage, reference_price):
                 self.args = (coin, is_buy, Decimal(str(slippage)), Decimal(str(reference_price)))
@@ -3674,7 +3674,9 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertIsNotNone(order)
         self.assertEqual(order["side"], "buy")
-        self.assertEqual(order["size"], "0.4")
+        self.assertEqual(order["size"], "0.42")
+        self.assertEqual(order["plan"]["base_size"], Decimal("0.20"))
+        self.assertEqual(order["plan"]["position_tenth"], Decimal("0.428"))
         self.assertTrue(order["reduce_only"])
         self.assertEqual(order["plan"]["order_type"], {"limit": {"tif": "Ioc"}})
         self.assertTrue(order["plan"]["reduce_only"])
@@ -3759,6 +3761,52 @@ class GridAvgTests(unittest.TestCase):
             "near_farthest_active_midpoint",
         )
         self.assertEqual(twins[1]["plan"]["birth_far_active_price"], Decimal("110"))
+
+    def test_large_birth_splits_three_layers_at_farthest_active_thirds(self) -> None:
+        row = {
+            "gap_rate": "0.01",
+            "base_buy_size": "0.3",
+            "base_sell_size": "0.3",
+            "min_order_value": "10",
+            "levels": [
+                {"side": "sell", "status": "active", "oid": 9, "price": "110", "size": "0.3"},
+            ],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        near = panic_reversal_order_from_reduce(
+            row, "BTC", asset, Decimal("100"), True, Decimal("1.05"), Decimal("-10"), "abs"
+        )
+
+        births = lifecycle_birth_twin_orders(row, asset, near, Decimal("100"), Decimal("1.05"))
+
+        self.assertEqual([order["birth_slot"] for order in births], ["near", "far1", "far2"])
+        self.assertEqual([order["size"] for order in births], ["0.35", "0.35", "0.35"])
+        self.assertEqual([order["price"] for order in births], ["102", "104.67", "107.33"])
+        self.assertEqual(
+            [order["plan"].get("birth_far_fraction") for order in births[1:]],
+            [Decimal("1") / Decimal("3"), Decimal("2") / Decimal("3")],
+        )
+
+    def test_larger_birth_keeps_increasing_layer_denominator(self) -> None:
+        row = {
+            "gap_rate": "0.01",
+            "base_buy_size": "0.3",
+            "base_sell_size": "0.3",
+            "min_order_value": "10",
+            "levels": [
+                {"side": "sell", "status": "active", "oid": 9, "price": "110", "size": "0.3"},
+            ],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        near = panic_reversal_order_from_reduce(
+            row, "BTC", asset, Decimal("100"), True, Decimal("1.25"), Decimal("-10"), "abs"
+        )
+
+        births = lifecycle_birth_twin_orders(row, asset, near, Decimal("100"), Decimal("1.25"))
+
+        self.assertEqual([order["birth_slot"] for order in births], ["near", "far1", "far2", "far3"])
+        self.assertEqual([order["size"] for order in births], ["0.31", "0.31", "0.31", "0.32"])
+        self.assertEqual([order["price"] for order in births], ["102", "104", "106", "108"])
 
     def test_birth_twins_move_far_sell_outward_until_active_spacing_is_clear(self) -> None:
         row = {

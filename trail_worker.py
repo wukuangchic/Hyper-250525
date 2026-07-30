@@ -4406,7 +4406,8 @@ def build_grid_panic_reduce_order(
             sz_decimals,
             GRID_PANIC_REDUCE_MIN_NOTIONAL,
         )
-    size = min(base_size * Decimal("2"), max_size)
+    position_tenth = max_size * Decimal("0.1")
+    size = min(max(base_size * Decimal("2"), position_tenth), max_size)
     size = (size / step).to_integral_value(rounding=ROUND_FLOOR) * step
     if size <= 0:
         return None
@@ -4445,6 +4446,8 @@ def build_grid_panic_reduce_order(
             "worst_notional": notional,
             "reference_price": current_mid,
             "price_source": f"mid with {slippage} slippage protection",
+            "base_size": base_size,
+            "position_tenth": position_tenth,
         },
     }
 
@@ -8393,25 +8396,35 @@ def lifecycle_birth_twin_orders(
     fill_price: Decimal,
     fill_size: Decimal,
 ) -> list[dict[str, Any]]:
-    """Split a P0/P4 market birth into near/far children when both are tradable."""
+    """Split a P0/P4 fill into size-aware near/far children."""
     gap = Decimal(str(row["gap_rate"]))
     sz_decimals = int(row.get("sz_decimals") or asset["szDecimals"])
     step = Decimal(1).scaleb(-sz_decimals)
-    near_size = ((fill_size / Decimal("2")) / step).to_integral_value(rounding=ROUND_FLOOR) * step
-    far_size = ((fill_size - near_size) / step).to_integral_value(rounding=ROUND_FLOOR) * step
     near_price = decimal_or_none(near_birth.get("price", near_birth.get("limit_px")))
+    side = str(near_birth.get("side") or "")
+    size_key = "base_buy_size" if side == "buy" else "base_sell_size"
+    base_size = decimal_or_none(row.get(size_key))
+    if base_size is not None:
+        base_size = (base_size / step).to_integral_value(rounding=ROUND_FLOOR) * step
+    child_count = 2
+    if base_size is not None and base_size > 0 and fill_size > base_size * Decimal("3"):
+        child_count = max(3, int((fill_size / base_size).to_integral_value(rounding=ROUND_FLOOR)))
+    child_size = ((fill_size / Decimal(child_count)) / step).to_integral_value(rounding=ROUND_FLOOR) * step
+    child_sizes = [child_size for _ in range(child_count)]
+    child_sizes[-1] = ((fill_size - child_size * Decimal(child_count - 1)) / step).to_integral_value(
+        rounding=ROUND_FLOOR
+    ) * step
     if (
         fill_price <= 0
         or gap <= 0
         or near_price is None
         or near_price <= 0
-        or near_size <= 0
-        or far_size <= 0
+        or side not in {"buy", "sell"}
+        or any(size <= 0 for size in child_sizes)
     ):
         near_birth["birth_slot"] = "single"
         return [near_birth]
 
-    side = str(near_birth.get("side") or "")
     active_prices = [
         price
         for entry in row.get("levels") or []
@@ -8423,92 +8436,106 @@ def lifecycle_birth_twin_orders(
         if (price := decimal_or_none(entry.get("price", entry.get("limit_px")))) is not None
         and price > 0
     ]
+    has_farther_active = False
     if side == "buy":
         farthest_active = min(active_prices) if active_prices else None
         if farthest_active is not None and farthest_active < near_price:
-            far_price = rounded_perp_price(
-                (near_price + farthest_active) / Decimal("2"),
-                sz_decimals,
-            )
+            has_farther_active = True
+            far_boundary = farthest_active
         else:
-            far_price = rounded_perp_price(
-                fill_price * (Decimal("1") - gap * Decimal("3")),
-                sz_decimals,
-            )
+            far_boundary = fill_price * (Decimal("1") - gap * Decimal(child_count + 2))
     elif side == "sell":
         farthest_active = max(active_prices) if active_prices else None
         if farthest_active is not None and farthest_active > near_price:
-            far_price = rounded_perp_price(
-                (near_price + farthest_active) / Decimal("2"),
-                sz_decimals,
-            )
+            has_farther_active = True
+            far_boundary = farthest_active
         else:
-            far_price = rounded_perp_price(
-                fill_price * (Decimal("1") + gap * Decimal("3")),
-                sz_decimals,
-            )
-    else:
-        near_birth["birth_slot"] = "single"
-        return [near_birth]
+            far_boundary = fill_price * (Decimal("1") + gap * Decimal(child_count + 2))
 
-    far_anchor_price = far_price
-    far_spacing_adjustments = 0
-    for _attempt in range(GRID_ALO_PRICE_ATTEMPT_LIMIT):
-        if not lifecycle_active_price_too_close(row, side, far_price):
-            break
-        multiplier = Decimal("1") - gap if side == "buy" else Decimal("1") + gap
-        next_far_price = rounded_perp_price(far_price * multiplier, sz_decimals)
-        if next_far_price <= 0 or next_far_price == far_price:
+    far_prices: list[Decimal] = []
+    far_metadata: list[tuple[Decimal, int]] = []
+    multiplier = Decimal("1") - gap if side == "buy" else Decimal("1") + gap
+    for index in range(1, child_count):
+        anchor_price = rounded_perp_price(
+            near_price + (far_boundary - near_price) * Decimal(index) / Decimal(child_count),
+            sz_decimals,
+        )
+        far_price = anchor_price
+        spacing_adjustments = 0
+        for _attempt in range(GRID_ALO_PRICE_ATTEMPT_LIMIT):
+            generated_too_close = any(
+                abs(far_price - price) / price <= gap * Decimal("0.95")
+                for price in [near_price, *far_prices]
+                if price > 0
+            )
+            if not generated_too_close and not lifecycle_active_price_too_close(row, side, far_price):
+                break
+            next_far_price = rounded_perp_price(far_price * multiplier, sz_decimals)
+            if next_far_price <= 0 or next_far_price == far_price:
+                near_birth["birth_slot"] = "single"
+                return [near_birth]
+            far_price = next_far_price
+            spacing_adjustments += 1
+        else:
             near_birth["birth_slot"] = "single"
             return [near_birth]
-        far_price = next_far_price
-        far_spacing_adjustments += 1
-    else:
-        near_birth["birth_slot"] = "single"
-        return [near_birth]
+        far_prices.append(far_price)
+        far_metadata.append((anchor_price, spacing_adjustments))
 
     min_notional = max(
         MIN_NOTIONAL,
         decimal_or_none(row.get("min_order_value")) or MIN_NOTIONAL,
     )
     if (
-        far_price <= 0
-        or near_size * near_price < min_notional
-        or far_size * far_price < min_notional
+        any(price <= 0 for price in far_prices)
+        or child_sizes[0] * near_price < min_notional
+        or any(size * price < min_notional for size, price in zip(child_sizes[1:], far_prices))
     ):
         near_birth["birth_slot"] = "single"
         return [near_birth]
 
-    set_grid_order_size_exact(near_birth, near_size)
+    set_grid_order_size_exact(near_birth, child_sizes[0])
     near_birth["birth_slot"] = "near"
     near_plan = near_birth.get("plan")
     if isinstance(near_plan, dict):
         near_plan["birth_slot"] = "near"
-        near_plan["birth_size_fraction"] = Decimal("0.5")
+        near_plan["birth_size_fraction"] = Decimal("1") / Decimal(child_count)
+        near_plan["birth_layer_count"] = child_count
 
-    far_birth = deepcopy(near_birth)
-    set_grid_order_size_exact(far_birth, far_size)
-    set_grid_order_price(far_birth, far_price)
-    far_birth["birth_slot"] = "far"
-    far_plan = far_birth.get("plan")
-    if isinstance(far_plan, dict):
-        far_plan["birth_slot"] = "far"
-        far_plan["birth_size_fraction"] = Decimal("0.5")
-        far_plan["birth_far_anchor_source"] = (
-            "near_farthest_active_midpoint"
-            if farthest_active is not None
-            and (
-                (side == "buy" and farthest_active < near_price)
-                or (side == "sell" and farthest_active > near_price)
-            )
-            else "fill_3gap"
-        )
-        if far_plan["birth_far_anchor_source"] == "near_farthest_active_midpoint":
-            far_plan["birth_far_active_price"] = farthest_active
-        if far_spacing_adjustments:
-            far_plan["birth_far_anchor_price"] = far_anchor_price
-            far_plan["birth_far_spacing_adjustments"] = far_spacing_adjustments
-    return [near_birth, far_birth]
+    births = [near_birth]
+    for index, (size, price, metadata) in enumerate(
+        zip(child_sizes[1:], far_prices, far_metadata),
+        start=1,
+    ):
+        far_birth = deepcopy(near_birth)
+        set_grid_order_size_exact(far_birth, size)
+        set_grid_order_price(far_birth, price)
+        slot = "far" if child_count == 2 else f"far{index}"
+        far_birth["birth_slot"] = slot
+        far_plan = far_birth.get("plan")
+        if isinstance(far_plan, dict):
+            far_plan["birth_slot"] = slot
+            far_plan["birth_size_fraction"] = Decimal("1") / Decimal(child_count)
+            far_plan["birth_layer_count"] = child_count
+            far_plan["birth_far_fraction"] = Decimal(index) / Decimal(child_count)
+            if has_farther_active:
+                far_plan["birth_far_anchor_source"] = (
+                    "near_farthest_active_midpoint"
+                    if child_count == 2
+                    else "near_farthest_active_fraction"
+                )
+            else:
+                far_plan["birth_far_anchor_source"] = (
+                    "fill_3gap" if child_count == 2 else "fill_gap_ladder"
+                )
+            if has_farther_active:
+                far_plan["birth_far_active_price"] = farthest_active
+            anchor_price, spacing_adjustments = metadata
+            if spacing_adjustments:
+                far_plan["birth_far_anchor_price"] = anchor_price
+                far_plan["birth_far_spacing_adjustments"] = spacing_adjustments
+        births.append(far_birth)
+    return births
 
 
 def lifecycle_materialize_birth_intent(
