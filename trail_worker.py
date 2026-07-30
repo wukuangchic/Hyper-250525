@@ -8395,6 +8395,7 @@ def lifecycle_birth_twin_orders(
     near_birth: dict[str, Any],
     fill_price: Decimal,
     fill_size: Decimal,
+    _max_child_count: int | None = None,
 ) -> list[dict[str, Any]]:
     """Split a P0/P4 fill into size-aware near/far children."""
     gap = Decimal(str(row["gap_rate"]))
@@ -8409,6 +8410,22 @@ def lifecycle_birth_twin_orders(
     child_count = 2
     if base_size is not None and base_size > 0 and fill_size > base_size * Decimal("3"):
         child_count = max(3, int((fill_size / base_size).to_integral_value(rounding=ROUND_FLOOR)))
+    if _max_child_count is not None:
+        child_count = max(2, min(child_count, _max_child_count))
+
+    def fewer_layers_or_single() -> list[dict[str, Any]]:
+        if child_count > 2:
+            return lifecycle_birth_twin_orders(
+                row,
+                asset,
+                near_birth,
+                fill_price,
+                fill_size,
+                child_count - 1,
+            )
+        near_birth["birth_slot"] = "single"
+        return [near_birth]
+
     child_size = ((fill_size / Decimal(child_count)) / step).to_integral_value(rounding=ROUND_FLOOR) * step
     child_sizes = [child_size for _ in range(child_count)]
     child_sizes[-1] = ((fill_size - child_size * Decimal(child_count - 1)) / step).to_integral_value(
@@ -8422,8 +8439,7 @@ def lifecycle_birth_twin_orders(
         or side not in {"buy", "sell"}
         or any(size <= 0 for size in child_sizes)
     ):
-        near_birth["birth_slot"] = "single"
-        return [near_birth]
+        return fewer_layers_or_single()
 
     active_prices = [
         price
@@ -8472,13 +8488,11 @@ def lifecycle_birth_twin_orders(
                 break
             next_far_price = rounded_perp_price(far_price * multiplier, sz_decimals)
             if next_far_price <= 0 or next_far_price == far_price:
-                near_birth["birth_slot"] = "single"
-                return [near_birth]
+                return fewer_layers_or_single()
             far_price = next_far_price
             spacing_adjustments += 1
         else:
-            near_birth["birth_slot"] = "single"
-            return [near_birth]
+            return fewer_layers_or_single()
         far_prices.append(far_price)
         far_metadata.append((anchor_price, spacing_adjustments))
 
@@ -8491,8 +8505,7 @@ def lifecycle_birth_twin_orders(
         or child_sizes[0] * near_price < min_notional
         or any(size * price < min_notional for size, price in zip(child_sizes[1:], far_prices))
     ):
-        near_birth["birth_slot"] = "single"
-        return [near_birth]
+        return fewer_layers_or_single()
 
     set_grid_order_size_exact(near_birth, child_sizes[0])
     near_birth["birth_slot"] = "near"

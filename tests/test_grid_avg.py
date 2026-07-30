@@ -3808,6 +3808,31 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual([order["size"] for order in births], ["0.31", "0.31", "0.31", "0.32"])
         self.assertEqual([order["price"] for order in births], ["102", "104", "106", "108"])
 
+    def test_large_birth_reduces_layer_count_instead_of_single_when_far_min_fails(self) -> None:
+        row = {
+            "gap_rate": "0.0002",
+            "base_buy_size": "0.13",
+            "base_sell_size": "0.13",
+            "min_order_value": "20",
+            "sz_decimals": 2,
+            "levels": [
+                {"side": "buy", "status": "active", "oid": 9, "price": "150", "size": "0.13"},
+            ],
+        }
+        asset = {"szDecimals": 2, "maxLeverage": 20}
+        near = {
+            "side": "buy",
+            "price": "159.39",
+            "size": "0.52",
+            "plan": {"limit_px": Decimal("159.39"), "size": Decimal("0.52")},
+        }
+
+        births = lifecycle_birth_twin_orders(row, asset, near, Decimal("159.45"), Decimal("0.52"))
+
+        self.assertEqual([order["birth_slot"] for order in births], ["near", "far1", "far2"])
+        self.assertEqual([order["size"] for order in births], ["0.17", "0.17", "0.18"])
+        self.assertTrue(all(Decimal(order["size"]) * Decimal(order["price"]) >= 20 for order in births))
+
     def test_birth_twins_move_far_sell_outward_until_active_spacing_is_clear(self) -> None:
         row = {
             "gap_rate": "0.01",
