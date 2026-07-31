@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh the Simple-Hyper Grid economic ledger every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=15s
+Persistent=true
+Unit=simple-hyper-economic-ledger.service
+
+[Install]
+WantedBy=timers.target

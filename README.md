@@ -716,3 +716,35 @@ print(info.all_mids()["BTC"])
 wallet = eth_account.Account.from_key("0x你的私钥")
 exchange = Exchange(wallet, constants.MAINNET_API_URL, account_address="0x主账户地址")
 ```
+
+## Grid 经济账本（服务器子程序）
+
+`grid_economic_ledger.py` 是只读观察进程：它读取 worker 的 action audit、
+`server_batch.json` 和 Hyperliquid 公共历史接口，不加载私钥，也没有下单、改单或撤单能力。
+
+账本用 `economic_chain_id` 串起一次 P0/P4 市价成交、对应反向子单及后续替换单。
+只有买卖数量完全回到净零的链才进入 `flat_incremental_cash_after_fees`；
+尚未回补的链保留在 `open`，不会提前算作已落袋利润。交易所的
+`closedPnl` 仍单独保存，便于同时比较账户会计口径和“高卖低接”的增量现金口径。
+
+服务器默认每五分钟运行一次：
+
+```bash
+systemctl status simple-hyper-economic-ledger.timer
+systemctl start simple-hyper-economic-ledger.service
+```
+
+持久化结果：
+
+- SQLite 明细：`/var/lib/simple-hyper/grid-economic-ledger.sqlite3`
+- JSON 摘要：`/var/lib/simple-hyper/logs/grid-economic-ledger-summary.json`
+
+本地只读验证、不请求交易所：
+
+```bash
+python3 grid_economic_ledger.py --no-fetch \
+  --audit-path /path/to/trail-action-audit.jsonl \
+  --state-path /path/to/server_batch.json \
+  --db-path /tmp/grid-economic-ledger.sqlite3 \
+  --summary-path /tmp/grid-economic-ledger-summary.json
+```

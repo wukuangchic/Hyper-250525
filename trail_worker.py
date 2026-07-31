@@ -420,6 +420,43 @@ def audit_grid_action(action: str, **payload: Any) -> None:
         handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
 
 
+def economic_chain_id(row: dict[str, Any], entry: dict[str, Any]) -> str:
+    """Return one stable identifier for the economic order chain."""
+    existing = str(
+        entry.get("economic_chain_id")
+        or entry.get("birth_intent_cloid")
+        or ""
+    ).strip()
+    if existing:
+        entry["economic_chain_id"] = existing
+        return existing
+    grid_id = str(row.get("id") or row.get("coin") or "grid")
+    for key in ("source_oid", "p9_source_oid", "confirmed_filled_oid", "oid"):
+        value = entry.get(key)
+        if value is not None and str(value).strip():
+            chain_id = f"{grid_id}:oid:{value}"
+            entry["economic_chain_id"] = chain_id
+            return chain_id
+    queue_seq = entry.get("p3_queue_seq")
+    if queue_seq is not None:
+        chain_id = f"{grid_id}:p3:{queue_seq}"
+        entry["economic_chain_id"] = chain_id
+        return chain_id
+    created_at = (
+        entry.get("submitted_at")
+        or entry.get("created_at")
+        or entry.get("chain_debt_at")
+        or entry.get("margin_at")
+        or 0
+    )
+    side = str(entry.get("side") or "-")
+    price = str(entry.get("price", entry.get("limit_px")) or "-")
+    size = str(entry.get("size") or "-")
+    chain_id = f"{grid_id}:legacy:{created_at}:{side}:{price}:{size}"
+    entry["economic_chain_id"] = chain_id
+    return chain_id
+
+
 def pending_cancel_rate(deficit: int) -> Decimal | None:
     if deficit <= 0:
         return None
@@ -2107,6 +2144,15 @@ def submit_grid_child_order(
         replacement=bool(order.get("replacement_order")),
         phase=order.get("audit_phase"),
         deficit=order.get("audit_deficit"),
+        economic_chain_id=order.get("economic_chain_id") or order.get("birth_intent_cloid"),
+        grid_id=order.get("grid_id"),
+        birth_source=order.get("birth_source"),
+        birth_slot=order.get("birth_slot"),
+        grid_leg=order.get("grid_leg"),
+        iteration=order.get("iteration"),
+        source_oid=order.get("source_oid"),
+        p9_source_oid=order.get("p9_source_oid"),
+        p3_queue_seq=order.get("p3_queue_seq"),
         result=result,
     )
     log_event("grid_child_order", {"side": "buy" if plan["is_buy"] else "sell", "result": result})
@@ -4534,6 +4580,10 @@ def submit_grid_panic_reduce(
         side=order.get("side"),
         price=order.get("price"),
         size=order.get("size"),
+        reduce_only=True,
+        economic_chain_id=str(cloid) if cloid is not None else None,
+        birth_source="panic",
+        grid_id=row.get("id"),
         result=result,
     )
     log_event("grid_panic_reduce_order", {"coin": coin, "side": order.get("side"), "result": result})
@@ -7432,6 +7482,9 @@ def lifecycle_replacement_from_fill(
     order["replacement_order"] = True
     order["grid_leg"] = 1 - lifecycle_leg(source)
     order["source_grid_leg"] = lifecycle_leg(source)
+    order["source_oid"] = source.get("oid")
+    order["grid_id"] = row.get("id")
+    order["economic_chain_id"] = economic_chain_id(row, source)
     order["iteration"] = lifecycle_iteration(source)
     order["replacement_anchor_price"] = decimal_to_plain(fill_price)
     order["replacement_anchor_source"] = "market_fill" if isinstance(source.get("fill"), dict) else "saved_fill"
@@ -7504,6 +7557,11 @@ def lifecycle_submit_order(
     allow_non_reduce_only_fallback: bool = False,
 ) -> str:
     """Submit one finite-chain order; chain debt defers, completed legs may end."""
+    order["grid_id"] = row.get("id")
+    economic_chain_id(row, order)
+    order["audit_phase"] = cache.get("grid_action_phase")
+    order["audit_deficit"] = raw_action_limit_deficit(cache)
+
     def defer(error_text: str) -> str:
         if lifecycle_leg(order) == 1 and is_min_order_value_error_text(error_text):
             size = decimal_or_none(order.get("size")) or Decimal("0")
@@ -7981,6 +8039,8 @@ def lifecycle_cancel_p9_candidate(
         "grid_p9_withdrawable_cancel",
         coin=coin,
         oid=oid,
+        grid_id=row.get("id"),
+        economic_chain_id=economic_chain_id(row, entry),
         grid_leg=lifecycle_leg(entry),
         score=decimal_to_plain(score),
         estimated_margin=decimal_to_plain(estimated_margin),
@@ -8273,6 +8333,26 @@ def lifecycle_process_fills(
     submitted = 0
     isolated_ready: set[str] = cache.setdefault("lifecycle_isolated_ready", set())
     for source in newly_filled:
+        chain_id = economic_chain_id(row, source)
+        if not source.get("economic_fill_audited_at"):
+            fill_price, fill_size = lifecycle_fill_price_size(source)
+            audit_grid_action(
+                "grid_fill_confirmed",
+                coin=ctx["coin"],
+                grid_id=row.get("id"),
+                economic_chain_id=chain_id,
+                oid=source.get("oid"),
+                side=source.get("side"),
+                price=decimal_to_plain(fill_price) if fill_price is not None else None,
+                size=decimal_to_plain(fill_size) if fill_size is not None else None,
+                grid_leg=lifecycle_leg(source),
+                iteration=lifecycle_iteration(source),
+                birth_source=source.get("birth_source"),
+                birth_slot=source.get("birth_slot"),
+                fill=source.get("fill"),
+            )
+            source["economic_fill_audited_at"] = ctx["now"]
+            changed = True
         if source.get("confirmed_partial_filled_oid") is not None and lifecycle_leg(source) == 1:
             remaining_size = decimal_or_none(source.get("partial_unfilled_size"))
             if remaining_size is None:
@@ -8750,6 +8830,8 @@ def lifecycle_materialize_birth_intent(
         birth["iteration"] = 0
         birth["birth_source"] = source
         birth["birth_intent_cloid"] = cloid_text
+        birth["economic_chain_id"] = cloid_text
+        birth["grid_id"] = row.get("id")
         birth["preserve_fill_size"] = True
         birth["status"] = GRID_CHAIN_DEBT_STATUS
         lifecycle_assign_p3_queue_seq(birth, cache)
@@ -8787,6 +8869,30 @@ def lifecycle_materialize_birth_intent(
                 levels.remove(birth)
     row[f"{source}_fill_price"] = decimal_to_plain(fill_price)
     row[f"{source}_birth_status"] = results or "already_materialized"
+    audit_grid_action(
+        "grid_birth_materialized",
+        coin=ctx["coin"],
+        grid_id=row.get("id"),
+        economic_chain_id=cloid_text,
+        birth_source=source,
+        market_oid=intent.get("market_oid"),
+        market_side="buy" if market_is_buy else "sell",
+        market_fill_price=decimal_to_plain(fill_price),
+        market_fill_size=decimal_to_plain(fill_size),
+        children=[
+            {
+                "side": birth.get("side"),
+                "price": birth.get("price", birth.get("limit_px")),
+                "size": birth.get("size"),
+                "birth_slot": birth.get("birth_slot"),
+                "status": birth.get("status"),
+                "oid": birth.get("oid"),
+                "p3_queue_seq": birth.get("p3_queue_seq"),
+            }
+            for birth in births
+        ],
+        submit_results=results or "already_materialized",
+    )
     return True
 
 
@@ -8917,6 +9023,18 @@ def lifecycle_submit_limit_chase(row: dict[str, Any], ctx: dict[str, Any], cache
         row["limit_chase_error"] = str(exc)
         persist_lifecycle_intent(cache)
         return True
+    audit_grid_action(
+        "limit_chase_market_submit",
+        coin=ctx["coin"],
+        side=market.get("side"),
+        price=market.get("price"),
+        size=market.get("size"),
+        reduce_only=bool(plan.get("reduce_only")),
+        economic_chain_id=intent.get("cloid"),
+        birth_source="limit_chase",
+        grid_id=row.get("id"),
+        result=result,
+    )
     if not isinstance(result, dict) or result.get("status") != "ok":
         row["limit_chase_error"] = str(result)
         lifecycle_remove_birth_intent(row, intent, cache)
@@ -8938,6 +9056,7 @@ def lifecycle_submit_limit_chase(row: dict[str, Any], ctx: dict[str, Any], cache
         return True
     fill_price = decimal_or_none(filled.get("avgPx")) or ctx["current_mid"]
     fill_size = decimal_or_none(filled.get("totalSz", filled.get("sz"))) or decimal_or_none(market.get("size"))
+    intent["market_oid"] = filled.get("oid")
     lifecycle_materialize_birth_intent(
         row, ctx, cache, intent, fill_price, fill_size or Decimal("0")
     )
@@ -9019,6 +9138,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                     persist_lifecycle_intent(cache)
                     submitted = False
                 if submitted and str(market.get("status") or "") == "filled":
+                    intent["market_oid"] = market.get("oid")
                     fill_price = decimal_or_none(market.get("filled_avg_px")) or ctx["current_mid"]
                     fill_size = decimal_or_none(market.get("filled_size")) or decimal_or_none(market.get("size"))
                     if lifecycle_materialize_birth_intent(
