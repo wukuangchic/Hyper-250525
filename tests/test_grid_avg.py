@@ -101,6 +101,7 @@ from trail_worker import (
     grid_risk_density_pause_candidates,
     grid_risk_density_restore_allowed,
     grid_target_orders_per_side,
+    GRID_LIMIT_CHASE_ADD_RISK_FROZEN,
     GRID_LIMIT_CHASE_MARGIN_ADEQUACY_THRESHOLD,
     grid_survival_slot_available,
     maintain_grid,
@@ -1224,6 +1225,52 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertFalse(lifecycle_submit_limit_chase(row, ctx, {"action_limit_headroom": 200}))
         self.assertEqual(row["levels"], [])
+
+    def test_p4_add_risk_is_frozen_before_market_construction(self) -> None:
+        self.assertTrue(GRID_LIMIT_CHASE_ADD_RISK_FROZEN)
+
+        class UnexpectedExchange:
+            def _slippage_price(self, *args, **kwargs):
+                raise AssertionError("frozen P4 add-risk must not build or submit a market order")
+
+            def order(self, *args, **kwargs):
+                raise AssertionError("frozen P4 add-risk must not submit an exchange action")
+
+        row = {
+            "id": "grid-btc",
+            "position_limit_mode": "limit",
+            "min_position_value": "100",
+            "max_position_value": "150",
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "0.3",
+            "base_sell_size": "0.3",
+            "levels": [],
+        }
+        ctx = {
+            "withdrawable": Decimal("100"),
+            "position_size": Decimal("0.5"),
+            "position_value": Decimal("50"),
+            "position_leverage": Decimal("10"),
+            "exchange": UnexpectedExchange(),
+            "coin": "BTC",
+            "asset": {"szDecimals": 2, "maxLeverage": 20},
+            "current_mid": Decimal("100"),
+            "best_bid": Decimal("99.9"),
+            "best_ask": Decimal("100.1"),
+            "now": 123,
+            "open_orders": [],
+        }
+
+        with patch("trail_worker.audit_grid_action") as audit_mock:
+            self.assertFalse(
+                lifecycle_submit_limit_chase(row, ctx, {"action_limit_headroom": 200})
+            )
+
+        self.assertEqual(row["levels"], [])
+        audit_mock.assert_called_once()
+        self.assertEqual(audit_mock.call_args.args[0], "limit_chase_add_risk_frozen")
+        self.assertEqual(audit_mock.call_args.kwargs["source"], "lifecycle")
 
     def test_p4_margin_adequacy_uses_ioc_slippage_price_and_leverage(self) -> None:
         class FakeExchange:
@@ -3112,7 +3159,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertNotIn("limit_chase_error", row)
         self.assertNotIn("limit_chase_error_at", row)
 
-    def test_legacy_limit_chase_requires_margin_adequacy_above_1_1(self) -> None:
+    def test_legacy_limit_chase_freezes_add_risk_before_margin_gate(self) -> None:
         class FakeInfo:
             def all_mids(self, dex):
                 return {"BTC": "100"}
@@ -3139,7 +3186,7 @@ class GridAvgTests(unittest.TestCase):
                 return reference_price
 
             def order(self, *args, **kwargs):
-                raise AssertionError("limit chase must not submit when margin adequacy is at most 1.1")
+                raise AssertionError("frozen legacy P4 add-risk must not submit")
 
         row = {
             "type": "grid",
@@ -3166,11 +3213,15 @@ class GridAvgTests(unittest.TestCase):
         with (
             patch("trail_worker.clear_info_cache"),
             patch("trail_worker.resolve_perp_asset", return_value=("BTC", {"szDecimals": 2, "maxLeverage": 20})),
+            patch("trail_worker.audit_grid_action") as audit_mock,
         ):
             self.assertTrue(run_grid_limit_chase_p3(cache))
 
-        self.assertEqual(row["limit_chase_status"], "skipped_margin_adequacy")
+        self.assertEqual(row["limit_chase_status"], "add_risk_frozen")
         self.assertEqual(row["levels"], [])
+        audit_mock.assert_called_once()
+        self.assertEqual(audit_mock.call_args.args[0], "limit_chase_add_risk_frozen")
+        self.assertEqual(audit_mock.call_args.kwargs["source"], "legacy")
 
     def test_precheck_action_limit_initializes_shared_p1_budget_below_cap_once(self) -> None:
         class FakeInfo:

@@ -95,6 +95,7 @@ GRID_SURVIVAL_ACTIVE_ORDERS_PER_SIDE = 1
 GRID_WITHDRAWABLE_REDUCE_ONLY_THRESHOLD = Decimal("5")
 GRID_WITHDRAWABLE_PAUSE_THRESHOLD = Decimal("10")
 GRID_LIMIT_CHASE_MARGIN_ADEQUACY_THRESHOLD = Decimal("1.1")
+GRID_LIMIT_CHASE_ADD_RISK_FROZEN = True
 GRID_LIFECYCLE_VERSION = 2
 GRID_LEGACY_PAUSE_STATUS = "legacy_pause"
 GRID_MARGIN_STATUS = "margin"
@@ -7163,6 +7164,26 @@ def run_grid_limit_chase_p3(cache: dict[str, Any]) -> bool:
     reduces_position = grid_limit_chase_market_reduces_position(
         position_size, is_buy, market_size
     )
+    if GRID_LIMIT_CHASE_ADD_RISK_FROZEN and not reduces_position:
+        row["limit_chase_status"] = "add_risk_frozen"
+        audit_grid_action(
+            "limit_chase_add_risk_frozen",
+            coin=coin,
+            grid_id=row.get("id"),
+            side="buy" if is_buy else "sell",
+            position_size=decimal_to_plain(position_size),
+            position_value=decimal_to_plain(
+                signed_position_value(position_size, position_value)
+            ),
+            min_position_value=row.get("min_position_value"),
+            max_position_value=row.get("max_position_value"),
+            current_mid=decimal_to_plain(current_mid),
+            withdrawable=(
+                decimal_to_plain(withdrawable) if withdrawable is not None else None
+            ),
+            source="legacy",
+        )
+        return True
     position_leverage = decimal_or_none(
         (current_position.get("leverage") or {}).get("value")
     ) if isinstance(current_position, dict) else None
@@ -8958,6 +8979,27 @@ def lifecycle_submit_limit_chase(row: dict[str, Any], ctx: dict[str, Any], cache
         (is_buy and ctx["position_size"] < 0)
         or (not is_buy and ctx["position_size"] > 0)
     )
+    if GRID_LIMIT_CHASE_ADD_RISK_FROZEN and not reduction_mode:
+        audit_grid_action(
+            "limit_chase_add_risk_frozen",
+            coin=ctx["coin"],
+            grid_id=row.get("id"),
+            side="buy" if is_buy else "sell",
+            position_size=decimal_to_plain(ctx["position_size"]),
+            position_value=decimal_to_plain(
+                signed_position_value(ctx["position_size"], ctx["position_value"])
+            ),
+            min_position_value=row.get("min_position_value"),
+            max_position_value=row.get("max_position_value"),
+            current_mid=decimal_to_plain(ctx["current_mid"]),
+            withdrawable=(
+                decimal_to_plain(ctx["withdrawable"])
+                if ctx.get("withdrawable") is not None
+                else None
+            ),
+            source="lifecycle",
+        )
+        return False
     sz_decimals = int(row.get("sz_decimals") or ctx["asset"]["szDecimals"])
     reduction_target = (
         grid_limit_chase_reduction_target_size(
