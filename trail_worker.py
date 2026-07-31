@@ -12,7 +12,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from copy import deepcopy
-from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
@@ -1394,6 +1394,30 @@ def grid_limit_chase_market_reduces_position(
     return position_size > 0 and order_size <= position_size
 
 
+def grid_limit_chase_reduction_target_size(
+    row: dict[str, Any],
+    position_size: Decimal,
+    position_value: Decimal,
+    current_mid: Decimal,
+    is_buy: bool,
+    sz_decimals: int,
+) -> Decimal | None:
+    """Return the one-shot P4 reduction needed to reach the nearest limit bound."""
+    if current_mid <= 0 or position_size == 0:
+        return None
+    if (is_buy and position_size >= 0) or (not is_buy and position_size <= 0):
+        return None
+    minimum = Decimal(str(row.get("min_position_value") or "0"))
+    maximum = Decimal(str(row.get("max_position_value") or "0"))
+    lower_bound, upper_bound = grid_position_bounds("limit", minimum, maximum)
+    signed_value = signed_position_value(position_size, position_value)
+    excess_value = lower_bound - signed_value if is_buy else signed_value - upper_bound
+    if excess_value <= 0:
+        return None
+    step = Decimal(1).scaleb(-sz_decimals)
+    return (excess_value / current_mid / step).to_integral_value(rounding=ROUND_CEILING) * step
+
+
 def grid_limit_chase_margin_adequacy(
     market_order: dict[str, Any],
     withdrawable: Decimal | None,
@@ -2682,6 +2706,8 @@ def build_grid_limit_chase_market_order(
     current_mid: Decimal,
     is_buy: bool,
     max_size: Decimal | None = None,
+    target_size: Decimal | None = None,
+    reduce_only: bool = False,
 ) -> dict[str, Any] | None:
     if current_mid <= 0:
         return None
@@ -2698,6 +2724,8 @@ def build_grid_limit_chase_market_order(
     min_notional = max(MIN_NOTIONAL, row_min_notional) * GRID_LIMIT_CHASE_MIN_NOTIONAL_MULTIPLIER
     base_size = grid_size_for_min_notional(base_size, current_mid, sz_decimals, min_notional)
     size = base_size * Decimal("2")
+    if target_size is not None and target_size > 0:
+        size = max(size, target_size)
     if max_size is not None:
         size = min(size, max(Decimal("0"), max_size))
     size = (size / step).to_integral_value(rounding=ROUND_FLOOR) * step
@@ -2717,7 +2745,7 @@ def build_grid_limit_chase_market_order(
         "size": decimal_to_plain(size),
         "price": decimal_to_plain(limit_px),
         "limit_px": decimal_to_plain(limit_px),
-        "reduce_only": False,
+        "reduce_only": reduce_only,
         "limit_chase_order": True,
         "plan": {
             "label": "grid-limit-chase",
@@ -2726,7 +2754,7 @@ def build_grid_limit_chase_market_order(
             "size": size,
             "limit_px": limit_px,
             "order_type": {"limit": {"tif": "Ioc"}},
-            "reduce_only": False,
+            "reduce_only": reduce_only,
             "mode": "market",
             "notional": notional,
             "target_notional": notional,
@@ -2734,6 +2762,8 @@ def build_grid_limit_chase_market_order(
             "reference_price": current_mid,
             "reference_notional": size * current_mid,
             "min_notional_buffer": min_notional,
+            "limit_chase_target_size": target_size,
+            "limit_chase_reduce_to_boundary": reduce_only,
             "price_source": f"mid with {slippage} slippage protection",
         },
     }
@@ -8760,6 +8790,23 @@ def lifecycle_submit_limit_chase(row: dict[str, Any], ctx: dict[str, Any], cache
     is_buy = grid_limit_chase_direction(row, ctx["position_size"], ctx["position_value"])
     if is_buy is None:
         return False
+    reduction_mode = (
+        (is_buy and ctx["position_size"] < 0)
+        or (not is_buy and ctx["position_size"] > 0)
+    )
+    sz_decimals = int(row.get("sz_decimals") or ctx["asset"]["szDecimals"])
+    reduction_target = (
+        grid_limit_chase_reduction_target_size(
+            row,
+            ctx["position_size"],
+            ctx["position_value"],
+            ctx["current_mid"],
+            is_buy,
+            sz_decimals,
+        )
+        if reduction_mode
+        else None
+    )
     market = build_grid_limit_chase_market_order(
         ctx["exchange"],
         row,
@@ -8775,6 +8822,8 @@ def lifecycle_submit_limit_chase(row: dict[str, Any], ctx: dict[str, Any], cache
             )
             else None
         ),
+        target_size=reduction_target,
+        reduce_only=reduction_mode,
     )
     if market is None:
         return False
@@ -8800,7 +8849,8 @@ def lifecycle_submit_limit_chase(row: dict[str, Any], ctx: dict[str, Any], cache
         reserve_grid_exchange_actions(cache)
         result = ctx["exchange"].order(
             ctx["coin"], bool(plan["is_buy"]), float(plan["size"]), float(plan["limit_px"]),
-            plan["order_type"], reduce_only=False, cloid=Cloid.from_str(str(intent["cloid"])),
+            plan["order_type"], reduce_only=bool(plan.get("reduce_only")),
+            cloid=Cloid.from_str(str(intent["cloid"])),
         )
     except Exception as exc:
         intent["status"] = "awaiting_reconcile"

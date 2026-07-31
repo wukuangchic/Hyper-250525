@@ -1024,6 +1024,65 @@ class GridAvgTests(unittest.TestCase):
         self.assertTrue(
             all(birth["plan"]["order_type"] == {"limit": {"tif": "Gtc"}} for birth in row["levels"])
         )
+        self.assertTrue(exchange.calls[0][2])
+
+    def test_p4_reduce_reaches_limit_boundary_once_then_splits_actual_fill(self) -> None:
+        class FakeExchange:
+            def __init__(self):
+                self.calls = []
+
+            def _slippage_price(self, coin, is_buy, slippage, mid):
+                return 100
+
+            def order(self, coin, is_buy, size, price, order_type, reduce_only=False, cloid=None):
+                self.calls.append((is_buy, Decimal(str(size)), order_type, reduce_only))
+                if len(self.calls) == 1:
+                    return {
+                        "status": "ok",
+                        "response": {"data": {"statuses": [{"filled": {
+                            "oid": 1, "avgPx": "100", "totalSz": str(size),
+                        }}]}},
+                    }
+                return {
+                    "status": "ok",
+                    "response": {"data": {"statuses": [{"resting": {"oid": len(self.calls)}}]}},
+                }
+
+        row = {
+            "position_limit_mode": "limit",
+            "min_position_value": "-100",
+            "max_position_value": "150",
+            "gap_rate": "0.01",
+            "min_order_value": "10",
+            "base_buy_size": "0.3",
+            "base_sell_size": "0.3",
+            "levels": [],
+        }
+        exchange = FakeExchange()
+        ctx = {
+            "withdrawable": Decimal("0"),
+            "position_size": Decimal("5"),
+            "position_value": Decimal("500"),
+            "exchange": exchange,
+            "coin": "BTC",
+            "asset": {"szDecimals": 2, "maxLeverage": 20},
+            "current_mid": Decimal("100"),
+            "best_bid": Decimal("99.9"),
+            "best_ask": Decimal("100.1"),
+            "now": 123,
+            "open_orders": [],
+        }
+
+        changed = lifecycle_submit_limit_chase(row, ctx, {"action_limit_headroom": 200})
+
+        self.assertTrue(changed)
+        self.assertEqual(exchange.calls[0][1], Decimal("3.5"))
+        self.assertTrue(exchange.calls[0][3])
+        self.assertEqual(len(row["levels"]), 11)
+        self.assertEqual(sum(Decimal(entry["size"]) for entry in row["levels"]), Decimal("3.5"))
+        self.assertEqual(row["levels"][0]["birth_slot"], "near")
+        self.assertEqual(row["levels"][-1]["birth_slot"], "far10")
+        self.assertTrue(all(entry["birth_source"] == "limit_chase" for entry in row["levels"]))
 
     def test_p4_add_market_requires_margin_adequacy_strictly_above_1_1(self) -> None:
         self.assertEqual(GRID_LIMIT_CHASE_MARGIN_ADEQUACY_THRESHOLD, Decimal("1.1"))
