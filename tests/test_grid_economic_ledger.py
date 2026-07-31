@@ -140,6 +140,47 @@ class GridEconomicLedgerTests(unittest.TestCase):
             finally:
                 connection.close()
 
+    def test_p10_market_submit_maps_fill_to_existing_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connection = connect_db(Path(directory) / "ledger.sqlite3")
+            try:
+                ingest_action_record(
+                    connection,
+                    0,
+                    {
+                        "ts": 100,
+                        "action": "p10_market_submit",
+                        "economic_chain_id": "chain-p10",
+                        "result": {
+                            "response": {
+                                "data": {"statuses": [{"filled": {"oid": 25}}]}
+                            }
+                        },
+                    },
+                )
+                ingest_fills(
+                    connection,
+                    [
+                        {
+                            "time": 1000,
+                            "coin": "XYZ",
+                            "oid": 25,
+                            "tid": 4,
+                            "side": "B",
+                            "px": "60",
+                            "sz": "1",
+                            "fee": "0.1",
+                            "closedPnl": "0",
+                            "crossed": True,
+                        }
+                    ],
+                )
+                chain = chain_summaries(connection)[0]
+                self.assertEqual(chain["economic_chain_id"], "chain-p10")
+                self.assertEqual(chain["origins"], ["p10_market_submit"])
+            finally:
+                connection.close()
+
     def test_audit_cursor_is_incremental_and_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

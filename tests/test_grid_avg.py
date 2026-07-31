@@ -2250,6 +2250,8 @@ class GridAvgTests(unittest.TestCase):
                 ("BTC", GRID_LIFECYCLE_PHASE_P8),
                 ("ETH", GRID_LIFECYCLE_PHASE_P9),
                 ("BTC", GRID_LIFECYCLE_PHASE_P9),
+                ("ETH", "p10"),
+                ("BTC", "p10"),
             ],
         )
         save_server_batch.assert_called_once()
@@ -2936,7 +2938,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(seen[0], (None, None, None))
         self.assertEqual(seen[1], (None, None, 3))
         self.assertEqual(seen[-1][:2], (None, None))
-        self.assertEqual(info.clear_calls, 9)
+        self.assertEqual(info.clear_calls, 10)
 
     def test_lifecycle_context_fetches_only_phase_required_data_and_keeps_asset_metadata(self) -> None:
         class FakeInfo:

@@ -282,7 +282,12 @@ def map_order(
     resolved_chain = str(old["economic_chain_id"] or "") or chain_id
     old_action = str(old["origin_action"] or "")
     resolved_action = old_action or action
-    if action in {"panic_reduce_submit", "limit_chase_market_submit", "grid_order_submit"}:
+    if action in {
+        "panic_reduce_submit",
+        "limit_chase_market_submit",
+        "p10_market_submit",
+        "grid_order_submit",
+    }:
         resolved_action = action
     connection.execute(
         """

@@ -107,6 +107,8 @@ GRID_P7_WITHDRAWABLE_THRESHOLD = Decimal("5")
 GRID_P7_MIN_ACTIVE_PER_SIDE = 5
 GRID_P7_MIN_ORDER_AGE_SECONDS = 10 * 60
 GRID_P9_WITHDRAWABLE_THRESHOLD = Decimal("1")
+GRID_P10_MARGIN_ADEQUACY_THRESHOLD = GRID_LIMIT_CHASE_MARGIN_ADEQUACY_THRESHOLD
+GRID_P10_REQUIRED_ACTION_HEADROOM = 3
 GRID_P3_MAX_RESTORES_PER_RUN = 10
 GRID_PANIC_RATIO_LEGACY_DEFAULT_THRESHOLDS = {
     Decimal("10"),
@@ -157,6 +159,7 @@ GRID_LIFECYCLE_PHASE_P6 = "p6"
 GRID_LIFECYCLE_PHASE_P7 = "p7"
 GRID_LIFECYCLE_PHASE_P8 = "p8"
 GRID_LIFECYCLE_PHASE_P9 = "p9"
+GRID_LIFECYCLE_PHASE_P10 = "p10"
 GRID_LIFECYCLE_PHASES = (
     GRID_LIFECYCLE_PHASE_P0,
     GRID_LIFECYCLE_PHASE_P1,
@@ -168,6 +171,7 @@ GRID_LIFECYCLE_PHASES = (
     GRID_LIFECYCLE_PHASE_P7,
     GRID_LIFECYCLE_PHASE_P8,
     GRID_LIFECYCLE_PHASE_P9,
+    GRID_LIFECYCLE_PHASE_P10,
 )
 GRID_P8_REACCUMULATE_STATUS = "p8_reaccumulate"
 GRID_MAX_LEVELS_PER_SIDE = 1024
@@ -7542,7 +7546,7 @@ def lifecycle_mark_deferred_or_discarded(
     """Preserve unfinished legs and P9 restores; only margin failures use margin status."""
     order["oid"] = None
     order["last_error"] = error_text
-    if lifecycle_leg(order) == 1 or bool(order.get("p9_restore")):
+    if lifecycle_leg(order) == 1 or bool(order.get("p9_restore")) or bool(order.get("p10_restore")):
         if is_insufficient_margin_text(error_text):
             order["status"] = GRID_MARGIN_STATUS
             order["margin_at"] = now
@@ -7762,12 +7766,14 @@ def lifecycle_context(row: dict[str, Any], cache: dict[str, Any]) -> dict[str, A
         GRID_LIFECYCLE_PHASE_P3,
         GRID_LIFECYCLE_PHASE_P4,
         GRID_LIFECYCLE_PHASE_P6,
+        GRID_LIFECYCLE_PHASE_P10,
     }
     needs_book = phase in {
         GRID_LIFECYCLE_PHASE_P0,
         GRID_LIFECYCLE_PHASE_P2,
         GRID_LIFECYCLE_PHASE_P3,
         GRID_LIFECYCLE_PHASE_P4,
+        GRID_LIFECYCLE_PHASE_P10,
     }
     needs_position = needs_book
     needs_withdrawable = phase != GRID_LIFECYCLE_PHASE_P5
@@ -7779,11 +7785,13 @@ def lifecycle_context(row: dict[str, Any], cache: dict[str, Any]) -> dict[str, A
         GRID_LIFECYCLE_PHASE_P5,
         GRID_LIFECYCLE_PHASE_P7,
         GRID_LIFECYCLE_PHASE_P9,
+        GRID_LIFECYCLE_PHASE_P10,
     }
     needs_fills = phase in {
         GRID_LIFECYCLE_PHASE_P0,
         GRID_LIFECYCLE_PHASE_P2,
         GRID_LIFECYCLE_PHASE_P5,
+        GRID_LIFECYCLE_PHASE_P10,
     }
 
     mids: dict[str, Any] = {}
@@ -8094,6 +8102,588 @@ def lifecycle_cancel_p9_candidate(
         levels.remove(entry)
         levels.append(entry)
     return True
+
+
+def build_grid_p10_market_order(
+    exchange: Any,
+    row: dict[str, Any],
+    coin: str,
+    asset: dict[str, Any],
+    current_mid: Decimal,
+    is_buy: bool,
+    size: Decimal,
+) -> dict[str, Any] | None:
+    """Build an exact-size IOC used to promote one existing active Grid order."""
+    if current_mid <= 0 or size <= 0:
+        return None
+    sz_decimals = int(row.get("sz_decimals") or asset["szDecimals"])
+    step = Decimal(1).scaleb(-sz_decimals)
+    size = (size / step).to_integral_value(rounding=ROUND_FLOOR) * step
+    if size <= 0:
+        return None
+    slippage = Decimal(str(row.get("slippage") or DEFAULT_SLIPPAGE))
+    limit_px = Decimal(
+        str(exchange._slippage_price(coin, is_buy, float(slippage), float(current_mid)))
+    )
+    limit_px = rounded_perp_price(limit_px, sz_decimals)
+    min_notional = max(MIN_NOTIONAL, decimal_or_none(row.get("min_order_value")) or MIN_NOTIONAL)
+    if limit_px <= 0 or size * limit_px < min_notional:
+        return None
+    notional = size * limit_px
+    return {
+        "side": "buy" if is_buy else "sell",
+        "is_buy": is_buy,
+        "size": decimal_to_plain(size),
+        "price": decimal_to_plain(limit_px),
+        "limit_px": decimal_to_plain(limit_px),
+        "reduce_only": False,
+        "p10_market_order": True,
+        "plan": {
+            "label": "grid-p10-promotion",
+            "coin": coin,
+            "is_buy": is_buy,
+            "size": size,
+            "limit_px": limit_px,
+            "order_type": {"limit": {"tif": "Ioc"}},
+            "reduce_only": False,
+            "mode": "market",
+            "notional": notional,
+            "target_notional": notional,
+            "worst_notional": notional,
+            "reference_price": current_mid,
+            "reference_notional": size * current_mid,
+            "price_source": f"mid with {slippage} slippage protection",
+        },
+    }
+
+
+def lifecycle_p10_candidate(
+    row: dict[str, Any],
+    ctx: dict[str, Any],
+) -> tuple[dict[str, Any], Decimal, Decimal, bool] | None:
+    """Choose the nearest active add-risk order in the current limit-breach direction."""
+    is_buy = grid_limit_chase_direction(row, ctx["position_size"], ctx["position_value"])
+    if is_buy is None:
+        return None
+    side = "buy" if is_buy else "sell"
+    open_by_oid: dict[int, dict[str, Any]] = {}
+    for open_order in ctx.get("open_orders") or []:
+        if not isinstance(open_order, dict) or not fill_matches_coin(
+            str(open_order.get("coin", "")), ctx["coin"]
+        ):
+            continue
+        try:
+            open_by_oid[int(open_order["oid"])] = open_order
+        except (KeyError, TypeError, ValueError):
+            continue
+    candidates: list[tuple[Decimal, Decimal, int, dict[str, Any], Decimal]] = []
+    for entry in row.get("levels") or []:
+        if (
+            not isinstance(entry, dict)
+            or str(entry.get("status") or "") != "active"
+            or str(entry.get("side") or "") != side
+            or bool(entry.get("reduce_only"))
+            or grid_order_reduces_position(entry, ctx["position_size"])
+        ):
+            continue
+        try:
+            oid = int(entry["oid"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        open_order = open_by_oid.get(oid)
+        if open_order is None:
+            continue
+        price = decimal_or_none(open_order.get("limitPx")) or decimal_or_none(
+            entry.get("price", entry.get("limit_px"))
+        )
+        remaining_size = decimal_or_none(open_order.get("sz")) or decimal_or_none(entry.get("size"))
+        if price is None or price <= 0 or remaining_size is None or remaining_size <= 0:
+            continue
+        # The promoted order must still be on the passive side of the market;
+        # otherwise the mirrored target could land on the wrong side of the
+        # eventual IOC fill and no longer represent a profitable closure.
+        if (is_buy and price >= ctx["current_mid"]) or (
+            not is_buy and price <= ctx["current_mid"]
+        ):
+            continue
+        candidates.append((abs(ctx["current_mid"] - price), price, oid, entry, remaining_size))
+    if not candidates:
+        return None
+    _distance, source_price, _oid, entry, remaining_size = min(
+        candidates, key=lambda item: (item[0], item[2])
+    )
+    return entry, remaining_size, source_price, is_buy
+
+
+def lifecycle_p10_margin_adequacy(
+    market: dict[str, Any],
+    withdrawable: Decimal | None,
+    leverage: Decimal | None,
+) -> tuple[Decimal | None, Decimal | None]:
+    return grid_limit_chase_margin_adequacy(market, withdrawable, leverage)
+
+
+def lifecycle_p10_projected_within_max(
+    row: dict[str, Any],
+    position_size: Decimal,
+    position_value: Decimal,
+    market: dict[str, Any],
+) -> bool:
+    plan = market.get("plan")
+    if not isinstance(plan, dict):
+        return False
+    notional = decimal_or_none(plan.get("worst_notional"))
+    if notional is None or notional <= 0:
+        return False
+    minimum = Decimal(str(row.get("min_position_value") or "0"))
+    maximum = Decimal(str(row.get("max_position_value") or "0"))
+    lower_bound, upper_bound = grid_position_bounds("limit", minimum, maximum)
+    current = signed_position_value(position_size, position_value)
+    if bool(plan.get("is_buy")):
+        return current + notional <= upper_bound
+    return current - notional >= lower_bound
+
+
+def lifecycle_p10_intent(row: dict[str, Any]) -> dict[str, Any] | None:
+    intent = row.get("p10_promotion_intent")
+    return intent if isinstance(intent, dict) else None
+
+
+def lifecycle_p10_source(row: dict[str, Any], intent: dict[str, Any]) -> dict[str, Any] | None:
+    cloid = str(intent.get("cloid") or "")
+    for entry in row.get("levels") or []:
+        if isinstance(entry, dict) and str(entry.get("p10_intent_cloid") or "") == cloid:
+            return entry
+    return None
+
+
+def lifecycle_remove_p10_intent(
+    row: dict[str, Any],
+    source: dict[str, Any] | None,
+    cache: dict[str, Any],
+) -> None:
+    if isinstance(source, dict):
+        source.pop("p10_intent_cloid", None)
+    row.pop("p10_promotion_intent", None)
+    persist_lifecycle_intent(cache)
+
+
+def lifecycle_restore_p10_source(
+    row: dict[str, Any],
+    ctx: dict[str, Any],
+    cache: dict[str, Any],
+    intent: dict[str, Any],
+    reason: str,
+) -> bool:
+    """Restore the cancelled source as P3 debt when P10 definitely did not fill."""
+    source = lifecycle_p10_source(row, intent)
+    if source is None:
+        price = decimal_or_none(intent.get("source_price"))
+        size = decimal_or_none(intent.get("source_size"))
+        if price is None or price <= 0 or size is None or size <= 0:
+            intent["status"] = "restore_blocked"
+            intent["last_error"] = reason
+            persist_lifecycle_intent(cache)
+            return False
+        source = grid_order_entry(
+            row,
+            ctx["coin"],
+            ctx["asset"],
+            bool(intent.get("market_is_buy")),
+            price,
+            False,
+            size=size,
+            gap=Decimal(str(row["gap_rate"])),
+            preserve_size=True,
+        )
+        source["grid_leg"] = int(intent.get("source_grid_leg") or 0)
+        source["iteration"] = int(intent.get("source_iteration") or 0)
+        source["economic_chain_id"] = intent.get("economic_chain_id")
+        row.setdefault("levels", []).append(source)
+    source["oid"] = None
+    source["status"] = GRID_CHAIN_DEBT_STATUS
+    source["chain_debt_at"] = ctx["now"]
+    source["p10_restore"] = True
+    source["p10_restore_reason"] = reason
+    source["p10_source_oid"] = intent.get("source_oid")
+    source.pop("submitted_at", None)
+    source.pop("p3_queue_seq", None)
+    lifecycle_assign_p3_queue_seq(source, cache)
+    levels = row.get("levels")
+    if isinstance(levels, list) and source in levels:
+        levels.remove(source)
+        levels.append(source)
+    lifecycle_remove_p10_intent(row, source, cache)
+    return True
+
+
+def lifecycle_p10_replacement_from_fill(
+    row: dict[str, Any],
+    ctx: dict[str, Any],
+    intent: dict[str, Any],
+    fill_price: Decimal,
+    fill_size: Decimal,
+) -> dict[str, Any] | None:
+    source_price = decimal_or_none(intent.get("source_price"))
+    if source_price is None or source_price <= 0 or fill_price <= 0 or fill_size <= 0:
+        return None
+    market_is_buy = bool(intent.get("market_is_buy"))
+    target_price = rounded_perp_price(
+        fill_price * Decimal("2") - source_price,
+        int(row.get("sz_decimals") or ctx["asset"]["szDecimals"]),
+    )
+    if target_price <= 0:
+        return None
+    if (market_is_buy and target_price <= fill_price) or (not market_is_buy and target_price >= fill_price):
+        return None
+    child = grid_order_entry(
+        row,
+        ctx["coin"],
+        ctx["asset"],
+        not market_is_buy,
+        target_price,
+        True,
+        size=fill_size,
+        gap=Decimal(str(row["gap_rate"])),
+        preserve_size=True,
+    )
+    child.update(
+        {
+            "replacement_order": True,
+            "p10_replacement": True,
+            "p10_restore": True,
+            "grid_leg": 1 - int(intent.get("source_grid_leg") or 0),
+            "source_grid_leg": int(intent.get("source_grid_leg") or 0),
+            "source_oid": intent.get("source_oid"),
+            "p10_source_oid": intent.get("source_oid"),
+            "p10_market_cloid": intent.get("cloid"),
+            "grid_id": row.get("id"),
+            "economic_chain_id": intent.get("economic_chain_id"),
+            "iteration": int(intent.get("source_iteration") or 0),
+            "replacement_anchor_price": decimal_to_plain(fill_price),
+            "replacement_anchor_source": "p10_market_fill",
+            "p10_original_order_price": decimal_to_plain(source_price),
+            "preserve_fill_size": True,
+        }
+    )
+    return child
+
+
+def lifecycle_materialize_p10_fill(
+    row: dict[str, Any],
+    ctx: dict[str, Any],
+    cache: dict[str, Any],
+    intent: dict[str, Any],
+    fill_price: Decimal,
+    fill_size: Decimal,
+    market_oid: int | None,
+) -> bool:
+    child = lifecycle_p10_replacement_from_fill(row, ctx, intent, fill_price, fill_size)
+    if child is None:
+        intent["status"] = "filled_waiting_for_replacement"
+        intent["last_error"] = "P10 fill could not build its mirrored replacement"
+        persist_lifecycle_intent(cache)
+        return False
+    source = lifecycle_p10_source(row, intent)
+    levels = row.setdefault("levels", [])
+    if source in levels:
+        levels.remove(source)
+    child["status"] = GRID_CHAIN_DEBT_STATUS
+    child["oid"] = None
+    child["chain_debt_at"] = ctx["now"]
+    lifecycle_assign_p3_queue_seq(child, cache)
+    levels.append(child)
+    lifecycle_remove_p10_intent(row, source, cache)
+
+    synthetic_position = ctx["position_size"] + (fill_size if bool(intent.get("market_is_buy")) else -fill_size)
+    result = lifecycle_submit_order(
+        ctx["exchange"], ctx["coin"], child, ctx["now"], row, ctx["asset"],
+        synthetic_position, ctx["current_mid"], ctx["best_bid"], ctx["best_ask"],
+        cache.setdefault("lifecycle_isolated_ready", set()), ctx["open_orders"], cache,
+        search_outward=False, force_gtc=True,
+    )
+    if result == GRID_P8_REACCUMULATE_STATUS and lifecycle_accumulate_p8_partial_debt(
+        row,
+        child,
+        decimal_or_none(child.get("size")) or Decimal("0"),
+        decimal_or_none(child.get("price", child.get("limit_px"))) or Decimal("0"),
+        ctx["now"],
+    ):
+        if child in levels:
+            levels.remove(child)
+    row["p10_status"] = "submitted" if result == "submitted" else result
+    row["p10_fill_price"] = decimal_to_plain(fill_price)
+    row["p10_fill_size"] = decimal_to_plain(fill_size)
+    row["p10_replacement_price"] = child.get("price")
+    row["p10_at"] = ctx["now"]
+    audit_grid_action(
+        "grid_p10_materialized",
+        coin=ctx["coin"],
+        grid_id=row.get("id"),
+        economic_chain_id=intent.get("economic_chain_id"),
+        source_oid=intent.get("source_oid"),
+        market_oid=market_oid,
+        market_side="buy" if bool(intent.get("market_is_buy")) else "sell",
+        market_fill_price=decimal_to_plain(fill_price),
+        market_fill_size=decimal_to_plain(fill_size),
+        original_order_price=intent.get("source_price"),
+        replacement_price=child.get("price"),
+        replacement_oid=child.get("oid"),
+        replacement_status=child.get("status"),
+    )
+    return True
+
+
+def lifecycle_submit_p10_market(
+    row: dict[str, Any],
+    ctx: dict[str, Any],
+    cache: dict[str, Any],
+    intent: dict[str, Any],
+    market: dict[str, Any],
+) -> bool:
+    plan = market.get("plan")
+    if not isinstance(plan, dict):
+        return False
+    intent["status"] = "submitting"
+    persist_lifecycle_intent(cache)
+    try:
+        reserve_grid_exchange_actions(cache)
+        result = ctx["exchange"].order(
+            ctx["coin"], bool(plan["is_buy"]), float(plan["size"]), float(plan["limit_px"]),
+            plan["order_type"], reduce_only=False, cloid=Cloid.from_str(str(intent["cloid"])),
+        )
+    except Exception as exc:
+        intent["status"] = "awaiting_reconcile"
+        intent["last_error"] = str(exc)
+        intent["last_checked_at"] = ctx["now"]
+        persist_lifecycle_intent(cache)
+        return True
+    audit_grid_action(
+        "p10_market_submit",
+        coin=ctx["coin"],
+        grid_id=row.get("id"),
+        economic_chain_id=intent.get("economic_chain_id"),
+        source_oid=intent.get("source_oid"),
+        side=market.get("side"),
+        price=market.get("price"),
+        size=market.get("size"),
+        reduce_only=False,
+        cloid=intent.get("cloid"),
+        result=result,
+    )
+    if not isinstance(result, dict) or result.get("status") != "ok":
+        return lifecycle_restore_p10_source(row, ctx, cache, intent, str(result))
+    filled: dict[str, Any] | None = None
+    for status in result.get("response", {}).get("data", {}).get("statuses", []):
+        if isinstance(status, dict) and isinstance(status.get("filled"), dict):
+            filled = status["filled"]
+            break
+        if isinstance(status, dict) and status.get("error"):
+            return lifecycle_restore_p10_source(row, ctx, cache, intent, str(status["error"]))
+    if filled is None:
+        intent["status"] = "awaiting_reconcile"
+        intent["last_error"] = str(result)
+        persist_lifecycle_intent(cache)
+        return True
+    fill_price = decimal_or_none(filled.get("avgPx")) or ctx["current_mid"]
+    fill_size = decimal_or_none(filled.get("totalSz", filled.get("sz"))) or decimal_or_none(
+        market.get("size")
+    )
+    market_oid = int(filled["oid"]) if filled.get("oid") is not None else None
+    return lifecycle_materialize_p10_fill(
+        row, ctx, cache, intent, fill_price, fill_size or Decimal("0"), market_oid
+    )
+
+
+def lifecycle_reconcile_p10_intent(
+    row: dict[str, Any],
+    ctx: dict[str, Any],
+    cache: dict[str, Any],
+    intent: dict[str, Any],
+) -> tuple[bool, bool]:
+    """Return (changed, stop); stop means P10 must not start/resume another action."""
+    status = str(intent.get("status") or "")
+    source = lifecycle_p10_source(row, intent)
+    if status in {"prepared", "cancelled"}:
+        return False, False
+    if status == "filled_waiting_for_replacement":
+        return False, True
+    try:
+        order_status = ctx["info"].query_order_by_cloid(
+            ctx["account"], Cloid.from_str(str(intent["cloid"]))
+        )
+    except Exception as exc:
+        intent["last_error"] = str(exc)
+        intent["last_checked_at"] = ctx["now"]
+        persist_lifecycle_intent(cache)
+        return True, True
+    status_name = grid_order_status_name(order_status).strip()
+    intent["exchange_status"] = status_name
+    intent["last_checked_at"] = ctx["now"]
+    order_wrapper = order_status.get("order") if isinstance(order_status, dict) else None
+    order_data = order_wrapper.get("order") if isinstance(order_wrapper, dict) else None
+    market_oid = None
+    if isinstance(order_data, dict) and order_data.get("oid") is not None:
+        market_oid = int(order_data["oid"])
+    if status_name == "filled" and market_oid is not None:
+        fill = ctx["fills_by_oid"].get(market_oid)
+        fill_price = decimal_or_none(fill.get("px")) if isinstance(fill, dict) else None
+        fill_size = decimal_or_none(fill.get("sz")) if isinstance(fill, dict) else None
+        if fill_price is not None and fill_size is not None:
+            return lifecycle_materialize_p10_fill(
+                row, ctx, cache, intent, fill_price, fill_size, market_oid
+            ), True
+        intent["status"] = "awaiting_reconcile"
+        intent["last_error"] = "P10 fill details are not available yet"
+        persist_lifecycle_intent(cache)
+        return True, True
+    lowered = status_name.lower()
+    if grid_order_status_is_cancelled(order_status) or lowered in {"rejected", "margincanceled"}:
+        return lifecycle_restore_p10_source(row, ctx, cache, intent, status_name), True
+    if (
+        lowered == "unknownoid"
+        and ctx["now"] - int(intent.get("created_at") or 0) >= GRID_BIRTH_INTENT_UNKNOWN_GRACE_SECONDS
+    ):
+        return lifecycle_restore_p10_source(row, ctx, cache, intent, status_name), True
+    persist_lifecycle_intent(cache)
+    return True, True
+
+
+def lifecycle_process_p10(row: dict[str, Any], ctx: dict[str, Any], cache: dict[str, Any]) -> bool:
+    """Promote one existing add-risk order after all pre-cancel safety checks pass."""
+    intent = lifecycle_p10_intent(row)
+    if intent is not None:
+        changed, stop = lifecycle_reconcile_p10_intent(row, ctx, cache, intent)
+        if stop:
+            return changed
+        source = lifecycle_p10_source(row, intent)
+        if source is None:
+            return lifecycle_restore_p10_source(
+                row, ctx, cache, intent, "P10 source order is missing"
+            )
+        source_size = decimal_or_none(intent.get("source_size")) or Decimal("0")
+        is_buy = bool(intent.get("market_is_buy"))
+        source_price = decimal_or_none(intent.get("source_price")) or Decimal("0")
+    else:
+        candidate = lifecycle_p10_candidate(row, ctx)
+        if candidate is None:
+            return False
+        source, source_size, source_price, is_buy = candidate
+
+    market = build_grid_p10_market_order(
+        ctx["exchange"], row, ctx["coin"], ctx["asset"], ctx["current_mid"], is_buy, source_size
+    )
+    leverage = decimal_or_none(ctx.get("position_leverage")) or decimal_or_none(
+        ctx["asset"].get("maxLeverage")
+    )
+    estimated_margin, adequacy = lifecycle_p10_margin_adequacy(
+        market or {}, ctx.get("withdrawable"), leverage
+    )
+    row["p10_estimated_margin"] = (
+        decimal_to_plain(estimated_margin) if estimated_margin is not None else None
+    )
+    row["p10_margin_adequacy"] = decimal_to_plain(adequacy) if adequacy is not None else None
+    if (
+        market is None
+        or adequacy is None
+        or adequacy <= GRID_P10_MARGIN_ADEQUACY_THRESHOLD
+        or not lifecycle_p10_projected_within_max(
+            row, ctx["position_size"], ctx["position_value"], market
+        )
+        or raw_action_limit_deficit(cache) > -GRID_P10_REQUIRED_ACTION_HEADROOM
+    ):
+        row["p10_status"] = "skipped_pre_cancel_safety"
+        audit_grid_action(
+            "grid_p10_pre_cancel_skipped",
+            coin=ctx["coin"],
+            grid_id=row.get("id"),
+            source_oid=source.get("oid"),
+            source_price=decimal_to_plain(source_price),
+            source_size=decimal_to_plain(source_size),
+            estimated_margin=(decimal_to_plain(estimated_margin) if estimated_margin is not None else None),
+            margin_adequacy=(decimal_to_plain(adequacy) if adequacy is not None else None),
+            margin_threshold=decimal_to_plain(GRID_P10_MARGIN_ADEQUACY_THRESHOLD),
+            projected_within_max=(
+                lifecycle_p10_projected_within_max(
+                    row, ctx["position_size"], ctx["position_value"], market
+                )
+                if market is not None
+                else False
+            ),
+            raw_deficit=raw_action_limit_deficit(cache),
+        )
+        if intent is not None and str(intent.get("status") or "") == "cancelled":
+            return lifecycle_restore_p10_source(
+                row, ctx, cache, intent, "P10 resume failed pre-cancel safety recheck"
+            )
+        return False
+
+    if intent is None:
+        source_oid = int(source["oid"])
+        chain_id = economic_chain_id(row, source)
+        intent = {
+            "cloid": str(Cloid.from_int(uuid.uuid4().int)),
+            "status": "prepared",
+            "created_at": ctx["now"],
+            "source_oid": source_oid,
+            "source_price": decimal_to_plain(source_price),
+            "source_size": decimal_to_plain(source_size),
+            "source_grid_leg": lifecycle_leg(source),
+            "source_iteration": lifecycle_iteration(source),
+            "market_is_buy": is_buy,
+            "economic_chain_id": chain_id,
+            "estimated_margin": decimal_to_plain(estimated_margin or Decimal("0")),
+            "margin_adequacy": decimal_to_plain(adequacy or Decimal("0")),
+        }
+        row["p10_promotion_intent"] = intent
+        source["p10_intent_cloid"] = intent["cloid"]
+        set_grid_order_size_exact(source, source_size)
+        persist_lifecycle_intent(cache)
+    else:
+        source_oid = int(intent["source_oid"])
+
+    if str(intent.get("status")) == "prepared":
+        if source_oid not in ctx["open_oids"]:
+            try:
+                source_status = ctx["info"].query_order_by_oid(ctx["account"], source_oid)
+            except Exception as exc:
+                intent["last_error"] = str(exc)
+                persist_lifecycle_intent(cache)
+                return True
+            if grid_order_status_name(source_status) == "filled":
+                lifecycle_remove_p10_intent(row, source, cache)
+                return True
+            if not grid_order_status_is_cancelled(source_status):
+                intent["last_error"] = f"source order is neither open nor cancelled: {source_status}"
+                persist_lifecycle_intent(cache)
+                return True
+        else:
+            request = {"coin": ctx["coin"], "oid": source_oid}
+            try:
+                reserve_grid_exchange_actions(cache)
+                cancel_result = ctx["exchange"].bulk_cancel([request])
+            except Exception as exc:
+                intent["last_error"] = str(exc)
+                persist_lifecycle_intent(cache)
+                return True
+            audit_grid_action(
+                "grid_p10_source_cancel",
+                coin=ctx["coin"], grid_id=row.get("id"), source_oid=source_oid,
+                economic_chain_id=intent.get("economic_chain_id"), result=cancel_result,
+            )
+            cancelled, errors = successful_cancel_oids(cancel_result, [request])
+            if source_oid not in cancelled:
+                intent["last_error"] = "; ".join(errors) or str(cancel_result)
+                lifecycle_remove_p10_intent(row, source, cache)
+                return True
+        source["oid"] = None
+        source["status"] = "p10_cancelled"
+        source["p10_cancelled_at"] = ctx["now"]
+        intent["status"] = "cancelled"
+        intent["cancelled_at"] = ctx["now"]
+        persist_lifecycle_intent(cache)
+
+    return lifecycle_submit_p10_market(row, ctx, cache, intent, market)
 
 
 def lifecycle_legacy_pause_candidate(
@@ -9344,6 +9934,17 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                 counters["p9_enqueued"] = int(counters.get("p9_enqueued") or 0) + 1
                 changed = True
 
+    elif phase == GRID_LIFECYCLE_PHASE_P10:
+        account_key = lifecycle_row_account_key(row, ctx["network"], ctx["account"])
+        attempted = cache.setdefault("lifecycle_p10_accounts", set())
+        existing_intent = lifecycle_p10_intent(row)
+        if existing_intent is not None or account_key not in attempted:
+            p10_changed = lifecycle_process_p10(row, ctx, cache)
+            if p10_changed:
+                attempted.add(account_key)
+                counters["p10_promotions"] = int(counters.get("p10_promotions") or 0) + 1
+            changed = changed or p10_changed
+
     row["legacy_pause_remaining"] = sum(
         1 for entry in levels if isinstance(entry, dict) and str(entry.get("status") or "") == GRID_LEGACY_PAUSE_STATUS
     )
@@ -9357,6 +9958,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         GRID_LIFECYCLE_PHASE_P0,
         GRID_LIFECYCLE_PHASE_P2,
         GRID_LIFECYCLE_PHASE_P5,
+        GRID_LIFECYCLE_PHASE_P10,
     }:
         row["last_fill_check_ms"] = ctx["now_ms"]
     row["note"] = (
@@ -9497,12 +10099,13 @@ def run_once() -> None:
                 process_grid_index(index, f"grid {phase}")
         if phase != GRID_LIFECYCLE_PHASE_P8:
             reconcile_cached_grid_open_orders(rows, active_grid_indexes, grid_cache)
-        if phase != GRID_LIFECYCLE_PHASE_P9:
+        if phase != GRID_LIFECYCLE_PHASE_P10:
             for info, _exchange, _account, _signer, _role in grid_cache.get("clients", {}).values():
                 clear_info_cache(info)
             # Recompute position, withdrawable and market context before every
-            # following phase. Clearing after local-only P8 explicitly forces
-            # P9 to read withdrawable again after P0-P8 have completed.
+            # following phase. Clearing after local-only P8 forces P9 to read
+            # withdrawable again, and clearing after P9 gives P10 a fresh
+            # position, order, and margin snapshot before any promotion.
             for cache_name in ("mids", "books", "user_states", "spot_user_states", "fills"):
                 grid_cache.pop(cache_name, None)
             # Our own open-order delta is reconciled after every exchange phase;
