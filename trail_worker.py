@@ -7505,6 +7505,19 @@ def lifecycle_submit_order(
 ) -> str:
     """Submit one finite-chain order; chain debt defers, completed legs may end."""
     def defer(error_text: str) -> str:
+        if lifecycle_leg(order) == 1 and is_min_order_value_error_text(error_text):
+            size = decimal_or_none(order.get("size")) or Decimal("0")
+            price = decimal_or_none(order.get("price", order.get("limit_px"))) or Decimal("0")
+            if size > 0 and price > 0:
+                order["oid"] = None
+                order["status"] = GRID_P8_REACCUMULATE_STATUS
+                order["last_error"] = error_text
+                order["p8_reaccumulate_at"] = now
+                order["p8_reaccumulate_price"] = decimal_to_plain(price)
+                order["p8_reaccumulate_value"] = decimal_to_plain(size * price)
+                order["p8_reaccumulate_reason"] = "minimum_order_value_rejected"
+                order.pop("p3_queue_seq", None)
+                return GRID_P8_REACCUMULATE_STATUS
         result = lifecycle_mark_deferred_or_discarded(order, now, error_text)
         lifecycle_assign_p3_queue_seq(order, cache)
         return result
@@ -8113,6 +8126,34 @@ def lifecycle_accumulate_p8_partial_debt(
     return True
 
 
+def lifecycle_migrate_min_rejected_debts_to_p8(row: dict[str, Any], now: int) -> int:
+    """Move persisted leg-1 minimum-value rejects out of P3 and into P8."""
+    levels = row.setdefault("levels", [])
+    migrated = 0
+    for entry in list(levels):
+        if (
+            not isinstance(entry, dict)
+            or lifecycle_leg(entry) != 1
+            or str(entry.get("status") or "") not in {
+                GRID_MARGIN_STATUS,
+                GRID_CHAIN_DEBT_STATUS,
+                GRID_P8_REACCUMULATE_STATUS,
+            }
+            or not is_min_order_value_error_text(str(entry.get("last_error") or ""))
+        ):
+            continue
+        size = decimal_or_none(entry.get("size")) or Decimal("0")
+        price = decimal_or_none(entry.get("price", entry.get("limit_px"))) or Decimal("0")
+        if not lifecycle_accumulate_p8_partial_debt(row, entry, size, price, now):
+            continue
+        levels.remove(entry)
+        migrated += 1
+    if migrated:
+        row["p8_min_reject_migrated"] = int(row.get("p8_min_reject_migrated") or 0) + migrated
+        row["p8_min_reject_migrated_at"] = now
+    return migrated
+
+
 def lifecycle_process_p8(
     row: dict[str, Any],
     now: int,
@@ -8285,6 +8326,14 @@ def lifecycle_process_fills(
             levels.remove(source)
         if result in {"submitted", GRID_MARGIN_STATUS, GRID_CHAIN_DEBT_STATUS}:
             levels.append(child)
+        elif result == GRID_P8_REACCUMULATE_STATUS:
+            lifecycle_accumulate_p8_partial_debt(
+                row,
+                child,
+                decimal_or_none(child.get("size")) or Decimal("0"),
+                decimal_or_none(child.get("price", child.get("limit_px"))) or Decimal("0"),
+                ctx["now"],
+            )
         source["replacement_pending"] = False
         source["replacement_processed_at"] = ctx["now"]
         submitted += int(result == "submitted")
@@ -8727,6 +8776,15 @@ def lifecycle_materialize_birth_intent(
             force_gtc=True,
         )
         results[str(birth.get("birth_slot") or "single")] = result
+        if result == GRID_P8_REACCUMULATE_STATUS and lifecycle_accumulate_p8_partial_debt(
+            row,
+            birth,
+            decimal_or_none(birth.get("size")) or Decimal("0"),
+            decimal_or_none(birth.get("price", birth.get("limit_px"))) or Decimal("0"),
+            ctx["now"],
+        ):
+            if birth in levels:
+                levels.remove(birth)
     row[f"{source}_fill_price"] = decimal_to_plain(fill_price)
     row[f"{source}_birth_status"] = results or "already_materialized"
     return True
@@ -8894,6 +8952,8 @@ def maintain_grid_p8(row: dict[str, Any], cache: dict[str, Any]) -> tuple[dict[s
     now = int(cache.setdefault("now", int(time.time())))
     changed = migrate_grid_lifecycle(row, now)
     changed = initialize_lifecycle_iterations(row) or changed
+    migrated = lifecycle_migrate_min_rejected_debts_to_p8(row, now)
+    changed = bool(migrated) or changed
     promoted, p8_changed = lifecycle_process_p8(row, now, cache)
     changed = changed or p8_changed
     counters = cache.setdefault("grid_lifecycle_counters", {}).setdefault(id(row), {})
@@ -8930,6 +8990,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     if invalidated:
         changed = True
     changed = initialize_lifecycle_iterations(row) or changed
+    migrated = lifecycle_migrate_min_rejected_debts_to_p8(row, ctx["now"])
+    changed = bool(migrated) or changed
     levels = row.setdefault("levels", [])
     counters = cache.setdefault("grid_lifecycle_counters", {}).setdefault(id(row), {})
 

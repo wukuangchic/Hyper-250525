@@ -110,6 +110,7 @@ from trail_worker import (
     lifecycle_legacy_pause_candidate,
     lifecycle_mark_deferred_or_discarded,
     lifecycle_materialize_birth_intent,
+    lifecycle_migrate_min_rejected_debts_to_p8,
     lifecycle_p3_pending_pool,
     lifecycle_p3_failure_is_unknown,
     lifecycle_p3_restore_budget,
@@ -904,6 +905,121 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(result, GRID_P8_REACCUMULATE_STATUS)
         self.assertEqual(order["size"], "1")
         self.assertEqual(order["p8_reaccumulate_value"], "9")
+
+    def test_minimum_value_rejected_leg_one_returns_to_p8(self) -> None:
+        class MinimumRejectExchange:
+            def order(self, *args, **kwargs):
+                raise RuntimeError(
+                    "Failed to submit grid child order: Order must have minimum value of $10. asset=110024"
+                )
+
+        row = {
+            "coin": "xyz:JPY", "gap_rate": "0.0002", "sz_decimals": 2,
+            "min_order_value": "10", "base_buy_size": "0.1", "base_sell_size": "0.1",
+            "levels": [],
+        }
+        order = grid_order_entry(
+            row, "xyz:JPY", {"szDecimals": 2, "maxLeverage": 20}, False,
+            Decimal("164.96"), False, size=Decimal("0.01"), preserve_size=True,
+        )
+        order.update({
+            "status": GRID_CHAIN_DEBT_STATUS,
+            "grid_leg": 1,
+            "p3_queue_seq": 1687,
+            "preserve_fill_size": True,
+        })
+
+        result = lifecycle_submit_order(
+            MinimumRejectExchange(), "xyz:JPY", order, 123, row,
+            {"szDecimals": 2, "maxLeverage": 20}, Decimal("-1"), Decimal("164"),
+            Decimal("163.9"), Decimal("164.1"), set(), [], {}, search_outward=False,
+        )
+
+        self.assertEqual(result, GRID_P8_REACCUMULATE_STATUS)
+        self.assertEqual(order["status"], GRID_P8_REACCUMULATE_STATUS)
+        self.assertEqual(order["p8_reaccumulate_value"], "1.6496")
+        self.assertEqual(order["p8_reaccumulate_reason"], "minimum_order_value_rejected")
+        self.assertNotIn("p3_queue_seq", order)
+
+    def test_existing_minimum_value_debts_migrate_to_same_side_p8(self) -> None:
+        error = "Failed to submit grid child order: Order must have minimum value of $10. asset=110024"
+        row = {
+            "coin": "xyz:JPY", "gap_rate": "0.0002", "sz_decimals": 2,
+            "levels": [
+                {
+                    "side": "sell", "is_buy": False, "status": GRID_CHAIN_DEBT_STATUS,
+                    "grid_leg": 1, "price": "164.96", "size": "0.01", "last_error": error,
+                    "p3_queue_seq": 1687,
+                },
+                {
+                    "side": "sell", "is_buy": False, "status": GRID_CHAIN_DEBT_STATUS,
+                    "grid_leg": 1, "price": "165", "size": "0.02", "last_error": error,
+                    "p3_queue_seq": 1688,
+                },
+                {
+                    "side": "buy", "is_buy": True, "status": GRID_CHAIN_DEBT_STATUS,
+                    "grid_leg": 1, "price": "160", "size": "0.01", "last_error": "temporary error",
+                    "p3_queue_seq": 1689,
+                },
+            ],
+        }
+
+        migrated = lifecycle_migrate_min_rejected_debts_to_p8(row, 123)
+
+        self.assertEqual(migrated, 2)
+        self.assertEqual(len(row["levels"]), 1)
+        self.assertEqual(row["levels"][0]["p3_queue_seq"], 1689)
+        bucket = row["p8_partial_debts"][0]
+        self.assertEqual(bucket["side"], "sell")
+        self.assertEqual(bucket["size"], "0.03")
+        self.assertEqual(bucket["weighted_notional"], "4.9496")
+        self.assertEqual(row["p8_min_reject_migrated"], 2)
+
+    def test_p3_minimum_value_reject_moves_generic_leg_one_to_p8(self) -> None:
+        class MinimumRejectExchange:
+            def order(self, *args, **kwargs):
+                raise RuntimeError("minTradeNtlRejected")
+
+        row = {
+            "type": "grid", "status": "active", "grid_lifecycle_version": 2,
+            "network": "mainnet", "account": "0xabc", "coin": "xyz:JPY",
+            "position_limit_mode": "limit", "min_position_value": "-100",
+            "max_position_value": "100", "gap_rate": "0.0002", "sz_decimals": 2,
+            "min_order_value": "10", "base_buy_size": "0.1", "base_sell_size": "0.1",
+            "levels": [],
+        }
+        debt = grid_order_entry(
+            row, "xyz:JPY", {"szDecimals": 2, "maxLeverage": 20}, False,
+            Decimal("164.96"), False, size=Decimal("0.01"), preserve_size=True,
+        )
+        debt.update({
+            "status": GRID_CHAIN_DEBT_STATUS, "grid_leg": 1, "p3_queue_seq": 1687,
+            "preserve_fill_size": True,
+        })
+        row["levels"].append(debt)
+        ctx = {
+            "network": "mainnet", "account": "0xabc", "coin": "xyz:JPY",
+            "asset": {"szDecimals": 2, "maxLeverage": 20}, "exchange": MinimumRejectExchange(),
+            "info": object(), "now": 123, "now_ms": 123000,
+            "position_size": Decimal("-1"), "position_value": Decimal("-164"),
+            "position_leverage": Decimal("20"), "current_mid": Decimal("164"),
+            "best_bid": Decimal("163.9"), "best_ask": Decimal("164.1"),
+            "withdrawable": Decimal("2"), "liquidation_px": None,
+            "open_orders": [], "open_oids": set(), "fills_by_oid": {},
+        }
+        cache = {
+            "grid_rows": [row], "grid_action_phase": "p3",
+            "lifecycle_p3_target": debt, "action_limit_headroom": 200,
+        }
+
+        with patch("trail_worker.lifecycle_context", return_value=ctx):
+            maintained, changed = maintain_grid(row, cache)
+
+        self.assertTrue(changed)
+        self.assertEqual(maintained["levels"], [])
+        self.assertEqual(maintained["p8_partial_debts"][0]["side"], "sell")
+        self.assertEqual(maintained["p8_partial_debts"][0]["size"], "0.01")
+        self.assertEqual(maintained["p8_partial_debts"][0]["weighted_notional"], "1.6496")
 
     def test_p3_moves_sub_ten_p8_origin_back_to_accumulator(self) -> None:
         class NoSubmitExchange:
