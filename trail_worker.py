@@ -94,8 +94,6 @@ GRID_ROE_STOP_THRESHOLD = Decimal("-0.40")
 GRID_SURVIVAL_ACTIVE_ORDERS_PER_SIDE = 1
 GRID_WITHDRAWABLE_REDUCE_ONLY_THRESHOLD = Decimal("5")
 GRID_WITHDRAWABLE_PAUSE_THRESHOLD = Decimal("10")
-GRID_LIMIT_CHASE_MARGIN_ADEQUACY_THRESHOLD = Decimal("1.1")
-GRID_LIMIT_CHASE_ADD_RISK_FROZEN = True
 GRID_LIFECYCLE_VERSION = 2
 GRID_LEGACY_PAUSE_STATUS = "legacy_pause"
 GRID_MARGIN_STATUS = "margin"
@@ -107,7 +105,7 @@ GRID_P7_WITHDRAWABLE_THRESHOLD = Decimal("5")
 GRID_P7_MIN_ACTIVE_PER_SIDE = 5
 GRID_P7_MIN_ORDER_AGE_SECONDS = 10 * 60
 GRID_P9_WITHDRAWABLE_THRESHOLD = Decimal("1")
-GRID_P10_MARGIN_ADEQUACY_THRESHOLD = GRID_LIMIT_CHASE_MARGIN_ADEQUACY_THRESHOLD
+GRID_P10_MARGIN_ADEQUACY_THRESHOLD = Decimal("1.1")
 GRID_P10_REQUIRED_ACTION_HEADROOM = 3
 GRID_P3_MAX_RESTORES_PER_RUN = 10
 GRID_PANIC_RATIO_LEGACY_DEFAULT_THRESHOLDS = {
@@ -1423,19 +1421,6 @@ def grid_limit_chase_direction(
     return None
 
 
-def grid_limit_chase_market_reduces_position(
-    position_size: Decimal,
-    is_buy: bool,
-    order_size: Decimal,
-) -> bool:
-    """Return whether a P4 market action can only reduce the current position."""
-    if order_size <= 0:
-        return False
-    if is_buy:
-        return position_size < 0 and order_size <= abs(position_size)
-    return position_size > 0 and order_size <= position_size
-
-
 def grid_limit_chase_reduction_target_size(
     row: dict[str, Any],
     position_size: Decimal,
@@ -1460,48 +1445,6 @@ def grid_limit_chase_reduction_target_size(
     return (excess_value / current_mid / step).to_integral_value(rounding=ROUND_CEILING) * step
 
 
-def grid_limit_chase_margin_adequacy(
-    market_order: dict[str, Any],
-    withdrawable: Decimal | None,
-    leverage: Decimal | None,
-) -> tuple[Decimal | None, Decimal | None]:
-    """Estimate P4 add-risk margin at the IOC slippage price and its coverage."""
-    plan = market_order.get("plan")
-    worst_notional = (
-        decimal_or_none(plan.get("worst_notional")) if isinstance(plan, dict) else None
-    )
-    if (
-        withdrawable is None
-        or withdrawable < 0
-        or leverage is None
-        or leverage <= 0
-        or worst_notional is None
-        or worst_notional <= 0
-    ):
-        return None, None
-    estimated_margin = worst_notional / leverage
-    if estimated_margin <= 0:
-        return None, None
-    return estimated_margin, withdrawable / estimated_margin
-
-
-def grid_limit_chase_add_risk_allowed(
-    market_order: dict[str, Any],
-    withdrawable: Decimal | None,
-    leverage: Decimal | None,
-) -> bool:
-    estimated_margin, adequacy = grid_limit_chase_margin_adequacy(
-        market_order, withdrawable, leverage
-    )
-    plan = market_order.get("plan")
-    if isinstance(plan, dict):
-        plan["estimated_margin"] = estimated_margin
-        plan["margin_leverage"] = leverage
-        plan["margin_adequacy_ratio"] = adequacy
-        plan["margin_adequacy_threshold"] = GRID_LIMIT_CHASE_MARGIN_ADEQUACY_THRESHOLD
-    return adequacy is not None and adequacy > GRID_LIMIT_CHASE_MARGIN_ADEQUACY_THRESHOLD
-
-
 def record_grid_limit_chase_candidate(
     cache: dict[str, Any],
     row: dict[str, Any],
@@ -1510,6 +1453,10 @@ def record_grid_limit_chase_candidate(
 ) -> None:
     is_buy = grid_limit_chase_direction(row, position_size, position_value)
     if is_buy is None:
+        return
+    # P4 is reduction-only. Position deficits that would require adding risk
+    # are handled exclusively by P10 through promotion of an existing order.
+    if (is_buy and position_size >= 0) or (not is_buy and position_size <= 0):
         return
     seen = cache.setdefault("limit_chase_candidate_ids", set())
     row_id = id(row)
@@ -2758,7 +2705,6 @@ def build_grid_limit_chase_market_order(
     is_buy: bool,
     max_size: Decimal | None = None,
     target_size: Decimal | None = None,
-    reduce_only: bool = False,
 ) -> dict[str, Any] | None:
     if current_mid <= 0:
         return None
@@ -2796,7 +2742,7 @@ def build_grid_limit_chase_market_order(
         "size": decimal_to_plain(size),
         "price": decimal_to_plain(limit_px),
         "limit_px": decimal_to_plain(limit_px),
-        "reduce_only": reduce_only,
+        "reduce_only": True,
         "limit_chase_order": True,
         "plan": {
             "label": "grid-limit-chase",
@@ -2805,7 +2751,7 @@ def build_grid_limit_chase_market_order(
             "size": size,
             "limit_px": limit_px,
             "order_type": {"limit": {"tif": "Ioc"}},
-            "reduce_only": reduce_only,
+            "reduce_only": True,
             "mode": "market",
             "notional": notional,
             "target_notional": notional,
@@ -2814,7 +2760,7 @@ def build_grid_limit_chase_market_order(
             "reference_notional": size * current_mid,
             "min_notional_buffer": min_notional,
             "limit_chase_target_size": target_size,
-            "limit_chase_reduce_to_boundary": reduce_only,
+            "limit_chase_reduce_to_boundary": True,
             "price_source": f"mid with {slippage} slippage protection",
         },
     }
@@ -7041,7 +6987,7 @@ def submit_grid_limit_chase_market(
             float(plan["size"]),
             float(plan["limit_px"]),
             plan["order_type"],
-            reduce_only=False,
+            reduce_only=bool(plan.get("reduce_only")),
         )
 
     def record_wait(wait_count: int, error_text: str) -> None:
@@ -7061,6 +7007,7 @@ def submit_grid_limit_chase_market(
         side=order.get("side"),
         price=order.get("price"),
         size=order.get("size"),
+        reduce_only=bool(plan.get("reduce_only")),
         result=result,
     )
     if not isinstance(result, dict) or result.get("status") != "ok":
@@ -7153,6 +7100,21 @@ def run_grid_limit_chase_p3(cache: dict[str, Any]) -> bool:
     if is_buy is None:
         row["limit_chase_status"] = "skipped_back_within_limit"
         return True
+    reduction_mode = (
+        (is_buy and position_size < 0)
+        or (not is_buy and position_size > 0)
+    )
+    if not reduction_mode:
+        return False
+    sz_decimals = int(row.get("sz_decimals") or asset["szDecimals"])
+    reduction_target = grid_limit_chase_reduction_target_size(
+        row,
+        position_size,
+        position_value,
+        current_mid,
+        is_buy,
+        sz_decimals,
+    )
     market_order = build_grid_limit_chase_market_order(
         exchange,
         row,
@@ -7160,72 +7122,13 @@ def run_grid_limit_chase_p3(cache: dict[str, Any]) -> bool:
         asset,
         current_mid,
         is_buy,
+        max_size=abs(position_size),
+        target_size=reduction_target,
     )
     if market_order is None:
         row["limit_chase_status"] = "skipped_invalid_market_order"
         return True
-    market_size = decimal_or_none(market_order.get("size")) or Decimal("0")
-    reduces_position = grid_limit_chase_market_reduces_position(
-        position_size, is_buy, market_size
-    )
-    if GRID_LIMIT_CHASE_ADD_RISK_FROZEN and not reduces_position:
-        row["limit_chase_status"] = "add_risk_frozen"
-        audit_grid_action(
-            "limit_chase_add_risk_frozen",
-            coin=coin,
-            grid_id=row.get("id"),
-            side="buy" if is_buy else "sell",
-            position_size=decimal_to_plain(position_size),
-            position_value=decimal_to_plain(
-                signed_position_value(position_size, position_value)
-            ),
-            min_position_value=row.get("min_position_value"),
-            max_position_value=row.get("max_position_value"),
-            current_mid=decimal_to_plain(current_mid),
-            withdrawable=(
-                decimal_to_plain(withdrawable) if withdrawable is not None else None
-            ),
-            source="legacy",
-        )
-        return True
-    position_leverage = decimal_or_none(
-        (current_position.get("leverage") or {}).get("value")
-    ) if isinstance(current_position, dict) else None
-    leverage = position_leverage or decimal_or_none(asset.get("maxLeverage"))
-    estimated_margin, margin_adequacy = grid_limit_chase_margin_adequacy(
-        market_order, withdrawable, leverage
-    )
-    row["limit_chase_estimated_margin"] = (
-        decimal_to_plain(estimated_margin) if estimated_margin is not None else None
-    )
-    row["limit_chase_margin_leverage"] = (
-        decimal_to_plain(leverage) if leverage is not None else None
-    )
-    row["limit_chase_margin_adequacy"] = (
-        decimal_to_plain(margin_adequacy) if margin_adequacy is not None else None
-    )
-    if not reduces_position and not grid_limit_chase_add_risk_allowed(
-        market_order, withdrawable, leverage
-    ):
-        row["limit_chase_status"] = "skipped_margin_adequacy"
-        return True
-
     isolated_leverage_ready: set[str] = set()
-    if position_size == 0 and asset_requires_isolated_margin(asset):
-        reserve_grid_exchange_actions(cache)
-        leverage, leverage_result = update_isolated_opening_leverage(
-            exchange,
-            int(asset["maxLeverage"]),
-            coin,
-        )
-        if leverage_result.get("status") != "ok":
-            row["limit_chase_status"] = "failed_leverage"
-            row["limit_chase_error"] = (
-                f"Failed to set isolated opening leverage to {leverage}x for {coin}: {leverage_result}"
-            )
-            row["limit_chase_error_at"] = row["limit_chase_checked_at"]
-            return True
-        isolated_leverage_ready.add(coin)
 
     now = int(row["limit_chase_checked_at"])
     if not submit_grid_limit_chase_market(exchange, coin, market_order, now, row, cache):
@@ -8220,7 +8123,33 @@ def lifecycle_p10_margin_adequacy(
     withdrawable: Decimal | None,
     leverage: Decimal | None,
 ) -> tuple[Decimal | None, Decimal | None]:
-    return grid_limit_chase_margin_adequacy(market, withdrawable, leverage)
+    """Estimate P10 IOC margin and its withdrawable coverage before cancellation."""
+    plan = market.get("plan")
+    worst_notional = (
+        decimal_or_none(plan.get("worst_notional")) if isinstance(plan, dict) else None
+    )
+    if (
+        withdrawable is None
+        or withdrawable < 0
+        or leverage is None
+        or leverage <= 0
+        or worst_notional is None
+        or worst_notional <= 0
+    ):
+        return None, None
+    estimated_margin = worst_notional / leverage
+    if estimated_margin <= 0:
+        return None, None
+    return estimated_margin, withdrawable / estimated_margin
+
+
+def lifecycle_p10_source_distance_rate(
+    current_mid: Decimal,
+    source_price: Decimal,
+) -> Decimal | None:
+    if current_mid <= 0 or source_price <= 0:
+        return None
+    return abs(current_mid - source_price) / current_mid
 
 
 def lifecycle_p10_projected_within_max(
@@ -8569,6 +8498,27 @@ def lifecycle_process_p10(row: dict[str, Any], ctx: dict[str, Any], cache: dict[
         if candidate is None:
             return False
         source, source_size, source_price, is_buy = candidate
+        distance_rate = lifecycle_p10_source_distance_rate(
+            ctx["current_mid"], source_price
+        )
+        gap_rate = decimal_or_none(row.get("gap_rate")) or Decimal("0")
+        row["p10_source_distance_rate"] = (
+            decimal_to_plain(distance_rate) if distance_rate is not None else None
+        )
+        row["p10_gap_rate"] = decimal_to_plain(gap_rate)
+        if distance_rate is not None and gap_rate > 0 and distance_rate < gap_rate:
+            row["p10_status"] = "skipped_source_within_gap"
+            audit_grid_action(
+                "grid_p10_source_within_gap_skipped",
+                coin=ctx["coin"],
+                grid_id=row.get("id"),
+                source_oid=source.get("oid"),
+                source_price=decimal_to_plain(source_price),
+                current_mid=decimal_to_plain(ctx["current_mid"]),
+                source_distance_rate=decimal_to_plain(distance_rate),
+                gap_rate=decimal_to_plain(gap_rate),
+            )
+            return False
 
     market = build_grid_p10_market_order(
         ctx["exchange"], row, ctx["coin"], ctx["asset"], ctx["current_mid"], is_buy, source_size
@@ -9569,26 +9519,7 @@ def lifecycle_submit_limit_chase(row: dict[str, Any], ctx: dict[str, Any], cache
         (is_buy and ctx["position_size"] < 0)
         or (not is_buy and ctx["position_size"] > 0)
     )
-    if GRID_LIMIT_CHASE_ADD_RISK_FROZEN and not reduction_mode:
-        audit_grid_action(
-            "limit_chase_add_risk_frozen",
-            coin=ctx["coin"],
-            grid_id=row.get("id"),
-            side="buy" if is_buy else "sell",
-            position_size=decimal_to_plain(ctx["position_size"]),
-            position_value=decimal_to_plain(
-                signed_position_value(ctx["position_size"], ctx["position_value"])
-            ),
-            min_position_value=row.get("min_position_value"),
-            max_position_value=row.get("max_position_value"),
-            current_mid=decimal_to_plain(ctx["current_mid"]),
-            withdrawable=(
-                decimal_to_plain(ctx["withdrawable"])
-                if ctx.get("withdrawable") is not None
-                else None
-            ),
-            source="lifecycle",
-        )
+    if not reduction_mode:
         return False
     sz_decimals = int(row.get("sz_decimals") or ctx["asset"]["szDecimals"])
     reduction_target = (
@@ -9600,8 +9531,6 @@ def lifecycle_submit_limit_chase(row: dict[str, Any], ctx: dict[str, Any], cache
             is_buy,
             sz_decimals,
         )
-        if reduction_mode
-        else None
     )
     market = build_grid_limit_chase_market_order(
         ctx["exchange"],
@@ -9610,32 +9539,10 @@ def lifecycle_submit_limit_chase(row: dict[str, Any], ctx: dict[str, Any], cache
         ctx["asset"],
         ctx["current_mid"],
         is_buy,
-        max_size=(
-            abs(ctx["position_size"])
-            if (
-                (is_buy and ctx["position_size"] < 0)
-                or (not is_buy and ctx["position_size"] > 0)
-            )
-            else None
-        ),
+        max_size=abs(ctx["position_size"]),
         target_size=reduction_target,
-        reduce_only=reduction_mode,
     )
     if market is None:
-        return False
-    market_size = decimal_or_none(market.get("size")) or Decimal("0")
-    reduces_position = grid_limit_chase_market_reduces_position(
-        ctx["position_size"], is_buy, market_size
-    )
-    if (
-        not reduces_position
-        and not grid_limit_chase_add_risk_allowed(
-            market,
-            ctx["withdrawable"],
-            decimal_or_none(ctx.get("position_leverage"))
-            or decimal_or_none(ctx["asset"].get("maxLeverage")),
-        )
-    ):
         return False
     plan = market.get("plan")
     if not isinstance(plan, dict):
@@ -9936,12 +9843,15 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
 
     elif phase == GRID_LIFECYCLE_PHASE_P10:
         account_key = lifecycle_row_account_key(row, ctx["network"], ctx["account"])
-        attempted = cache.setdefault("lifecycle_p10_accounts", set())
+        attempt_key = (*account_key, ctx["coin"])
+        attempted = cache.setdefault("lifecycle_p10_coins", set())
         existing_intent = lifecycle_p10_intent(row)
-        if existing_intent is not None or account_key not in attempted:
+        # Reconcile every persisted intent, but start at most one new P10
+        # promotion per account/coin in this worker round.
+        if existing_intent is not None or attempt_key not in attempted:
             p10_changed = lifecycle_process_p10(row, ctx, cache)
             if p10_changed:
-                attempted.add(account_key)
+                attempted.add(attempt_key)
                 counters["p10_promotions"] = int(counters.get("p10_promotions") or 0) + 1
             changed = changed or p10_changed
 

@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import unittest
 from decimal import Decimal
+from unittest.mock import patch
 
 from trail_worker import (
     GRID_CHAIN_DEBT_STATUS,
+    GRID_LIFECYCLE_PHASE_P10,
     GRID_LIFECYCLE_PHASES,
     lifecycle_process_p10,
+    maintain_grid,
 )
 
 
@@ -194,6 +197,72 @@ class P10PromotionTests(unittest.TestCase):
         self.assertEqual(exchange.order_calls[1]["price"], 50.0)
         self.assertTrue(exchange.order_calls[1]["reduce_only"])
         self.assertEqual(row["levels"][0]["price"], "50")
+
+    def test_source_strictly_within_one_gap_skips_before_cancel(self) -> None:
+        row, source = make_row()
+        source["price"] = "59.5"
+        exchange = FakeExchange()
+        ctx = make_ctx(exchange)
+        ctx["open_orders"][0]["limitPx"] = "59.5"
+
+        with patch("trail_worker.audit_grid_action") as audit_mock:
+            changed = lifecycle_process_p10(row, ctx, {"action_limit_headroom": 10})
+
+        self.assertFalse(changed)
+        self.assertEqual(exchange.cancel_calls, [])
+        self.assertEqual(exchange.order_calls, [])
+        self.assertEqual(source["status"], "active")
+        self.assertEqual(row["p10_status"], "skipped_source_within_gap")
+        self.assertEqual(row["p10_source_distance_rate"], "0.008333333333333333333333333333")
+        audit_mock.assert_called_once()
+        self.assertEqual(
+            audit_mock.call_args.args[0], "grid_p10_source_within_gap_skipped"
+        )
+
+    def test_source_exactly_one_gap_still_promotes(self) -> None:
+        row, source = make_row()
+        source["price"] = "59.4"
+        exchange = FakeExchange()
+        ctx = make_ctx(exchange)
+        ctx["open_orders"][0]["limitPx"] = "59.4"
+
+        changed = lifecycle_process_p10(row, ctx, {"action_limit_headroom": 10})
+
+        self.assertTrue(changed)
+        self.assertEqual(len(exchange.cancel_calls), 1)
+        self.assertEqual(len(exchange.order_calls), 2)
+        self.assertEqual(row["p10_source_distance_rate"], "0.01")
+
+    def test_p10_allows_one_new_promotion_per_coin_per_round(self) -> None:
+        btc_row, _ = make_row()
+        duplicate_btc_row, _ = make_row()
+        duplicate_btc_row["id"] = "grid-p10-btc-2"
+        eth_row, _ = make_row()
+        eth_row["id"] = "grid-p10-eth"
+        eth_row["coin"] = "ETH"
+        cache = {
+            "grid_action_phase": GRID_LIFECYCLE_PHASE_P10,
+            "action_limit_headroom": 100,
+        }
+
+        def context_for(row, _cache):
+            ctx = make_ctx(FakeExchange())
+            ctx["coin"] = row["coin"]
+            return ctx
+
+        with (
+            patch("trail_worker.lifecycle_context", side_effect=context_for),
+            patch("trail_worker.lifecycle_process_p10", return_value=True) as process_mock,
+        ):
+            maintain_grid(btc_row, cache)
+            maintain_grid(duplicate_btc_row, cache)
+            maintain_grid(eth_row, cache)
+
+        self.assertEqual(process_mock.call_count, 2)
+        self.assertEqual(
+            cache["lifecycle_p10_coins"],
+            {("mainnet", "0xabc", "BTC"), ("mainnet", "0xabc", "ETH")},
+        )
 
     def test_margin_budget_failure_never_cancels_source(self) -> None:
         row, source = make_row()

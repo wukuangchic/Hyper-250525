@@ -90,9 +90,6 @@ from trail_worker import (
     grid_replacement_rebalance_pair,
     grid_reduce_only_capacity_available,
     grid_reduce_only_canceled_restore_without_reduce_only,
-    grid_limit_chase_market_reduces_position,
-    grid_limit_chase_margin_adequacy,
-    grid_limit_chase_add_risk_allowed,
     grid_roe_add_risk_allowed,
     grid_roe_for_position_value,
     grid_latest_replacement_roe_allowed,
@@ -101,8 +98,6 @@ from trail_worker import (
     grid_risk_density_pause_candidates,
     grid_risk_density_restore_allowed,
     grid_target_orders_per_side,
-    GRID_LIMIT_CHASE_ADD_RISK_FROZEN,
-    GRID_LIMIT_CHASE_MARGIN_ADEQUACY_THRESHOLD,
     grid_survival_slot_available,
     maintain_grid,
     maintain_grid_legacy,
@@ -1201,14 +1196,13 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(row["levels"][-1]["birth_slot"], "far10")
         self.assertTrue(all(entry["birth_source"] == "limit_chase" for entry in row["levels"]))
 
-    def test_p4_add_market_requires_margin_adequacy_strictly_above_1_1(self) -> None:
-        self.assertEqual(GRID_LIMIT_CHASE_MARGIN_ADEQUACY_THRESHOLD, Decimal("1.1"))
+    def test_p4_add_risk_path_is_absent(self) -> None:
         class UnexpectedExchange:
-            def _slippage_price(self, coin, is_buy, slippage, mid):
-                return 100
+            def _slippage_price(self, *args, **kwargs):
+                raise AssertionError("reduction-only P4 must not build an add-risk market order")
 
             def order(self, *args, **kwargs):
-                raise AssertionError("P4 add-risk market action must remain blocked")
+                raise AssertionError("reduction-only P4 must not submit an add-risk action")
 
         row = {
             "position_limit_mode": "limit", "min_position_value": "100", "max_position_value": "150",
@@ -1225,89 +1219,6 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertFalse(lifecycle_submit_limit_chase(row, ctx, {"action_limit_headroom": 200}))
         self.assertEqual(row["levels"], [])
-
-    def test_p4_add_risk_is_frozen_before_market_construction(self) -> None:
-        self.assertTrue(GRID_LIMIT_CHASE_ADD_RISK_FROZEN)
-
-        class UnexpectedExchange:
-            def _slippage_price(self, *args, **kwargs):
-                raise AssertionError("frozen P4 add-risk must not build or submit a market order")
-
-            def order(self, *args, **kwargs):
-                raise AssertionError("frozen P4 add-risk must not submit an exchange action")
-
-        row = {
-            "id": "grid-btc",
-            "position_limit_mode": "limit",
-            "min_position_value": "100",
-            "max_position_value": "150",
-            "gap_rate": "0.01",
-            "min_order_value": "10",
-            "base_buy_size": "0.3",
-            "base_sell_size": "0.3",
-            "levels": [],
-        }
-        ctx = {
-            "withdrawable": Decimal("100"),
-            "position_size": Decimal("0.5"),
-            "position_value": Decimal("50"),
-            "position_leverage": Decimal("10"),
-            "exchange": UnexpectedExchange(),
-            "coin": "BTC",
-            "asset": {"szDecimals": 2, "maxLeverage": 20},
-            "current_mid": Decimal("100"),
-            "best_bid": Decimal("99.9"),
-            "best_ask": Decimal("100.1"),
-            "now": 123,
-            "open_orders": [],
-        }
-
-        with patch("trail_worker.audit_grid_action") as audit_mock:
-            self.assertFalse(
-                lifecycle_submit_limit_chase(row, ctx, {"action_limit_headroom": 200})
-            )
-
-        self.assertEqual(row["levels"], [])
-        audit_mock.assert_called_once()
-        self.assertEqual(audit_mock.call_args.args[0], "limit_chase_add_risk_frozen")
-        self.assertEqual(audit_mock.call_args.kwargs["source"], "lifecycle")
-
-    def test_p4_margin_adequacy_uses_ioc_slippage_price_and_leverage(self) -> None:
-        class FakeExchange:
-            def _slippage_price(self, coin, is_buy, slippage, mid):
-                return Decimal(str(mid)) * Decimal("1.10")
-
-        market = build_grid_limit_chase_market_order(
-            FakeExchange(),
-            {
-                "base_buy_size": "0.3", "min_order_value": "10",
-                "sz_decimals": 2, "slippage": "0.10",
-            },
-            "BTC",
-            {"szDecimals": 2, "maxLeverage": 20},
-            Decimal("100"),
-            True,
-        )
-        self.assertIsNotNone(market)
-        estimated_margin, adequacy = grid_limit_chase_margin_adequacy(
-            market, Decimal("3.63"), Decimal("20")
-        )
-        self.assertEqual(estimated_margin, Decimal("3.3"))
-        self.assertEqual(adequacy, Decimal("1.1"))
-        self.assertFalse(grid_limit_chase_add_risk_allowed(market, Decimal("3.63"), Decimal("20")))
-        self.assertTrue(grid_limit_chase_add_risk_allowed(market, Decimal("3.631"), Decimal("20")))
-
-    def test_p4_direction_is_not_reduction_when_size_would_flip_position(self) -> None:
-        self.assertTrue(
-            grid_limit_chase_market_reduces_position(
-                Decimal("-0.3"), True, Decimal("0.3")
-            )
-        )
-        self.assertFalse(
-            grid_limit_chase_market_reduces_position(
-                Decimal("-0.2"), True, Decimal("0.3")
-            )
-        )
 
     def test_p4_allows_multiple_grid_births_in_one_worker_round(self) -> None:
         rows = [
@@ -3137,7 +3048,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertTrue(all(call.args == (10,) for call in sleep_mock.call_args_list))
         self.assertEqual(exchange.orders[0][1], False)
         self.assertEqual(exchange.orders[0][4], {"limit": {"tif": "Ioc"}})
-        self.assertFalse(exchange.orders[0][5])
+        self.assertTrue(exchange.orders[0][5])
         self.assertEqual(exchange.orders[1][1], False)
         self.assertEqual(exchange.orders[1][4], {"limit": {"tif": "Ioc"}})
         self.assertEqual(exchange.orders[2][1], True)
@@ -3161,7 +3072,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertNotIn("limit_chase_error", row)
         self.assertNotIn("limit_chase_error_at", row)
 
-    def test_legacy_limit_chase_freezes_add_risk_before_margin_gate(self) -> None:
+    def test_legacy_limit_chase_ignores_add_risk_candidate(self) -> None:
         class FakeInfo:
             def all_mids(self, dex):
                 return {"BTC": "100"}
@@ -3188,7 +3099,7 @@ class GridAvgTests(unittest.TestCase):
                 return reference_price
 
             def order(self, *args, **kwargs):
-                raise AssertionError("frozen legacy P4 add-risk must not submit")
+                raise AssertionError("reduction-only legacy P4 must not submit add-risk")
 
         row = {
             "type": "grid",
@@ -3215,15 +3126,10 @@ class GridAvgTests(unittest.TestCase):
         with (
             patch("trail_worker.clear_info_cache"),
             patch("trail_worker.resolve_perp_asset", return_value=("BTC", {"szDecimals": 2, "maxLeverage": 20})),
-            patch("trail_worker.audit_grid_action") as audit_mock,
         ):
-            self.assertTrue(run_grid_limit_chase_p3(cache))
+            self.assertFalse(run_grid_limit_chase_p3(cache))
 
-        self.assertEqual(row["limit_chase_status"], "add_risk_frozen")
         self.assertEqual(row["levels"], [])
-        audit_mock.assert_called_once()
-        self.assertEqual(audit_mock.call_args.args[0], "limit_chase_add_risk_frozen")
-        self.assertEqual(audit_mock.call_args.kwargs["source"], "legacy")
 
     def test_precheck_action_limit_initializes_shared_p1_budget_below_cap_once(self) -> None:
         class FakeInfo:
@@ -3977,7 +3883,7 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertIsNone(order)
 
-    def test_limit_chase_market_and_replacement_use_base_size_normal_orders_and_two_gaps(self) -> None:
+    def test_limit_chase_market_is_reduce_only_and_replacement_uses_two_gaps(self) -> None:
         class FakeExchange:
             def _slippage_price(self, coin, is_buy, slippage, reference_price):
                 return Decimal(str(reference_price)) * (Decimal("1.001") if is_buy else Decimal("0.999"))
@@ -4002,7 +3908,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertIsNotNone(market)
         self.assertEqual(market["side"], "sell")
         self.assertEqual(market["size"], "0.6")
-        self.assertFalse(market["reduce_only"])
+        self.assertTrue(market["reduce_only"])
         self.assertEqual(market["plan"]["order_type"], {"limit": {"tif": "Ioc"}})
         self.assertIsNotNone(replacement)
         self.assertEqual(replacement["side"], "buy")
