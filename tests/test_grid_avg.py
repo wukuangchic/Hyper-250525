@@ -108,6 +108,7 @@ from trail_worker import (
     lifecycle_mark_deferred_or_discarded,
     lifecycle_materialize_birth_intent,
     lifecycle_migrate_min_rejected_debts_to_p8,
+    lifecycle_prepare_economic_chain_ids,
     lifecycle_p3_pending_pool,
     lifecycle_p3_failure_is_unknown,
     lifecycle_p3_restore_budget,
@@ -128,6 +129,7 @@ from trail_worker import (
     lifecycle_submit_order,
     lifecycle_terminal_candidate,
     lifecycle_fill_price_size,
+    new_economic_chain_id,
     lifecycle_context,
     migrate_grid_lifecycle,
     mark_missing_order_confirmed_open,
@@ -229,7 +231,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(len(set(generated)), 4)
         self.assertEqual(generated[1], generated[2])
         for chain_id in generated:
-            self.assertRegex(chain_id, r"^[0-9A-Za-z]{10}$")
+            self.assertRegex(chain_id, r"^C[0-9]{10}[A-Za-z]{4}$")
         self.assertEqual(rows[0]["levels"][5]["economic_chain_id"], existing)
         self.assertNotIn("economic_chain_id", rows[0]["levels"][6])
         self.assertEqual(rows[0]["economic_chain_id_backfilled_count"], 5)
@@ -242,6 +244,19 @@ class GridAvgTests(unittest.TestCase):
             [entry["economic_chain_id"] for entry in rows[0]["levels"][:5]],
             generated,
         )
+
+    def test_new_economic_chain_id_retries_only_this_run_duplicates(self) -> None:
+        lifecycle_prepare_economic_chain_ids([])
+        letters = list("AAAA" "AAAA" "BBBB")
+        with (
+            patch("trail_worker.time.time", return_value=1785580200),
+            patch("trail_worker.secrets.choice", side_effect=letters),
+        ):
+            first = new_economic_chain_id()
+            second = new_economic_chain_id()
+
+        self.assertEqual(first, "C2608011830AAAA")
+        self.assertEqual(second, "C2608011830BBBB")
 
     def test_finite_chain_migration_maps_active_to_zero_and_paused_to_legacy_one(self) -> None:
         row = {
@@ -1336,7 +1351,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(row["birth_market_intents"][0]["status"], "awaiting_reconcile")
         chain_id = row["birth_market_intents"][0]["economic_chain_id"]
         cloid = row["birth_market_intents"][0]["cloid"]
-        self.assertRegex(chain_id, r"^[0-9A-Za-z]{10}$")
+        self.assertRegex(chain_id, r"^C[0-9]{10}[A-Za-z]{4}$")
         self.assertNotEqual(chain_id, cloid)
 
         class FakeInfo:
@@ -1479,7 +1494,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(submit_mock.call_count, 1)
         self.assertEqual(updated["birth_market_intents"][0]["status"], "submitting")
         chain_id = updated["birth_market_intents"][0]["economic_chain_id"]
-        self.assertRegex(chain_id, r"^[0-9A-Za-z]{10}$")
+        self.assertRegex(chain_id, r"^C[0-9]{10}[A-Za-z]{4}$")
         self.assertEqual(market["economic_chain_id"], chain_id)
         self.assertNotEqual(chain_id, updated["birth_market_intents"][0]["cloid"])
 

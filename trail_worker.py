@@ -424,9 +424,11 @@ def audit_grid_action(action: str, **payload: Any) -> None:
         handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
 
 
-ECONOMIC_CHAIN_ID_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-ECONOMIC_CHAIN_ID_LENGTH = 10
-_ECONOMIC_CHAIN_IDS_IN_USE: set[str] = set()
+ECONOMIC_CHAIN_ID_RANDOM_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+ECONOMIC_CHAIN_ID_RANDOM_LENGTH = 4
+ECONOMIC_CHAIN_ID_PREFIX = "C"
+ECONOMIC_CHAIN_ID_CHINA_UTC_OFFSET_SECONDS = 8 * 60 * 60
+_ECONOMIC_CHAIN_IDS_GENERATED_THIS_RUN: set[str] = set()
 _ECONOMIC_CHAIN_IDS_BY_LINEAGE: dict[tuple[str, ...], str] = {}
 
 
@@ -464,15 +466,14 @@ def economic_chain_lineage_key(
 
 
 def lifecycle_prepare_economic_chain_ids(rows: list[dict[str, Any]]) -> None:
-    """Load persisted IDs so generated 10-character IDs cannot collide."""
-    _ECONOMIC_CHAIN_IDS_IN_USE.clear()
+    """Prepare persisted lineage inheritance and reset this-run ID tracking."""
+    _ECONOMIC_CHAIN_IDS_GENERATED_THIS_RUN.clear()
     _ECONOMIC_CHAIN_IDS_BY_LINEAGE.clear()
 
     def visit(row: dict[str, Any], value: Any) -> None:
         if isinstance(value, dict):
             chain_id = str(value.get("economic_chain_id") or "").strip()
             if chain_id:
-                _ECONOMIC_CHAIN_IDS_IN_USE.add(chain_id)
                 _ECONOMIC_CHAIN_IDS_BY_LINEAGE.setdefault(
                     economic_chain_lineage_key(row, value), chain_id,
                 )
@@ -487,14 +488,19 @@ def lifecycle_prepare_economic_chain_ids(rows: list[dict[str, Any]]) -> None:
 
 
 def new_economic_chain_id() -> str:
-    """Generate one collision-checked fixed-width economic chain ID."""
+    """Generate C+China YYMMDDHHmm+4 letters, unique within this worker run."""
+    timestamp = time.strftime(
+        "%y%m%d%H%M",
+        time.gmtime(time.time() + ECONOMIC_CHAIN_ID_CHINA_UTC_OFFSET_SECONDS),
+    )
     while True:
-        chain_id = "".join(
-            secrets.choice(ECONOMIC_CHAIN_ID_ALPHABET)
-            for _ in range(ECONOMIC_CHAIN_ID_LENGTH)
+        suffix = "".join(
+            secrets.choice(ECONOMIC_CHAIN_ID_RANDOM_ALPHABET)
+            for _ in range(ECONOMIC_CHAIN_ID_RANDOM_LENGTH)
         )
-        if chain_id not in _ECONOMIC_CHAIN_IDS_IN_USE:
-            _ECONOMIC_CHAIN_IDS_IN_USE.add(chain_id)
+        chain_id = f"{ECONOMIC_CHAIN_ID_PREFIX}{timestamp}{suffix}"
+        if chain_id not in _ECONOMIC_CHAIN_IDS_GENERATED_THIS_RUN:
+            _ECONOMIC_CHAIN_IDS_GENERATED_THIS_RUN.add(chain_id)
             return chain_id
 
 
@@ -502,7 +508,6 @@ def economic_chain_id(row: dict[str, Any], entry: dict[str, Any]) -> str:
     """Return one stable identifier for the economic order chain."""
     existing = str(entry.get("economic_chain_id") or "").strip()
     if existing:
-        _ECONOMIC_CHAIN_IDS_IN_USE.add(existing)
         _ECONOMIC_CHAIN_IDS_BY_LINEAGE.setdefault(
             economic_chain_lineage_key(row, entry), existing,
         )
