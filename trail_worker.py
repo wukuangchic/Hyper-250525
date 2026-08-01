@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import math
 import random
+import secrets
 import signal
 import threading
 import time
@@ -423,28 +424,28 @@ def audit_grid_action(action: str, **payload: Any) -> None:
         handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
 
 
-def economic_chain_id(row: dict[str, Any], entry: dict[str, Any]) -> str:
-    """Return one stable identifier for the economic order chain."""
-    existing = str(
-        entry.get("economic_chain_id")
-        or entry.get("birth_intent_cloid")
-        or ""
-    ).strip()
-    if existing:
-        entry["economic_chain_id"] = existing
-        return existing
+ECONOMIC_CHAIN_ID_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+ECONOMIC_CHAIN_ID_LENGTH = 10
+_ECONOMIC_CHAIN_IDS_IN_USE: set[str] = set()
+_ECONOMIC_CHAIN_IDS_BY_LINEAGE: dict[tuple[str, ...], str] = {}
+
+
+def economic_chain_lineage_key(
+    row: dict[str, Any],
+    entry: dict[str, Any],
+) -> tuple[str, ...]:
+    """Return the best available stable lineage evidence for one order."""
     grid_id = str(row.get("id") or row.get("coin") or "grid")
+    birth_intent_cloid = str(entry.get("birth_intent_cloid") or "").strip()
+    if birth_intent_cloid:
+        return (grid_id, "birth", birth_intent_cloid)
     for key in ("source_oid", "p9_source_oid", "confirmed_filled_oid", "oid"):
         value = entry.get(key)
         if value is not None and str(value).strip():
-            chain_id = f"{grid_id}:oid:{value}"
-            entry["economic_chain_id"] = chain_id
-            return chain_id
+            return (grid_id, "oid", str(value))
     queue_seq = entry.get("p3_queue_seq")
     if queue_seq is not None:
-        chain_id = f"{grid_id}:p3:{queue_seq}"
-        entry["economic_chain_id"] = chain_id
-        return chain_id
+        return (grid_id, "p3", str(queue_seq))
     created_at = (
         entry.get("submitted_at")
         or entry.get("created_at")
@@ -452,10 +453,66 @@ def economic_chain_id(row: dict[str, Any], entry: dict[str, Any]) -> str:
         or entry.get("margin_at")
         or 0
     )
-    side = str(entry.get("side") or "-")
-    price = str(entry.get("price", entry.get("limit_px")) or "-")
-    size = str(entry.get("size") or "-")
-    chain_id = f"{grid_id}:legacy:{created_at}:{side}:{price}:{size}"
+    return (
+        grid_id,
+        "legacy",
+        str(created_at),
+        str(entry.get("side") or "-"),
+        str(entry.get("price", entry.get("limit_px")) or "-"),
+        str(entry.get("size") or "-"),
+    )
+
+
+def lifecycle_prepare_economic_chain_ids(rows: list[dict[str, Any]]) -> None:
+    """Load persisted IDs so generated 10-character IDs cannot collide."""
+    _ECONOMIC_CHAIN_IDS_IN_USE.clear()
+    _ECONOMIC_CHAIN_IDS_BY_LINEAGE.clear()
+
+    def visit(row: dict[str, Any], value: Any) -> None:
+        if isinstance(value, dict):
+            chain_id = str(value.get("economic_chain_id") or "").strip()
+            if chain_id:
+                _ECONOMIC_CHAIN_IDS_IN_USE.add(chain_id)
+                _ECONOMIC_CHAIN_IDS_BY_LINEAGE.setdefault(
+                    economic_chain_lineage_key(row, value), chain_id,
+                )
+            for nested in value.values():
+                visit(row, nested)
+        elif isinstance(value, list):
+            for nested in value:
+                visit(row, nested)
+
+    for row in rows:
+        visit(row, row)
+
+
+def new_economic_chain_id() -> str:
+    """Generate one collision-checked fixed-width economic chain ID."""
+    while True:
+        chain_id = "".join(
+            secrets.choice(ECONOMIC_CHAIN_ID_ALPHABET)
+            for _ in range(ECONOMIC_CHAIN_ID_LENGTH)
+        )
+        if chain_id not in _ECONOMIC_CHAIN_IDS_IN_USE:
+            _ECONOMIC_CHAIN_IDS_IN_USE.add(chain_id)
+            return chain_id
+
+
+def economic_chain_id(row: dict[str, Any], entry: dict[str, Any]) -> str:
+    """Return one stable identifier for the economic order chain."""
+    existing = str(entry.get("economic_chain_id") or "").strip()
+    if existing:
+        _ECONOMIC_CHAIN_IDS_IN_USE.add(existing)
+        _ECONOMIC_CHAIN_IDS_BY_LINEAGE.setdefault(
+            economic_chain_lineage_key(row, entry), existing,
+        )
+        entry["economic_chain_id"] = existing
+        return existing
+    lineage_key = economic_chain_lineage_key(row, entry)
+    chain_id = _ECONOMIC_CHAIN_IDS_BY_LINEAGE.get(lineage_key)
+    if chain_id is None:
+        chain_id = new_economic_chain_id()
+        _ECONOMIC_CHAIN_IDS_BY_LINEAGE[lineage_key] = chain_id
     entry["economic_chain_id"] = chain_id
     return chain_id
 
@@ -555,6 +612,42 @@ def lifecycle_initialize_p3_queue(
                 next_seq += 1
                 changed = True
     return changed
+
+
+def lifecycle_backfill_economic_chain_ids(
+    rows: list[dict[str, Any]],
+    active_grid_indexes: list[int],
+    now: int,
+) -> tuple[int, dict[str, int], dict[str, int]]:
+    """Persist stable chain IDs for historical active orders and P3 debt."""
+    total = 0
+    by_status: dict[str, int] = {}
+    by_coin: dict[str, int] = {}
+    target_statuses = {"active", GRID_MARGIN_STATUS, GRID_CHAIN_DEBT_STATUS}
+    for index in sorted(active_grid_indexes):
+        row = rows[index]
+        row_count = 0
+        for entry in row.get("levels") or []:
+            if not isinstance(entry, dict):
+                continue
+            status = str(entry.get("status") or "")
+            if status not in target_statuses:
+                continue
+            if str(entry.get("economic_chain_id") or "").strip():
+                continue
+            economic_chain_id(row, entry)
+            entry["economic_chain_id_backfilled_at"] = now
+            total += 1
+            row_count += 1
+            by_status[status] = by_status.get(status, 0) + 1
+            coin = str(row.get("coin") or "-")
+            by_coin[coin] = by_coin.get(coin, 0) + 1
+        if row_count:
+            row["economic_chain_id_backfilled_at"] = now
+            row["economic_chain_id_backfilled_count"] = int(
+                row.get("economic_chain_id_backfilled_count") or 0
+            ) + row_count
+    return total, by_status, by_coin
 
 
 def lifecycle_assign_p3_queue_seq(entry: dict[str, Any], cache: dict[str, Any]) -> None:
@@ -9891,6 +9984,7 @@ def run_once() -> None:
     cancelled_levels_pruned = prune_grid_level_history(rows)
     if cancelled_grids_pruned or cancelled_levels_pruned:
         save_server_batch(rows)
+    lifecycle_prepare_economic_chain_ids(rows)
     active_trail_indexes = [
         index
         for index, row in enumerate(rows)
@@ -9913,6 +10007,22 @@ def run_once() -> None:
         "run_monotonic_started_at": time.monotonic(),
     }
     changed = lifecycle_initialize_p3_queue(rows, active_grid_indexes)
+    chain_backfilled, chain_backfilled_by_status, chain_backfilled_by_coin = (
+        lifecycle_backfill_economic_chain_ids(
+            rows,
+            active_grid_indexes,
+            int(grid_cache["run_started_at"]),
+        )
+    )
+    if chain_backfilled:
+        save_server_batch(rows)
+        audit_grid_action(
+            "grid_economic_chain_id_backfill",
+            count=chain_backfilled,
+            by_status=chain_backfilled_by_status,
+            by_coin=chain_backfilled_by_coin,
+        )
+        changed = False
     for index in active_trail_indexes:
         row = rows[index]
         try:

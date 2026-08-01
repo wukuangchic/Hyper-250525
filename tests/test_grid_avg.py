@@ -103,6 +103,7 @@ from trail_worker import (
     maintain_grid_legacy,
     lifecycle_active_price_too_close,
     lifecycle_birth_twin_orders,
+    lifecycle_backfill_economic_chain_ids,
     lifecycle_legacy_pause_candidate,
     lifecycle_mark_deferred_or_discarded,
     lifecycle_materialize_birth_intent,
@@ -192,6 +193,56 @@ from trail_worker import (
 
 
 class GridAvgTests(unittest.TestCase):
+    def test_backfill_economic_chain_ids_is_fixed_width_stable_and_idempotent(self) -> None:
+        existing = "old-chain-id-must-not-change"
+        rows = [{
+            "id": "grid-a",
+            "coin": "BTC",
+            "levels": [
+                {"status": "active", "oid": 11},
+                {
+                    "status": GRID_CHAIN_DEBT_STATUS,
+                    "birth_intent_cloid": "0xabc",
+                    "p3_queue_seq": 7,
+                },
+                {
+                    "status": GRID_CHAIN_DEBT_STATUS,
+                    "birth_intent_cloid": "0xabc",
+                    "p3_queue_seq": 70,
+                },
+                {"status": GRID_MARGIN_STATUS, "p9_source_oid": 22, "p3_queue_seq": 8},
+                {"status": GRID_CHAIN_DEBT_STATUS, "p3_queue_seq": 9},
+                {"status": "active", "oid": 33, "economic_chain_id": existing},
+                {"status": "legacy_pause", "p3_queue_seq": 10},
+            ],
+        }]
+
+        total, by_status, by_coin = lifecycle_backfill_economic_chain_ids(rows, [0], 123)
+
+        self.assertEqual(total, 5)
+        self.assertEqual(
+            by_status,
+            {"active": 1, GRID_CHAIN_DEBT_STATUS: 3, GRID_MARGIN_STATUS: 1},
+        )
+        self.assertEqual(by_coin, {"BTC": 5})
+        generated = [entry["economic_chain_id"] for entry in rows[0]["levels"][:5]]
+        self.assertEqual(len(set(generated)), 4)
+        self.assertEqual(generated[1], generated[2])
+        for chain_id in generated:
+            self.assertRegex(chain_id, r"^[0-9A-Za-z]{10}$")
+        self.assertEqual(rows[0]["levels"][5]["economic_chain_id"], existing)
+        self.assertNotIn("economic_chain_id", rows[0]["levels"][6])
+        self.assertEqual(rows[0]["economic_chain_id_backfilled_count"], 5)
+
+        again = lifecycle_backfill_economic_chain_ids(rows, [0], 124)
+
+        self.assertEqual(again, (0, {}, {}))
+        self.assertEqual(rows[0]["economic_chain_id_backfilled_count"], 5)
+        self.assertEqual(
+            [entry["economic_chain_id"] for entry in rows[0]["levels"][:5]],
+            generated,
+        )
+
     def test_finite_chain_migration_maps_active_to_zero_and_paused_to_legacy_one(self) -> None:
         row = {
             "levels": [

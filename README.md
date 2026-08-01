@@ -722,7 +722,12 @@ exchange = Exchange(wallet, constants.MAINNET_API_URL, account_address="0x主账
 `grid_economic_ledger.py` 是只读观察进程：它读取 worker 的 action audit、
 `server_batch.json` 和 Hyperliquid 公共历史接口，不加载私钥，也没有下单、改单或撤单能力。
 
-账本用 `economic_chain_id` 串起一次 P0/P4 市价成交、对应反向子单及后续替换单。
+账本用 `economic_chain_id` 串起一次市价成交、对应反向子单及后续替换单。
+新生成的链号统一为 10 位大小写字母加数字，并在 worker 当前持久化状态内检查重复；
+已有旧链号保持不变，避免历史账本断链。
+worker 启动时会为尚未关联的 active 单及 P3 `margin/chain_debt` 队列项补链号：
+优先按 birth intent 或来源 OID 归链，没有来源时使用持久化 `p3_queue_seq` 生成稳定链号。
+`p3_queue_seq` 只负责队列顺序，与 `economic_chain_id` 是两个独立字段。
 只有买卖数量完全回到净零的链才进入 `flat_incremental_cash_after_fees`；
 尚未回补的链保留在 `open`，不会提前算作已落袋利润。交易所的
 `closedPnl` 仍单独保存，便于同时比较账户会计口径和“高卖低接”的增量现金口径。
