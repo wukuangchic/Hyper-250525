@@ -145,6 +145,125 @@ class GridEconomicLedgerTests(unittest.TestCase):
             finally:
                 connection.close()
 
+    def test_split_birth_allocates_market_fill_and_profit_to_each_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connection = connect_db(Path(directory) / "ledger.sqlite3")
+            try:
+                ingest_action_record(
+                    connection,
+                    0,
+                    {
+                        "ts": 100,
+                        "action": "panic_reduce_submit",
+                        "coin": "XYZ",
+                        "economic_chain_id": "root",
+                        "result": {
+                            "response": {
+                                "data": {"statuses": [{"filled": {"oid": 41}}]}
+                            }
+                        },
+                    },
+                )
+                ingest_action_record(
+                    connection,
+                    1,
+                    {
+                        "ts": 101,
+                        "action": "grid_birth_materialized",
+                        "coin": "XYZ",
+                        "market_oid": 41,
+                        "economic_chain_id": "root",
+                        "economic_chain_branch_version": 1,
+                        "children": [
+                            {
+                                "oid": 42,
+                                "size": "0.4",
+                                "birth_slot": "near",
+                                "economic_chain_id": "root_1",
+                            },
+                            {
+                                "oid": 43,
+                                "size": "0.6",
+                                "birth_slot": "far",
+                                "economic_chain_id": "root_2",
+                            },
+                        ],
+                    },
+                )
+                ingest_fills(
+                    connection,
+                    [
+                        {
+                            "time": 1000,
+                            "coin": "XYZ",
+                            "oid": 41,
+                            "tid": 11,
+                            "side": "A",
+                            "dir": "Close Long",
+                            "px": "110",
+                            "sz": "1",
+                            "fee": "0.1",
+                            "closedPnl": "-50",
+                            "crossed": True,
+                        },
+                        {
+                            "time": 2000,
+                            "coin": "XYZ",
+                            "oid": 42,
+                            "tid": 12,
+                            "side": "B",
+                            "dir": "Open Long",
+                            "px": "100",
+                            "sz": "0.4",
+                            "fee": "0.04",
+                            "closedPnl": "0",
+                            "crossed": False,
+                        },
+                        {
+                            "time": 3000,
+                            "coin": "XYZ",
+                            "oid": 43,
+                            "tid": 13,
+                            "side": "B",
+                            "dir": "Open Long",
+                            "px": "90",
+                            "sz": "0.6",
+                            "fee": "0.06",
+                            "closedPnl": "0",
+                            "crossed": False,
+                        },
+                    ],
+                )
+
+                summaries = {
+                    item["economic_chain_id"]: item
+                    for item in chain_summaries(connection)
+                }
+                self.assertEqual(set(summaries), {"root_1", "root_2"})
+                self.assertTrue(summaries["root_1"]["flat"])
+                self.assertEqual(summaries["root_1"]["cash_flow"], "4.0")
+                self.assertEqual(
+                    summaries["root_1"]["incremental_cash_after_fees"],
+                    "3.92",
+                )
+                self.assertEqual(summaries["root_1"]["exchange_closed_pnl"], "-20.0")
+                self.assertTrue(summaries["root_2"]["flat"])
+                self.assertEqual(summaries["root_2"]["cash_flow"], "12.0")
+                self.assertEqual(
+                    summaries["root_2"]["incremental_cash_after_fees"],
+                    "11.88",
+                )
+                self.assertEqual(summaries["root_2"]["exchange_closed_pnl"], "-30.0")
+                mappings = {
+                    row["oid"]: row["economic_chain_id"]
+                    for row in connection.execute(
+                        "SELECT oid, economic_chain_id FROM order_map WHERE oid IN ('42', '43')"
+                    )
+                }
+                self.assertEqual(mappings, {"42": "root_1", "43": "root_2"})
+            finally:
+                connection.close()
+
     def test_p10_market_submit_maps_fill_to_existing_chain(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connection = connect_db(Path(directory) / "ledger.sqlite3")

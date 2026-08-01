@@ -1429,7 +1429,15 @@ class GridAvgTests(unittest.TestCase):
         self.assertTrue(all(entry["grid_leg"] == 1 for entry in row["levels"]))
         self.assertTrue(all(entry["status"] == "active" for entry in row["levels"]))
         self.assertTrue(all(entry["birth_source"] == "limit_chase" for entry in row["levels"]))
-        self.assertTrue(all(entry["economic_chain_id"] == chain_id for entry in row["levels"]))
+        self.assertEqual(
+            [entry["economic_chain_id"] for entry in row["levels"]],
+            [f"{chain_id}_1", f"{chain_id}_2"],
+        )
+        self.assertTrue(all(entry["economic_chain_root_id"] == chain_id for entry in row["levels"]))
+        self.assertEqual(
+            [entry["economic_chain_branch"] for entry in row["levels"]],
+            [1, 2],
+        )
         self.assertTrue(all(entry["birth_intent_cloid"] == cloid for entry in row["levels"]))
 
     def test_birth_intent_recovery_completes_missing_far_twin_without_duplicate_near(self) -> None:

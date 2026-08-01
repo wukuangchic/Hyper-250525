@@ -199,6 +199,17 @@ def connect_db(path: Path) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS fills_chain_idx
             ON fills(economic_chain_id, time_ms);
         CREATE INDEX IF NOT EXISTS fills_oid_idx ON fills(oid);
+        CREATE TABLE IF NOT EXISTS fill_chain_allocations (
+            source_oid TEXT NOT NULL,
+            economic_chain_id TEXT NOT NULL,
+            allocation_size TEXT NOT NULL,
+            child_oid TEXT,
+            birth_slot TEXT,
+            created_ts INTEGER NOT NULL,
+            PRIMARY KEY(source_oid, economic_chain_id)
+        );
+        CREATE INDEX IF NOT EXISTS fill_chain_allocations_chain_idx
+            ON fill_chain_allocations(economic_chain_id);
         CREATE TABLE IF NOT EXISTS funding (
             funding_key TEXT PRIMARY KEY,
             time_ms INTEGER NOT NULL,
@@ -289,6 +300,8 @@ def map_order(
         "grid_order_submit",
     }:
         resolved_action = action
+        if chain_id:
+            resolved_chain = chain_id
     connection.execute(
         """
         UPDATE order_map
@@ -328,9 +341,51 @@ def ingest_action_record(
     if action == "grid_birth_materialized":
         children = record.get("children")
         if isinstance(children, list):
+            allocations: list[tuple[str, str, str | None, str | None]] = []
             for child in children:
-                if isinstance(child, dict) and child.get("oid") is not None:
-                    map_order(connection, str(child["oid"]), chain_id, "grid_order_submit", ts)
+                if not isinstance(child, dict):
+                    continue
+                child_chain_id = str(child.get("economic_chain_id") or chain_id or "").strip()
+                child_oid = str(child["oid"]) if child.get("oid") is not None else None
+                if child_oid is not None:
+                    map_order(
+                        connection,
+                        child_oid,
+                        child_chain_id or None,
+                        "grid_order_submit",
+                        ts,
+                    )
+                allocation_size = decimal_value(child.get("size"))
+                if child_chain_id and allocation_size > 0:
+                    allocations.append(
+                        (
+                            child_chain_id,
+                            decimal_text(allocation_size),
+                            child_oid,
+                            str(child.get("birth_slot") or "") or None,
+                        )
+                    )
+            source_oid = record.get("market_oid")
+            distinct_chains = {item[0] for item in allocations}
+            if source_oid is not None and len(distinct_chains) > 1:
+                for child_chain_id, allocation_size, child_oid, birth_slot in allocations:
+                    connection.execute(
+                        """
+                        INSERT INTO fill_chain_allocations(
+                            source_oid, economic_chain_id, allocation_size,
+                            child_oid, birth_slot, created_ts
+                        ) VALUES(?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(source_oid, economic_chain_id) DO UPDATE SET
+                            allocation_size = excluded.allocation_size,
+                            child_oid = excluded.child_oid,
+                            birth_slot = excluded.birth_slot,
+                            created_ts = excluded.created_ts
+                        """,
+                        (
+                            str(source_oid), child_chain_id, allocation_size,
+                            child_oid, birth_slot, ts,
+                        ),
+                    )
 
 
 def ingest_audit(connection: sqlite3.Connection, path: Path, reset: bool = False) -> int:
@@ -344,6 +399,7 @@ def ingest_audit(connection: sqlite3.Connection, path: Path, reset: bool = False
         if reset:
             connection.execute("DELETE FROM actions")
             connection.execute("DELETE FROM order_map")
+            connection.execute("DELETE FROM fill_chain_allocations")
     inserted = 0
     with path.open("rb") as handle:
         handle.seek(stored_offset)
@@ -506,50 +562,97 @@ def refresh_fill_links(connection: sqlite3.Connection) -> int:
 
 def chain_summaries(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     grouped: dict[str, dict[str, Any]] = {}
-    rows = connection.execute(
+    allocations_by_oid: dict[str, list[sqlite3.Row]] = defaultdict(list)
+    allocation_table_exists = connection.execute(
         """
+        SELECT 1 FROM sqlite_master
+        WHERE type = 'table' AND name = 'fill_chain_allocations'
+        """
+    ).fetchone() is not None
+    if allocation_table_exists:
+        for allocation in connection.execute(
+            """
+            SELECT source_oid, economic_chain_id, allocation_size
+            FROM fill_chain_allocations
+            ORDER BY source_oid, economic_chain_id
+            """
+        ):
+            allocations_by_oid[str(allocation["source_oid"])].append(allocation)
+    allocation_filter = (
+        """
+           OR EXISTS (
+                SELECT 1 FROM fill_chain_allocations
+                WHERE fill_chain_allocations.source_oid = fills.oid
+           )
+        """
+        if allocation_table_exists
+        else ""
+    )
+    rows = connection.execute(
+        f"""
         SELECT economic_chain_id, origin_action, time_ms, side, px, sz, fee,
                closed_pnl, coin, oid
         FROM fills
-        WHERE economic_chain_id IS NOT NULL AND economic_chain_id != ''
+        WHERE (economic_chain_id IS NOT NULL AND economic_chain_id != '')
+        {allocation_filter}
         ORDER BY economic_chain_id, time_ms, fill_key
         """
     )
     for row in rows:
-        chain_id = str(row["economic_chain_id"])
-        item = grouped.setdefault(
-            chain_id,
-            {
-                "economic_chain_id": chain_id,
-                "coins": set(),
-                "origins": set(),
-                "fill_count": 0,
-                "first_fill_ms": int(row["time_ms"]),
-                "last_fill_ms": int(row["time_ms"]),
-                "net_size": Decimal("0"),
-                "cash_flow": Decimal("0"),
-                "fees": Decimal("0"),
-                "closed_pnl": Decimal("0"),
-                "oids": set(),
-            },
-        )
-        side = str(row["side"] or "").upper()
-        size = decimal_value(row["sz"])
-        price = decimal_value(row["px"])
-        signed_size = size if side == "B" else -size if side == "A" else Decimal("0")
-        cash = -(signed_size * price)
-        item["coins"].add(str(row["coin"]))
-        if row["origin_action"]:
-            item["origins"].add(str(row["origin_action"]))
-        if row["oid"]:
-            item["oids"].add(str(row["oid"]))
-        item["fill_count"] += 1
-        item["first_fill_ms"] = min(item["first_fill_ms"], int(row["time_ms"]))
-        item["last_fill_ms"] = max(item["last_fill_ms"], int(row["time_ms"]))
-        item["net_size"] += signed_size
-        item["cash_flow"] += cash
-        item["fees"] += decimal_value(row["fee"])
-        item["closed_pnl"] += decimal_value(row["closed_pnl"])
+        oid = str(row["oid"] or "")
+        allocations = allocations_by_oid.get(oid, [])
+        pieces: list[tuple[str, Decimal]] = []
+        if allocations:
+            weights = [decimal_value(item["allocation_size"]) for item in allocations]
+            total_weight = sum(weights, Decimal("0"))
+            allocated_ratio = Decimal("0")
+            for index, (allocation, weight) in enumerate(zip(allocations, weights)):
+                ratio = (
+                    Decimal("1") - allocated_ratio
+                    if index + 1 == len(allocations)
+                    else weight / total_weight
+                )
+                allocated_ratio += ratio
+                pieces.append((str(allocation["economic_chain_id"]), ratio))
+        else:
+            chain_id = str(row["economic_chain_id"] or "").strip()
+            if chain_id:
+                pieces.append((chain_id, Decimal("1")))
+
+        for chain_id, ratio in pieces:
+            item = grouped.setdefault(
+                chain_id,
+                {
+                    "economic_chain_id": chain_id,
+                    "coins": set(),
+                    "origins": set(),
+                    "fill_count": 0,
+                    "first_fill_ms": int(row["time_ms"]),
+                    "last_fill_ms": int(row["time_ms"]),
+                    "net_size": Decimal("0"),
+                    "cash_flow": Decimal("0"),
+                    "fees": Decimal("0"),
+                    "closed_pnl": Decimal("0"),
+                    "oids": set(),
+                },
+            )
+            side = str(row["side"] or "").upper()
+            size = decimal_value(row["sz"]) * ratio
+            price = decimal_value(row["px"])
+            signed_size = size if side == "B" else -size if side == "A" else Decimal("0")
+            cash = -(signed_size * price)
+            item["coins"].add(str(row["coin"]))
+            if row["origin_action"]:
+                item["origins"].add(str(row["origin_action"]))
+            if row["oid"]:
+                item["oids"].add(str(row["oid"]))
+            item["fill_count"] += 1
+            item["first_fill_ms"] = min(item["first_fill_ms"], int(row["time_ms"]))
+            item["last_fill_ms"] = max(item["last_fill_ms"], int(row["time_ms"]))
+            item["net_size"] += signed_size
+            item["cash_flow"] += cash
+            item["fees"] += decimal_value(row["fee"]) * ratio
+            item["closed_pnl"] += decimal_value(row["closed_pnl"]) * ratio
 
     summaries: list[dict[str, Any]] = []
     for item in grouped.values():

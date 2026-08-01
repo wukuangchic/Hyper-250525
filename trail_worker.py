@@ -9214,6 +9214,7 @@ def lifecycle_create_birth_intent(
     intent = {
         "cloid": str(Cloid.from_int(uuid.uuid4().int)),
         "economic_chain_id": chain_id,
+        "economic_chain_branch_version": 1,
         "source": source,
         "status": "submitting",
         "created_at": now,
@@ -9235,6 +9236,17 @@ def lifecycle_birth_intent_economic_chain_id(intent: dict[str, Any]) -> str:
         if chain_id:
             intent["economic_chain_id"] = chain_id
     return chain_id
+
+
+def lifecycle_birth_branch_chain_ids(
+    intent: dict[str, Any],
+    child_count: int,
+) -> list[str]:
+    """Return stable per-child IDs for newly created split P0/P4 chains."""
+    root_chain_id = lifecycle_birth_intent_economic_chain_id(intent)
+    if child_count <= 1 or int(intent.get("economic_chain_branch_version") or 0) < 1:
+        return [root_chain_id for _ in range(child_count)]
+    return [f"{root_chain_id}_{index}" for index in range(1, child_count + 1)]
 
 
 def lifecycle_remove_birth_intent(row: dict[str, Any], intent: dict[str, Any], cache: dict[str, Any]) -> None:
@@ -9461,9 +9473,6 @@ def lifecycle_materialize_birth_intent(
         for entry in levels
         if isinstance(entry, dict) and str(entry.get("birth_intent_cloid") or "") == cloid_text
     ]
-    for entry in existing_entries:
-        if not str(entry.get("economic_chain_id") or "").strip():
-            entry["economic_chain_id"] = chain_id
     if any(not entry.get("birth_slot") for entry in existing_entries):
         # A pre-twin deployment may already have materialized this cloid as
         # one full-size birth.  Treat it as complete rather than duplicating it.
@@ -9515,12 +9524,33 @@ def lifecycle_materialize_birth_intent(
         persist_lifecycle_intent(cache)
         return False
 
+    branch_chain_ids = lifecycle_birth_branch_chain_ids(intent, len(births))
+    branch_by_slot = {
+        str(birth.get("birth_slot") or "single"): (index, branch_chain_ids[index - 1])
+        for index, birth in enumerate(births, start=1)
+    }
+    branching_enabled = (
+        len(births) > 1
+        and int(intent.get("economic_chain_branch_version") or 0) >= 1
+    )
+    for entry in existing_entries:
+        slot = str(entry.get("birth_slot") or "single")
+        branch = branch_by_slot.get(slot)
+        if branch is None:
+            continue
+        branch_index, branch_chain_id = branch
+        if branching_enabled or not str(entry.get("economic_chain_id") or "").strip():
+            entry["economic_chain_id"] = branch_chain_id
+        if branching_enabled:
+            entry["economic_chain_root_id"] = chain_id
+            entry["economic_chain_branch"] = branch_index
+
     existing = {
         str(entry.get("birth_slot") or "single"): entry
         for entry in existing_entries
     }
     appended: list[dict[str, Any]] = []
-    for birth in births:
+    for branch_index, birth in enumerate(births, start=1):
         slot = str(birth.get("birth_slot") or "single")
         if slot in existing:
             continue
@@ -9529,14 +9559,18 @@ def lifecycle_materialize_birth_intent(
         birth["iteration"] = 0
         birth["birth_source"] = source
         birth["birth_intent_cloid"] = cloid_text
-        birth["economic_chain_id"] = chain_id
+        birth["economic_chain_id"] = branch_chain_ids[branch_index - 1]
+        if branching_enabled:
+            birth["economic_chain_root_id"] = chain_id
+            birth["economic_chain_branch"] = branch_index
         birth["grid_id"] = row.get("id")
         birth["preserve_fill_size"] = True
         birth["status"] = GRID_CHAIN_DEBT_STATUS
         lifecycle_assign_p3_queue_seq(birth, cache)
         levels.append(birth)
         appended.append(birth)
-    lifecycle_remove_birth_intent(row, intent, cache)
+    intent["status"] = "materializing_branches"
+    persist_lifecycle_intent(cache)
     results: dict[str, str] = {}
     for birth in appended:
         result = lifecycle_submit_order(
@@ -9573,6 +9607,7 @@ def lifecycle_materialize_birth_intent(
         coin=ctx["coin"],
         grid_id=row.get("id"),
         economic_chain_id=chain_id,
+        economic_chain_branch_version=(1 if branching_enabled else 0),
         birth_source=source,
         market_oid=intent.get("market_oid"),
         market_side="buy" if market_is_buy else "sell",
@@ -9587,11 +9622,15 @@ def lifecycle_materialize_birth_intent(
                 "status": birth.get("status"),
                 "oid": birth.get("oid"),
                 "p3_queue_seq": birth.get("p3_queue_seq"),
+                "economic_chain_id": birth.get("economic_chain_id"),
+                "economic_chain_root_id": birth.get("economic_chain_root_id"),
+                "economic_chain_branch": birth.get("economic_chain_branch"),
             }
             for birth in births
         ],
         submit_results=results or "already_materialized",
     )
+    lifecycle_remove_birth_intent(row, intent, cache)
     return True
 
 

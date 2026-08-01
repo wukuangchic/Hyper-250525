@@ -723,10 +723,13 @@ exchange = Exchange(wallet, constants.MAINNET_API_URL, account_address="0x主账
 `server_batch.json` 和 Hyperliquid 公共历史接口，不加载私钥，也没有下单、改单或撤单能力。
 
 账本用 `economic_chain_id` 串起一次市价成交、对应反向子单及后续替换单。
-新生成的链号统一为 10 位大小写字母加数字，并在 worker 当前持久化状态内检查重复；
-已有旧链号保持不变，避免历史账本断链。
-P0/P4 的 `economic_chain_id` 与交易所 `cloid` 分开持久化；P7 平移分别继承原 BUY/SELL 链，
-P8 聚合来自多条尾数时才建立新的聚合链。
+新生成的根链号统一为 `C + 北京时间 YYMMDDHHmm + 4 位随机大小写字母`，仅在同一
+worker 运行内防止重复；已有旧链号保持不变，避免历史账本断链。
+P0/P4 的 `economic_chain_id` 与交易所 `cloid` 分开持久化。若实际成交只生成一个反向子单，
+继续使用根链号；若拆成 near/far 或更多层，则按 `_1`、`_2`、`_3` 顺序建立独立分支链。
+账本按每个子单的实际 size 权重，将同一笔 P0/P4 市价成交的数量、手续费和 `closedPnl`
+分摊到各分支；查询界面只显示并统计该订单自己的分支，不再合并兄弟分支。
+P7 平移分别继承原 BUY/SELL 分支链，P8 聚合来自多条尾数时才建立新的聚合链。
 worker 启动时会为尚未关联的 active 单及 P3 `margin/chain_debt` 队列项补链号：
 优先按 birth intent 或来源 OID 归链，没有来源时使用持久化 `p3_queue_seq` 生成稳定链号。
 `p3_queue_seq` 只负责队列顺序，与 `economic_chain_id` 是两个独立字段。
