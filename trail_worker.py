@@ -935,14 +935,21 @@ def lifecycle_process_p7(row: dict[str, Any], ctx: dict[str, Any], cache: dict[s
     buy_residual_size = buy_size - paired_size
     sell_residual_size = sell_size - paired_size
     new_orders = [
-        grid_order_entry(row, ctx["coin"], ctx["asset"], True, new_buy_price, bool(buy_source.get("reduce_only")), size=paired_size, gap=Decimal(str(row["gap_rate"])), preserve_size=True),
-        grid_order_entry(row, ctx["coin"], ctx["asset"], False, new_sell_price, bool(sell_source.get("reduce_only")), size=paired_size, gap=Decimal(str(row["gap_rate"])), preserve_size=True),
+        (
+            grid_order_entry(row, ctx["coin"], ctx["asset"], True, new_buy_price, bool(buy_source.get("reduce_only")), size=paired_size, gap=Decimal(str(row["gap_rate"])), preserve_size=True),
+            buy_source,
+        ),
+        (
+            grid_order_entry(row, ctx["coin"], ctx["asset"], False, new_sell_price, bool(sell_source.get("reduce_only")), size=paired_size, gap=Decimal(str(row["gap_rate"])), preserve_size=True),
+            sell_source,
+        ),
     ]
-    for order in new_orders:
+    for order, source in new_orders:
         order["grid_leg"] = 1
         order["p7_restructure"] = True
         order["p7_source_buy_oid"] = intent.get("buy_oid")
         order["p7_source_sell_oid"] = intent.get("sell_oid")
+        order["economic_chain_id"] = economic_chain_id(row, source)
         order["status"] = GRID_CHAIN_DEBT_STATUS
         order["chain_debt_at"] = ctx["now"]
         lifecycle_assign_p3_queue_seq(order, cache)
@@ -4625,7 +4632,10 @@ def submit_grid_panic_reduce(
         price=order.get("price"),
         size=order.get("size"),
         reduce_only=True,
-        economic_chain_id=str(cloid) if cloid is not None else None,
+        economic_chain_id=(
+            order.get("economic_chain_id")
+            or (str(cloid) if cloid is not None else None)
+        ),
         birth_source="panic",
         grid_id=row.get("id"),
         result=result,
@@ -9182,8 +9192,10 @@ def lifecycle_create_birth_intent(
     cache: dict[str, Any],
 ) -> dict[str, Any]:
     plan = market.get("plan") if isinstance(market.get("plan"), dict) else {}
+    chain_id = new_economic_chain_id()
     intent = {
         "cloid": str(Cloid.from_int(uuid.uuid4().int)),
+        "economic_chain_id": chain_id,
         "source": source,
         "status": "submitting",
         "created_at": now,
@@ -9191,9 +9203,20 @@ def lifecycle_create_birth_intent(
         "market_size": decimal_to_plain(Decimal(str(plan.get("size", market.get("size", "0"))))),
         "market_limit_px": decimal_to_plain(Decimal(str(plan.get("limit_px", market.get("price", "0"))))),
     }
+    market["economic_chain_id"] = chain_id
     lifecycle_birth_intents(row).append(intent)
     persist_lifecycle_intent(cache)
     return intent
+
+
+def lifecycle_birth_intent_economic_chain_id(intent: dict[str, Any]) -> str:
+    """Keep pre-migration cloid chains intact; new intents carry a short ID."""
+    chain_id = str(intent.get("economic_chain_id") or "").strip()
+    if not chain_id:
+        chain_id = str(intent.get("cloid") or "").strip()
+        if chain_id:
+            intent["economic_chain_id"] = chain_id
+    return chain_id
 
 
 def lifecycle_remove_birth_intent(row: dict[str, Any], intent: dict[str, Any], cache: dict[str, Any]) -> None:
@@ -9413,12 +9436,16 @@ def lifecycle_materialize_birth_intent(
         persist_lifecycle_intent(cache)
         return False
     cloid_text = str(intent.get("cloid") or "")
+    chain_id = lifecycle_birth_intent_economic_chain_id(intent)
     levels = row.setdefault("levels", [])
     existing_entries = [
         entry
         for entry in levels
         if isinstance(entry, dict) and str(entry.get("birth_intent_cloid") or "") == cloid_text
     ]
+    for entry in existing_entries:
+        if not str(entry.get("economic_chain_id") or "").strip():
+            entry["economic_chain_id"] = chain_id
     if any(not entry.get("birth_slot") for entry in existing_entries):
         # A pre-twin deployment may already have materialized this cloid as
         # one full-size birth.  Treat it as complete rather than duplicating it.
@@ -9484,7 +9511,7 @@ def lifecycle_materialize_birth_intent(
         birth["iteration"] = 0
         birth["birth_source"] = source
         birth["birth_intent_cloid"] = cloid_text
-        birth["economic_chain_id"] = cloid_text
+        birth["economic_chain_id"] = chain_id
         birth["grid_id"] = row.get("id")
         birth["preserve_fill_size"] = True
         birth["status"] = GRID_CHAIN_DEBT_STATUS
@@ -9527,7 +9554,7 @@ def lifecycle_materialize_birth_intent(
         "grid_birth_materialized",
         coin=ctx["coin"],
         grid_id=row.get("id"),
-        economic_chain_id=cloid_text,
+        economic_chain_id=chain_id,
         birth_source=source,
         market_oid=intent.get("market_oid"),
         market_side="buy" if market_is_buy else "sell",
@@ -9662,7 +9689,7 @@ def lifecycle_submit_limit_chase(row: dict[str, Any], ctx: dict[str, Any], cache
         price=market.get("price"),
         size=market.get("size"),
         reduce_only=bool(plan.get("reduce_only")),
-        economic_chain_id=intent.get("cloid"),
+        economic_chain_id=lifecycle_birth_intent_economic_chain_id(intent),
         birth_source="limit_chase",
         grid_id=row.get("id"),
         result=result,

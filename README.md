@@ -228,7 +228,7 @@ BTC grid --limit -300 0
 - P4 `limit-chase`：raw deficit `< 0` 且 signed 仓位 value 仍在 `--limit` 之外时检查回归方向。P4 只处理减少绝对仓位的方向；任何需要增加风险才能回到 limit 的情况都不会在 P4 构造市价单。减仓数量按当前 signed value 与最近 `--limit` 边界的差额一次性计算，至少为 `2 * base_size`，封顶到当前仓位并强制 reduce-only，避免穿过零仓；确认成交后，以实际 `avgPx` 为锚点并按真实成交量动态出生 near/far 多层 `grid_leg=1` GTC 单。升级前已经存在的 P4 出生意图、反向单和债务继续按原链处理。
 - P5 `anomaly`：只在 raw deficit `< -100` 时运行。记录中的 OID 异常消失后，确认零成交取消时，`grid_leg=1` 以新的 FIFO seq 加入 P3 队尾，`grid_leg=0` 直接从 batch 移除。若交易所返回的 `origSz - sz > 0` 且仍有未成交 `sz`，`grid_leg=0` 仍按实际成交量交给 P2；`grid_leg=1` 的已成交部分终结，未成交部分按原挂单价格进入 P8，不再丢弃整笔残量。
 - P6 `legacy-pause`：仅用于过渡。升级时现有 active 统一记为 `grid_leg=0`，现有 paused 统一转为 `legacy_pause + grid_leg=1`。当 `withdrawable > 3` 时，每个账户（跨 DEX 合并计算）每轮只恢复一张相对盘口最近的 legacy pause；`withdrawable <= 3` 不恢复。恢复后进入普通 P3 债务队列。
-- P7 `debt-restructure`：仅在 `raw deficit < -100` 且 `withdrawable < 5` 时运行；每个账户（跨 DEX、跨币种合并）每轮最多操作一组，且该币种 BUY/SELL 两侧 active 数量都必须 `> 5`。候选币种按债务估值降序处理：`min(active leg1 BUY 总数量, active leg1 SELL 总数量) × 该币种最小下单 value ÷ maxLeverage`；最小下单 value 取该 Grid 的 `min_order_value`，缺省使用系统最小值。已有未完成的 P7 撤单意图优先续处理。满足后选择 active `grid_leg=1` 的最远 BUY 和 SELL（不筛选 reduce-only），撤销两腿后按原跨度围绕当前 mid 对称规划；共同 size 取两腿较小值，较大一腿的剩余 size 按原价格、原方向进入同 Grid 的 P8 桶，不在两侧之间凭空增减。两腿都撤销成功后，成对重组的新单以 `chain_debt` 写入，下一轮进入普通 P3 队列；尾数严格大于 `10 USDC` 时由同轮 P8 晋升，否则继续本地累计。若只有一腿撤销成功，则把已撤销的一腿按原属性恢复为 P3 债务。网络错误和部分撤单结果会持久化意图并在后续轮次重试。
+- P7 `debt-restructure`：仅在 `raw deficit < -100` 且 `withdrawable < 5` 时运行；每个账户（跨 DEX、跨币种合并）每轮最多操作一组，且该币种 BUY/SELL 两侧 active 数量都必须 `> 5`。候选币种按债务估值降序处理：`min(active leg1 BUY 总数量, active leg1 SELL 总数量) × 该币种最小下单 value ÷ maxLeverage`；最小下单 value 取该 Grid 的 `min_order_value`，缺省使用系统最小值。已有未完成的 P7 撤单意图优先续处理。满足后选择 active `grid_leg=1` 的最远 BUY 和 SELL（不筛选 reduce-only），撤销两腿后按原跨度围绕当前 mid 对称规划；共同 size 取两腿较小值，较大一腿的剩余 size 按原价格、原方向进入同 Grid 的 P8 桶，不在两侧之间凭空增减。平移后的 BUY 继续继承原 BUY 的 `economic_chain_id`，SELL 继续继承原 SELL 的链号。两腿都撤销成功后，成对重组的新单以 `chain_debt` 写入，下一轮进入普通 P3 队列；尾数严格大于 `10 USDC` 时由同轮 P8 晋升，否则继续本地累计。若只有一腿撤销成功，则把已撤销的一腿按原属性恢复为 P3 债务。网络错误和部分撤单结果会持久化意图并在后续轮次重试。
 - P8 `partial-debt accumulator`：只处理本地持久化状态，不请求交易所。按同一 Grid 内的 BUY/SELL 分桶，使用 `Σ(剩余 size × 原挂单 price) ÷ Σ剩余 size` 计算加权平均价；累计 value 严格 `> 10 USDC` 后合并为一张保持原总 size 的 `grid_leg=1 + chain_debt`，分配新的 FIFO seq 并进入下一轮 P3 队尾。等于 `10 USDC` 仍留在 P8；不同方向、币种、DEX 或 Grid 永不合并。
 - P9 `withdrawable-tail`：P0-P8 全部完成后，清除账户余额缓存并重新读取一次 withdrawable；严格 `< 1 USDC` 时，每个账户每轮从全部 Grid、DEX、币种的 active 非 reduce-only 单中最多撤一张。排序分数为 `(订单价格 × size ÷ 当前杠杆) × abs(mid - 订单价格) ÷ mid`，即预估占用保证金乘以相对盘口偏离率；选择最高分，交易所确认撤单后保留原 `grid_leg`，以新的 FIFO seq 加入下一轮 P3 队尾。`withdrawable = 1` 不触发。
 - 每轮严格按 `P0 → P1 → P2 → P3 → P4 → P5 → P6 → P7 → P8 → P9 → P10` 执行。P0/P1/P2 必须扫描；P3/P4 仅在 raw deficit `< 0` 时执行；P5 仅在 raw deficit `< -100` 时执行；P6 只受自己的过渡余额条件控制；P7 只受自己的债务重组条件控制；P8 无余额和 action-limit 门槛，只做本地累计与入队；P9 在重新读取的 withdrawable 严格 `< 1` 时执行；P10 每账户每轮每币种最多上提一张已有 active 单，原单与 mid 距离严格 `< 1 * gap` 时跳过，并要求撤单、市价单、反向单至少预留 3 次 action headroom，保证金覆盖率严格大于 `1.1`。
@@ -725,6 +725,8 @@ exchange = Exchange(wallet, constants.MAINNET_API_URL, account_address="0x主账
 账本用 `economic_chain_id` 串起一次市价成交、对应反向子单及后续替换单。
 新生成的链号统一为 10 位大小写字母加数字，并在 worker 当前持久化状态内检查重复；
 已有旧链号保持不变，避免历史账本断链。
+P0/P4 的 `economic_chain_id` 与交易所 `cloid` 分开持久化；P7 平移分别继承原 BUY/SELL 链，
+P8 聚合来自多条尾数时才建立新的聚合链。
 worker 启动时会为尚未关联的 active 单及 P3 `margin/chain_debt` 队列项补链号：
 优先按 birth intent 或来源 OID 归链，没有来源时使用持久化 `p3_queue_seq` 生成稳定链号。
 `p3_queue_seq` 只负责队列顺序，与 `economic_chain_id` 是两个独立字段。

@@ -1334,6 +1334,10 @@ class GridAvgTests(unittest.TestCase):
             self.assertTrue(lifecycle_submit_limit_chase(row, ctx, {"action_limit_headroom": 200, "grid_rows": [row]}))
         self.assertTrue(save_mock.called)
         self.assertEqual(row["birth_market_intents"][0]["status"], "awaiting_reconcile")
+        chain_id = row["birth_market_intents"][0]["economic_chain_id"]
+        cloid = row["birth_market_intents"][0]["cloid"]
+        self.assertRegex(chain_id, r"^[0-9A-Za-z]{10}$")
+        self.assertNotEqual(chain_id, cloid)
 
         class FakeInfo:
             def query_order_by_cloid(self, account, cloid):
@@ -1358,6 +1362,8 @@ class GridAvgTests(unittest.TestCase):
         self.assertTrue(all(entry["grid_leg"] == 1 for entry in row["levels"]))
         self.assertTrue(all(entry["status"] == "active" for entry in row["levels"]))
         self.assertTrue(all(entry["birth_source"] == "limit_chase" for entry in row["levels"]))
+        self.assertTrue(all(entry["economic_chain_id"] == chain_id for entry in row["levels"]))
+        self.assertTrue(all(entry["birth_intent_cloid"] == cloid for entry in row["levels"]))
 
     def test_birth_intent_recovery_completes_missing_far_twin_without_duplicate_near(self) -> None:
         class FakeExchange:
@@ -1425,6 +1431,10 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(exchange.calls, 1)
         self.assertEqual([entry["birth_slot"] for entry in row["levels"]], ["near", "far"])
         self.assertEqual([entry["size"] for entry in row["levels"]], ["0.3", "0.3"])
+        self.assertEqual(
+            [entry["economic_chain_id"] for entry in row["levels"]],
+            [cloid, cloid],
+        )
 
     def test_p0_birth_uses_single_persisted_cloid_submission(self) -> None:
         market = {
@@ -1468,6 +1478,10 @@ class GridAvgTests(unittest.TestCase):
         self.assertTrue(changed)
         self.assertEqual(submit_mock.call_count, 1)
         self.assertEqual(updated["birth_market_intents"][0]["status"], "submitting")
+        chain_id = updated["birth_market_intents"][0]["economic_chain_id"]
+        self.assertRegex(chain_id, r"^[0-9A-Za-z]{10}$")
+        self.assertEqual(market["economic_chain_id"], chain_id)
+        self.assertNotEqual(chain_id, updated["birth_market_intents"][0]["cloid"])
 
     def test_spot_usdc_withdrawable_matches_worker_total_minus_hold(self) -> None:
         self.assertEqual(
@@ -2379,9 +2393,9 @@ class GridAvgTests(unittest.TestCase):
             "gap_rate": "0.01",
             "sz_decimals": 2,
             "levels": [
-                {"side": "buy", "is_buy": True, "status": "active", "grid_leg": 1, "oid": 1, "price": "60", "size": "0.20", "reduce_only": True},
+                {"side": "buy", "is_buy": True, "status": "active", "grid_leg": 1, "oid": 1, "price": "60", "size": "0.20", "reduce_only": True, "economic_chain_id": "BUYCHAIN01"},
                 {"side": "buy", "is_buy": True, "status": "active", "grid_leg": 1, "oid": 2, "price": "90", "size": "3", "reduce_only": False},
-                {"side": "sell", "is_buy": False, "status": "active", "grid_leg": 1, "oid": 3, "price": "110", "size": "0.25", "reduce_only": False},
+                {"side": "sell", "is_buy": False, "status": "active", "grid_leg": 1, "oid": 3, "price": "110", "size": "0.25", "reduce_only": False, "economic_chain_id": "SELLCHAIN1"},
                 {"side": "sell", "is_buy": False, "status": "active", "grid_leg": 1, "oid": 4, "price": "105", "size": "5", "reduce_only": True},
             ],
         }
@@ -2421,6 +2435,10 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual([(entry["side"], entry["price"]) for entry in rebuilt], [("buy", "75"), ("sell", "125")])
         self.assertEqual({entry["status"] for entry in rebuilt}, {GRID_CHAIN_DEBT_STATUS})
         self.assertEqual({entry["size"] for entry in rebuilt}, {"0.2"})
+        self.assertEqual(
+            {entry["side"]: entry["economic_chain_id"] for entry in rebuilt},
+            {"buy": "BUYCHAIN01", "sell": "SELLCHAIN1"},
+        )
         self.assertEqual({entry.get("oid") for entry in rebuilt}, {None})
         self.assertNotIn(1, {entry.get("oid") for entry in row["levels"]})
         self.assertNotIn(3, {entry.get("oid") for entry in row["levels"]})
