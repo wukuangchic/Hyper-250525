@@ -32,6 +32,7 @@ import io
 import json
 import math
 import os
+import sqlite3
 import sys
 import time
 import traceback
@@ -108,6 +109,7 @@ RUNTIME_DIR = Path(
 )
 SERVER_BATCH_PATH = RUNTIME_DIR / "server_batch.json"
 SERVER_BATCH_LOCK_PATH = RUNTIME_DIR / "server_batch.lock"
+ECONOMIC_LEDGER_DB_PATH = RUNTIME_DIR / "grid-economic-ledger.sqlite3"
 SYMMETRIC_SIDE_ALIASES = {"both"}
 GRID_SIDE_ALIASES = {"grid"}
 DEFAULT_GRID_GAP_LABEL = ["auto-minTick", "auto-takerFee", "auto-makerFee"]
@@ -1736,27 +1738,124 @@ def grid_mid_marker_row(current_mid: Decimal) -> dict[str, str]:
         "side": marker,
         "leg": marker,
         "iteration": marker,
+        "source": marker,
         "status": "mid",
         "live": "-",
         "price": f"--- {format_optional_decimal(current_mid)} ---",
         "size": marker,
         "value": marker,
+        "economic_chain_id": marker,
+        "chainPnl": marker,
         "oid": marker,
         "updated": marker,
         "fillPx": marker,
     }
 
 
+def grid_entry_source_display(entry: dict[str, Any]) -> str:
+    if entry.get("p9_restore"):
+        return "P9"
+    if entry.get("p10_replacement") or entry.get("p10_restore"):
+        return "P10"
+    birth_source = str(entry.get("birth_source") or "")
+    if birth_source == "panic":
+        return "P0"
+    if birth_source == "limit_chase":
+        return "P4"
+    if birth_source == "p8_partial_debt":
+        return "P8"
+    if entry.get("p7_restructure"):
+        return "P7"
+    if entry.get("p7_restore"):
+        return "P7R"
+    if entry.get("p6_legacy_pause"):
+        return "P6"
+    if entry.get("replacement_order"):
+        return "P2"
+    return "-"
+
+
+def load_economic_chain_profit_map(
+    db_path: Path = ECONOMIC_LEDGER_DB_PATH,
+) -> dict[str, str] | None:
+    """Read recognized per-chain profit without mutating the ledger."""
+    if not db_path.is_file():
+        return None
+    try:
+        from grid_economic_ledger import chain_summaries
+
+        connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
+        try:
+            return {
+                str(chain["economic_chain_id"]): str(chain["incremental_cash_after_fees"])
+                for chain in chain_summaries(connection)
+            }
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error) as exc:
+        log_event(
+            "grid_query_economic_ledger_error",
+            {"type": type(exc).__name__, "message": str(exc)},
+        )
+        return None
+
+
+def economic_chain_profit_display(
+    entry: dict[str, Any],
+    chain_profits: dict[str, str] | None,
+) -> str:
+    chain_id = str(entry.get("economic_chain_id") or "").strip()
+    if not chain_id:
+        return "-"
+    if chain_profits is None:
+        return "-"
+    profit = Decimal(str(chain_profits.get(chain_id, "0")))
+    text = decimal_to_plain(profit)
+    return f"+{text}" if profit > 0 else text
+
+
+def grid_entry_updated_display(entry: dict[str, Any]) -> str:
+    timestamps: list[int] = []
+    for key in (
+        "updated_at",
+        "submitted_at",
+        "recovered_at",
+        "filled_at",
+        "cancelled_at",
+        "chain_debt_at",
+        "margin_at",
+        "last_error_at",
+        "p8_promoted_at",
+    ):
+        try:
+            value = int(entry.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            timestamps.append(value)
+    if not timestamps:
+        return "-"
+    latest = max(timestamps)
+    return format_timestamp_ms(latest if latest >= 1_000_000_000_000 else latest * 1000)
+
+
 def format_grid_detail_rows(
     row: dict[str, Any],
     open_oids: set[int],
     current_mid: Decimal | None = None,
+    chain_profits: dict[str, str] | None = None,
 ) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     entries = [
         item
         for item in row.get("levels") or []
-        if isinstance(item, dict) and item.get("side") and show_grid_entry_in_detail(item)
+        if (
+            isinstance(item, dict)
+            and item.get("side")
+            and str(item.get("status") or "") not in {"margin", "chain_debt"}
+            and show_grid_entry_in_detail(item)
+        )
     ]
     live_statuses = {
         "active",
@@ -1795,15 +1894,16 @@ def format_grid_detail_rows(
                 "iteration": str(max(0, int(entry.get("iteration") or 0)))
                 if str(entry.get("iteration") or "0").lstrip("-").isdigit()
                 else "0",
+                "source": grid_entry_source_display(entry),
                 "status": display_status,
                 "live": live,
                 "price": format_optional_decimal(entry.get("price", entry.get("limit_px"))),
                 "size": format_optional_quantity(entry.get("size")),
                 "value": format_open_order_value({"limitPx": entry.get("price", entry.get("limit_px")), "sz": entry.get("size")}),
+                "economic_chain_id": str(entry.get("economic_chain_id") or "-"),
+                "chainPnl": economic_chain_profit_display(entry, chain_profits),
                 "oid": str(entry.get("oid", "")),
-                "updated": format_timestamp_ms(int(entry.get("submitted_at") or entry.get("recovered_at") or entry.get("filled_at") or entry.get("cancelled_at") or 0) * 1000)
-                if (entry.get("submitted_at") or entry.get("recovered_at") or entry.get("filled_at") or entry.get("cancelled_at"))
-                else "-",
+                "updated": grid_entry_updated_display(entry),
                 "fillPx": format_optional_decimal(fill.get("px")) if fill else "-",
             }
         )
@@ -1909,14 +2009,16 @@ def format_p3_queue_rows(
     batch_rows: list[dict[str, Any]],
     network: str,
     account: str | None,
+    coin: str | None = None,
+    chain_profits: dict[str, str] | None = None,
 ) -> list[dict[str, str]]:
-    """Format all account-scoped P3 debt entries across coins and DEXes."""
+    """Format account-scoped P3 debt, optionally limited to one queried coin."""
     queue_rows: list[dict[str, str]] = []
     for row in batch_rows:
         if (
             row.get("type") != "grid"
             or str(row.get("status") or "") == "cancelled"
-            or not batch_row_matches_context(row, network, account)
+            or not batch_row_matches_context(row, network, account, coin)
         ):
             continue
         for entry in row.get("levels") or []:
@@ -1943,26 +2045,22 @@ def format_p3_queue_rows(
                     "coin": str(row.get("coin") or ""),
                     "side": str(entry.get("side") or ""),
                     "leg": str(entry.get("grid_leg", "-")),
+                    "iteration": str(max(0, int(entry.get("iteration") or 0)))
+                    if str(entry.get("iteration") or "0").lstrip("-").isdigit()
+                    else "0",
                     "status": status,
-                    "source": (
-                        "P9"
-                        if entry.get("p9_restore")
-                        else "P8"
-                        if str(entry.get("birth_source") or "") == "p8_partial_debt"
-                        else "p7"
-                        if entry.get("p7_restructure")
-                        else "p7_restore"
-                        if entry.get("p7_restore")
-                        else "P6"
-                        if entry.get("p6_legacy_pause")
-                        else "-"
-                    ),
+                    "source": grid_entry_source_display(entry),
                     "reduce": "1" if bool(entry.get("reduce_only")) else "0",
                     "price": format_optional_decimal(entry.get("price", entry.get("limit_px"))),
                     "size": format_optional_quantity(entry.get("size")),
+                    "value": format_open_order_value(
+                        {"limitPx": entry.get("price", entry.get("limit_px")), "sz": entry.get("size")}
+                    ),
+                    "economic_chain_id": str(entry.get("economic_chain_id") or "-"),
+                    "chainPnl": economic_chain_profit_display(entry, chain_profits),
                     "oid": str(entry.get("oid") or "-"),
                     "error": str(entry.get("last_error") or "-"),
-                    "updated": format_timestamp_ms(timestamp_ms) if timestamp_ms else "-",
+                    "updated": grid_entry_updated_display(entry),
                     "_sort": f"{sort_key}{row.get('dex', '')}:{row.get('coin', '')}:{entry.get('side', '')}",
                 }
             )
@@ -1970,8 +2068,14 @@ def format_p3_queue_rows(
     return queue_rows
 
 
-def print_p3_queue(batch_rows: list[dict[str, Any]], network: str, account: str | None) -> None:
-    queue_rows = format_p3_queue_rows(batch_rows, network, account)
+def print_p3_queue(
+    batch_rows: list[dict[str, Any]],
+    network: str,
+    account: str | None,
+    coin: str | None = None,
+    chain_profits: dict[str, str] | None = None,
+) -> None:
+    queue_rows = format_p3_queue_rows(batch_rows, network, account, coin, chain_profits)
     if not queue_rows:
         return
     print_table(
@@ -1979,17 +2083,16 @@ def print_p3_queue(batch_rows: list[dict[str, Any]], network: str, account: str 
         queue_rows,
         [
             ("seq", "seq"),
-            ("dex", "dex"),
-            ("coin", "coin"),
             ("side", "side"),
             ("leg", "leg"),
-            ("status", "status"),
+            ("iteration", "iter"),
             ("source", "source"),
-            ("reduce", "RO"),
+            ("status", "status"),
             ("price", "price"),
             ("size", "size"),
-            ("oid", "oid"),
-            ("error", "error"),
+            ("value", "value"),
+            ("economic_chain_id", "economic_chain_id"),
+            ("chainPnl", "链盈亏"),
             ("updated", "updated"),
         ],
         show_count=True,
@@ -2007,6 +2110,7 @@ def query_grid(args: argparse.Namespace) -> None:
         print("account_role_source:", role)
 
     batch_rows = load_server_batch()
+    chain_profits = load_economic_chain_profit_map()
     print_account_metrics(
         info,
         account,
@@ -2015,7 +2119,7 @@ def query_grid(args: argparse.Namespace) -> None:
     rows = grid_query_rows(batch_rows, args.network, account, coin)
     if not rows:
         print_box("Grid", [("coin", coin), ("status", "not found")])
-        print_p3_queue(batch_rows, args.network, account)
+        print_p3_queue(batch_rows, args.network, account, coin, chain_profits)
         return
 
     open_oids: set[int] = set()
@@ -2077,7 +2181,7 @@ def query_grid(args: argparse.Namespace) -> None:
             ("note", str(row.get("note", ""))),
         ]
         print_box("Grid", summary)
-        detail_rows = format_grid_detail_rows(row, open_oids, current_mid)
+        detail_rows = format_grid_detail_rows(row, open_oids, current_mid, chain_profits)
         print_table(
             "Grid Orders",
             detail_rows,
@@ -2085,18 +2189,18 @@ def query_grid(args: argparse.Namespace) -> None:
                 ("side", "side"),
                 ("leg", "leg"),
                 ("iteration", "iter"),
-                ("status", "status"),
-                ("live", "live"),
+                ("source", "source"),
                 ("price", "price"),
                 ("size", "size"),
                 ("value", "value"),
+                ("economic_chain_id", "economic_chain_id"),
+                ("chainPnl", "链盈亏"),
                 ("oid", "oid"),
                 ("updated", "updated"),
-                ("fillPx", "fillPx"),
             ],
             show_count=False,
         )
-    print_p3_queue(batch_rows, args.network, account)
+    print_p3_queue(batch_rows, args.network, account, coin, chain_profits)
     print_recent_history(info, account, coin=coin, limit=10)
 
 
@@ -2159,7 +2263,12 @@ def query_account(args: argparse.Namespace) -> None:
         show_count=False,
     )
     print_server_batch(batch_rows, args.network, account)
-    print_p3_queue(batch_rows, args.network, account)
+    print_p3_queue(
+        batch_rows,
+        args.network,
+        account,
+        chain_profits=load_economic_chain_profit_map(),
+    )
     print_recent_history(info, account, show_empty=True)
 
 

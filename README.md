@@ -270,7 +270,7 @@ BTC --cancel grid
 ```
 
 - `BTC grid --recover --limit -300 300 --gap 0.5%` 会把当前该币普通 limit open orders 接管为 `grid_leg=0`，用于服务器断点或 JSON 丢失后的人工恢复。
-- `BTC grid --query` 会展示该币 grid 的 limit/min/gap/仓位、买卖两边 active 数量、每张子单的 oid/价格/状态/live 情况和最近成交，并额外显示当前账户跨 DEX/跨币种的全部 `P3 Queue`；P3 队列显示持久化 FIFO 序号，便于回溯。
+- `BTC grid --query` 会展示该币 grid 的 limit/min/gap/仓位、买卖两边 active 数量，并把订单分成两个互不重复的区域：`Grid Orders` 不显示 `margin/chain_debt`，列出 side/leg/iter/source/price/size/value/economic_chain_id/链盈亏/oid/updated；`P3 Queue` 只显示本次查询币种的债务，列出 seq/side/leg/iter/source/status/price/size/value/economic_chain_id/链盈亏/updated。链盈亏从只读经济账本加载，未闭合或尚无成交的链显示 `0`，账本不可读时显示 `-`。账户总览仍显示跨币种的完整 P3 队列。
 - `BTC --cancel grid` 会取消服务器维护的网格和所有活跃子单。
 
 ### Worker 行为

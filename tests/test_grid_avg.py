@@ -3743,6 +3743,32 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual([item["price"] for item in rows], ["105.00", "103.00", "101.00", "99.00"])
         self.assertEqual([item["iteration"] for item in rows], ["0", "0", "0", "0"])
 
+    def test_grid_detail_excludes_p3_and_displays_chain_source_and_profit(self) -> None:
+        row = {
+            "levels": [
+                {
+                    "side": "sell", "status": "active", "oid": 1,
+                    "price": "101", "size": "0.2", "grid_leg": 1,
+                    "iteration": 3, "birth_source": "panic",
+                    "economic_chain_id": "CHAIN00001", "submitted_at": 10,
+                },
+                {
+                    "side": "buy", "status": "chain_debt", "price": "99",
+                    "size": "0.2", "grid_leg": 1, "p3_queue_seq": 5,
+                    "economic_chain_id": "CHAIN00002", "chain_debt_at": 11,
+                },
+            ]
+        }
+
+        rows = format_grid_detail_rows(
+            row, {1}, chain_profits={"CHAIN00001": "0.00533"}
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["source"], "P0")
+        self.assertEqual(rows[0]["economic_chain_id"], "CHAIN00001")
+        self.assertEqual(rows[0]["chainPnl"], "+0.00533")
+
     def test_grid_detail_rows_insert_mid_marker_by_price(self) -> None:
         row = {
             "levels": [
@@ -8582,7 +8608,7 @@ class GridAvgTests(unittest.TestCase):
         display_rows = format_p3_queue_rows(rows, "mainnet", "0xabc")
 
         self.assertEqual([(row["coin"], row["status"], row["source"]) for row in display_rows], [
-            ("BTC", "chain_debt", "p7"),
+            ("BTC", "chain_debt", "P7"),
             ("xyz:SPCX", "margin", "P6"),
             ("JPY", "chain_debt", "P8"),
             ("HYPE", "chain_debt", "P9"),
@@ -8590,6 +8616,19 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual([row["seq"] for row in display_rows], ["1", "2", "3", "4"])
         self.assertEqual(display_rows[0]["price"], "60.00")
         self.assertEqual(display_rows[1]["error"], "Insufficient margin")
+
+        btc_rows = format_p3_queue_rows(
+            rows,
+            "mainnet",
+            "0xabc",
+            "BTC",
+            {"missing-chain": "1"},
+        )
+        self.assertEqual(len(btc_rows), 1)
+        self.assertEqual(btc_rows[0]["coin"], "BTC")
+        self.assertEqual(btc_rows[0]["source"], "P7")
+        self.assertEqual(btc_rows[0]["iteration"], "0")
+        self.assertEqual(btc_rows[0]["value"], "60.00")
 
     def test_grid_plan_persists_base_and_effective_values(self) -> None:
         class FakeInfo:
