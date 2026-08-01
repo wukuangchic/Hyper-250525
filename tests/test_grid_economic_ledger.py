@@ -91,6 +91,8 @@ class GridEconomicLedgerTests(unittest.TestCase):
                 self.assertEqual(chain["net_size"], "0")
                 self.assertEqual(chain["cash_flow"], "10")
                 self.assertEqual(chain["incremental_cash_after_fees"], "9.8")
+                self.assertEqual(chain["unclosed_cash_flow_after_fees"], "0")
+                self.assertTrue(chain["profit_recognized"])
                 self.assertEqual(chain["exchange_closed_pnl"], "-50")
                 self.assertEqual(
                     chain["origins"],
@@ -137,6 +139,9 @@ class GridEconomicLedgerTests(unittest.TestCase):
                 chain = chain_summaries(connection)[0]
                 self.assertFalse(chain["flat"])
                 self.assertEqual(chain["net_size"], "-1")
+                self.assertEqual(chain["incremental_cash_after_fees"], "0")
+                self.assertEqual(chain["unclosed_cash_flow_after_fees"], "109.9")
+                self.assertFalse(chain["profit_recognized"])
             finally:
                 connection.close()
 

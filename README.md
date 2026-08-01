@@ -731,7 +731,9 @@ worker 启动时会为尚未关联的 active 单及 P3 `margin/chain_debt` 队�
 优先按 birth intent 或来源 OID 归链，没有来源时使用持久化 `p3_queue_seq` 生成稳定链号。
 `p3_queue_seq` 只负责队列顺序，与 `economic_chain_id` 是两个独立字段。
 只有买卖数量完全回到净零的链才进入 `flat_incremental_cash_after_fees`；
-尚未回补的链保留在 `open`，不会提前算作已落袋利润。交易所的
+尚未回补的链保留在 `open`，其 `incremental_cash_after_fees` 和统计盈利统一记为 `0`，
+不会提前算作已落袋利润；未闭合期间的原始净现金流单独保存在
+`unclosed_cash_flow_after_fees`，仅用于追溯，不能当作盈利。交易所的
 `closedPnl` 仍单独保存，便于同时比较账户会计口径和“高卖低接”的增量现金口径。
 
 服务器默认每五分钟运行一次：

@@ -554,6 +554,8 @@ def chain_summaries(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     summaries: list[dict[str, Any]] = []
     for item in grouped.values():
         flat = abs(item["net_size"]) <= Decimal("0.000000000001")
+        raw_cash_after_fees = item["cash_flow"] - item["fees"]
+        recognized_profit = raw_cash_after_fees if flat else Decimal("0")
         summaries.append(
             {
                 "economic_chain_id": item["economic_chain_id"],
@@ -565,9 +567,13 @@ def chain_summaries(connection: sqlite3.Connection) -> list[dict[str, Any]]:
                 "net_size": decimal_text(item["net_size"]),
                 "cash_flow": decimal_text(item["cash_flow"]),
                 "fees": decimal_text(item["fees"]),
-                "incremental_cash_after_fees": decimal_text(item["cash_flow"] - item["fees"]),
+                "incremental_cash_after_fees": decimal_text(recognized_profit),
+                "unclosed_cash_flow_after_fees": decimal_text(
+                    Decimal("0") if flat else raw_cash_after_fees
+                ),
                 "exchange_closed_pnl": decimal_text(item["closed_pnl"]),
                 "flat": flat,
+                "profit_recognized": flat,
                 "oid_count": len(item["oids"]),
             }
         )
