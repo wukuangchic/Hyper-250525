@@ -9850,6 +9850,13 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
             )
             if market is not None:
                 intent = lifecycle_create_birth_intent(row, market, "panic", ctx["now"], cache)
+                account_key = lifecycle_row_account_key(row, ctx["network"], ctx["account"])
+                p0_attempt_key = (*account_key, ctx["coin"])
+                # Creating the persisted intent commits this worker round to P0
+                # for the account/coin. Block later P4/P10 starts even when the
+                # exchange result is rejected, times out, or needs reconciliation.
+                cache.setdefault("lifecycle_p0_attempted_coins", set()).add(p0_attempt_key)
+                counters["p0_attempted"] = int(counters.get("p0_attempted") or 0) + 1
                 try:
                     submitted = submit_grid_panic_reduce(
                         ctx["exchange"], ctx["coin"], market, ctx["now"], row, cache,
@@ -9951,7 +9958,19 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
 
     elif phase == GRID_LIFECYCLE_PHASE_P4:
         if raw_action_limit_deficit(cache) < 0:
-            if lifecycle_submit_limit_chase(row, ctx, cache):
+            account_key = lifecycle_row_account_key(row, ctx["network"], ctx["account"])
+            attempt_key = (*account_key, ctx["coin"])
+            if attempt_key in cache.setdefault("lifecycle_p0_attempted_coins", set()):
+                audited = cache.setdefault("lifecycle_p4_after_p0_audited", set())
+                if attempt_key not in audited:
+                    audited.add(attempt_key)
+                    audit_grid_action(
+                        "grid_p4_after_p0_skipped",
+                        network=attempt_key[0],
+                        account=attempt_key[1],
+                        coin=attempt_key[2],
+                    )
+            elif lifecycle_submit_limit_chase(row, ctx, cache):
                 counters["p4_births"] = int(counters.get("p4_births") or 0) + 1
                 changed = True
 
@@ -10032,8 +10051,20 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
         attempted = cache.setdefault("lifecycle_p10_coins", set())
         existing_intent = lifecycle_p10_intent(row)
         # Reconcile every persisted intent, but start at most one new P10
-        # promotion per account/coin in this worker round.
-        if existing_intent is not None or attempt_key not in attempted:
+        # promotion per account/coin in this worker round. A P0 attempt blocks
+        # only a new promotion; persisted P10 intents must still be reconciled.
+        p0_attempted = attempt_key in cache.setdefault("lifecycle_p0_attempted_coins", set())
+        if existing_intent is None and p0_attempted:
+            audited = cache.setdefault("lifecycle_p10_after_p0_audited", set())
+            if attempt_key not in audited:
+                audited.add(attempt_key)
+                audit_grid_action(
+                    "grid_p10_after_p0_skipped",
+                    network=attempt_key[0],
+                    account=attempt_key[1],
+                    coin=attempt_key[2],
+                )
+        elif existing_intent is not None or attempt_key not in attempted:
             p10_changed = lifecycle_process_p10(row, ctx, cache)
             if p10_changed:
                 attempted.add(attempt_key)

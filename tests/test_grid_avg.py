@@ -1589,6 +1589,91 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(market["economic_chain_id"], chain_id)
         self.assertNotEqual(chain_id, updated["birth_market_intents"][0]["cloid"])
 
+    def test_p0_attempt_blocks_new_p4_and_p10_for_coin_in_same_worker_round(self) -> None:
+        market = {
+            "side": "buy", "is_buy": True, "price": "100", "size": "0.3",
+            "plan": {
+                "is_buy": True, "size": Decimal("0.3"), "limit_px": Decimal("100"),
+                "order_type": {"limit": {"tif": "Ioc"}},
+            },
+        }
+        row = {
+            "type": "grid", "status": "active", "grid_lifecycle_version": 2,
+            "network": "mainnet", "account": "0xabc", "coin": "BTC",
+            "gap_rate": "0.01", "levels": [],
+        }
+        ctx = {
+            "network": "mainnet", "account": "0xabc", "coin": "BTC",
+            "asset": {"szDecimals": 2, "maxLeverage": 20}, "exchange": object(),
+            "info": object(), "now": 123, "now_ms": 123000,
+            "position_size": Decimal("-1"), "position_value": Decimal("-100"),
+            "current_mid": Decimal("100"), "best_bid": Decimal("99.9"), "best_ask": Decimal("100.1"),
+            "withdrawable": Decimal("10"), "liquidation_px": Decimal("120"),
+            "open_orders": [], "open_oids": set(), "fills_by_oid": {},
+        }
+        cache = {
+            "grid_action_phase": "p0", "grid_rows": [row], "action_limit_headroom": 200,
+        }
+
+        with (
+            patch("trail_worker.lifecycle_context", return_value=ctx),
+            patch("trail_worker.lifecycle_reconcile_birth_intents", return_value=False),
+            patch("trail_worker.grid_panic_ratio", return_value=Decimal("0")),
+            patch("trail_worker.grid_panic_ratio_threshold", return_value=Decimal("1")),
+            patch("trail_worker.build_grid_panic_reduce_order", return_value=market),
+            patch("trail_worker.submit_grid_panic_reduce", side_effect=TimeoutError("unknown result")),
+            patch("trail_worker.lifecycle_submit_limit_chase") as p4_submit,
+            patch("trail_worker.lifecycle_process_p10") as p10_process,
+            patch("trail_worker.audit_grid_action") as audit_mock,
+            patch("trail_worker.save_server_batch"),
+        ):
+            maintain_grid(row, cache)
+            attempt_key = ("mainnet", "0xabc", "BTC")
+            self.assertIn(attempt_key, cache["lifecycle_p0_attempted_coins"])
+            self.assertEqual(cache["grid_lifecycle_counters"][id(row)]["p0_attempted"], 1)
+
+            cache["grid_action_phase"] = "p4"
+            maintain_grid(row, cache)
+            cache["grid_action_phase"] = "p10"
+            maintain_grid(row, cache)
+
+        p4_submit.assert_not_called()
+        p10_process.assert_not_called()
+        self.assertEqual(
+            [call.args[0] for call in audit_mock.call_args_list],
+            ["grid_p4_after_p0_skipped", "grid_p10_after_p0_skipped"],
+        )
+
+    def test_p0_attempt_does_not_block_existing_p10_intent_reconciliation(self) -> None:
+        row = {
+            "type": "grid", "status": "active", "grid_lifecycle_version": 2,
+            "network": "mainnet", "account": "0xabc", "coin": "BTC",
+            "levels": [],
+            "p10_promotion_intent": {"cloid": "0x1", "status": "awaiting_reconcile"},
+        }
+        ctx = {
+            "network": "mainnet", "account": "0xabc", "coin": "BTC",
+            "asset": {"szDecimals": 2, "maxLeverage": 20}, "exchange": object(),
+            "info": object(), "now": 123, "now_ms": 123000,
+            "position_size": Decimal("1"), "position_value": Decimal("100"),
+            "current_mid": Decimal("100"), "best_bid": Decimal("99.9"), "best_ask": Decimal("100.1"),
+            "withdrawable": Decimal("10"), "liquidation_px": Decimal("80"),
+            "open_orders": [], "open_oids": set(), "fills_by_oid": {},
+        }
+        cache = {
+            "grid_action_phase": "p10", "grid_rows": [row], "action_limit_headroom": 200,
+            "lifecycle_p0_attempted_coins": {("mainnet", "0xabc", "BTC")},
+        }
+
+        with (
+            patch("trail_worker.lifecycle_context", return_value=ctx),
+            patch("trail_worker.lifecycle_process_p10", return_value=True) as p10_process,
+        ):
+            _updated, changed = maintain_grid(row, cache)
+
+        self.assertTrue(changed)
+        p10_process.assert_called_once()
+
     def test_spot_usdc_withdrawable_matches_worker_total_minus_hold(self) -> None:
         self.assertEqual(
             spot_usdc_withdrawable(
