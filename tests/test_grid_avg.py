@@ -867,6 +867,37 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(row["p8_partial_debts"][0]["size"], "0.01")
         self.assertEqual(row["p8_partial_debts"][0]["weighted_notional"], "1.7069")
 
+    def test_p2_resized_reduce_only_cancel_without_fill_waits_for_p5(self) -> None:
+        class FakeInfo:
+            def query_order_by_oid(self, account, oid):
+                return {
+                    "status": "order",
+                    "order": {
+                        "order": {"oid": oid, "origSz": "0.10", "sz": "0.04"},
+                        "status": "reduceOnlyCanceled",
+                    },
+                }
+
+        source = {
+            "side": "sell", "is_buy": False, "status": "active", "oid": 9,
+            "grid_leg": 1, "iteration": 1, "price": "118.17", "size": "0.10",
+        }
+        row = {"gap_rate": "0.01", "levels": [source]}
+        ctx = {
+            "coin": "xyz:SPCX", "asset": {"szDecimals": 2, "maxLeverage": 20},
+            "exchange": object(), "now": 124, "position_size": Decimal("2.3"),
+            "current_mid": Decimal("109"), "best_bid": Decimal("108.99"),
+            "best_ask": Decimal("109.01"), "open_orders": [], "open_oids": set(),
+            "fills_by_oid": {}, "info": FakeInfo(), "account": "0xabc",
+        }
+
+        count, changed = lifecycle_process_fills(row, ctx, {"action_limit_headroom": 200})
+
+        self.assertFalse(changed)
+        self.assertEqual(count, 0)
+        self.assertEqual(source["status"], "active")
+        self.assertEqual(source["size"], "0.10")
+
     def test_full_fill_with_zero_remainder_is_not_partial(self) -> None:
         order_status = {
             "status": "order",

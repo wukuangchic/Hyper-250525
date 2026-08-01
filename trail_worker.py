@@ -8976,7 +8976,15 @@ def lifecycle_process_fills(
         order_status = None
         if fill is None or lifecycle_leg(entry) == 1:
             order_status = ctx["info"].query_order_by_oid(ctx["account"], oid)
-        partial_fill_size = grid_order_status_partial_fill_size(order_status)
+        # ``origSz > sz`` can also be caused by an in-place resize.  In P2,
+        # only a fill record keyed by this OID authorizes the partial-fill
+        # bookkeeping and P8 remainder path; otherwise leave the order for
+        # P5 to classify as an intact, zero-fill cancellation.
+        partial_fill_size = (
+            grid_order_status_partial_fill_size(order_status)
+            if fill is not None
+            else None
+        )
         if partial_fill_size is not None:
             entry["filled_size"] = decimal_to_plain(partial_fill_size)
             entry["confirmed_partial_filled_oid"] = oid
