@@ -7779,15 +7779,22 @@ def lifecycle_context(row: dict[str, Any], cache: dict[str, Any]) -> dict[str, A
         GRID_LIFECYCLE_PHASE_P6,
         GRID_LIFECYCLE_PHASE_P10,
     }
-    needs_book = phase in {
+    # P0/P4/P10 submit IOC actions from the fresh mid, then fixed-price GTC
+    # children without outward ALO search. P2 needs the book only after it has
+    # confirmed a fill and is actually about to place a replacement. P3 is the
+    # only phase that always needs a book up front.
+    needs_book = phase == GRID_LIFECYCLE_PHASE_P3
+    needs_position = phase in {
         GRID_LIFECYCLE_PHASE_P0,
         GRID_LIFECYCLE_PHASE_P2,
         GRID_LIFECYCLE_PHASE_P3,
         GRID_LIFECYCLE_PHASE_P4,
         GRID_LIFECYCLE_PHASE_P10,
     }
-    needs_position = needs_book
-    needs_withdrawable = phase != GRID_LIFECYCLE_PHASE_P5
+    needs_withdrawable = phase not in {
+        GRID_LIFECYCLE_PHASE_P4,
+        GRID_LIFECYCLE_PHASE_P5,
+    }
     needs_open_orders = phase in {
         GRID_LIFECYCLE_PHASE_P0,
         GRID_LIFECYCLE_PHASE_P2,
@@ -7912,6 +7919,21 @@ def lifecycle_context(row: dict[str, Any], cache: dict[str, Any]) -> dict[str, A
         "open_oids": open_oids,
         "fills_by_oid": fills_by_oid,
     }
+
+
+def lifecycle_ensure_context_book(ctx: dict[str, Any], cache: dict[str, Any]) -> None:
+    """Load one fresh book only when an action needs outward price protection."""
+    if ctx.get("best_bid") is not None or ctx.get("best_ask") is not None:
+        return
+    network = str(ctx.get("network") or "mainnet")
+    coin = str(ctx.get("coin") or "")
+    if not coin:
+        return
+    books_key = (network, coin)
+    books = cache.setdefault("books", {})
+    if books_key not in books:
+        books[books_key] = best_bid_ask(ctx["info"], coin)
+    ctx["best_bid"], ctx["best_ask"] = books[books_key]
 
 
 def lifecycle_row_account_key(row: dict[str, Any], network: str, account: str) -> tuple[str, str]:
@@ -9073,6 +9095,7 @@ def lifecycle_process_fills(
         if child is None:
             source["last_error"] = "filled lifecycle order could not build its replacement"
             continue
+        lifecycle_ensure_context_book(ctx, cache)
         result = lifecycle_submit_order(
             ctx["exchange"], ctx["coin"], child, ctx["now"], row, ctx["asset"],
             ctx["position_size"], ctx["current_mid"], ctx["best_bid"], ctx["best_ask"],
@@ -10249,7 +10272,13 @@ def run_once() -> None:
             # following phase. Clearing after local-only P8 forces P9 to read
             # withdrawable again, and clearing after P9 gives P10 a fresh
             # position, order, and margin snapshot before any promotion.
-            for cache_name in ("mids", "books", "user_states", "spot_user_states", "fills"):
+            cache_names = ["books", "user_states", "spot_user_states", "fills"]
+            # P6 only ranks legacy pauses and does not submit an order. Reuse
+            # the P4 mid snapshot across local/anomaly-only P5, then clear it
+            # after P6 so every later action phase still gets a fresh price.
+            if phase not in {GRID_LIFECYCLE_PHASE_P4, GRID_LIFECYCLE_PHASE_P5}:
+                cache_names.append("mids")
+            for cache_name in cache_names:
                 grid_cache.pop(cache_name, None)
             # Our own open-order delta is reconciled after every exchange phase;
             # retaining it avoids losing a just-submitted child before the

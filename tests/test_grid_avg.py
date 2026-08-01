@@ -576,6 +576,14 @@ class GridAvgTests(unittest.TestCase):
         self.assertTrue(lifecycle_active_price_too_close(row, "buy", Decimal("100")))
 
     def test_p2_replaces_filled_leg_and_removes_source(self) -> None:
+        class FakeInfo:
+            def __init__(self):
+                self.book_calls = 0
+
+            def l2_snapshot(self, coin):
+                self.book_calls += 1
+                return {"levels": [[{"px": "99.9"}], [{"px": "100.1"}]]}
+
         class FakeExchange:
             def order(self, coin, is_buy, size, price, order_type, reduce_only=False):
                 self.request = (coin, is_buy, size, price, order_type, reduce_only)
@@ -587,11 +595,12 @@ class GridAvgTests(unittest.TestCase):
         }
         row = {"gap_rate": "0.01", "min_order_value": "10", "base_buy_size": "0.4", "base_sell_size": "0.4", "levels": [source]}
         exchange = FakeExchange()
+        info = FakeInfo()
         ctx = {
-            "coin": "BTC", "asset": {"szDecimals": 2, "maxLeverage": 20}, "exchange": exchange,
+            "network": "mainnet", "coin": "BTC", "asset": {"szDecimals": 2, "maxLeverage": 20}, "exchange": exchange,
             "now": 123, "position_size": Decimal("1"), "current_mid": Decimal("100"),
-            "best_bid": Decimal("99.9"), "best_ask": Decimal("100.1"), "open_orders": [],
-            "open_oids": set(), "fills_by_oid": {}, "info": object(), "account": "0xabc",
+            "best_bid": None, "best_ask": None, "open_orders": [],
+            "open_oids": set(), "fills_by_oid": {}, "info": info, "account": "0xabc",
         }
 
         count, changed = lifecycle_process_fills(row, ctx, {"action_limit_headroom": 100})
@@ -605,6 +614,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(child["side"], "sell")
         self.assertEqual(child["status"], "active")
         self.assertTrue(exchange.request[-1])
+        self.assertEqual(info.book_calls, 1)
 
     def test_p2_iteration_counts_each_alo_submit_after_outward_rejects(self) -> None:
         class FakeExchange:
@@ -3087,7 +3097,12 @@ class GridAvgTests(unittest.TestCase):
         info = FakeInfo()
 
         def fake_maintain_grid(row: dict, cache: dict) -> tuple[dict, bool]:
-            seen.append((cache.get("user_states"), cache.get("mids"), cache.get("action_limit_p1_budget_remaining")))
+            seen.append((
+                cache.get("grid_action_phase"),
+                cache.get("user_states"),
+                cache.get("mids"),
+                cache.get("action_limit_p1_budget_remaining"),
+            ))
             cache["user_states"] = {"stale": True}
             cache["account_margin_ratios"] = {"stale": True}
             cache["open_orders"] = {"stale": True}
@@ -3106,9 +3121,13 @@ class GridAvgTests(unittest.TestCase):
         ):
             run_once()
 
-        self.assertEqual(seen[0], (None, None, None))
-        self.assertEqual(seen[1], (None, None, 3))
-        self.assertEqual(seen[-1][:2], (None, None))
+        self.assertEqual(seen[0], ("p0", None, None, None))
+        self.assertEqual(seen[1], ("p1", None, None, 3))
+        first_p5 = next(item for item in seen if item[0] == "p5")
+        first_p6 = next(item for item in seen if item[0] == "p6")
+        self.assertEqual(first_p5[:3], ("p5", None, {"shared": True}))
+        self.assertEqual(first_p6[:3], ("p6", None, {"shared": True}))
+        self.assertEqual(seen[-1][:3], ("p10", None, None))
         self.assertEqual(info.clear_calls, 10)
 
     def test_lifecycle_context_fetches_only_phase_required_data_and_keeps_asset_metadata(self) -> None:
@@ -3165,7 +3184,7 @@ class GridAvgTests(unittest.TestCase):
             lifecycle_context(row, cache)
             self.assertEqual(
                 info.calls,
-                {"meta": 1, "mids": 1, "book": 1, "state": 1, "spot": 1, "open": 1, "fills": 1, "rate": 1},
+                {"meta": 1, "mids": 1, "book": 0, "state": 1, "spot": 1, "open": 1, "fills": 1, "rate": 1},
             )
 
             for name in ("mids", "books", "user_states", "spot_user_states", "fills"):
@@ -3174,7 +3193,7 @@ class GridAvgTests(unittest.TestCase):
             lifecycle_context(row, cache)
             self.assertEqual(info.calls["meta"], 1)
             self.assertEqual(info.calls["mids"], 1)
-            self.assertEqual(info.calls["book"], 1)
+            self.assertEqual(info.calls["book"], 0)
             self.assertEqual(info.calls["state"], 1)
             self.assertEqual(info.calls["spot"], 2)
             self.assertEqual(info.calls["open"], 1)
@@ -3186,7 +3205,7 @@ class GridAvgTests(unittest.TestCase):
             lifecycle_context(row, cache)
             self.assertEqual(info.calls["meta"], 1)
             self.assertEqual(info.calls["mids"], 1)
-            self.assertEqual(info.calls["book"], 1)
+            self.assertEqual(info.calls["book"], 0)
             self.assertEqual(info.calls["state"], 1)
             self.assertEqual(info.calls["spot"], 2)
             self.assertEqual(info.calls["open"], 1)
@@ -3198,11 +3217,27 @@ class GridAvgTests(unittest.TestCase):
             lifecycle_context(row, cache)
             self.assertEqual(info.calls["meta"], 1)
             self.assertEqual(info.calls["mids"], 2)
-            self.assertEqual(info.calls["book"], 2)
+            self.assertEqual(info.calls["book"], 0)
             self.assertEqual(info.calls["state"], 2)
             self.assertEqual(info.calls["spot"], 3)
             self.assertEqual(info.calls["open"], 1)
             self.assertEqual(info.calls["fills"], 3)
+
+            for name in ("mids", "books", "user_states", "spot_user_states", "fills"):
+                cache.pop(name, None)
+            cache["grid_action_phase"] = "p4"
+            lifecycle_context(row, cache)
+            self.assertEqual(info.calls["book"], 0)
+            self.assertEqual(info.calls["state"], 3)
+            self.assertEqual(info.calls["spot"], 3)
+
+            for name in ("mids", "books", "user_states", "spot_user_states", "fills"):
+                cache.pop(name, None)
+            cache["grid_action_phase"] = "p3"
+            lifecycle_context(row, cache)
+            self.assertEqual(info.calls["book"], 1)
+            self.assertEqual(info.calls["state"], 4)
+            self.assertEqual(info.calls["spot"], 4)
 
     def test_limit_chase_p3_waits_every_ten_seconds_for_market_and_replacement_capacity(self) -> None:
         class FakeInfo:
