@@ -9104,9 +9104,11 @@ def lifecycle_process_anomalies(row: dict[str, Any], ctx: dict[str, Any], cache:
         if oid in ctx["open_oids"]:
             continue
         fill = ctx["fills_by_oid"].get(oid)
-        order_status = None if fill is not None else ctx["info"].query_order_by_oid(ctx["account"], oid)
-        status_name = "filled" if fill is not None else grid_order_status_name(order_status)
-        if status_name == "filled":
+        order_status = None
+        if fill is None or lifecycle_leg(entry) == 1:
+            order_status = ctx["info"].query_order_by_oid(ctx["account"], oid)
+        status_name = grid_order_status_name(order_status)
+        if status_name == "filled" or (fill is not None and not status_name):
             entry["status"] = "filled"
             entry["fill"] = fill if fill is not None else entry.get("fill")
             entry["replacement_pending"] = True
@@ -9116,7 +9118,16 @@ def lifecycle_process_anomalies(row: dict[str, Any], ctx: dict[str, Any], cache:
         if status_name.strip().lower() in {"open", "resting"}:
             continue
         if status_name == "reduceOnlyCanceled" or grid_order_status_is_cancelled(order_status):
-            partial_fill_size = grid_order_status_partial_fill_size(order_status)
+            # A smaller exchange ``sz`` is not sufficient proof of a fill:
+            # an order may have been resized in place before the exchange
+            # canceled it.  Only a fill record keyed by this OID can certify
+            # the partial-fill -> P8 path.  Otherwise preserve the local
+            # original size and send the whole leg-1 debt to the P3 tail.
+            partial_fill_size = (
+                grid_order_status_partial_fill_size(order_status)
+                if fill is not None
+                else None
+            )
             if partial_fill_size is not None:
                 partial_remainder = grid_order_status_partial_remainder(order_status)
                 entry["status"] = "filled"
@@ -9166,6 +9177,8 @@ def lifecycle_process_anomalies(row: dict[str, Any], ctx: dict[str, Any], cache:
             entry["p5_restore_queued_at"] = ctx["now"]
             # This is a new debt event, so it joins the current queue tail
             # instead of reclaiming a FIFO position from an earlier debt.
+            # Keep the existing economic chain: P5->P3 is recovery of the
+            # same lifecycle leg, not a new economic birth.
             entry.pop("p3_queue_seq", None)
             lifecycle_assign_p3_queue_seq(entry, cache)
             levels.remove(entry)

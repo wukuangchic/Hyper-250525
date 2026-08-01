@@ -653,7 +653,10 @@ class GridAvgTests(unittest.TestCase):
             {"gap_rate": "0.01", "min_order_value": "10", "base_buy_size": "1", "base_sell_size": "1"},
             "BTC", {"szDecimals": 2}, False, Decimal("101"), True, size=Decimal("1"), preserve_size=True,
         )
-        entry.update({"status": "active", "oid": 9, "grid_leg": 1, "p3_queue_seq": 99})
+        entry.update({
+            "status": "active", "oid": 9, "grid_leg": 1, "p3_queue_seq": 99,
+            "economic_chain_id": "CHAIN-ORIGINAL",
+        })
         prior_debt = {"status": GRID_CHAIN_DEBT_STATUS, "grid_leg": 1, "p3_queue_seq": 4}
         row = {
             "gap_rate": "0.01", "min_order_value": "10", "base_buy_size": "1", "base_sell_size": "1",
@@ -663,7 +666,8 @@ class GridAvgTests(unittest.TestCase):
             "coin": "BTC", "asset": {"szDecimals": 2, "maxLeverage": 20}, "exchange": object(),
             "now": 123, "position_size": Decimal("1"), "current_mid": Decimal("100"),
             "best_bid": Decimal("99.9"), "best_ask": Decimal("100.1"), "open_orders": [],
-            "open_oids": set(), "fills_by_oid": {}, "info": FakeInfo(), "account": "0xabc",
+            "open_oids": set(), "fills_by_oid": {},
+            "info": FakeInfo(), "account": "0xabc",
         }
 
         count, changed = lifecycle_process_anomalies(row, ctx, {"action_limit_headroom": 200, "grid_rows": [row]})
@@ -697,13 +701,17 @@ class GridAvgTests(unittest.TestCase):
             "xyz:SKHY", {"szDecimals": 2}, False, Decimal("170.69"), True,
             size=Decimal("0.07"), preserve_size=True,
         )
-        entry.update({"status": "active", "oid": 9, "grid_leg": 1, "p3_queue_seq": 99})
+        entry.update({
+            "status": "active", "oid": 9, "grid_leg": 1, "p3_queue_seq": 99,
+            "economic_chain_id": "CHAIN-ORIGINAL",
+        })
         row = {"gap_rate": "0.01", "levels": [entry]}
         ctx = {
             "coin": "xyz:SKHY", "asset": {"szDecimals": 2, "maxLeverage": 20}, "exchange": object(),
             "now": 123, "position_size": Decimal("1"), "current_mid": Decimal("170"),
             "best_bid": Decimal("169.9"), "best_ask": Decimal("170.1"), "open_orders": [],
-            "open_oids": set(), "fills_by_oid": {}, "info": FakeInfo(), "account": "0xabc",
+            "open_oids": set(), "fills_by_oid": {9: {"oid": 9, "sz": "0.06", "px": "170.69"}},
+            "info": FakeInfo(), "account": "0xabc",
         }
 
         count, changed = lifecycle_process_anomalies(row, ctx, {"action_limit_headroom": 200, "grid_rows": [row]})
@@ -724,6 +732,50 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(bucket["weighted_avg_price"], "170.69")
         self.assertEqual(bucket["weighted_notional"], "1.7069")
         self.assertEqual(bucket["source_oids"], [9])
+
+    def test_p5_resized_reduce_only_cancel_without_fill_uses_original_size_p3_tail(self) -> None:
+        class FakeInfo:
+            def query_order_by_oid(self, account, oid):
+                return {
+                    "status": "order",
+                    "order": {
+                        "order": {
+                            "oid": oid,
+                            "limitPx": "118.79",
+                            "origSz": "0.10",
+                            "sz": "0.08",
+                        },
+                        "status": "reduceOnlyCanceled",
+                    },
+                }
+
+        entry = grid_order_entry(
+            {"gap_rate": "0.01", "min_order_value": "10", "base_buy_size": "0.10", "base_sell_size": "0.10"},
+            "xyz:SPCX", {"szDecimals": 2}, False, Decimal("118.79"), True,
+            size=Decimal("0.10"), preserve_size=True,
+        )
+        entry.update({
+            "status": "active", "oid": 9, "grid_leg": 1, "p3_queue_seq": 99,
+            "economic_chain_id": "CHAIN-ORIGINAL",
+        })
+        row = {"gap_rate": "0.01", "levels": [entry]}
+        ctx = {
+            "coin": "xyz:SPCX", "asset": {"szDecimals": 2, "maxLeverage": 20}, "exchange": object(),
+            "now": 123, "position_size": Decimal("1.91"), "current_mid": Decimal("109"),
+            "best_bid": Decimal("108.99"), "best_ask": Decimal("109.01"), "open_orders": [],
+            "open_oids": set(), "fills_by_oid": {}, "info": FakeInfo(), "account": "0xabc",
+        }
+
+        count, changed = lifecycle_process_anomalies(row, ctx, {"action_limit_headroom": 200})
+
+        self.assertTrue(changed)
+        self.assertEqual(count, 1)
+        self.assertEqual(entry["status"], GRID_CHAIN_DEBT_STATUS)
+        self.assertIsNone(entry["oid"])
+        self.assertEqual(entry["size"], "0.1")
+        self.assertEqual(entry["p3_queue_seq"], 0)
+        self.assertEqual(entry["economic_chain_id"], "CHAIN-ORIGINAL")
+        self.assertEqual(row["levels"], [entry])
 
     def test_p2_partial_leg_zero_below_ten_expands_to_submit(self) -> None:
         class FakeExchange:
