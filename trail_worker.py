@@ -8702,6 +8702,31 @@ def lifecycle_reconcile_p10_intent(
         market_oid = int(order_data["oid"])
     if status_name == "filled" and market_oid is not None:
         fill = ctx["fills_by_oid"].get(market_oid)
+        if not isinstance(fill, dict):
+            # A busy account can exceed the exchange's result cap inside the
+            # normal 24-hour fill window.  Query the small interval around the
+            # persisted intent so an old confirmed P10 fill can still repair
+            # itself after deployment or a restart.
+            created_at = int(intent.get("created_at") or ctx["now"])
+            recovery_start_ms = max(0, created_at - 60) * 1000
+            recovery_end_ms = min(ctx["now"], created_at + 15 * 60) * 1000
+            try:
+                recovery_fills = ctx["info"].user_fills_by_time(
+                    ctx["account"], recovery_start_ms, recovery_end_ms
+                )
+            except Exception as exc:
+                intent["status"] = "awaiting_reconcile"
+                intent["last_error"] = str(exc)
+                persist_lifecycle_intent(cache)
+                return True, True
+            fill = recent_fills_by_oid(
+                ctx["info"],
+                ctx["account"],
+                ctx["coin"],
+                recovery_start_ms,
+                recovery_end_ms,
+                recovery_fills,
+            ).get(market_oid)
         fill_price = decimal_or_none(fill.get("px")) if isinstance(fill, dict) else None
         fill_size = decimal_or_none(fill.get("sz")) if isinstance(fill, dict) else None
         if fill_price is not None and fill_size is not None:

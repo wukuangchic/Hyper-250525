@@ -14,14 +14,20 @@ from trail_worker import (
 
 
 class FakeInfo:
-    def __init__(self, *, cloid_status=None) -> None:
+    def __init__(self, *, cloid_status=None, historical_fills=None) -> None:
         self.cloid_status = cloid_status
+        self.historical_fills = historical_fills or []
+        self.fill_queries = []
 
     def query_order_by_oid(self, account, oid):
         return {"status": "order", "order": {"status": "canceled", "order": {"oid": oid}}}
 
     def query_order_by_cloid(self, account, cloid):
         return self.cloid_status or {"status": "unknownOid"}
+
+    def user_fills_by_time(self, account, start_ms, end_ms):
+        self.fill_queries.append((account, start_ms, end_ms))
+        return self.historical_fills
 
 
 class FakeExchange:
@@ -274,9 +280,12 @@ class P10PromotionTests(unittest.TestCase):
             cloid_status={
                 "status": "order",
                 "order": {"status": "filled", "order": {"oid": 22}},
-            }
+            },
+            historical_fills=[
+                {"coin": "BTC", "oid": 22, "px": "49.9", "sz": "0.2", "time": 100000}
+            ],
         )
-        ctx["fills_by_oid"] = {22: {"px": "49.9", "sz": "0.2"}}
+        ctx["fills_by_oid"] = {}
 
         changed = lifecycle_process_p10(row, ctx, {"action_limit_headroom": 10})
 
@@ -287,6 +296,7 @@ class P10PromotionTests(unittest.TestCase):
         self.assertEqual(exchange.order_calls[0]["price"], 50.399)
         self.assertEqual(row["levels"][0]["oid"], 23)
         self.assertNotIn("p10_promotion_intent", row)
+        self.assertEqual(ctx["info"].fill_queries, [("0xabc", 30000, 100000)])
 
     def test_source_strictly_within_one_gap_skips_before_cancel(self) -> None:
         row, source = make_row()
