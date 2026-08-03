@@ -8352,6 +8352,30 @@ def lifecycle_p10_margin_adequacy(
     return estimated_margin, withdrawable / estimated_margin
 
 
+def lifecycle_p10_source_release_margin(
+    source_price: Decimal,
+    source_size: Decimal,
+    leverage: Decimal | None,
+) -> Decimal | None:
+    """Estimate margin released when P10 cancels its existing passive source."""
+    if source_price <= 0 or source_size <= 0 or leverage is None or leverage <= 0:
+        return None
+    return source_price * source_size / leverage
+
+
+def lifecycle_p10_fresh_withdrawable(
+    ctx: dict[str, Any],
+    cache: dict[str, Any],
+) -> Decimal | None:
+    """Read authoritative withdrawable after the source cancellation."""
+    info = ctx["info"]
+    clear_info_cache(info)
+    states = cache.setdefault("spot_user_states", {})
+    states.pop((ctx["network"], ctx["account"]), None)
+    state = account_spot_withdrawable(info, ctx["account"], ctx["network"], cache)
+    return state[0] if state is not None else None
+
+
 def lifecycle_p10_source_distance_rate(
     current_mid: Decimal,
     source_price: Decimal,
@@ -8853,11 +8877,33 @@ def lifecycle_process_p10(row: dict[str, Any], ctx: dict[str, Any], cache: dict[
     leverage = decimal_or_none(ctx.get("position_leverage")) or decimal_or_none(
         ctx["asset"].get("maxLeverage")
     )
+    current_withdrawable = decimal_or_none(ctx.get("withdrawable"))
+    source_release_margin = (
+        Decimal("0")
+        if intent is not None and str(intent.get("status") or "") == "cancelled"
+        else lifecycle_p10_source_release_margin(source_price, source_size, leverage)
+    )
+    prospective_withdrawable = (
+        current_withdrawable + source_release_margin
+        if current_withdrawable is not None and source_release_margin is not None
+        else None
+    )
     estimated_margin, adequacy = lifecycle_p10_margin_adequacy(
-        market or {}, ctx.get("withdrawable"), leverage
+        market or {}, prospective_withdrawable, leverage
     )
     row["p10_estimated_margin"] = (
         decimal_to_plain(estimated_margin) if estimated_margin is not None else None
+    )
+    row["p10_current_withdrawable"] = (
+        decimal_to_plain(current_withdrawable) if current_withdrawable is not None else None
+    )
+    row["p10_source_release_margin"] = (
+        decimal_to_plain(source_release_margin) if source_release_margin is not None else None
+    )
+    row["p10_prospective_withdrawable"] = (
+        decimal_to_plain(prospective_withdrawable)
+        if prospective_withdrawable is not None
+        else None
     )
     row["p10_margin_adequacy"] = decimal_to_plain(adequacy) if adequacy is not None else None
     if (
@@ -8877,6 +8923,21 @@ def lifecycle_process_p10(row: dict[str, Any], ctx: dict[str, Any], cache: dict[
             source_oid=source.get("oid"),
             source_price=decimal_to_plain(source_price),
             source_size=decimal_to_plain(source_size),
+            current_withdrawable=(
+                decimal_to_plain(current_withdrawable)
+                if current_withdrawable is not None
+                else None
+            ),
+            source_release_margin=(
+                decimal_to_plain(source_release_margin)
+                if source_release_margin is not None
+                else None
+            ),
+            prospective_withdrawable=(
+                decimal_to_plain(prospective_withdrawable)
+                if prospective_withdrawable is not None
+                else None
+            ),
             estimated_margin=(decimal_to_plain(estimated_margin) if estimated_margin is not None else None),
             margin_adequacy=(decimal_to_plain(adequacy) if adequacy is not None else None),
             margin_threshold=decimal_to_plain(GRID_P10_MARGIN_ADEQUACY_THRESHOLD),
@@ -8911,6 +8972,15 @@ def lifecycle_process_p10(row: dict[str, Any], ctx: dict[str, Any], cache: dict[
             "economic_chain_id": chain_id,
             "estimated_margin": decimal_to_plain(estimated_margin or Decimal("0")),
             "margin_adequacy": decimal_to_plain(adequacy or Decimal("0")),
+            "pre_cancel_withdrawable": decimal_to_plain(
+                current_withdrawable or Decimal("0")
+            ),
+            "estimated_source_release_margin": decimal_to_plain(
+                source_release_margin or Decimal("0")
+            ),
+            "prospective_withdrawable": decimal_to_plain(
+                prospective_withdrawable or Decimal("0")
+            ),
             "chain_realized_surplus": decimal_to_plain(chain_realized_surplus),
             "required_surplus": decimal_to_plain(required_surplus),
             "estimated_chase_cost": decimal_to_plain(chase_cost),
@@ -8965,6 +9035,58 @@ def lifecycle_process_p10(row: dict[str, Any], ctx: dict[str, Any], cache: dict[
         intent["status"] = "cancelled"
         intent["cancelled_at"] = ctx["now"]
         persist_lifecycle_intent(cache)
+
+    post_cancel_withdrawable = lifecycle_p10_fresh_withdrawable(ctx, cache)
+    post_cancel_estimated_margin, post_cancel_adequacy = lifecycle_p10_margin_adequacy(
+        market or {}, post_cancel_withdrawable, leverage
+    )
+    row["p10_post_cancel_withdrawable"] = (
+        decimal_to_plain(post_cancel_withdrawable)
+        if post_cancel_withdrawable is not None
+        else None
+    )
+    row["p10_post_cancel_margin_adequacy"] = (
+        decimal_to_plain(post_cancel_adequacy)
+        if post_cancel_adequacy is not None
+        else None
+    )
+    intent["post_cancel_withdrawable"] = row["p10_post_cancel_withdrawable"]
+    intent["post_cancel_margin_adequacy"] = row["p10_post_cancel_margin_adequacy"]
+    persist_lifecycle_intent(cache)
+    audit_grid_action(
+        "grid_p10_post_cancel_margin_checked",
+        coin=ctx["coin"],
+        grid_id=row.get("id"),
+        economic_chain_id=intent.get("economic_chain_id"),
+        source_oid=intent.get("source_oid"),
+        pre_cancel_withdrawable=intent.get("pre_cancel_withdrawable"),
+        estimated_source_release_margin=intent.get("estimated_source_release_margin"),
+        prospective_withdrawable=intent.get("prospective_withdrawable"),
+        actual_withdrawable=row["p10_post_cancel_withdrawable"],
+        estimated_margin=(
+            decimal_to_plain(post_cancel_estimated_margin)
+            if post_cancel_estimated_margin is not None
+            else None
+        ),
+        margin_adequacy=row["p10_post_cancel_margin_adequacy"],
+        margin_threshold=decimal_to_plain(GRID_P10_MARGIN_ADEQUACY_THRESHOLD),
+        passed=(
+            post_cancel_adequacy is not None
+            and post_cancel_adequacy > GRID_P10_MARGIN_ADEQUACY_THRESHOLD
+        ),
+    )
+    if (
+        post_cancel_adequacy is None
+        or post_cancel_adequacy <= GRID_P10_MARGIN_ADEQUACY_THRESHOLD
+    ):
+        row["p10_status"] = "skipped_post_cancel_margin"
+        return lifecycle_restore_p10_source(
+            row,
+            ctx,
+            cache,
+            intent,
+            "P10 post-cancel margin adequacy did not strictly exceed threshold",
+        )
 
     return lifecycle_submit_p10_market(row, ctx, cache, intent, market)
 

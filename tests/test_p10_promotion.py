@@ -15,9 +15,16 @@ from trail_worker import (
 
 
 class FakeInfo:
-    def __init__(self, *, cloid_status=None, historical_fills=None) -> None:
+    def __init__(
+        self,
+        *,
+        cloid_status=None,
+        historical_fills=None,
+        post_cancel_withdrawable: str = "10",
+    ) -> None:
         self.cloid_status = cloid_status
         self.historical_fills = historical_fills or []
+        self.post_cancel_withdrawable = post_cancel_withdrawable
         self.fill_queries = []
 
     def query_order_by_oid(self, account, oid):
@@ -29,6 +36,18 @@ class FakeInfo:
     def user_fills_by_time(self, account, start_ms, end_ms):
         self.fill_queries.append((account, start_ms, end_ms))
         return self.historical_fills
+
+    def spot_user_state(self, account):
+        return {
+            "balances": [
+                {
+                    "coin": "USDC",
+                    "token": 0,
+                    "total": self.post_cancel_withdrawable,
+                    "hold": "0",
+                }
+            ]
+        }
 
 
 class FakeExchange:
@@ -469,7 +488,7 @@ class P10PromotionTests(unittest.TestCase):
         exchange = FakeExchange()
 
         changed = lifecycle_process_p10(
-            row, make_ctx(exchange, withdrawable="1"), {"action_limit_headroom": 10}
+            row, make_ctx(exchange, withdrawable="0.2"), {"action_limit_headroom": 10}
         )
 
         self.assertFalse(changed)
@@ -479,6 +498,54 @@ class P10PromotionTests(unittest.TestCase):
         self.assertEqual(source["oid"], 11)
         self.assertEqual(row["p10_status"], "skipped_pre_cancel_safety")
         self.assertEqual(row["p10_estimated_margin"], "1.2")
+        self.assertEqual(row["p10_current_withdrawable"], "0.2")
+        self.assertEqual(row["p10_source_release_margin"], "1")
+        self.assertEqual(row["p10_prospective_withdrawable"], "1.2")
+
+    def test_source_release_margin_allows_cancel_then_uses_fresh_balance(self) -> None:
+        row, source = make_row()
+        exchange = FakeExchange()
+        ctx = make_ctx(exchange, withdrawable="1")
+        ctx["info"] = FakeInfo(post_cancel_withdrawable="2")
+
+        changed = lifecycle_process_p10(row, ctx, {"action_limit_headroom": 10})
+
+        self.assertTrue(changed)
+        self.assertEqual(len(exchange.cancel_calls), 1)
+        self.assertEqual(len(exchange.order_calls), 2)
+        self.assertNotIn(source, row["levels"])
+        self.assertEqual(row["p10_current_withdrawable"], "1")
+        self.assertEqual(row["p10_source_release_margin"], "1")
+        self.assertEqual(row["p10_prospective_withdrawable"], "2")
+        self.assertEqual(row["p10_post_cancel_withdrawable"], "2")
+        self.assertEqual(
+            row["p10_post_cancel_margin_adequacy"],
+            "1.666666666666666666666666667",
+        )
+
+    def test_post_cancel_real_balance_failure_restores_source_to_p3(self) -> None:
+        row, source = make_row()
+        exchange = FakeExchange()
+        ctx = make_ctx(exchange, withdrawable="1")
+        ctx["info"] = FakeInfo(post_cancel_withdrawable="1.32")
+
+        with patch("trail_worker.audit_grid_action") as audit_mock:
+            changed = lifecycle_process_p10(row, ctx, {"action_limit_headroom": 10})
+
+        self.assertTrue(changed)
+        self.assertEqual(len(exchange.cancel_calls), 1)
+        self.assertEqual(exchange.order_calls, [])
+        self.assertEqual(source["status"], GRID_CHAIN_DEBT_STATUS)
+        self.assertTrue(source["p10_restore"])
+        self.assertNotIn("p10_promotion_intent", row)
+        self.assertEqual(row["p10_status"], "skipped_post_cancel_margin")
+        self.assertEqual(row["p10_post_cancel_withdrawable"], "1.32")
+        self.assertEqual(row["p10_post_cancel_margin_adequacy"], "1.1")
+        self.assertEqual(
+            audit_mock.call_args_list[-1].args[0],
+            "grid_p10_post_cancel_margin_checked",
+        )
+        self.assertFalse(audit_mock.call_args_list[-1].kwargs["passed"])
 
     def test_max_position_failure_never_cancels_source(self) -> None:
         row, source = make_row()
