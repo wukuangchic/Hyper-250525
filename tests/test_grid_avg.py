@@ -108,6 +108,7 @@ from trail_worker import (
     lifecycle_mark_deferred_or_discarded,
     lifecycle_materialize_birth_intent,
     lifecycle_migrate_min_rejected_debts_to_p8,
+    lifecycle_migrate_oversized_p8_debts,
     lifecycle_prepare_economic_chain_ids,
     lifecycle_p3_pending_pool,
     lifecycle_p3_failure_is_unknown,
@@ -967,7 +968,7 @@ class GridAvgTests(unittest.TestCase):
         self.assertNotIn("last_error", source)
         self.assertTrue(exchange.request[-1])
 
-    def test_p8_combines_same_side_remainders_and_promotes_above_ten(self) -> None:
+    def test_p8_combines_same_side_remainders_and_splits_above_ten(self) -> None:
         row = {
             "coin": "xyz:JPY", "gap_rate": "0.001", "sz_decimals": 2,
             "min_order_value": "10", "base_buy_size": "0.13", "base_sell_size": "0.13",
@@ -995,19 +996,87 @@ class GridAvgTests(unittest.TestCase):
         )
 
         self.assertTrue(changed)
-        self.assertEqual(promoted, 1)
-        self.assertNotIn("p8_partial_debts", row)
-        self.assertEqual(row["p8_partial_debt_count"], 0)
-        debt = row["levels"][0]
-        self.assertEqual(debt["side"], "buy")
-        self.assertEqual(debt["size"], "0.16")
-        self.assertEqual(debt["price"], "163.83")
-        self.assertEqual(debt["status"], GRID_CHAIN_DEBT_STATUS)
-        self.assertEqual(debt["grid_leg"], 1)
-        self.assertEqual(debt["birth_source"], "p8_partial_debt")
-        self.assertTrue(debt["preserve_fill_size"])
-        self.assertEqual(debt["p3_queue_seq"], 7)
-        self.assertEqual(debt["p8_source_oids"], [101, 102])
+        self.assertEqual(promoted, 2)
+        self.assertEqual(row["p8_partial_debt_count"], 1)
+        self.assertEqual(len(row["levels"]), 2)
+        self.assertEqual([debt["size"] for debt in row["levels"]], ["0.07", "0.07"])
+        for index, debt in enumerate(row["levels"], start=1):
+            self.assertEqual(debt["side"], "buy")
+            self.assertEqual(debt["price"], "163.83")
+            self.assertGreater(Decimal(debt["size"]) * Decimal(debt["price"]), Decimal("10"))
+            self.assertEqual(debt["status"], GRID_CHAIN_DEBT_STATUS)
+            self.assertEqual(debt["grid_leg"], 1)
+            self.assertEqual(debt["birth_source"], "p8_partial_debt")
+            self.assertTrue(debt["preserve_fill_size"])
+            self.assertEqual(debt["p3_queue_seq"], 6 + index)
+            self.assertEqual(debt["p8_source_oids"], [])
+            self.assertEqual(debt["p8_batch_source_oids"], [101, 102])
+            self.assertEqual(debt["p8_batch_index"], index)
+            self.assertEqual(debt["p8_batch_count"], 2)
+        self.assertEqual(row["p8_partial_debts"][0]["size"], "0.02")
+        self.assertEqual(row["p8_partial_debts"][0]["weighted_notional"], "3.2766")
+
+    def test_p8_large_bucket_creates_exchange_valid_batches(self) -> None:
+        row = {
+            "coin": "HYPE", "gap_rate": "0.0005", "sz_decimals": 2,
+            "min_order_value": "10", "base_buy_size": "0.22", "base_sell_size": "0.22",
+            "levels": [],
+            "p8_partial_debts": [{
+                "side": "buy", "is_buy": True, "size": "33.09",
+                "weighted_avg_price": "54.32447416137805983680870354",
+                "weighted_notional": "1797.59685", "source_count": 188,
+                "source_oids": [101, 102],
+            }],
+        }
+
+        promoted, changed = lifecycle_process_p8(
+            row, 102, {"grid_rows": [row], "lifecycle_p3_next_seq": 7}
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(promoted, 174)
+        self.assertEqual(sum(Decimal(debt["size"]) for debt in row["levels"]), Decimal("33.06"))
+        self.assertTrue(
+            all(Decimal(debt["size"]) * Decimal(debt["price"]) > Decimal("10") for debt in row["levels"])
+        )
+        self.assertTrue(all(debt["p8_batch_count"] == 174 for debt in row["levels"]))
+        self.assertEqual(row["levels"][0]["p8_batch_source_count"], 188)
+        self.assertEqual(row["levels"][0]["p8_batch_source_oids"], [101, 102])
+        self.assertEqual(row["p8_partial_debts"][0]["size"], "0.03")
+        self.assertEqual(row["p8_partial_debts"][0]["weighted_notional"], "1.629734224841341795104261106")
+        self.assertEqual(
+            sum(Decimal(debt["size"]) for debt in row["levels"])
+            + Decimal(row["p8_partial_debts"][0]["size"]),
+            Decimal("33.09"),
+        )
+
+    def test_p8_legacy_oversized_debt_is_migrated_and_split(self) -> None:
+        row = {
+            "coin": "HYPE", "gap_rate": "0.0005", "sz_decimals": 2,
+            "min_order_value": "10", "base_buy_size": "0.22", "base_sell_size": "0.22",
+            "levels": [{
+                "side": "buy", "is_buy": True, "status": GRID_MARGIN_STATUS,
+                "oid": None, "grid_leg": 1, "birth_source": "p8_partial_debt",
+                "size": "33.09", "price": "51.18", "p3_queue_seq": 6580,
+                "p8_weighted_notional": "1797.59685",
+                "p8_weighted_avg_price": "54.32447416137805983680870354",
+                "p8_source_count": 188, "p8_source_oids": [101, 102],
+            }],
+        }
+        cache = {"grid_rows": [row], "lifecycle_p3_next_seq": 7000}
+
+        migrated = lifecycle_migrate_oversized_p8_debts(row, 102, cache)
+
+        self.assertEqual(migrated, 1)
+        self.assertEqual(len(row["levels"]), 174)
+        self.assertEqual(row["levels"][0]["p3_queue_seq"], 6580)
+        self.assertTrue(all(order["status"] == GRID_MARGIN_STATUS for order in row["levels"]))
+        self.assertTrue(
+            all(Decimal(order["size"]) * Decimal(order["price"]) > Decimal("10") for order in row["levels"])
+        )
+        self.assertTrue(all(order["legacy_p8_migrated_at"] == 102 for order in row["levels"]))
+        self.assertEqual(row["p8_partial_debts"][0]["size"], "0.03")
+        self.assertEqual(row["p8_oversized_debt_migrated"], 1)
 
     def test_p8_keeps_equal_ten_and_separates_sides(self) -> None:
         row = {

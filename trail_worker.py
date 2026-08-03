@@ -8911,6 +8911,38 @@ def lifecycle_refresh_p8_summary(row: dict[str, Any]) -> None:
         row.pop("p8_partial_debts", None)
 
 
+def lifecycle_p8_batch_sizes(
+    total_size: Decimal,
+    price: Decimal,
+    sz_decimals: int,
+) -> tuple[list[Decimal], Decimal]:
+    """Split one P8 bucket into exchange-valid batches just above $10.
+
+    P8 keeps a weighted-average price and an aggregate size, so batches use
+    that price while preserving the complete aggregate size.  The strict
+    ``> MIN_NOTIONAL`` check is intentional: an order at exactly $10 can be
+    rejected by the exchange, and a size step is added when necessary.  Any
+    quantity below one valid batch remains in P8 for the next accumulation.
+    """
+    if total_size <= 0 or price <= 0:
+        return [], Decimal("0")
+    step = Decimal(1).scaleb(-sz_decimals)
+    minimum_size = grid_size_for_min_notional(
+        Decimal("0"), price, sz_decimals, MIN_NOTIONAL
+    )
+    while minimum_size * price <= MIN_NOTIONAL:
+        minimum_size += step
+    total_units = int((total_size / step).to_integral_value(rounding=ROUND_FLOOR))
+    minimum_units = int((minimum_size / step).to_integral_value(rounding=ROUND_FLOOR))
+    if minimum_units <= 0 or total_units < minimum_units:
+        return [], total_size
+
+    batch_count, remainder_units = divmod(total_units, minimum_units)
+    batch_units = [minimum_units] * batch_count
+    remainder_size = Decimal(remainder_units) * step
+    return [Decimal(units) * step for units in batch_units], remainder_size
+
+
 def lifecycle_accumulate_p8_partial_debt(
     row: dict[str, Any],
     source: dict[str, Any],
@@ -9000,6 +9032,144 @@ def lifecycle_migrate_min_rejected_debts_to_p8(row: dict[str, Any], now: int) ->
     return migrated
 
 
+def lifecycle_merge_p8_bucket(row: dict[str, Any], incoming: dict[str, Any], now: int) -> None:
+    """Merge a migrated P8 remainder into the row's side bucket."""
+    side = str(incoming.get("side") or "")
+    size = decimal_or_none(incoming.get("size")) or Decimal("0")
+    weighted_notional = decimal_or_none(incoming.get("weighted_notional")) or Decimal("0")
+    if side not in {"buy", "sell"} or size <= 0 or weighted_notional <= 0:
+        return
+    buckets = lifecycle_p8_buckets(row)
+    bucket = next(
+        (
+            candidate
+            for candidate in buckets
+            if isinstance(candidate, dict) and str(candidate.get("side") or "") == side
+        ),
+        None,
+    )
+    if bucket is None:
+        bucket = {
+            "side": side,
+            "is_buy": side == "buy",
+            "size": "0",
+            "weighted_notional": "0",
+            "weighted_avg_price": "0",
+            "source_count": 0,
+            "source_oids": [],
+            "created_at": now,
+        }
+        buckets.append(bucket)
+    old_size = decimal_or_none(bucket.get("size")) or Decimal("0")
+    old_notional = decimal_or_none(bucket.get("weighted_notional")) or Decimal("0")
+    total_size = old_size + size
+    total_notional = old_notional + weighted_notional
+    known_oids = {
+        int(value)
+        for value in bucket.get("source_oids") or []
+        if isinstance(value, int) or str(value).isdigit()
+    }
+    incoming_oids = {
+        int(value)
+        for value in incoming.get("source_oids") or []
+        if isinstance(value, int) or str(value).isdigit()
+    }
+    bucket["size"] = decimal_to_plain(total_size)
+    bucket["weighted_notional"] = decimal_to_plain(total_notional)
+    bucket["weighted_avg_price"] = decimal_to_plain(total_notional / total_size)
+    bucket["source_count"] = int(bucket.get("source_count") or 0) + int(
+        incoming.get("source_count") or 0
+    )
+    bucket["source_oids"] = sorted(known_oids.union(incoming_oids))
+    bucket["updated_at"] = now
+    lifecycle_refresh_p8_summary(row)
+
+
+def lifecycle_migrate_oversized_p8_debts(
+    row: dict[str, Any],
+    now: int,
+    cache: dict[str, Any],
+) -> int:
+    """Split legacy P8-origin debt entries that predate batch metadata.
+
+    Active exchange orders are deliberately left untouched here.  The operator
+    migration must cancel those OIDs first, then rerun the same transformation
+    with no live order attached; this prevents a state-only split from creating
+    duplicate exchange orders.
+    """
+    levels = row.setdefault("levels", [])
+    migrated = 0
+    debt_statuses = {
+        GRID_MARGIN_STATUS,
+        GRID_CHAIN_DEBT_STATUS,
+        GRID_P8_REACCUMULATE_STATUS,
+    }
+    for entry in list(levels):
+        if (
+            not isinstance(entry, dict)
+            or entry.get("birth_source") != "p8_partial_debt"
+            or entry.get("oid") is not None
+            or str(entry.get("status") or "") not in debt_statuses
+        ):
+            continue
+        try:
+            if int(entry.get("p8_batch_count") or 0) > 1:
+                continue
+        except (TypeError, ValueError):
+            pass
+        weighted_notional = decimal_or_none(entry.get("p8_weighted_notional")) or Decimal("0")
+        average_price = decimal_or_none(entry.get("p8_weighted_avg_price"))
+        size = decimal_or_none(entry.get("size")) or Decimal("0")
+        if weighted_notional <= Decimal("50") or average_price is None or average_price <= 0:
+            continue
+        if size <= 0:
+            size = weighted_notional / average_price
+        side = str(entry.get("side") or "")
+        if side not in {"buy", "sell"}:
+            continue
+
+        bucket = {
+            "side": side,
+            "is_buy": side == "buy",
+            "size": decimal_to_plain(size),
+            "weighted_notional": decimal_to_plain(weighted_notional),
+            "weighted_avg_price": decimal_to_plain(average_price),
+            "source_count": int(entry.get("p8_source_count") or 0),
+            "source_oids": list(entry.get("p8_source_oids") or []),
+            "created_at": int(entry.get("p8_promoted_at") or now),
+        }
+        temporary_row = dict(row)
+        temporary_row["levels"] = []
+        temporary_row["p8_partial_debts"] = [bucket]
+        temporary_row.pop("p8_partial_debt_count", None)
+        temporary_row.pop("p8_partial_debt_value", None)
+        promoted, _changed = lifecycle_process_p8(temporary_row, now, cache)
+        children = temporary_row.get("levels") or []
+        if not promoted or not children:
+            continue
+
+        parent_chain_id = entry.get("economic_chain_id")
+        original_queue_seq = entry.get("p3_queue_seq")
+        for child in children:
+            child["status"] = str(entry.get("status") or GRID_CHAIN_DEBT_STATUS)
+            child["legacy_p8_migrated_at"] = now
+            if parent_chain_id:
+                child["p8_parent_economic_chain_id"] = parent_chain_id
+        if original_queue_seq is not None:
+            children[0]["p3_queue_seq"] = original_queue_seq
+        levels.remove(entry)
+        levels.extend(children)
+        for remainder in temporary_row.get("p8_partial_debts") or []:
+            lifecycle_merge_p8_bucket(row, remainder, now)
+        migrated += 1
+    if migrated:
+        row["p8_oversized_debt_migrated"] = int(
+            row.get("p8_oversized_debt_migrated") or 0
+        ) + migrated
+        row["p8_oversized_debt_migrated_at"] = now
+    return migrated
+
+
 def lifecycle_process_p8(
     row: dict[str, Any],
     now: int,
@@ -9026,39 +9196,65 @@ def lifecycle_process_p8(
         side = str(bucket.get("side") or "")
         if size <= 0 or weighted_notional <= MIN_NOTIONAL or side not in {"buy", "sell"}:
             continue
-        price = rounded_perp_price(weighted_notional / size, sz_decimals)
+        average_price = weighted_notional / size
+        price = rounded_perp_price(average_price, sz_decimals)
         if price <= 0 or size * price <= MIN_NOTIONAL:
             continue
-        order = grid_order_entry(
-            row,
-            coin,
-            asset,
-            side == "buy",
-            price,
-            False,
-            size=size,
-            gap=Decimal(str(row["gap_rate"])),
-            preserve_size=True,
-        )
-        order.update(
-            {
-                "status": GRID_CHAIN_DEBT_STATUS,
-                "oid": None,
-                "grid_leg": 1,
-                "birth_source": "p8_partial_debt",
-                "preserve_fill_size": True,
-                "p8_promoted_at": now,
-                "p8_weighted_notional": decimal_to_plain(weighted_notional),
-                "p8_weighted_avg_price": decimal_to_plain(weighted_notional / size),
-                "p8_source_count": int(bucket.get("source_count") or 0),
-                "p8_source_oids": list(bucket.get("source_oids") or []),
-                "chain_debt_at": now,
-            }
-        )
-        lifecycle_assign_p3_queue_seq(order, cache)
-        levels.append(order)
-        buckets.remove(bucket)
-        promoted += 1
+        batch_sizes, remainder_size = lifecycle_p8_batch_sizes(size, price, sz_decimals)
+        if not batch_sizes:
+            continue
+        batch_count = len(batch_sizes)
+        source_count = int(bucket.get("source_count") or 0)
+        source_oids = list(bucket.get("source_oids") or [])
+        for batch_index, batch_size in enumerate(batch_sizes, start=1):
+            batch_notional = weighted_notional * batch_size / size
+            order = grid_order_entry(
+                row,
+                coin,
+                asset,
+                side == "buy",
+                price,
+                False,
+                size=batch_size,
+                gap=Decimal(str(row["gap_rate"])),
+                preserve_size=True,
+            )
+            order.update(
+                {
+                    "status": GRID_CHAIN_DEBT_STATUS,
+                    "oid": None,
+                    "grid_leg": 1,
+                    "birth_source": "p8_partial_debt",
+                    "preserve_fill_size": True,
+                    "p8_promoted_at": now,
+                    "p8_weighted_notional": decimal_to_plain(batch_notional),
+                    "p8_weighted_avg_price": decimal_to_plain(average_price),
+                    # Keep aggregate provenance outside p8_source_oids for
+                    # split batches.  Reusing the same source OIDs on every
+                    # batch would make a later failed batch look duplicated
+                    # when it returns to the P8 accumulator.
+                    "p8_source_count": source_count if batch_count == 1 else 0,
+                    "p8_source_oids": source_oids if batch_count == 1 else [],
+                    "p8_batch_source_count": source_count,
+                    "p8_batch_source_oids": source_oids,
+                    "p8_batch_index": batch_index,
+                    "p8_batch_count": batch_count,
+                    "p8_batch_total_size": decimal_to_plain(size),
+                    "p8_batch_total_notional": decimal_to_plain(weighted_notional),
+                    "chain_debt_at": now,
+                }
+            )
+            lifecycle_assign_p3_queue_seq(order, cache)
+            levels.append(order)
+            promoted += 1
+        if remainder_size > 0:
+            remainder_notional = weighted_notional * remainder_size / size
+            bucket["size"] = decimal_to_plain(remainder_size)
+            bucket["weighted_notional"] = decimal_to_plain(remainder_notional)
+            bucket["weighted_avg_price"] = decimal_to_plain(average_price)
+            bucket["updated_at"] = now
+        else:
+            buckets.remove(bucket)
         changed = True
     lifecycle_refresh_p8_summary(row)
     return promoted, changed
@@ -9915,6 +10111,8 @@ def maintain_grid_p8(row: dict[str, Any], cache: dict[str, Any]) -> tuple[dict[s
     changed = initialize_lifecycle_iterations(row) or changed
     migrated = lifecycle_migrate_min_rejected_debts_to_p8(row, now)
     changed = bool(migrated) or changed
+    oversized_migrated = lifecycle_migrate_oversized_p8_debts(row, now, cache)
+    changed = bool(oversized_migrated) or changed
     promoted, p8_changed = lifecycle_process_p8(row, now, cache)
     changed = changed or p8_changed
     counters = cache.setdefault("grid_lifecycle_counters", {}).setdefault(id(row), {})
@@ -9953,6 +10151,8 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
     changed = initialize_lifecycle_iterations(row) or changed
     migrated = lifecycle_migrate_min_rejected_debts_to_p8(row, ctx["now"])
     changed = bool(migrated) or changed
+    oversized_migrated = lifecycle_migrate_oversized_p8_debts(row, ctx["now"], cache)
+    changed = bool(oversized_migrated) or changed
     levels = row.setdefault("levels", [])
     counters = cache.setdefault("grid_lifecycle_counters", {}).setdefault(id(row), {})
 
