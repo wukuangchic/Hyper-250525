@@ -8,6 +8,7 @@ from trail_worker import (
     GRID_CHAIN_DEBT_STATUS,
     GRID_LIFECYCLE_PHASE_P10,
     GRID_LIFECYCLE_PHASES,
+    lifecycle_p10_replacement_from_fill,
     lifecycle_process_p10,
     maintain_grid,
 )
@@ -175,6 +176,8 @@ def make_ctx(exchange, *, short: bool = False, withdrawable: str = "10") -> dict
         "open_oids": {11},
         "fills_by_oid": {},
         "p10_chain_realized_surplus": {"C2608031200AbCd": "10"},
+        "p10_taker_fee_rate": Decimal("0.000432"),
+        "p10_maker_fee_rate": Decimal("0.000144"),
     }
 
 
@@ -350,7 +353,7 @@ class P10PromotionTests(unittest.TestCase):
         self.assertEqual(row["p10_required_surplus"], "2.12")
         self.assertEqual(audit_mock.call_args.args[0], "grid_p10_chain_profit_skipped")
 
-    def test_positive_but_insufficient_profit_chain_is_not_promoted(self) -> None:
+    def test_any_positive_profit_chain_is_promoted(self) -> None:
         row, source = make_row()
         exchange = FakeExchange()
         ctx = make_ctx(exchange)
@@ -358,12 +361,11 @@ class P10PromotionTests(unittest.TestCase):
 
         changed = lifecycle_process_p10(row, ctx, {"action_limit_headroom": 10})
 
-        self.assertFalse(changed)
-        self.assertEqual(exchange.cancel_calls, [])
-        self.assertEqual(exchange.order_calls, [])
-        self.assertEqual(row["p10_status"], "skipped_chain_profit")
+        self.assertTrue(changed)
+        self.assertEqual(len(exchange.cancel_calls), 1)
+        self.assertEqual(len(exchange.order_calls), 2)
 
-    def test_legacy_chain_profit_is_treated_as_zero(self) -> None:
+    def test_traceable_legacy_chain_profit_is_eligible(self) -> None:
         row, source = make_row()
         source["economic_chain_id"] = "7N5E1HuGi8"
         exchange = FakeExchange()
@@ -372,11 +374,53 @@ class P10PromotionTests(unittest.TestCase):
 
         changed = lifecycle_process_p10(row, ctx, {"action_limit_headroom": 10})
 
+        self.assertTrue(changed)
+        self.assertEqual(len(exchange.cancel_calls), 1)
+        self.assertEqual(row["p10_chain_realized_surplus"], "100")
+
+    def test_untraceable_legacy_chain_stays_blocked_at_zero(self) -> None:
+        row, source = make_row()
+        source["economic_chain_id"] = "7N5E1HuGi8"
+        exchange = FakeExchange()
+        ctx = make_ctx(exchange)
+        ctx["p10_chain_realized_surplus"] = {}
+
+        changed = lifecycle_process_p10(row, ctx, {"action_limit_headroom": 10})
+
         self.assertFalse(changed)
         self.assertEqual(exchange.cancel_calls, [])
         self.assertEqual(row["p10_chain_realized_surplus"], "0")
 
-    def test_profit_must_cover_chase_cost_and_gap_buffer(self) -> None:
+    def test_p10_replacement_gap_covers_actual_fees_plus_price_tick(self) -> None:
+        row, _source = make_row()
+        row["gap_rate"] = "0.0005"
+        row["sz_decimals"] = 5
+        ctx = make_ctx(FakeExchange())
+        ctx["asset"]["szDecimals"] = 5
+        intent = {
+            "source_price": "63842",
+            "market_is_buy": True,
+            "source_grid_leg": 1,
+            "source_iteration": 4,
+            "source_oid": 11,
+            "economic_chain_id": "C2608031200AbCd",
+            "cloid": "0x00000000000000000000000000000001",
+            "taker_fee_rate": "0.000432",
+            "maker_fee_rate": "0.000144",
+        }
+
+        child = lifecycle_p10_replacement_from_fill(
+            row, ctx, intent, Decimal("63857"), Decimal("0.00016")
+        )
+
+        self.assertIsNotNone(child)
+        self.assertEqual(child["price"], "63895")
+        self.assertGreater(
+            (Decimal(child["price"]) - Decimal("63857")) * Decimal("0.00016"),
+            Decimal("63857") * Decimal("0.00016") * Decimal("0.000576"),
+        )
+
+    def test_positive_profit_records_chase_cost_and_gap_buffer(self) -> None:
         row, _source = make_row()
         exchange = FakeExchange()
         ctx = make_ctx(exchange)

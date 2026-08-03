@@ -34,6 +34,7 @@ from hl_order import (  # noqa: E402
     collect_frontend_open_orders,
     decimal_or_none,
     decimal_to_plain,
+    effective_perp_fee_rates,
     fill_matches_coin,
     format_signed_percent,
     grid_avg_multiplier,
@@ -50,6 +51,7 @@ from hl_order import (  # noqa: E402
     load_server_batch,
     log_event,
     mask,
+    minimum_grid_gap,
     order_plan_request,
     position_matches_coin,
     signed_position_value,
@@ -8271,12 +8273,11 @@ def lifecycle_p10_candidate(
             continue
         distance = abs(ctx["current_mid"] - price)
         chain_id = str(entry.get("economic_chain_id") or "").strip()
-        realized_surplus = (
-            decimal_or_none(surplus_map.get(chain_id)) or Decimal("0")
-            if current_economic_chain_id(chain_id)
-            and not entry.get("economic_chain_id_backfilled_at")
-            else Decimal("0")
-        )
+        # A positive, ledger-observed flat result is the admission ticket for
+        # P10.  The ID's spelling and its historical/backfilled origin do not
+        # matter once the ledger has proved that this exact chain earned money.
+        # Untraceable and newborn chains remain zero and therefore stay blocked.
+        realized_surplus = decimal_or_none(surplus_map.get(chain_id)) or Decimal("0")
         chase_cost = distance * remaining_size
         execution_buffer = ctx["current_mid"] * remaining_size * gap_rate
         required_surplus = chase_cost + execution_buffer
@@ -8284,7 +8285,7 @@ def lifecycle_p10_candidate(
             distance, price, oid, entry, remaining_size, realized_surplus,
             required_surplus, chase_cost, execution_buffer,
         )
-        if realized_surplus <= required_surplus:
+        if realized_surplus <= 0:
             profit_blocked.append(candidate[:-1])
             continue
         candidates.append(candidate)
@@ -8465,8 +8466,22 @@ def lifecycle_p10_replacement_from_fill(
     if source_price is None or source_price <= 0 or fill_price <= 0 or fill_size <= 0:
         return None
     market_is_buy = bool(intent.get("market_is_buy"))
-    gap_rate = decimal_or_none(row.get("gap_rate")) or Decimal("0")
     sz_decimals = int(row.get("sz_decimals") or ctx["asset"]["szDecimals"])
+    configured_gap_rate = decimal_or_none(row.get("gap_rate")) or Decimal("0")
+    taker_fee_rate = (
+        decimal_or_none(intent.get("taker_fee_rate"))
+        or decimal_or_none(ctx.get("p10_taker_fee_rate"))
+        or Decimal("0")
+    )
+    maker_fee_rate = (
+        decimal_or_none(intent.get("maker_fee_rate"))
+        or decimal_or_none(ctx.get("p10_maker_fee_rate"))
+        or Decimal("0")
+    )
+    fee_safe_gap_rate = (
+        taker_fee_rate + maker_fee_rate + minimum_grid_gap(fill_price, sz_decimals)
+    )
+    gap_rate = max(configured_gap_rate, fee_safe_gap_rate)
     reflected_price = fill_price * Decimal("2") - source_price
     target_price = (
         rounded_perp_price(reflected_price, sz_decimals)
@@ -8522,6 +8537,9 @@ def lifecycle_p10_replacement_from_fill(
             "replacement_anchor_price": decimal_to_plain(fill_price),
             "replacement_anchor_source": "p10_market_fill",
             "p10_original_order_price": decimal_to_plain(source_price),
+            "p10_effective_gap_rate": decimal_to_plain(gap_rate),
+            "p10_taker_fee_rate": decimal_to_plain(taker_fee_rate),
+            "p10_maker_fee_rate": decimal_to_plain(maker_fee_rate),
             "preserve_fill_size": True,
         }
     )
@@ -8804,6 +8822,31 @@ def lifecycle_process_p10(row: dict[str, Any], ctx: dict[str, Any], cache: dict[
             )
             return False
 
+        taker_fee_rate = decimal_or_none(ctx.get("p10_taker_fee_rate"))
+        maker_fee_rate = decimal_or_none(ctx.get("p10_maker_fee_rate"))
+        if taker_fee_rate is None or maker_fee_rate is None:
+            fee_key = (ctx["network"], ctx["account"], ctx.get("dex") or "")
+            fee_cache = cache.setdefault("p10_fee_rates", {})
+            if fee_key not in fee_cache:
+                fee_cache[fee_key] = effective_perp_fee_rates(
+                    ctx["info"], ctx["account"], ctx["asset"], ctx.get("dex") or ""
+                )
+            fee_rates = fee_cache[fee_key]
+            taker_fee_rate = decimal_or_none(fee_rates.get("taker_effective"))
+            maker_fee_rate = decimal_or_none(fee_rates.get("maker_effective"))
+        if taker_fee_rate is None or maker_fee_rate is None:
+            row["p10_status"] = "skipped_fee_rate_unavailable"
+            audit_grid_action(
+                "grid_p10_fee_rate_skipped",
+                coin=ctx["coin"],
+                grid_id=row.get("id"),
+                economic_chain_id=source.get("economic_chain_id"),
+                source_oid=source.get("oid"),
+            )
+            return False
+        ctx["p10_taker_fee_rate"] = taker_fee_rate
+        ctx["p10_maker_fee_rate"] = maker_fee_rate
+
     market = build_grid_p10_market_order(
         ctx["exchange"], row, ctx["coin"], ctx["asset"], ctx["current_mid"], is_buy, source_size
     )
@@ -8872,6 +8915,8 @@ def lifecycle_process_p10(row: dict[str, Any], ctx: dict[str, Any], cache: dict[
             "required_surplus": decimal_to_plain(required_surplus),
             "estimated_chase_cost": decimal_to_plain(chase_cost),
             "execution_buffer": decimal_to_plain(execution_buffer),
+            "taker_fee_rate": decimal_to_plain(ctx.get("p10_taker_fee_rate") or Decimal("0")),
+            "maker_fee_rate": decimal_to_plain(ctx.get("p10_maker_fee_rate") or Decimal("0")),
         }
         row["p10_promotion_intent"] = intent
         source["p10_intent_cloid"] = intent["cloid"]
