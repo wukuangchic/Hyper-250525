@@ -83,6 +83,7 @@ def make_row(*, short: bool = False) -> tuple[dict, dict]:
             "reduce_only": False,
             "grid_leg": 0,
             "iteration": 4,
+            "economic_chain_id": "C2608031200AbCd",
         }
         minimum, maximum = "-500", "-100"
     else:
@@ -96,6 +97,7 @@ def make_row(*, short: bool = False) -> tuple[dict, dict]:
             "reduce_only": False,
             "grid_leg": 0,
             "iteration": 4,
+            "economic_chain_id": "C2608031200AbCd",
         }
         minimum, maximum = "100", "500"
     row = {
@@ -150,6 +152,7 @@ def make_ctx(exchange, *, short: bool = False, withdrawable: str = "10") -> dict
         ],
         "open_oids": {11},
         "fills_by_oid": {},
+        "p10_chain_realized_surplus": {"C2608031200AbCd": "10"},
     }
 
 
@@ -232,6 +235,62 @@ class P10PromotionTests(unittest.TestCase):
         self.assertEqual(len(exchange.cancel_calls), 1)
         self.assertEqual(len(exchange.order_calls), 2)
         self.assertEqual(row["p10_source_distance_rate"], "0.01")
+
+    def test_new_zero_profit_chain_is_not_promoted(self) -> None:
+        row, source = make_row()
+        exchange = FakeExchange()
+        ctx = make_ctx(exchange)
+        ctx["p10_chain_realized_surplus"][source["economic_chain_id"]] = "0"
+
+        with patch("trail_worker.audit_grid_action") as audit_mock:
+            changed = lifecycle_process_p10(row, ctx, {"action_limit_headroom": 10})
+
+        self.assertFalse(changed)
+        self.assertEqual(exchange.cancel_calls, [])
+        self.assertEqual(exchange.order_calls, [])
+        self.assertEqual(row["p10_status"], "skipped_chain_profit")
+        self.assertEqual(row["p10_chain_realized_surplus"], "0")
+        self.assertEqual(row["p10_required_surplus"], "2.12")
+        self.assertEqual(audit_mock.call_args.args[0], "grid_p10_chain_profit_skipped")
+
+    def test_positive_but_insufficient_profit_chain_is_not_promoted(self) -> None:
+        row, source = make_row()
+        exchange = FakeExchange()
+        ctx = make_ctx(exchange)
+        ctx["p10_chain_realized_surplus"][source["economic_chain_id"]] = "2.12"
+
+        changed = lifecycle_process_p10(row, ctx, {"action_limit_headroom": 10})
+
+        self.assertFalse(changed)
+        self.assertEqual(exchange.cancel_calls, [])
+        self.assertEqual(exchange.order_calls, [])
+        self.assertEqual(row["p10_status"], "skipped_chain_profit")
+
+    def test_legacy_chain_profit_is_treated_as_zero(self) -> None:
+        row, source = make_row()
+        source["economic_chain_id"] = "7N5E1HuGi8"
+        exchange = FakeExchange()
+        ctx = make_ctx(exchange)
+        ctx["p10_chain_realized_surplus"] = {"7N5E1HuGi8": "100"}
+
+        changed = lifecycle_process_p10(row, ctx, {"action_limit_headroom": 10})
+
+        self.assertFalse(changed)
+        self.assertEqual(exchange.cancel_calls, [])
+        self.assertEqual(row["p10_chain_realized_surplus"], "0")
+
+    def test_profit_must_cover_chase_cost_and_gap_buffer(self) -> None:
+        row, _source = make_row()
+        exchange = FakeExchange()
+        ctx = make_ctx(exchange)
+        ctx["p10_chain_realized_surplus"]["C2608031200AbCd"] = "2.13"
+
+        changed = lifecycle_process_p10(row, ctx, {"action_limit_headroom": 10})
+
+        self.assertTrue(changed)
+        self.assertEqual(len(exchange.cancel_calls), 1)
+        self.assertEqual(row["p10_chain_realized_surplus"], "2.13")
+        self.assertEqual(row["p10_required_surplus"], "2.12")
 
     def test_p10_allows_one_new_promotion_per_coin_per_round(self) -> None:
         btc_row, _ = make_row()

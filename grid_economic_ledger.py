@@ -634,6 +634,8 @@ def chain_summaries(connection: sqlite3.Connection) -> list[dict[str, Any]]:
                     "fees": Decimal("0"),
                     "closed_pnl": Decimal("0"),
                     "oids": set(),
+                    "realized_surplus_after_fees": Decimal("0"),
+                    "realized_surplus_last_flat_ms": None,
                 },
             )
             side = str(row["side"] or "").upper()
@@ -653,6 +655,14 @@ def chain_summaries(connection: sqlite3.Connection) -> list[dict[str, Any]]:
             item["cash_flow"] += cash
             item["fees"] += decimal_value(row["fee"]) * ratio
             item["closed_pnl"] += decimal_value(row["closed_pnl"]) * ratio
+            if abs(item["net_size"]) <= Decimal("0.000000000001"):
+                # Preserve the last fully matched cash result even when the
+                # same long-lived chain subsequently opens another leg.  The
+                # query UI still reports an open chain's current profit as 0;
+                # this separate value is the already-earned budget available
+                # to risk controls such as P10.
+                item["realized_surplus_after_fees"] = item["cash_flow"] - item["fees"]
+                item["realized_surplus_last_flat_ms"] = int(row["time_ms"])
 
     summaries: list[dict[str, Any]] = []
     for item in grouped.values():
@@ -674,6 +684,10 @@ def chain_summaries(connection: sqlite3.Connection) -> list[dict[str, Any]]:
                 "unclosed_cash_flow_after_fees": decimal_text(
                     Decimal("0") if flat else raw_cash_after_fees
                 ),
+                "realized_surplus_after_fees": decimal_text(
+                    item["realized_surplus_after_fees"]
+                ),
+                "realized_surplus_last_flat_ms": item["realized_surplus_last_flat_ms"],
                 "exchange_closed_pnl": decimal_text(item["closed_pnl"]),
                 "flat": flat,
                 "profit_recognized": flat,

@@ -1801,6 +1801,34 @@ def load_economic_chain_profit_map(
         return None
 
 
+def load_economic_chain_realized_surplus_map(
+    db_path: Path = ECONOMIC_LEDGER_DB_PATH,
+) -> dict[str, str] | None:
+    """Read each chain's last fully matched net cash result without writes."""
+    if not db_path.is_file():
+        return None
+    try:
+        from grid_economic_ledger import chain_summaries
+
+        connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
+        try:
+            return {
+                str(chain["economic_chain_id"]): str(
+                    chain.get("realized_surplus_after_fees") or "0"
+                )
+                for chain in chain_summaries(connection)
+            }
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error) as exc:
+        log_event(
+            "grid_p10_economic_ledger_error",
+            {"type": type(exc).__name__, "message": str(exc)},
+        )
+        return None
+
+
 def economic_chain_profit_display(
     entry: dict[str, Any],
     chain_profits: dict[str, str] | None,

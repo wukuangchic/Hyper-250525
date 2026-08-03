@@ -40,6 +40,7 @@ from hl_order import (  # noqa: E402
     grid_avg_topup_params,
     grid_batch_open_oids,
     grid_limit_policy_from_row,
+    load_economic_chain_realized_surplus_map,
     grid_order_allowed_by_max,
     grid_order_should_reduce_only,
     grid_order_would_add_risk,
@@ -502,6 +503,19 @@ def new_economic_chain_id() -> str:
         if chain_id not in _ECONOMIC_CHAIN_IDS_GENERATED_THIS_RUN:
             _ECONOMIC_CHAIN_IDS_GENERATED_THIS_RUN.add(chain_id)
             return chain_id
+
+
+def current_economic_chain_id(value: Any) -> bool:
+    """Return whether an ID was born under the complete C+time+random scheme."""
+    chain_id = str(value or "").strip()
+    root, separator, branch = chain_id.partition("_")
+    return (
+        len(root) == 15
+        and root.startswith(ECONOMIC_CHAIN_ID_PREFIX)
+        and root[1:11].isdigit()
+        and root[11:].isalpha()
+        and (not separator or (branch.isdigit() and int(branch) > 0))
+    )
 
 
 def economic_chain_id(row: dict[str, Any], entry: dict[str, Any]) -> str:
@@ -7918,6 +7932,7 @@ def lifecycle_context(row: dict[str, Any], cache: dict[str, Any]) -> dict[str, A
         "open_orders": open_orders,
         "open_oids": open_oids,
         "fills_by_oid": fills_by_oid,
+        "p10_chain_realized_surplus": cache.get("p10_chain_realized_surplus"),
     }
 
 
@@ -8193,7 +8208,9 @@ def build_grid_p10_market_order(
 def lifecycle_p10_candidate(
     row: dict[str, Any],
     ctx: dict[str, Any],
-) -> tuple[dict[str, Any], Decimal, Decimal, bool] | None:
+) -> tuple[
+    dict[str, Any], Decimal, Decimal, bool, Decimal, Decimal, Decimal, Decimal
+] | None:
     """Choose the nearest active add-risk order in the current limit-breach direction."""
     is_buy = grid_limit_chase_direction(row, ctx["position_size"], ctx["position_value"])
     if is_buy is None:
@@ -8209,7 +8226,20 @@ def lifecycle_p10_candidate(
             open_by_oid[int(open_order["oid"])] = open_order
         except (KeyError, TypeError, ValueError):
             continue
-    candidates: list[tuple[Decimal, Decimal, int, dict[str, Any], Decimal]] = []
+    candidates: list[
+        tuple[
+            Decimal, Decimal, int, dict[str, Any], Decimal,
+            Decimal, Decimal, Decimal, Decimal,
+        ]
+    ] = []
+    profit_blocked: list[
+        tuple[Decimal, Decimal, int, dict[str, Any], Decimal, Decimal, Decimal, Decimal]
+    ] = []
+    surplus_map = ctx.get("p10_chain_realized_surplus")
+    if not isinstance(surplus_map, dict):
+        row["p10_status"] = "skipped_chain_profit_unavailable"
+        return None
+    gap_rate = decimal_or_none(row.get("gap_rate")) or Decimal("0")
     for entry in row.get("levels") or []:
         if (
             not isinstance(entry, dict)
@@ -8239,13 +8269,61 @@ def lifecycle_p10_candidate(
             not is_buy and price <= ctx["current_mid"]
         ):
             continue
-        candidates.append((abs(ctx["current_mid"] - price), price, oid, entry, remaining_size))
+        distance = abs(ctx["current_mid"] - price)
+        chain_id = str(entry.get("economic_chain_id") or "").strip()
+        realized_surplus = (
+            decimal_or_none(surplus_map.get(chain_id)) or Decimal("0")
+            if current_economic_chain_id(chain_id)
+            and not entry.get("economic_chain_id_backfilled_at")
+            else Decimal("0")
+        )
+        chase_cost = distance * remaining_size
+        execution_buffer = ctx["current_mid"] * remaining_size * gap_rate
+        required_surplus = chase_cost + execution_buffer
+        candidate = (
+            distance, price, oid, entry, remaining_size, realized_surplus,
+            required_surplus, chase_cost, execution_buffer,
+        )
+        if realized_surplus <= required_surplus:
+            profit_blocked.append(candidate[:-1])
+            continue
+        candidates.append(candidate)
     if not candidates:
+        if profit_blocked:
+            (
+                distance, source_price, source_oid, source, source_size,
+                realized_surplus, required_surplus, chase_cost,
+            ) = min(profit_blocked, key=lambda item: (item[0], item[2]))
+            execution_buffer = required_surplus - chase_cost
+            row["p10_status"] = "skipped_chain_profit"
+            row["p10_chain_realized_surplus"] = decimal_to_plain(realized_surplus)
+            row["p10_required_surplus"] = decimal_to_plain(required_surplus)
+            audit_grid_action(
+                "grid_p10_chain_profit_skipped",
+                coin=ctx["coin"],
+                grid_id=row.get("id"),
+                economic_chain_id=source.get("economic_chain_id"),
+                source_oid=source_oid,
+                source_price=decimal_to_plain(source_price),
+                source_size=decimal_to_plain(source_size),
+                current_mid=decimal_to_plain(ctx["current_mid"]),
+                source_distance=decimal_to_plain(distance),
+                chain_realized_surplus=decimal_to_plain(realized_surplus),
+                chase_cost=decimal_to_plain(chase_cost),
+                execution_buffer=decimal_to_plain(execution_buffer),
+                required_surplus=decimal_to_plain(required_surplus),
+            )
         return None
-    _distance, source_price, _oid, entry, remaining_size = min(
+    (
+        _distance, source_price, _oid, entry, remaining_size,
+        realized_surplus, required_surplus, chase_cost, execution_buffer,
+    ) = min(
         candidates, key=lambda item: (item[0], item[2])
     )
-    return entry, remaining_size, source_price, is_buy
+    return (
+        entry, remaining_size, source_price, is_buy, realized_surplus,
+        required_surplus, chase_cost, execution_buffer,
+    )
 
 
 def lifecycle_p10_margin_adequacy(
@@ -8627,7 +8705,20 @@ def lifecycle_process_p10(row: dict[str, Any], ctx: dict[str, Any], cache: dict[
         candidate = lifecycle_p10_candidate(row, ctx)
         if candidate is None:
             return False
-        source, source_size, source_price, is_buy = candidate
+        (
+            source,
+            source_size,
+            source_price,
+            is_buy,
+            chain_realized_surplus,
+            required_surplus,
+            chase_cost,
+            execution_buffer,
+        ) = candidate
+        row["p10_chain_realized_surplus"] = decimal_to_plain(chain_realized_surplus)
+        row["p10_required_surplus"] = decimal_to_plain(required_surplus)
+        row["p10_estimated_chase_cost"] = decimal_to_plain(chase_cost)
+        row["p10_execution_buffer"] = decimal_to_plain(execution_buffer)
         distance_rate = lifecycle_p10_source_distance_rate(
             ctx["current_mid"], source_price
         )
@@ -8714,6 +8805,10 @@ def lifecycle_process_p10(row: dict[str, Any], ctx: dict[str, Any], cache: dict[
             "economic_chain_id": chain_id,
             "estimated_margin": decimal_to_plain(estimated_margin or Decimal("0")),
             "margin_adequacy": decimal_to_plain(adequacy or Decimal("0")),
+            "chain_realized_surplus": decimal_to_plain(chain_realized_surplus),
+            "required_surplus": decimal_to_plain(required_surplus),
+            "estimated_chase_cost": decimal_to_plain(chase_cost),
+            "execution_buffer": decimal_to_plain(execution_buffer),
         }
         row["p10_promotion_intent"] = intent
         source["p10_intent_cloid"] = intent["cloid"]
@@ -10151,6 +10246,7 @@ def run_once() -> None:
         "grid_rows": rows,
         "run_started_at": int(time.time()),
         "run_monotonic_started_at": time.monotonic(),
+        "p10_chain_realized_surplus": load_economic_chain_realized_surplus_map(),
     }
     changed = lifecycle_initialize_p3_queue(rows, active_grid_indexes)
     chain_backfilled, chain_backfilled_by_status, chain_backfilled_by_coin = (

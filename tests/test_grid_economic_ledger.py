@@ -91,6 +91,8 @@ class GridEconomicLedgerTests(unittest.TestCase):
                 self.assertEqual(chain["net_size"], "0")
                 self.assertEqual(chain["cash_flow"], "10")
                 self.assertEqual(chain["incremental_cash_after_fees"], "9.8")
+                self.assertEqual(chain["realized_surplus_after_fees"], "9.8")
+                self.assertEqual(chain["realized_surplus_last_flat_ms"], 2000)
                 self.assertEqual(chain["unclosed_cash_flow_after_fees"], "0")
                 self.assertTrue(chain["profit_recognized"])
                 self.assertEqual(chain["exchange_closed_pnl"], "-50")
@@ -142,6 +144,41 @@ class GridEconomicLedgerTests(unittest.TestCase):
                 self.assertEqual(chain["incremental_cash_after_fees"], "0")
                 self.assertEqual(chain["unclosed_cash_flow_after_fees"], "109.9")
                 self.assertFalse(chain["profit_recognized"])
+                self.assertEqual(chain["realized_surplus_after_fees"], "0")
+                self.assertIsNone(chain["realized_surplus_last_flat_ms"])
+            finally:
+                connection.close()
+
+    def test_open_chain_retains_profit_from_its_last_flat_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connection = connect_db(Path(directory) / "ledger.sqlite3")
+            try:
+                for offset, oid in enumerate((51, 52, 53)):
+                    ingest_action_record(
+                        connection,
+                        offset,
+                        {
+                            "ts": 100 + offset,
+                            "action": "grid_order_submit",
+                            "coin": "XYZ",
+                            "economic_chain_id": "chain-cycles",
+                            "oid": oid,
+                        },
+                    )
+                ingest_fills(
+                    connection,
+                    [
+                        {"time": 1000, "coin": "XYZ", "oid": 51, "tid": 51, "side": "A", "px": "110", "sz": "1", "fee": "0.1", "closedPnl": "0", "crossed": False},
+                        {"time": 2000, "coin": "XYZ", "oid": 52, "tid": 52, "side": "B", "px": "100", "sz": "1", "fee": "0.1", "closedPnl": "0", "crossed": False},
+                        {"time": 3000, "coin": "XYZ", "oid": 53, "tid": 53, "side": "A", "px": "120", "sz": "1", "fee": "0.1", "closedPnl": "0", "crossed": False},
+                    ],
+                )
+
+                chain = chain_summaries(connection)[0]
+                self.assertFalse(chain["flat"])
+                self.assertEqual(chain["incremental_cash_after_fees"], "0")
+                self.assertEqual(chain["realized_surplus_after_fees"], "9.8")
+                self.assertEqual(chain["realized_surplus_last_flat_ms"], 2000)
             finally:
                 connection.close()
 
