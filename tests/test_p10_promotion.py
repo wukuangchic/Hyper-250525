@@ -14,17 +14,27 @@ from trail_worker import (
 
 
 class FakeInfo:
+    def __init__(self, *, cloid_status=None) -> None:
+        self.cloid_status = cloid_status
+
     def query_order_by_oid(self, account, oid):
         return {"status": "order", "order": {"status": "canceled", "order": {"oid": oid}}}
 
     def query_order_by_cloid(self, account, cloid):
-        return {"status": "unknownOid"}
+        return self.cloid_status or {"status": "unknownOid"}
 
 
 class FakeExchange:
-    def __init__(self, *, market_error: str | None = None, market_exception: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        market_error: str | None = None,
+        market_exception: str | None = None,
+        market_fill_price: str | None = None,
+    ) -> None:
         self.market_error = market_error
         self.market_exception = market_exception
+        self.market_fill_price = market_fill_price
         self.cancel_calls = []
         self.order_calls = []
 
@@ -60,7 +70,13 @@ class FakeExchange:
                 "response": {
                     "data": {
                         "statuses": [
-                            {"filled": {"oid": 22, "avgPx": str(price), "totalSz": str(size)}}
+                            {
+                                "filled": {
+                                    "oid": 22,
+                                    "avgPx": self.market_fill_price or str(price),
+                                    "totalSz": str(size),
+                                }
+                            }
                         ]
                     }
                 },
@@ -200,6 +216,77 @@ class P10PromotionTests(unittest.TestCase):
         self.assertEqual(exchange.order_calls[1]["price"], 50.0)
         self.assertTrue(exchange.order_calls[1]["reduce_only"])
         self.assertEqual(row["levels"][0]["price"], "50")
+
+    def test_long_better_fill_uses_one_gap_sell_fallback(self) -> None:
+        row, _source = make_row()
+        exchange = FakeExchange(market_fill_price="49.9")
+
+        changed = lifecycle_process_p10(
+            row, make_ctx(exchange), {"action_limit_headroom": 10}
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(len(exchange.order_calls), 2)
+        self.assertFalse(exchange.order_calls[1]["is_buy"])
+        self.assertEqual(exchange.order_calls[1]["price"], 50.399)
+        self.assertEqual(row["levels"][0]["price"], "50.399")
+        self.assertNotIn("p10_promotion_intent", row)
+
+    def test_short_better_fill_uses_one_gap_buy_fallback(self) -> None:
+        row, _source = make_row(short=True)
+        exchange = FakeExchange(market_fill_price="70.1")
+
+        changed = lifecycle_process_p10(
+            row, make_ctx(exchange, short=True), {"action_limit_headroom": 10}
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(len(exchange.order_calls), 2)
+        self.assertTrue(exchange.order_calls[1]["is_buy"])
+        self.assertEqual(exchange.order_calls[1]["price"], 69.399)
+        self.assertEqual(row["levels"][0]["price"], "69.399")
+        self.assertNotIn("p10_promotion_intent", row)
+
+    def test_legacy_waiting_intent_reconciles_fill_and_places_replacement(self) -> None:
+        row, source = make_row()
+        source.update(
+            {
+                "oid": None,
+                "status": "p10_cancelled",
+                "p10_intent_cloid": "0x00000000000000000000000000000001",
+            }
+        )
+        row["p10_promotion_intent"] = {
+            "cloid": source["p10_intent_cloid"],
+            "status": "filled_waiting_for_replacement",
+            "created_at": 90,
+            "source_oid": 11,
+            "source_price": "50",
+            "source_size": "0.2",
+            "source_grid_leg": 0,
+            "source_iteration": 4,
+            "market_is_buy": True,
+            "economic_chain_id": source["economic_chain_id"],
+        }
+        exchange = FakeExchange()
+        ctx = make_ctx(exchange)
+        ctx["info"] = FakeInfo(
+            cloid_status={
+                "status": "order",
+                "order": {"status": "filled", "order": {"oid": 22}},
+            }
+        )
+        ctx["fills_by_oid"] = {22: {"px": "49.9", "sz": "0.2"}}
+
+        changed = lifecycle_process_p10(row, ctx, {"action_limit_headroom": 10})
+
+        self.assertTrue(changed)
+        self.assertEqual(len(exchange.cancel_calls), 0)
+        self.assertEqual(len(exchange.order_calls), 1)
+        self.assertFalse(exchange.order_calls[0]["is_buy"])
+        self.assertEqual(exchange.order_calls[0]["price"], 50.399)
+        self.assertEqual(row["levels"][0]["oid"], 23)
+        self.assertNotIn("p10_promotion_intent", row)
 
     def test_source_strictly_within_one_gap_skips_before_cancel(self) -> None:
         row, source = make_row()

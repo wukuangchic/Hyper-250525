@@ -8465,13 +8465,35 @@ def lifecycle_p10_replacement_from_fill(
     if source_price is None or source_price <= 0 or fill_price <= 0 or fill_size <= 0:
         return None
     market_is_buy = bool(intent.get("market_is_buy"))
-    target_price = rounded_perp_price(
-        fill_price * Decimal("2") - source_price,
-        int(row.get("sz_decimals") or ctx["asset"]["szDecimals"]),
+    gap_rate = decimal_or_none(row.get("gap_rate")) or Decimal("0")
+    sz_decimals = int(row.get("sz_decimals") or ctx["asset"]["szDecimals"])
+    reflected_price = fill_price * Decimal("2") - source_price
+    target_price = (
+        rounded_perp_price(reflected_price, sz_decimals)
+        if reflected_price > 0
+        else Decimal("0")
     )
-    if target_price <= 0:
-        return None
-    if (market_is_buy and target_price <= fill_price) or (not market_is_buy and target_price >= fill_price):
+    # The IOC can occasionally improve through the old passive price while the
+    # cancel/fill race is in flight.  In that case the reflected target points
+    # to the wrong side of the fill.  Keep at least one configured gap between
+    # the actual fill and its reverse order so fees, slippage, and the normal
+    # profit buffer remain covered.
+    if gap_rate > 0:
+        gap_target = rounded_perp_price(
+            fill_price
+            * (Decimal("1") + gap_rate if market_is_buy else Decimal("1") - gap_rate),
+            sz_decimals,
+        )
+        target_price = (
+            max(target_price, gap_target)
+            if market_is_buy
+            else min(target_price, gap_target)
+        )
+    if target_price <= 0 or (
+        market_is_buy and target_price <= fill_price
+    ) or (
+        not market_is_buy and target_price >= fill_price
+    ):
         return None
     child = grid_order_entry(
         row,
@@ -8518,6 +8540,9 @@ def lifecycle_materialize_p10_fill(
     child = lifecycle_p10_replacement_from_fill(row, ctx, intent, fill_price, fill_size)
     if child is None:
         intent["status"] = "filled_waiting_for_replacement"
+        intent["market_fill_price"] = decimal_to_plain(fill_price)
+        intent["market_fill_size"] = decimal_to_plain(fill_size)
+        intent["market_oid"] = market_oid
         intent["last_error"] = "P10 fill could not build its mirrored replacement"
         persist_lifecycle_intent(cache)
         return False
@@ -8644,7 +8669,20 @@ def lifecycle_reconcile_p10_intent(
     if status in {"prepared", "cancelled"}:
         return False, False
     if status == "filled_waiting_for_replacement":
-        return False, True
+        fill_price = decimal_or_none(intent.get("market_fill_price"))
+        fill_size = decimal_or_none(intent.get("market_fill_size"))
+        market_oid = (
+            int(intent["market_oid"])
+            if intent.get("market_oid") is not None
+            else None
+        )
+        if fill_price is not None and fill_size is not None:
+            return lifecycle_materialize_p10_fill(
+                row, ctx, cache, intent, fill_price, fill_size, market_oid
+            ), True
+        # Older persisted intents did not retain the fill details.  Fall
+        # through to the CLOID/fill reconciliation below so deployment can
+        # repair them without a manual state edit.
     try:
         order_status = ctx["info"].query_order_by_cloid(
             ctx["account"], Cloid.from_str(str(intent["cloid"]))
