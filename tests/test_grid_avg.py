@@ -105,6 +105,7 @@ from trail_worker import (
     lifecycle_birth_twin_orders,
     lifecycle_backfill_economic_chain_ids,
     lifecycle_legacy_pause_candidate,
+    lifecycle_limit_return_force_non_reduce_only,
     lifecycle_mark_deferred_or_discarded,
     lifecycle_materialize_birth_intent,
     lifecycle_migrate_min_rejected_debts_to_p8,
@@ -627,6 +628,71 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(child["status"], "active")
         self.assertTrue(exchange.request[-1])
         self.assertEqual(info.book_calls, 1)
+
+    def test_p2_limit_return_buy_crosses_zero_without_reduce_only(self) -> None:
+        class FakeInfo:
+            def l2_snapshot(self, coin):
+                return {"levels": [[{"px": "119.9"}], [{"px": "120.1"}]]}
+
+        class FakeExchange:
+            def order(self, coin, is_buy, size, price, order_type, reduce_only=False):
+                self.request = (coin, is_buy, size, price, order_type, reduce_only)
+                return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 22}}]}}}
+
+        source = {
+            "side": "sell", "is_buy": False, "status": "filled", "replacement_pending": True,
+            "grid_leg": 0, "iteration": 0, "fill": {"px": "120", "sz": "0.1"},
+            "price": "120", "size": "0.1",
+        }
+        row = {
+            "gap_rate": "0.001", "min_order_value": "10",
+            "position_limit_mode": "limit", "min_position_value": "200",
+            "max_position_value": "500", "base_buy_size": "0.1", "base_sell_size": "0.1",
+            "levels": [source],
+        }
+        exchange = FakeExchange()
+        ctx = {
+            "coin": "xyz:SPCX", "asset": {"szDecimals": 2, "maxLeverage": 20},
+            "exchange": exchange, "now": 123, "position_size": Decimal("-0.23"),
+            "position_value": Decimal("27.6"), "current_mid": Decimal("120"),
+            "best_bid": None, "best_ask": None, "open_orders": [], "open_oids": set(),
+            "fills_by_oid": {}, "info": FakeInfo(), "account": "0xabc",
+        }
+
+        count, changed = lifecycle_process_fills(row, ctx, {"action_limit_headroom": 100})
+
+        self.assertTrue(changed)
+        self.assertEqual(count, 1)
+        child = row["levels"][0]
+        self.assertEqual(child["side"], "buy")
+        self.assertFalse(exchange.request[-1])
+        self.assertFalse(child["reduce_only"])
+        self.assertTrue(child["p2_limit_return_non_reduce_only"])
+
+    def test_limit_return_non_reduce_only_only_applies_toward_breached_range(self) -> None:
+        row = {
+            "position_limit_mode": "limit",
+            "min_position_value": "200",
+            "max_position_value": "500",
+        }
+        buy = {"is_buy": True}
+        sell = {"is_buy": False}
+
+        self.assertTrue(
+            lifecycle_limit_return_force_non_reduce_only(
+                row, buy, Decimal("-0.23"), Decimal("27.6")
+            )
+        )
+        self.assertFalse(
+            lifecycle_limit_return_force_non_reduce_only(
+                row, sell, Decimal("-0.23"), Decimal("27.6")
+            )
+        )
+        self.assertFalse(
+            lifecycle_limit_return_force_non_reduce_only(
+                row, sell, Decimal("2.5"), Decimal("250")
+            )
+        )
 
     def test_p2_iteration_counts_each_alo_submit_after_outward_rejects(self) -> None:
         class FakeExchange:

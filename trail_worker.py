@@ -7571,6 +7571,23 @@ def lifecycle_replacement_from_fill(
     return order
 
 
+def lifecycle_limit_return_force_non_reduce_only(
+    row: dict[str, Any],
+    order: dict[str, Any],
+    position_size: Decimal,
+    position_value: Decimal,
+) -> bool:
+    """Let a limit-policy order cross zero when it moves inventory back into range."""
+    if grid_limit_policy_from_row(row) != "limit":
+        return False
+    minimum = Decimal(str(row.get("min_position_value") or "0"))
+    maximum = Decimal(str(row.get("max_position_value") or "0"))
+    lower, upper = grid_position_bounds("limit", minimum, maximum)
+    current = signed_position_value(position_size, position_value)
+    is_buy = bool(order.get("is_buy"))
+    return (current < lower and is_buy) or (current > upper and not is_buy)
+
+
 def lifecycle_mark_deferred_or_discarded(
     order: dict[str, Any],
     now: int,
@@ -9865,11 +9882,23 @@ def lifecycle_process_fills(
         if child is None:
             source["last_error"] = "filled lifecycle order could not build its replacement"
             continue
+        position_value = decimal_or_none(ctx.get("position_value"))
+        if position_value is None:
+            position_value = abs(ctx["position_size"] * ctx["current_mid"])
+        force_limit_return = lifecycle_limit_return_force_non_reduce_only(
+            row,
+            child,
+            ctx["position_size"],
+            position_value,
+        )
+        if force_limit_return:
+            child["p2_limit_return_non_reduce_only"] = True
         lifecycle_ensure_context_book(ctx, cache)
         result = lifecycle_submit_order(
             ctx["exchange"], ctx["coin"], child, ctx["now"], row, ctx["asset"],
             ctx["position_size"], ctx["current_mid"], ctx["best_bid"], ctx["best_ask"],
             isolated_ready, ctx["open_orders"], cache, search_outward=True,
+            force_non_reduce_only=force_limit_return,
             allow_non_reduce_only_fallback=True,
         )
         if source in levels:
@@ -10741,7 +10770,15 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                     ctx["exchange"], ctx["coin"], entry, ctx["now"], row, ctx["asset"], ctx["position_size"],
                     ctx["current_mid"], ctx["best_bid"], ctx["best_ask"], isolated_ready,
                     ctx["open_orders"], cache, search_outward=True,
-                    force_non_reduce_only=bool(entry.get("p10_never_cancel")),
+                    force_non_reduce_only=(
+                        bool(entry.get("p10_never_cancel"))
+                        or lifecycle_limit_return_force_non_reduce_only(
+                            row,
+                            entry,
+                            ctx["position_size"],
+                            ctx["position_value"],
+                        )
+                    ),
                     allow_non_reduce_only_fallback=True,
                 )
                 changed = True
