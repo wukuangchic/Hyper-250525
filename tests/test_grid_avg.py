@@ -426,6 +426,17 @@ class GridAvgTests(unittest.TestCase):
 
         self.assertIsNone(lifecycle_terminal_candidate(rows, "mainnet", "0xabc"))
 
+    def test_p10_never_cancel_order_is_excluded_from_p1(self) -> None:
+        rows = [{
+            "type": "grid", "status": "active", "network": "mainnet", "account": "0xabc",
+            "levels": [{
+                "side": "buy", "status": "active", "oid": 1, "grid_leg": 0,
+                "reduce_only": False, "p10_never_cancel": True, "submitted_at": 1,
+            }],
+        }]
+
+        self.assertIsNone(lifecycle_terminal_candidate(rows, "mainnet", "0xabc"))
+
     def test_finite_chain_p6_uses_relative_nearest_legacy_pause(self) -> None:
         btc = {
             "type": "grid", "status": "active", "network": "mainnet", "account": "0xabc", "dex": "", "coin": "BTC",
@@ -690,6 +701,43 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(entry["p3_queue_seq"], 5)
         self.assertEqual(entry["grid_leg"], 1)
         self.assertEqual(row["levels"], [prior_debt, entry])
+
+    def test_p5_cancelled_p10_leg_zero_returns_to_p3_instead_of_terminating(self) -> None:
+        class FakeInfo:
+            def query_order_by_oid(self, account, oid):
+                return {"order": {"status": "canceled"}}
+
+        entry = grid_order_entry(
+            {"gap_rate": "0.01", "min_order_value": "10", "base_buy_size": "1", "base_sell_size": "1"},
+            "BTC", {"szDecimals": 2}, False, Decimal("101"), False,
+            size=Decimal("1"), preserve_size=True,
+        )
+        entry.update({
+            "status": "active", "oid": 9, "grid_leg": 0,
+            "economic_chain_id": "CHAIN-P10", "p10_replacement": True,
+            "p10_never_cancel": True,
+        })
+        row = {"gap_rate": "0.01", "levels": [entry]}
+        ctx = {
+            "coin": "BTC", "asset": {"szDecimals": 2, "maxLeverage": 20},
+            "exchange": object(), "now": 123, "position_size": Decimal("1"),
+            "current_mid": Decimal("100"), "best_bid": Decimal("99.9"),
+            "best_ask": Decimal("100.1"), "open_orders": [], "open_oids": set(),
+            "fills_by_oid": {}, "info": FakeInfo(), "account": "0xabc",
+        }
+
+        count, changed = lifecycle_process_anomalies(
+            row, ctx, {"action_limit_headroom": 200, "grid_rows": [row]}
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(count, 1)
+        self.assertEqual(entry["status"], GRID_CHAIN_DEBT_STATUS)
+        self.assertIsNone(entry["oid"])
+        self.assertTrue(entry["p10_never_cancel"])
+        self.assertTrue(entry["p10_restore"])
+        self.assertEqual(entry["p3_queue_seq"], 0)
+        self.assertEqual(row["levels"], [entry])
 
     def test_p5_partial_leg_one_remainder_moves_to_p8(self) -> None:
         class FakeInfo:
@@ -2582,6 +2630,39 @@ class GridAvgTests(unittest.TestCase):
         self.assertEqual(cache["lifecycle_p3_restore_attempts"], 2)
         self.assertEqual(submitted, ["BTC", "ETH"])
 
+    def test_p3_forces_protected_p10_debt_to_non_reduce_only(self) -> None:
+        debt = {
+            "side": "sell", "is_buy": False, "status": GRID_CHAIN_DEBT_STATUS,
+            "grid_leg": 0, "oid": None, "price": "110", "size": "1",
+            "p10_replacement": True, "p10_restore": True,
+            "p10_never_cancel": True,
+        }
+        row = {
+            "type": "grid", "status": "active", "grid_lifecycle_version": 2,
+            "network": "mainnet", "account": "0xabc", "coin": "BTC",
+            "gap_rate": "0.01", "levels": [debt],
+        }
+        ctx = {
+            "network": "mainnet", "account": "0xabc", "coin": "BTC",
+            "asset": {"szDecimals": 2}, "exchange": object(), "info": object(),
+            "now": 123, "now_ms": 123000, "position_size": Decimal("1"),
+            "position_value": Decimal("100"), "current_mid": Decimal("100"),
+            "best_bid": Decimal("99"), "best_ask": Decimal("101"),
+            "withdrawable": Decimal("2"), "liquidation_px": None,
+            "open_orders": [], "open_oids": set(), "fills_by_oid": {},
+        }
+
+        with (
+            patch("trail_worker.lifecycle_context", return_value=ctx),
+            patch("trail_worker.lifecycle_submit_order", return_value="submitted") as submit_mock,
+        ):
+            maintain_grid(row, {
+                "grid_rows": [row], "grid_action_phase": "p3",
+                "action_limit_raw_deficit": -1, "lifecycle_p3_target": debt,
+            })
+
+        self.assertTrue(submit_mock.call_args.kwargs["force_non_reduce_only"])
+
     def test_p3_failed_entry_moves_to_the_tail_of_its_grid_queue(self) -> None:
         row = {
             "type": "grid", "status": "active", "grid_lifecycle_version": 2,
@@ -2783,6 +2864,26 @@ class GridAvgTests(unittest.TestCase):
         self.assertIsNotNone(pair)
         self.assertEqual((pair[0]["oid"], pair[1]["oid"]), (0, 105))
 
+    def test_p10_never_cancel_order_is_excluded_from_p7_counts_and_pair(self) -> None:
+        row = {
+            "levels": [
+                *[
+                    {"side": "buy", "status": "active", "grid_leg": 1, "oid": index,
+                     "price": str(60 + index), "size": "1"}
+                    for index in range(5)
+                ],
+                {"side": "buy", "status": "active", "grid_leg": 1, "oid": 99,
+                 "price": "50", "size": "1", "p10_never_cancel": True},
+                *[
+                    {"side": "sell", "status": "active", "grid_leg": 1, "oid": 100 + index,
+                     "price": str(110 + index), "size": "1"}
+                    for index in range(6)
+                ],
+            ],
+        }
+
+        self.assertIsNone(lifecycle_p7_farthest_pair(row))
+
     def test_p7_skips_a_pair_until_both_orders_are_ten_minutes_old(self) -> None:
         row = {
             "levels": [
@@ -2919,6 +3020,20 @@ class GridAvgTests(unittest.TestCase):
         self.assertIs(candidate[0], btc)
         self.assertIs(candidate[1], btc_order)
         self.assertEqual(candidate[2:], (Decimal("2.4"), Decimal("6"), Decimal("0.4")))
+
+    def test_p10_never_cancel_order_is_excluded_from_p9(self) -> None:
+        protected = {
+            "side": "buy", "status": "active", "grid_leg": 0,
+            "oid": 1, "price": "60", "size": "1", "reduce_only": False,
+            "p10_never_cancel": True,
+        }
+        row = {
+            "type": "grid", "status": "active", "network": "mainnet",
+            "account": "0xabc", "coin": "BTC", "lifecycle_mid": "100",
+            "lifecycle_leverage": "10", "levels": [protected],
+        }
+
+        self.assertIsNone(lifecycle_p9_candidate([row], "mainnet", "0xabc"))
 
     def test_p9_below_one_cancels_highest_score_and_appends_original_leg_to_p3_tail(self) -> None:
         prior_debt = {

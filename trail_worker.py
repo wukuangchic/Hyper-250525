@@ -719,7 +719,11 @@ def lifecycle_p7_farthest_pair(
     active_buy_count = 0
     active_sell_count = 0
     for entry in row.get("levels") or []:
-        if isinstance(entry, dict) and str(entry.get("status") or "") == "active":
+        if (
+            isinstance(entry, dict)
+            and str(entry.get("status") or "") == "active"
+            and not grid_order_is_never_cancel(entry)
+        ):
             if str(entry.get("side") or "") == "buy":
                 active_buy_count += 1
             elif str(entry.get("side") or "") == "sell":
@@ -727,6 +731,7 @@ def lifecycle_p7_farthest_pair(
         if (
             not isinstance(entry, dict)
             or str(entry.get("status") or "") != "active"
+            or grid_order_is_never_cancel(entry)
             or lifecycle_leg(entry) != 1
             or entry.get("oid") is None
         ):
@@ -767,6 +772,7 @@ def lifecycle_p7_debt_value(row: dict[str, Any]) -> Decimal | None:
         if (
             not isinstance(entry, dict)
             or str(entry.get("status") or "") != "active"
+            or grid_order_is_never_cancel(entry)
             or lifecycle_leg(entry) != 1
         ):
             continue
@@ -3048,7 +3054,7 @@ def claim_withdrawable_pause_entry(
 
 
 def grid_order_is_never_cancel(entry: dict[str, Any]) -> bool:
-    return bool(entry.get("replace_never_cancel"))
+    return bool(entry.get("replace_never_cancel") or entry.get("p10_never_cancel"))
 
 
 def grid_price_occupancy_entries(row: dict[str, Any], side: str | None = None) -> list[dict[str, Any]]:
@@ -7974,7 +7980,12 @@ def lifecycle_terminal_candidate(
         for entry in candidate_row.get("levels") or []:
             if not isinstance(entry, dict) or str(entry.get("status") or "") != "active":
                 continue
-            if lifecycle_leg(entry) != 0 or entry.get("oid") is None or bool(entry.get("reduce_only")):
+            if (
+                lifecycle_leg(entry) != 0
+                or entry.get("oid") is None
+                or bool(entry.get("reduce_only"))
+                or grid_order_is_never_cancel(entry)
+            ):
                 continue
             timestamp = grid_entry_timestamp_ms(entry) or 0
             try:
@@ -8069,6 +8080,7 @@ def lifecycle_p9_candidate(
                 not isinstance(entry, dict)
                 or str(entry.get("status") or "") != "active"
                 or bool(entry.get("reduce_only"))
+                or grid_order_is_never_cancel(entry)
             ):
                 continue
             try:
@@ -8207,6 +8219,24 @@ def build_grid_p10_market_order(
     }
 
 
+def lifecycle_p10_chain_has_outstanding_reverse(
+    row: dict[str, Any],
+    chain_id: str,
+) -> bool:
+    """Keep one P10 loss advance per chain until its protected reverse fills."""
+    if not chain_id:
+        return False
+    for entry in row.get("levels") or []:
+        if (
+            isinstance(entry, dict)
+            and str(entry.get("economic_chain_id") or "").strip() == chain_id
+            and bool(entry.get("p10_never_cancel"))
+            and str(entry.get("status") or "") not in {"filled", "discarded"}
+        ):
+            return True
+    return False
+
+
 def lifecycle_p10_candidate(
     row: dict[str, Any],
     ctx: dict[str, Any],
@@ -8237,6 +8267,7 @@ def lifecycle_p10_candidate(
     profit_blocked: list[
         tuple[Decimal, Decimal, int, dict[str, Any], Decimal, Decimal, Decimal, Decimal]
     ] = []
+    chain_locked: list[tuple[Decimal, int, dict[str, Any]]] = []
     surplus_map = ctx.get("p10_chain_realized_surplus")
     if not isinstance(surplus_map, dict):
         row["p10_status"] = "skipped_chain_profit_unavailable"
@@ -8248,6 +8279,7 @@ def lifecycle_p10_candidate(
             or str(entry.get("status") or "") != "active"
             or str(entry.get("side") or "") != side
             or bool(entry.get("reduce_only"))
+            or grid_order_is_never_cancel(entry)
             or grid_order_reduces_position(entry, ctx["position_size"])
         ):
             continue
@@ -8273,6 +8305,9 @@ def lifecycle_p10_candidate(
             continue
         distance = abs(ctx["current_mid"] - price)
         chain_id = str(entry.get("economic_chain_id") or "").strip()
+        if lifecycle_p10_chain_has_outstanding_reverse(row, chain_id):
+            chain_locked.append((distance, oid, entry))
+            continue
         # A positive, ledger-observed flat result is the admission ticket for
         # P10.  The ID's spelling and its historical/backfilled origin do not
         # matter once the ledger has proved that this exact chain earned money.
@@ -8290,7 +8325,19 @@ def lifecycle_p10_candidate(
             continue
         candidates.append(candidate)
     if not candidates:
-        if profit_blocked:
+        if chain_locked:
+            _distance, source_oid, source = min(
+                chain_locked, key=lambda item: (item[0], item[1])
+            )
+            row["p10_status"] = "skipped_chain_outstanding_reverse"
+            audit_grid_action(
+                "grid_p10_chain_outstanding_reverse_skipped",
+                coin=ctx["coin"],
+                grid_id=row.get("id"),
+                economic_chain_id=source.get("economic_chain_id"),
+                source_oid=source_oid,
+            )
+        elif profit_blocked:
             (
                 distance, source_price, source_oid, source, source_size,
                 realized_surplus, required_surplus, chase_cost,
@@ -8331,8 +8378,9 @@ def lifecycle_p10_margin_adequacy(
     market: dict[str, Any],
     withdrawable: Decimal | None,
     leverage: Decimal | None,
+    reverse_notional: Decimal | None = None,
 ) -> tuple[Decimal | None, Decimal | None]:
-    """Estimate P10 IOC margin and its withdrawable coverage before cancellation."""
+    """Estimate combined P10 IOC and reverse-opening margin coverage."""
     plan = market.get("plan")
     worst_notional = (
         decimal_or_none(plan.get("worst_notional")) if isinstance(plan, dict) else None
@@ -8346,10 +8394,46 @@ def lifecycle_p10_margin_adequacy(
         or worst_notional <= 0
     ):
         return None, None
-    estimated_margin = worst_notional / leverage
+    if reverse_notional is None or reverse_notional < 0:
+        reverse_notional = Decimal("0")
+    estimated_margin = (worst_notional + reverse_notional) / leverage
     if estimated_margin <= 0:
         return None, None
     return estimated_margin, withdrawable / estimated_margin
+
+
+def lifecycle_p10_margin_components(
+    market: dict[str, Any],
+    reverse_price: Decimal | None,
+    withdrawable: Decimal | None,
+    leverage: Decimal | None,
+) -> tuple[Decimal | None, Decimal | None, Decimal | None, Decimal | None]:
+    """Return market, reverse, total margin and total withdrawable coverage."""
+    plan = market.get("plan")
+    size = decimal_or_none(plan.get("size")) if isinstance(plan, dict) else None
+    worst_notional = (
+        decimal_or_none(plan.get("worst_notional")) if isinstance(plan, dict) else None
+    )
+    if (
+        leverage is None
+        or leverage <= 0
+        or size is None
+        or size <= 0
+        or worst_notional is None
+        or worst_notional <= 0
+        or reverse_price is None
+        or reverse_price <= 0
+    ):
+        return None, None, None, None
+    market_margin = worst_notional / leverage
+    reverse_margin = reverse_price * size / leverage
+    total_margin, adequacy = lifecycle_p10_margin_adequacy(
+        market,
+        withdrawable,
+        leverage,
+        reverse_price * size,
+    )
+    return market_margin, reverse_margin, total_margin, adequacy
 
 
 def lifecycle_p10_source_release_margin(
@@ -8479,17 +8563,13 @@ def lifecycle_restore_p10_source(
     return True
 
 
-def lifecycle_p10_replacement_from_fill(
+def lifecycle_p10_effective_gap_rate(
     row: dict[str, Any],
     ctx: dict[str, Any],
     intent: dict[str, Any],
     fill_price: Decimal,
-    fill_size: Decimal,
-) -> dict[str, Any] | None:
-    source_price = decimal_or_none(intent.get("source_price"))
-    if source_price is None or source_price <= 0 or fill_price <= 0 or fill_size <= 0:
-        return None
-    market_is_buy = bool(intent.get("market_is_buy"))
+) -> tuple[Decimal, Decimal, Decimal]:
+    """Return fee-safe P10 reverse gap plus its effective fee components."""
     sz_decimals = int(row.get("sz_decimals") or ctx["asset"]["szDecimals"])
     configured_gap_rate = decimal_or_none(row.get("gap_rate")) or Decimal("0")
     taker_fee_rate = (
@@ -8505,18 +8585,30 @@ def lifecycle_p10_replacement_from_fill(
     fee_safe_gap_rate = (
         taker_fee_rate + maker_fee_rate + minimum_grid_gap(fill_price, sz_decimals)
     )
-    gap_rate = max(configured_gap_rate, fee_safe_gap_rate)
+    return max(configured_gap_rate, fee_safe_gap_rate), taker_fee_rate, maker_fee_rate
+
+
+def lifecycle_p10_reverse_target_price(
+    row: dict[str, Any],
+    ctx: dict[str, Any],
+    intent: dict[str, Any],
+    fill_price: Decimal,
+) -> tuple[Decimal | None, Decimal, Decimal, Decimal]:
+    """Calculate the mirrored P10 reverse price from an actual or budgeted fill."""
+    source_price = decimal_or_none(intent.get("source_price"))
+    if source_price is None or source_price <= 0 or fill_price <= 0:
+        return None, Decimal("0"), Decimal("0"), Decimal("0")
+    market_is_buy = bool(intent.get("market_is_buy"))
+    sz_decimals = int(row.get("sz_decimals") or ctx["asset"]["szDecimals"])
+    gap_rate, taker_fee_rate, maker_fee_rate = lifecycle_p10_effective_gap_rate(
+        row, ctx, intent, fill_price
+    )
     reflected_price = fill_price * Decimal("2") - source_price
     target_price = (
         rounded_perp_price(reflected_price, sz_decimals)
         if reflected_price > 0
         else Decimal("0")
     )
-    # The IOC can occasionally improve through the old passive price while the
-    # cancel/fill race is in flight.  In that case the reflected target points
-    # to the wrong side of the fill.  Keep at least one configured gap between
-    # the actual fill and its reverse order so fees, slippage, and the normal
-    # profit buffer remain covered.
     if gap_rate > 0:
         gap_target = rounded_perp_price(
             fill_price
@@ -8533,6 +8625,30 @@ def lifecycle_p10_replacement_from_fill(
     ) or (
         not market_is_buy and target_price >= fill_price
     ):
+        target_price = None
+    return target_price, gap_rate, taker_fee_rate, maker_fee_rate
+
+
+def lifecycle_p10_replacement_from_fill(
+    row: dict[str, Any],
+    ctx: dict[str, Any],
+    intent: dict[str, Any],
+    fill_price: Decimal,
+    fill_size: Decimal,
+) -> dict[str, Any] | None:
+    source_price = decimal_or_none(intent.get("source_price"))
+    if source_price is None or source_price <= 0 or fill_price <= 0 or fill_size <= 0:
+        return None
+    market_is_buy = bool(intent.get("market_is_buy"))
+    target_price, gap_rate, taker_fee_rate, maker_fee_rate = (
+        lifecycle_p10_reverse_target_price(row, ctx, intent, fill_price)
+    )
+    # The IOC can occasionally improve through the old passive price while the
+    # cancel/fill race is in flight.  In that case the reflected target points
+    # to the wrong side of the fill.  Keep at least one configured gap between
+    # the actual fill and its reverse order so fees, slippage, and the normal
+    # profit buffer remain covered.
+    if target_price is None:
         return None
     child = grid_order_entry(
         row,
@@ -8540,7 +8656,7 @@ def lifecycle_p10_replacement_from_fill(
         ctx["asset"],
         not market_is_buy,
         target_price,
-        True,
+        False,
         size=fill_size,
         gap=Decimal(str(row["gap_rate"])),
         preserve_size=True,
@@ -8550,6 +8666,7 @@ def lifecycle_p10_replacement_from_fill(
             "replacement_order": True,
             "p10_replacement": True,
             "p10_restore": True,
+            "p10_never_cancel": True,
             "grid_leg": 1 - int(intent.get("source_grid_leg") or 0),
             "source_grid_leg": int(intent.get("source_grid_leg") or 0),
             "source_oid": intent.get("source_oid"),
@@ -8599,12 +8716,77 @@ def lifecycle_materialize_p10_fill(
     levels.append(child)
     lifecycle_remove_p10_intent(row, source, cache)
 
+    leverage = decimal_or_none(ctx.get("position_leverage")) or decimal_or_none(
+        ctx["asset"].get("maxLeverage")
+    )
+    reverse_price = decimal_or_none(child.get("price", child.get("limit_px")))
+    reverse_size = decimal_or_none(child.get("size"))
+    post_market_withdrawable = lifecycle_p10_fresh_withdrawable(ctx, cache)
+    reverse_margin = (
+        reverse_price * reverse_size / leverage
+        if reverse_price is not None
+        and reverse_price > 0
+        and reverse_size is not None
+        and reverse_size > 0
+        and leverage is not None
+        and leverage > 0
+        else None
+    )
+    reverse_adequacy = (
+        post_market_withdrawable / reverse_margin
+        if post_market_withdrawable is not None
+        and post_market_withdrawable >= 0
+        and reverse_margin is not None
+        and reverse_margin > 0
+        else None
+    )
+    row["p10_post_market_withdrawable"] = (
+        decimal_to_plain(post_market_withdrawable)
+        if post_market_withdrawable is not None
+        else None
+    )
+    row["p10_actual_reverse_margin"] = (
+        decimal_to_plain(reverse_margin) if reverse_margin is not None else None
+    )
+    row["p10_reverse_margin_adequacy"] = (
+        decimal_to_plain(reverse_adequacy) if reverse_adequacy is not None else None
+    )
+    audit_grid_action(
+        "grid_p10_reverse_margin_checked",
+        coin=ctx["coin"],
+        grid_id=row.get("id"),
+        economic_chain_id=intent.get("economic_chain_id"),
+        source_oid=intent.get("source_oid"),
+        market_oid=market_oid,
+        actual_withdrawable=row["p10_post_market_withdrawable"],
+        reverse_price=(decimal_to_plain(reverse_price) if reverse_price is not None else None),
+        reverse_size=(decimal_to_plain(reverse_size) if reverse_size is not None else None),
+        estimated_reverse_margin=row["p10_actual_reverse_margin"],
+        margin_adequacy=row["p10_reverse_margin_adequacy"],
+        margin_threshold=decimal_to_plain(GRID_P10_MARGIN_ADEQUACY_THRESHOLD),
+        passed=(
+            reverse_adequacy is not None
+            and reverse_adequacy > GRID_P10_MARGIN_ADEQUACY_THRESHOLD
+        ),
+    )
+    if (
+        reverse_adequacy is None
+        or reverse_adequacy <= GRID_P10_MARGIN_ADEQUACY_THRESHOLD
+    ):
+        child["last_error"] = (
+            "P10 reverse margin adequacy did not strictly exceed threshold"
+        )
+        child["p10_reverse_margin_deferred_at"] = ctx["now"]
+        row["p10_status"] = "deferred_reverse_margin"
+        persist_lifecycle_intent(cache)
+        return True
+
     synthetic_position = ctx["position_size"] + (fill_size if bool(intent.get("market_is_buy")) else -fill_size)
     result = lifecycle_submit_order(
         ctx["exchange"], ctx["coin"], child, ctx["now"], row, ctx["asset"],
         synthetic_position, ctx["current_mid"], ctx["best_bid"], ctx["best_ask"],
         cache.setdefault("lifecycle_isolated_ready", set()), ctx["open_orders"], cache,
-        search_outward=False, force_gtc=True,
+        search_outward=False, force_gtc=True, force_non_reduce_only=True,
     )
     if result == GRID_P8_REACCUMULATE_STATUS and lifecycle_accumulate_p8_partial_debt(
         row,
@@ -8888,8 +9070,46 @@ def lifecycle_process_p10(row: dict[str, Any], ctx: dict[str, Any], cache: dict[
         if current_withdrawable is not None and source_release_margin is not None
         else None
     )
-    estimated_margin, adequacy = lifecycle_p10_margin_adequacy(
-        market or {}, prospective_withdrawable, leverage
+    budget_intent = intent if intent is not None else {
+        "source_price": decimal_to_plain(source_price),
+        "market_is_buy": is_buy,
+        "taker_fee_rate": decimal_to_plain(ctx.get("p10_taker_fee_rate") or Decimal("0")),
+        "maker_fee_rate": decimal_to_plain(ctx.get("p10_maker_fee_rate") or Decimal("0")),
+    }
+    market_plan = market.get("plan") if isinstance(market, dict) else None
+    budget_fill_price = (
+        max(
+            ctx["current_mid"],
+            decimal_or_none(market_plan.get("limit_px")) or Decimal("0"),
+        )
+        if isinstance(market_plan, dict)
+        else Decimal("0")
+    )
+    estimated_reverse_price, _gap, _taker, _maker = lifecycle_p10_reverse_target_price(
+        row, ctx, budget_intent, budget_fill_price
+    )
+    (
+        estimated_market_margin,
+        estimated_reverse_margin,
+        estimated_margin,
+        adequacy,
+    ) = lifecycle_p10_margin_components(
+        market or {}, estimated_reverse_price, prospective_withdrawable, leverage
+    )
+    row["p10_estimated_market_margin"] = (
+        decimal_to_plain(estimated_market_margin)
+        if estimated_market_margin is not None
+        else None
+    )
+    row["p10_estimated_reverse_margin"] = (
+        decimal_to_plain(estimated_reverse_margin)
+        if estimated_reverse_margin is not None
+        else None
+    )
+    row["p10_estimated_reverse_price"] = (
+        decimal_to_plain(estimated_reverse_price)
+        if estimated_reverse_price is not None
+        else None
     )
     row["p10_estimated_margin"] = (
         decimal_to_plain(estimated_margin) if estimated_margin is not None else None
@@ -8938,7 +9158,12 @@ def lifecycle_process_p10(row: dict[str, Any], ctx: dict[str, Any], cache: dict[
                 if prospective_withdrawable is not None
                 else None
             ),
-            estimated_margin=(decimal_to_plain(estimated_margin) if estimated_margin is not None else None),
+            estimated_market_margin=row["p10_estimated_market_margin"],
+            estimated_reverse_margin=row["p10_estimated_reverse_margin"],
+            estimated_total_margin=(
+                decimal_to_plain(estimated_margin) if estimated_margin is not None else None
+            ),
+            estimated_reverse_price=row["p10_estimated_reverse_price"],
             margin_adequacy=(decimal_to_plain(adequacy) if adequacy is not None else None),
             margin_threshold=decimal_to_plain(GRID_P10_MARGIN_ADEQUACY_THRESHOLD),
             projected_within_max=(
@@ -8971,6 +9196,15 @@ def lifecycle_process_p10(row: dict[str, Any], ctx: dict[str, Any], cache: dict[
             "market_is_buy": is_buy,
             "economic_chain_id": chain_id,
             "estimated_margin": decimal_to_plain(estimated_margin or Decimal("0")),
+            "estimated_market_margin": decimal_to_plain(
+                estimated_market_margin or Decimal("0")
+            ),
+            "estimated_reverse_margin": decimal_to_plain(
+                estimated_reverse_margin or Decimal("0")
+            ),
+            "estimated_reverse_price": decimal_to_plain(
+                estimated_reverse_price or Decimal("0")
+            ),
             "margin_adequacy": decimal_to_plain(adequacy or Decimal("0")),
             "pre_cancel_withdrawable": decimal_to_plain(
                 current_withdrawable or Decimal("0")
@@ -9037,8 +9271,13 @@ def lifecycle_process_p10(row: dict[str, Any], ctx: dict[str, Any], cache: dict[
         persist_lifecycle_intent(cache)
 
     post_cancel_withdrawable = lifecycle_p10_fresh_withdrawable(ctx, cache)
-    post_cancel_estimated_margin, post_cancel_adequacy = lifecycle_p10_margin_adequacy(
-        market or {}, post_cancel_withdrawable, leverage
+    (
+        post_cancel_market_margin,
+        post_cancel_reverse_margin,
+        post_cancel_estimated_margin,
+        post_cancel_adequacy,
+    ) = lifecycle_p10_margin_components(
+        market or {}, estimated_reverse_price, post_cancel_withdrawable, leverage
     )
     row["p10_post_cancel_withdrawable"] = (
         decimal_to_plain(post_cancel_withdrawable)
@@ -9063,7 +9302,17 @@ def lifecycle_process_p10(row: dict[str, Any], ctx: dict[str, Any], cache: dict[
         estimated_source_release_margin=intent.get("estimated_source_release_margin"),
         prospective_withdrawable=intent.get("prospective_withdrawable"),
         actual_withdrawable=row["p10_post_cancel_withdrawable"],
-        estimated_margin=(
+        estimated_market_margin=(
+            decimal_to_plain(post_cancel_market_margin)
+            if post_cancel_market_margin is not None
+            else None
+        ),
+        estimated_reverse_margin=(
+            decimal_to_plain(post_cancel_reverse_margin)
+            if post_cancel_reverse_margin is not None
+            else None
+        ),
+        estimated_total_margin=(
             decimal_to_plain(post_cancel_estimated_margin)
             if post_cancel_estimated_margin is not None
             else None
@@ -9714,6 +9963,22 @@ def lifecycle_process_anomalies(row: dict[str, Any], ctx: dict[str, Any], cache:
                     changed = True
                     continue
                 entry["replacement_pending"] = True
+                changed = True
+                continue
+            if bool(entry.get("p10_never_cancel")):
+                # P10's mirrored reverse is an outstanding economic
+                # obligation.  Even an unexpected exchange cancellation must
+                # return it to P3 instead of terminating the chain.
+                entry["oid"] = None
+                entry["status"] = GRID_CHAIN_DEBT_STATUS
+                entry["chain_debt_at"] = ctx["now"]
+                entry["p5_restore_queued_at"] = ctx["now"]
+                entry["p10_restore"] = True
+                entry.pop("p3_queue_seq", None)
+                lifecycle_assign_p3_queue_seq(entry, cache)
+                levels.remove(entry)
+                levels.append(entry)
+                enqueued += 1
                 changed = True
                 continue
             if lifecycle_leg(entry) == 0:
@@ -10476,6 +10741,7 @@ def maintain_grid(row: dict[str, Any], cache: dict[str, Any] | None = None) -> t
                     ctx["exchange"], ctx["coin"], entry, ctx["now"], row, ctx["asset"], ctx["position_size"],
                     ctx["current_mid"], ctx["best_bid"], ctx["best_ask"], isolated_ready,
                     ctx["open_orders"], cache, search_outward=True,
+                    force_non_reduce_only=bool(entry.get("p10_never_cancel")),
                     allow_non_reduce_only_fallback=True,
                 )
                 changed = True

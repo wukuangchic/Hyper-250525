@@ -219,7 +219,7 @@ class P10PromotionTests(unittest.TestCase):
         self.assertIsNotNone(exchange.order_calls[0]["cloid"])
         self.assertFalse(exchange.order_calls[1]["is_buy"])
         self.assertEqual(exchange.order_calls[1]["price"], 70.0)
-        self.assertTrue(exchange.order_calls[1]["reduce_only"])
+        self.assertFalse(exchange.order_calls[1]["reduce_only"])
         self.assertNotIn(source, row["levels"])
         replacement = row["levels"][0]
         self.assertEqual(replacement["price"], "70")
@@ -227,6 +227,8 @@ class P10PromotionTests(unittest.TestCase):
         self.assertEqual(replacement["oid"], 23)
         self.assertEqual(replacement["status"], "active")
         self.assertTrue(replacement["p10_replacement"])
+        self.assertTrue(replacement["p10_never_cancel"])
+        self.assertFalse(replacement["reduce_only"])
         self.assertNotIn("p10_promotion_intent", row)
         self.assertEqual(cache["action_limit_headroom"], 7)
 
@@ -242,7 +244,7 @@ class P10PromotionTests(unittest.TestCase):
         self.assertFalse(exchange.order_calls[0]["is_buy"])
         self.assertTrue(exchange.order_calls[1]["is_buy"])
         self.assertEqual(exchange.order_calls[1]["price"], 50.0)
-        self.assertTrue(exchange.order_calls[1]["reduce_only"])
+        self.assertFalse(exchange.order_calls[1]["reduce_only"])
         self.assertEqual(row["levels"][0]["price"], "50")
 
     def test_long_better_fill_uses_one_gap_sell_fallback(self) -> None:
@@ -497,7 +499,9 @@ class P10PromotionTests(unittest.TestCase):
         self.assertEqual(source["status"], "active")
         self.assertEqual(source["oid"], 11)
         self.assertEqual(row["p10_status"], "skipped_pre_cancel_safety")
-        self.assertEqual(row["p10_estimated_margin"], "1.2")
+        self.assertEqual(row["p10_estimated_market_margin"], "1.2")
+        self.assertEqual(row["p10_estimated_reverse_margin"], "1.4")
+        self.assertEqual(row["p10_estimated_margin"], "2.6")
         self.assertEqual(row["p10_current_withdrawable"], "0.2")
         self.assertEqual(row["p10_source_release_margin"], "1")
         self.assertEqual(row["p10_prospective_withdrawable"], "1.2")
@@ -505,8 +509,8 @@ class P10PromotionTests(unittest.TestCase):
     def test_source_release_margin_allows_cancel_then_uses_fresh_balance(self) -> None:
         row, source = make_row()
         exchange = FakeExchange()
-        ctx = make_ctx(exchange, withdrawable="1")
-        ctx["info"] = FakeInfo(post_cancel_withdrawable="2")
+        ctx = make_ctx(exchange, withdrawable="2")
+        ctx["info"] = FakeInfo(post_cancel_withdrawable="3")
 
         changed = lifecycle_process_p10(row, ctx, {"action_limit_headroom": 10})
 
@@ -514,20 +518,20 @@ class P10PromotionTests(unittest.TestCase):
         self.assertEqual(len(exchange.cancel_calls), 1)
         self.assertEqual(len(exchange.order_calls), 2)
         self.assertNotIn(source, row["levels"])
-        self.assertEqual(row["p10_current_withdrawable"], "1")
+        self.assertEqual(row["p10_current_withdrawable"], "2")
         self.assertEqual(row["p10_source_release_margin"], "1")
-        self.assertEqual(row["p10_prospective_withdrawable"], "2")
-        self.assertEqual(row["p10_post_cancel_withdrawable"], "2")
+        self.assertEqual(row["p10_prospective_withdrawable"], "3")
+        self.assertEqual(row["p10_post_cancel_withdrawable"], "3")
         self.assertEqual(
             row["p10_post_cancel_margin_adequacy"],
-            "1.666666666666666666666666667",
+            "1.153846153846153846153846154",
         )
 
     def test_post_cancel_real_balance_failure_restores_source_to_p3(self) -> None:
         row, source = make_row()
         exchange = FakeExchange()
-        ctx = make_ctx(exchange, withdrawable="1")
-        ctx["info"] = FakeInfo(post_cancel_withdrawable="1.32")
+        ctx = make_ctx(exchange, withdrawable="2")
+        ctx["info"] = FakeInfo(post_cancel_withdrawable="2.86")
 
         with patch("trail_worker.audit_grid_action") as audit_mock:
             changed = lifecycle_process_p10(row, ctx, {"action_limit_headroom": 10})
@@ -539,13 +543,70 @@ class P10PromotionTests(unittest.TestCase):
         self.assertTrue(source["p10_restore"])
         self.assertNotIn("p10_promotion_intent", row)
         self.assertEqual(row["p10_status"], "skipped_post_cancel_margin")
-        self.assertEqual(row["p10_post_cancel_withdrawable"], "1.32")
+        self.assertEqual(row["p10_post_cancel_withdrawable"], "2.86")
         self.assertEqual(row["p10_post_cancel_margin_adequacy"], "1.1")
         self.assertEqual(
             audit_mock.call_args_list[-1].args[0],
             "grid_p10_post_cancel_margin_checked",
         )
         self.assertFalse(audit_mock.call_args_list[-1].kwargs["passed"])
+
+    def test_post_market_reverse_margin_failure_keeps_protected_p3_debt(self) -> None:
+        row, source = make_row()
+        exchange = FakeExchange()
+        ctx = make_ctx(exchange, withdrawable="2")
+
+        with patch(
+            "trail_worker.lifecycle_p10_fresh_withdrawable",
+            side_effect=[Decimal("3"), Decimal("1.54")],
+        ):
+            changed = lifecycle_process_p10(
+                row, ctx, {"action_limit_headroom": 10, "grid_rows": [row]}
+            )
+
+        self.assertTrue(changed)
+        self.assertEqual(len(exchange.cancel_calls), 1)
+        self.assertEqual(len(exchange.order_calls), 1)
+        self.assertNotIn(source, row["levels"])
+        replacement = row["levels"][0]
+        self.assertEqual(replacement["status"], GRID_CHAIN_DEBT_STATUS)
+        self.assertTrue(replacement["p10_never_cancel"])
+        self.assertFalse(replacement["reduce_only"])
+        self.assertEqual(row["p10_status"], "deferred_reverse_margin")
+        self.assertEqual(row["p10_actual_reverse_margin"], "1.4")
+        self.assertEqual(row["p10_reverse_margin_adequacy"], "1.1")
+
+    def test_outstanding_p10_reverse_locks_same_chain_from_another_promotion(self) -> None:
+        row, source = make_row()
+        protected_reverse = {
+            "side": "sell",
+            "is_buy": False,
+            "status": "active",
+            "oid": 12,
+            "price": "70",
+            "size": "0.2",
+            "reduce_only": False,
+            "grid_leg": 1,
+            "economic_chain_id": source["economic_chain_id"],
+            "p10_replacement": True,
+            "p10_never_cancel": True,
+        }
+        row["levels"].append(protected_reverse)
+        exchange = FakeExchange()
+        ctx = make_ctx(exchange)
+        ctx["open_orders"].append(
+            {
+                "coin": "BTC", "side": "A", "limitPx": "70", "sz": "0.2",
+                "oid": 12, "reduceOnly": False,
+            }
+        )
+
+        changed = lifecycle_process_p10(row, ctx, {"action_limit_headroom": 10})
+
+        self.assertFalse(changed)
+        self.assertEqual(exchange.cancel_calls, [])
+        self.assertEqual(exchange.order_calls, [])
+        self.assertEqual(row["p10_status"], "skipped_chain_outstanding_reverse")
 
     def test_max_position_failure_never_cancels_source(self) -> None:
         row, source = make_row()
